@@ -67,6 +67,8 @@ Get-ChildItem -LiteralPath $source -Force | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $targetFullPath -Recurse -Force:$Force
 }
 
+Copy-Item -LiteralPath (Join-Path $templateRoot 'scripts\doctor.ps1') -Destination (Join-Path $targetFullPath 'scripts\doctor.ps1') -Force
+
 $createdAt = (Get-Date).ToUniversalTime().ToString("o")
 $replacements = @{
     "__PROJECT_ID__" = $ProjectId

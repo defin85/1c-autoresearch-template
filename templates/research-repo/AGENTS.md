@@ -8,10 +8,13 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 - `analysis/queue/tasks.jsonl` is the current analysis queue.
 - `analysis/features/` contains feature-level evidence packs.
 - `outputs/` contains human-facing deliverables.
+- `docs/agent/repo-map.md` maps agent entry points and change routing.
+- `docs/agent/verification.md` is the canonical verification matrix.
 
 ## Operating Rules
 
 - Process one queue task at a time.
+- Use `$1c-autoresearch-queue-worker` when selecting, claiming, executing, or updating queue tasks.
 - Prefer static source evidence and generated indexes before live 1C access.
 - Do not use unrelated 1C MCP servers as evidence.
 - If a finding depends on infobase data, mark it as `needs_infobase_data`.
@@ -21,6 +24,9 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 
 ## Verification
 
+See `docs/agent/verification.md` for the full verification runbook.
+
 ```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-ResearchRepo.ps1
 ```

@@ -23,13 +23,21 @@ function Require-Path {
     'AGENTS.md',
     'project.example.toml',
     'docs\agent\index.md',
+    'docs\agent\repo-map.md',
+    'docs\agent\verification.md',
     'docs\method\1c-autoresearch-process.md',
     'docs\method\queue-design.md',
     'templates\research-repo\project.toml',
+    'templates\research-repo\docs\agent\index.md',
+    'templates\research-repo\docs\agent\repo-map.md',
+    'templates\research-repo\docs\agent\verification.md',
     'templates\research-repo\analysis\queue\tasks.jsonl',
     'templates\research-repo\scripts\queue\Get-NextAnalysisTask.ps1',
     'templates\research-repo\scripts\queue\Set-AnalysisTaskStatus.ps1',
+    'templates\research-repo\.agents\skills\1c-autoresearch-queue-worker\SKILL.md',
+    'scripts\doctor.ps1',
     'scripts\bootstrap\New-1cResearchRepo.ps1',
+    'scripts\checks\Test-Doctor.ps1',
     'scripts\checks\Test-ResearchRepo.ps1'
 ) | ForEach-Object { Require-Path $_ }
 

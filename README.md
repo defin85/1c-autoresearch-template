@@ -13,6 +13,12 @@ Use it when you need to compare a vendor baseline, a customer-modified 1C config
 - Bootstrap and validation scripts for new research repositories.
 - A small method layer for standard-vs-custom-vs-next-release gap analysis.
 
+## Agent Docs
+
+- `docs/agent/repo-map.md`: entry points, change routing, and system-of-record map.
+- `docs/agent/verification.md`: canonical verification matrix.
+- `docs/agent/index.md`: short router for template work and concrete research repos.
+
 ## What This Template Does Not Contain
 
 - Real customer configuration dumps.
@@ -57,6 +63,7 @@ Validate:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-ResearchRepo.ps1 -RepoPath E:\Projects\do_21_research
+powershell -NoProfile -ExecutionPolicy Bypass -File E:\Projects\do_21_research\scripts\doctor.ps1
 ```
 
 ## Research Repo Contract
@@ -94,3 +101,31 @@ scripts/
 7. Update the task status and stop.
 
 The queue is deliberately file-backed. It is slower than a broker but transparent, diffable, and easy for Codex automation to resume.
+
+## Doctor
+
+See `docs/agent/verification.md` for the canonical verification matrix.
+
+Run from this template repo:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1
+```
+
+Run from a concrete research repo:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1
+```
+
+Check another repo explicitly:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -RepoPath E:\Projects\do_21_research
+```
+
+Useful flags:
+
+- `-Json`: machine-readable output for automation.
+- `-Deep`: also checks source path existence and basic tools.
+- `-Strict`: returns exit code `2` when warnings exist.

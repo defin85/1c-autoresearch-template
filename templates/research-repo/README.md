@@ -17,6 +17,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\queue\Get-NextAnalys
 Validate the repository:
 
 ```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-ResearchRepo.ps1
 ```
 
@@ -30,4 +31,7 @@ analysis/runs/       run logs
 outputs/             human-facing deliverables
 docs/                method and agent guidance
 scripts/             queue and validation helpers
+.agents/skills/      repo-local Codex workflows
 ```
+
+Agent navigation starts in `docs/agent/repo-map.md`. Verification details live in `docs/agent/verification.md`.
