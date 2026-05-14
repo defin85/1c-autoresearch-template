@@ -1,0 +1,14 @@
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+*.log
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+node_modules/
+
+# Generated research repositories may be created next to this template, not inside it.
+do_*_research/

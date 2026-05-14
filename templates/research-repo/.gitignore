@@ -1,0 +1,16 @@
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+*.log
+__pycache__/
+.pytest_cache/
+.venv/
+node_modules/
+
+# Generated local work
+analysis/runs/**
+analysis/queue/runs/**
+
+# Keep generated Excel/CSV outputs only when intentionally reviewed.
+~$*.xlsx

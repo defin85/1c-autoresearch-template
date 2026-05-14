@@ -1,0 +1,38 @@
+[project]
+id = "example-project"
+product = "1C Document Management"
+baseline_version = "2.1"
+target_version = "2.1"
+next_vendor_version = "3.0"
+description = "Example project manifest for a concrete 1C research repository."
+
+[paths]
+vendor_baseline = "E:/Projects/vendor_baseline"
+target_cf = "E:/Projects/customer/cf"
+target_cfe = "E:/Projects/customer/cfe"
+next_vendor = "E:/Projects/vendor_next"
+compare_repo = "."
+
+[rlm]
+vendor_baseline = "vendor_baseline"
+target_cf = "customer_cf"
+target_cfe = "customer_cfe"
+next_vendor = "vendor_next"
+
+[mcp]
+enabled = false
+server = ""
+url = ""
+service_root = "mcp"
+
+[web]
+enabled = false
+url = ""
+username = "codex"
+credential_file = ""
+
+[policy]
+static_sources_first = true
+allow_live_infobase_evidence = false
+mark_runtime_data_dependencies = true
+default_confidence_for_inference = "medium"

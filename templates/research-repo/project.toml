@@ -1,0 +1,38 @@
+[project]
+id = "__PROJECT_ID__"
+product = "__PRODUCT__"
+baseline_version = "__BASELINE_VERSION__"
+target_version = "__TARGET_VERSION__"
+next_vendor_version = "__NEXT_VENDOR_VERSION__"
+description = "Concrete 1C autoresearch repository."
+
+[paths]
+vendor_baseline = "__VENDOR_BASELINE__"
+target_cf = "__TARGET_CF__"
+target_cfe = "__TARGET_CFE__"
+next_vendor = "__NEXT_VENDOR__"
+compare_repo = "."
+
+[rlm]
+vendor_baseline = "__RLM_VENDOR_BASELINE__"
+target_cf = "__RLM_TARGET_CF__"
+target_cfe = "__RLM_TARGET_CFE__"
+next_vendor = "__RLM_NEXT_VENDOR__"
+
+[mcp]
+enabled = false
+server = ""
+url = ""
+service_root = "mcp"
+
+[web]
+enabled = false
+url = ""
+username = "codex"
+credential_file = ""
+
+[policy]
+static_sources_first = true
+allow_live_infobase_evidence = false
+mark_runtime_data_dependencies = true
+default_confidence_for_inference = "medium"
