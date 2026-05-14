@@ -10,7 +10,11 @@ node_modules/
 
 # Generated local work
 analysis/runs/**
+!analysis/runs/
+!analysis/runs/README.md
 analysis/queue/runs/**
+!analysis/queue/runs/
+!analysis/queue/runs/README.md
 
 # Keep generated Excel/CSV outputs only when intentionally reviewed.
 ~$*.xlsx

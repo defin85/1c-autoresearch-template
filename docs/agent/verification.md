@@ -12,6 +12,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-Doctor.p
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1
 ```
 
+The same gate runs in GitHub Actions via `.github/workflows/verify.yml`.
+
 For machine-readable automation output:
 
 ```powershell
@@ -57,7 +59,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File <target-repo>\scripts\doctor
 | `scripts/checks/Test-Template.ps1` | Required template paths and template queue JSONL parseability. |
 | `scripts/checks/Test-Doctor.ps1` | End-to-end doctor smoke test, bootstrap output, placeholder replacement, queue validation, and manifest policy diagnostics. |
 | `scripts/checks/Test-ResearchRepo.ps1` | Delegates generated repository health to `scripts/doctor.ps1 -Mode research`. |
-| `scripts/doctor.ps1` | Primary health gate for template or research repos: required paths, manifest sections, queue schema, dependency cycles, stale claims, expected outputs, unresolved placeholders, MCP/web policy, and optional tool checks. |
+| `scripts/doctor.ps1` | Primary health gate for template or research repos: required paths, manifest sections, queue schema, dependency cycles, stale claims, expected outputs, unresolved placeholders, MCP/web policy, optional `.codex/1c-mcp.toml` consistency, and optional tool checks. |
 
 ## Expected Result
 

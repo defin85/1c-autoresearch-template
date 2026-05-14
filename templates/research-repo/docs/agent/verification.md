@@ -44,3 +44,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Deep -St
 - `status = fail`: stop autonomous work and fix the contract issue first.
 
 The doctor validates required paths, `project.toml`, queue schema, task dependencies, stale claims, expected outputs, unresolved placeholders, MCP/web policy, and optional tools when `-Deep` is used.
+When `.codex/1c-mcp.toml` exists, the doctor also compares its MCP server, URL, and service root with `project.toml`.

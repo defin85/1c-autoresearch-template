@@ -8,7 +8,7 @@ Rules:
 2. Read analysis/queue/README.md, task-schema.md, review-checklist.md, and tasks.jsonl.
 3. Select exactly one pending task with the highest priority whose dependencies are done.
 4. Claim it with scripts/queue/Set-AnalysisTaskStatus.ps1.
-5. Create a run folder under analysis/queue/runs/<timestamp>-<task-id>/.
+5. Create a run folder under analysis/runs/<timestamp>-<task-id>/ when the run produces useful diagnostics.
 6. Use static sources and cached indexes first.
 7. Do not use 1C MCP or web evidence unless the task explicitly asks for it and project.toml allows it.
 8. Record source file and line for confirmed claims.

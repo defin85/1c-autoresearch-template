@@ -61,8 +61,10 @@ function Require-Path {
 function Read-SimpleToml {
     param([string]$Path)
 
-    $result = @{}
-    $section = $null
+    $result = @{
+        '_root' = @{}
+    }
+    $section = '_root'
     foreach ($rawLine in Get-Content -LiteralPath $Path) {
         $line = $rawLine.Trim()
         if ($line.Length -eq 0 -or $line.StartsWith('#')) {
@@ -215,6 +217,7 @@ function Test-ProjectToml {
     }
 
     Test-ManifestAccessPolicy -Manifest $manifest
+    Test-LocalMcpManifest -Manifest $manifest
 
     return $manifest
 }
@@ -257,6 +260,63 @@ function Test-ManifestAccessPolicy {
         } else {
             Add-Check 'manifest.web.enabled' ok "Web access is disabled"
         }
+    }
+}
+
+function Test-LocalMcpManifest {
+    param([hashtable]$Manifest)
+
+    $relativePath = '.codex\1c-mcp.toml'
+    $path = Join-Path $script:root $relativePath
+    if (-not (Test-Path -LiteralPath $path)) {
+        Add-Check 'manifest.local_mcp.absent' ok "No repo-local .codex/1c-mcp.toml manifest found"
+        return
+    }
+
+    try {
+        $localManifest = Read-SimpleToml $path
+        Add-Check 'manifest.local_mcp.parse' ok "Parsed $relativePath"
+    } catch {
+        Add-Check 'manifest.local_mcp.parse' fail "Could not parse ${relativePath}: $($_.Exception.Message)"
+        return
+    }
+
+    $projectMcpEnabled = Test-TomlEnabled -Manifest $Manifest -Section 'mcp'
+    if (-not $projectMcpEnabled) {
+        Add-Check 'manifest.mcp.local_with_disabled_project_mcp' warn "Repo-local .codex/1c-mcp.toml exists while project.toml has mcp.enabled=false"
+        return
+    }
+
+    $comparisons = @(
+        @{ ProjectKey = 'server'; LocalKey = 'mcp_server'; Label = 'MCP server' },
+        @{ ProjectKey = 'url'; LocalKey = 'url'; Label = 'MCP URL' },
+        @{ ProjectKey = 'service_root'; LocalKey = 'service_root'; Label = 'MCP service root' }
+    )
+
+    $mismatchCount = 0
+    $missingCount = 0
+    $uncheckedCount = 0
+    foreach ($comparison in $comparisons) {
+        $projectValue = Get-TomlValue -Manifest $Manifest -Section 'mcp' -Key $comparison.ProjectKey
+        $localValue = Get-TomlValue -Manifest $localManifest -Section '_root' -Key $comparison.LocalKey
+
+        if ([string]::IsNullOrWhiteSpace($localValue)) {
+            $missingCount += 1
+            Add-Check "manifest.local_mcp.$($comparison.LocalKey)" warn ".codex/1c-mcp.toml is missing $($comparison.LocalKey)"
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($projectValue)) {
+            $uncheckedCount += 1
+            continue
+        }
+        if ($projectValue -ne $localValue) {
+            $mismatchCount += 1
+            Add-Check 'manifest.mcp.local_mismatch' fail "$($comparison.Label) differs between project.toml and .codex/1c-mcp.toml: project.toml=$projectValue local=$localValue"
+        }
+    }
+
+    if ($mismatchCount -eq 0 -and $missingCount -eq 0 -and $uncheckedCount -eq 0) {
+        Add-Check 'manifest.mcp.local_match' ok "Repo-local .codex/1c-mcp.toml matches project.toml MCP settings"
     }
 }
 
@@ -437,6 +497,7 @@ function Test-UnresolvedPlaceholders {
 
 function Test-TemplateRepo {
     foreach ($path in @(
+        '.github\workflows\verify.yml',
         'README.md',
         'AGENTS.md',
         'project.example.toml',
@@ -449,6 +510,8 @@ function Test-TemplateRepo {
         'templates\research-repo\docs\agent\index.md',
         'templates\research-repo\docs\agent\repo-map.md',
         'templates\research-repo\docs\agent\verification.md',
+        'templates\research-repo\analysis\runs\README.md',
+        'templates\research-repo\analysis\queue\runs\README.md',
         'templates\research-repo\analysis\queue\tasks.jsonl',
         'templates\research-repo\scripts\queue\Get-NextAnalysisTask.ps1',
         'templates\research-repo\scripts\queue\Set-AnalysisTaskStatus.ps1',
@@ -479,9 +542,11 @@ function Test-ResearchRepo {
         'docs\agent\index.md',
         'docs\agent\repo-map.md',
         'docs\agent\verification.md',
+        'analysis\runs\README.md',
         'analysis\queue\tasks.jsonl',
         'analysis\queue\task-schema.md',
         'analysis\queue\review-checklist.md',
+        'analysis\queue\runs\README.md',
         'analysis\features\README.md',
         'analysis\cache\README.md',
         'outputs\README.md',

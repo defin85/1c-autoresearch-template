@@ -1,36 +1,64 @@
 # 1C Autoresearch Process
 
-Use static source evidence first:
+This method is for comparing:
 
-- vendor baseline from `project.toml`;
-- customer `cf`;
-- customer `cfe`;
-- cached indexes under `analysis/cache/`.
+- a vendor baseline configuration;
+- a customer-modified configuration;
+- optional customer extensions;
+- optional next vendor release.
 
-Use live infobase evidence only when a task explicitly requests it.
+The goal is a functional gap map, not a raw diff report.
 
-## Feature Pack Contract
+## Evidence Levels
 
-Each functional feature should have:
+- `high`: direct source evidence from BSL/XML/metadata, with file and line.
+- `medium`: strong static relation through marker, type, form, role, or call graph, but runtime values are unknown.
+- `low`: plausible hypothesis that requires live infobase, customer confirmation, or scenario execution.
 
-- `brief.md`;
-- `findings.md`;
-- `evidence.csv`;
-- `open-questions.md`;
-- `review.md`;
-- optional `artifacts/`.
+When behavior depends on infobase data, mark it as `needs_infobase_data`.
 
-## Required Coverage
+## Pipeline
 
-For deep dives, check:
+1. Build or import indexes:
+   - file diff index;
+   - change index;
+   - role rights index;
+   - form element index;
+   - symbol occurrence index.
+2. Split raw diffs into functional buckets.
+3. Convert bucket findings into feature candidates.
+4. Run deep dives per feature.
+5. Run independent review tasks.
+6. Produce a functional customization register.
+7. Compare features against the next vendor release.
+8. Classify each feature:
+   - standard;
+   - standard with settings;
+   - covered by existing customization;
+   - requires development;
+   - disputed or requires clarification.
 
-- metadata;
-- BSL;
-- forms;
-- validations;
-- lifecycle;
-- roles and rights;
-- background jobs;
+## Deep Dive Coverage
+
+For each feature, inspect:
+
+- metadata objects and attributes;
+- forms, commands, element visibility, mandatory flags, and event handlers;
+- write and before-write validations;
+- lifecycle state transitions;
+- scheduled/background behavior;
 - business processes and tasks;
-- extension overrides;
-- vendor delta.
+- roles, rights, workgroups, and routing participants;
+- extension overrides and borrowed objects;
+- vendor delta: added, changed, or vendor-existing.
+
+## Output Contract
+
+Each feature pack should be understandable without re-reading the full repository:
+
+- `brief.md`: business meaning and scope.
+- `findings.md`: grouped functional findings.
+- `evidence.csv`: machine-readable source evidence.
+- `open-questions.md`: unresolved facts and required evidence.
+- `review.md`: independent review result.
+- `artifacts/`: optional Excel/CSV/raw extracts.

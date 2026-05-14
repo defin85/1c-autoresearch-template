@@ -8,6 +8,7 @@ $tempRepo = Join-Path $env:TEMP '1c-autoresearch-doctor-smoke'
 $placeholderRepo = Join-Path $env:TEMP '1c-autoresearch-doctor-placeholder-smoke'
 $invalidQueueRepo = Join-Path $env:TEMP '1c-autoresearch-doctor-invalid-queue-smoke'
 $mcpWarnRepo = Join-Path $env:TEMP '1c-autoresearch-doctor-mcp-warn-smoke'
+$mcpMismatchRepo = Join-Path $env:TEMP '1c-autoresearch-doctor-mcp-mismatch-smoke'
 
 function Add-TestError {
     param([string]$Message)
@@ -85,7 +86,7 @@ try {
     if (Test-Path -LiteralPath $tempRepo) {
         Remove-Item -LiteralPath $tempRepo -Recurse -Force
     }
-    foreach ($path in @($placeholderRepo, $invalidQueueRepo, $mcpWarnRepo)) {
+    foreach ($path in @($placeholderRepo, $invalidQueueRepo, $mcpWarnRepo, $mcpMismatchRepo)) {
         if (Test-Path -LiteralPath $path) {
             Remove-Item -LiteralPath $path -Recurse -Force
         }
@@ -113,6 +114,12 @@ try {
 
     $embeddedDoctor = Join-Path $tempRepo 'scripts\doctor.ps1'
     Assert-True (Test-Path -LiteralPath $embeddedDoctor) "Bootstrap should install scripts\doctor.ps1 into research repo"
+    Assert-True (Test-Path -LiteralPath (Join-Path $tempRepo 'analysis\runs\README.md')) "Bootstrap should keep analysis\runs\README.md in research repo"
+    Assert-True (Test-Path -LiteralPath (Join-Path $tempRepo 'analysis\queue\runs\README.md')) "Bootstrap should keep analysis\queue\runs\README.md in research repo"
+
+    $generatedMethod = Get-Content -Raw -LiteralPath (Join-Path $tempRepo 'docs\method\1c-autoresearch-process.md')
+    Assert-True ($generatedMethod -match '## Evidence Levels') "Generated method docs should include evidence levels"
+    Assert-True ($generatedMethod -match '## Pipeline') "Generated method docs should include the full analysis pipeline"
 
     if (Test-Path -LiteralPath $embeddedDoctor) {
         $researchResult = Invoke-DoctorJson -DoctorPath $embeddedDoctor
@@ -153,8 +160,27 @@ try {
     Assert-True ($mcpWarnResult.status -eq 'warn') "Doctor should warn when MCP or web access is enabled but incomplete"
     Assert-True (@($mcpWarnChecks | Where-Object { $_.id -like 'manifest.mcp.*' -and $_.status -eq 'warn' }).Count -gt 0) "Doctor should emit MCP configuration warnings"
     Assert-True (@($mcpWarnChecks | Where-Object { $_.id -like 'manifest.web.*' -and $_.status -eq 'warn' }).Count -gt 0) "Doctor should emit web configuration warnings"
+
+    Copy-SmokeRepo -Destination $mcpMismatchRepo
+    $mcpMismatchTomlPath = Join-Path $mcpMismatchRepo 'project.toml'
+    $mcpMismatchToml = Get-Content -Raw -LiteralPath $mcpMismatchTomlPath
+    $mcpMismatchToml = $mcpMismatchToml -replace '(?ms)\[mcp\]\s*enabled = false\s*server = ""\s*url = ""\s*service_root = "mcp"', "[mcp]`nenabled = true`nserver = `"1c-project`"`nurl = `"http://localhost/project`"`nservice_root = `"mcp`""
+    Set-Content -LiteralPath $mcpMismatchTomlPath -Value $mcpMismatchToml -Encoding UTF8
+    $localMcpDir = Join-Path $mcpMismatchRepo '.codex'
+    New-Item -ItemType Directory -Force -Path $localMcpDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $localMcpDir '1c-mcp.toml') -Encoding UTF8 -Value @'
+infobase = "project"
+mcp_server = "1c-other"
+url = "http://localhost/other"
+service_root = "mcp"
+rlm_project = "project"
+'@
+    $mcpMismatchResult = Invoke-DoctorJsonAllowFailure -DoctorPath (Join-Path $mcpMismatchRepo 'scripts\doctor.ps1')
+    $mcpMismatchChecks = @($mcpMismatchResult.Json.checks)
+    Assert-True ($mcpMismatchResult.ExitCode -ne 0) "Doctor should fail when .codex/1c-mcp.toml conflicts with project.toml"
+    Assert-True (@($mcpMismatchChecks | Where-Object { $_.id -eq 'manifest.mcp.local_mismatch' }).Count -gt 0) "Doctor should report manifest.mcp.local_mismatch"
 } finally {
-    foreach ($path in @($tempRepo, $placeholderRepo, $invalidQueueRepo, $mcpWarnRepo)) {
+    foreach ($path in @($tempRepo, $placeholderRepo, $invalidQueueRepo, $mcpWarnRepo, $mcpMismatchRepo)) {
         if (Test-Path -LiteralPath $path) {
             Remove-Item -LiteralPath $path -Recurse -Force
         }

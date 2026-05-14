@@ -7,6 +7,7 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 | Path | Purpose | Edit When |
 | --- | --- | --- |
 | `project.toml` | Project identity, source paths, RLM projects, MCP/web policy, and evidence permissions. | Source locations, RLM projects, MCP/web targets, or policy change. |
+| `.codex/1c-mcp.toml` | Optional repo-local active 1C MCP/web target manifest. | Published infobase, MCP server, service root, URL, or active RLM target changes. |
 | `AGENTS.md` | Mandatory local rules for agents. | Agent safety rules or verification entry points change. |
 | `README.md` | Short project overview and first commands. | Onboarding commands or layout change. |
 | `docs/agent/` | Agent router, repo map, and verification runbook. | Agent workflow or navigation changes. |
@@ -33,6 +34,7 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 ## System Of Record
 
 - `project.toml`: active source paths, RLM projects, MCP/web target, and evidence policy.
+- `.codex/1c-mcp.toml`: active MCP/web target when present; it must match `project.toml` before live evidence is used.
 - `analysis/queue/tasks.jsonl`: current queue state.
 - `analysis/features/`: durable feature evidence.
 - `outputs/`: final human-facing deliverables.

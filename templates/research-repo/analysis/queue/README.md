@@ -8,7 +8,7 @@ This directory stores the queue state outside the Codex context window.
 - `task-schema.md`: field contract and statuses.
 - `worker-prompt.md`: prompt for manual or automation-based runs.
 - `review-checklist.md`: quality gates for deep dives and reviews.
-- `runs/`: optional run logs.
+- `runs/`: queue-specific automation diagnostics. Prefer `analysis/runs/` for new task run logs.
 
 ## Next Task
 

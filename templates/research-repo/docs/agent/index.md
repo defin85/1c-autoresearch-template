@@ -4,7 +4,7 @@ Read `docs/agent/repo-map.md` before choosing files. Read `docs/agent/verificati
 
 1. Read `project.toml`.
 2. Read `analysis/queue/README.md`.
-3. Use `$1c-autoresearch-queue-worker` when processing a queue task.
+3. Use `$1c-autoresearch-queue-worker` when processing a queue task. If the skill selector is unavailable, read `.agents/skills/1c-autoresearch-queue-worker/SKILL.md` and follow it directly.
 4. Select one task with `scripts/queue/Get-NextAnalysisTask.ps1`.
 5. Process only the selected task.
 6. Write evidence under `analysis/features/<feature-id>/`.
