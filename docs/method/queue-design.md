@@ -34,7 +34,7 @@ pending -> claimed -> evidence_pack -> drafted -> needs_review -> done
 ## Worker Rules
 
 - Process exactly one task per run.
-- Claim the task with `scripts/queue/Claim-NextAnalysisTask.ps1`.
+- Claim the task with `scripts/queue/claim_next_analysis_task.py`.
 - Prefer indexes and cached evidence before broad source searches.
 - Record source file and line for every confirmed claim.
 - Run positive and negative search.

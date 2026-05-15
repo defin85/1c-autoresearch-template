@@ -18,17 +18,17 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 | `analysis/runs/` | Run logs for task execution. | A worker run needs an auditable trace. |
 | `outputs/` | Human-facing deliverables. | Final reports, question registers, or backlog seeds are produced. |
 | `scripts/queue/` | Atomic claim, read-only selection, and status update helpers. | Queue mechanics change. |
-| `scripts/checks/` and `scripts/doctor.ps1` | Repository health checks. | Validation contract changes. |
+| `scripts/checks/` and `scripts/doctor.py` | Repository health checks. | Validation contract changes. |
 | `.agents/skills/` | Repo-local Codex workflows. | A repeatable agent workflow should be discoverable as a skill. |
 
 ## Task Run Route
 
 1. Read `project.toml`.
 2. Read `analysis/queue/README.md`, `task-schema.md`, `review-checklist.md`, and `tasks.jsonl`.
-3. Use `scripts/queue/Claim-NextAnalysisTask.ps1` to atomically claim one task.
+3. Use `scripts/queue/claim_next_analysis_task.py` to atomically claim one task.
 4. If no task is returned, stop without editing queue state.
 5. Write evidence under `analysis/features/<feature-id>/`.
-6. Run `scripts/doctor.ps1` and record warnings or failures.
+6. Run `scripts/doctor.py` and record warnings or failures.
 7. Update the selected task status and stop.
 
 ## System Of Record

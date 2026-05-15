@@ -13,7 +13,7 @@ This repository is a reusable template for concrete 1C autoresearch repositories
 | `docs/method/` | Reusable 1C analysis methodology and evidence pack schema. | Evidence levels, queue design, output contract, or analysis method changes. |
 | `scripts/bootstrap/` | Creates concrete research repositories from `templates/research-repo/`. | Bootstrap arguments, template copying, or token replacement changes. |
 | `scripts/checks/` | Template and generated-repo validation tests. | Validation rules, smoke tests, or doctor expectations change. |
-| `scripts/doctor.ps1` | Primary health check for both template and research repositories. | Repository contract, queue validation, manifest policy, or automation output changes. |
+| `scripts/doctor.py` | Primary health check for both template and research repositories. | Repository contract, queue validation, manifest policy, or automation output changes. |
 | `templates/research-repo/` | Files copied into a concrete research repository. | Concrete project layout, queue workflow, or generated repo instructions change. |
 | `examples/` | Small examples of intended command shapes. | User-facing examples need to reflect current bootstrap arguments. |
 
@@ -21,12 +21,12 @@ This repository is a reusable template for concrete 1C autoresearch repositories
 
 | Change Area | Read First | Likely Files | Verification |
 | --- | --- | --- | --- |
-| Template documentation | `AGENTS.md`, `README.md`, `docs/agent/index.md` | `README.md`, `docs/agent/*`, `docs/method/*` | `scripts/checks/Test-Template.ps1`, `scripts/doctor.ps1` |
-| Bootstrap behavior | `README.md`, `scripts/bootstrap/New-1cResearchRepo.ps1` | `scripts/bootstrap/New-1cResearchRepo.ps1`, `templates/research-repo/*` | `scripts/checks/Test-Doctor.ps1` |
-| Research repo contract | `templates/research-repo/AGENTS.md`, `templates/research-repo/project.toml` | `templates/research-repo/*`, `scripts/checks/Test-ResearchRepo.ps1`, `scripts/doctor.ps1` | `scripts/checks/Test-ResearchRepo.ps1 -RepoPath <target-repo>`, `<target-repo>\scripts\doctor.ps1` |
-| Queue workflow | `docs/method/queue-design.md`, `templates/research-repo/analysis/queue/*` | Queue docs, queue scripts, queue skill | `scripts/checks/Test-Doctor.ps1`, generated repo doctor |
-| Manifest/MCP/web policy | `project.example.toml`, `templates/research-repo/project.toml` | Manifests, `scripts/doctor.ps1`, research `AGENTS.md`, optional `.codex/1c-mcp.toml` checks | `scripts/doctor.ps1 -Json -Deep`, targeted doctor smoke tests |
-| Agent instructions | `AGENTS.md`, `docs/agent/index.md` | Root and template `AGENTS.md`, `docs/agent/*`, `.agents/skills/*` | `scripts/checks/Test-Template.ps1`, generated repo validation |
+| Template documentation | `AGENTS.md`, `README.md`, `docs/agent/index.md` | `README.md`, `docs/agent/*`, `docs/method/*` | `python -m one_c_autoresearch checks template`, `python -m one_c_autoresearch doctor` |
+| Bootstrap behavior | `README.md`, `scripts/bootstrap/new_research_repo.py` | `scripts/bootstrap/new_research_repo.py`, `templates/research-repo/*` | `python -m one_c_autoresearch checks doctor` |
+| Research repo contract | `templates/research-repo/AGENTS.md`, `templates/research-repo/project.toml` | `templates/research-repo/*`, `scripts/checks/test_research_repo.py`, `scripts/doctor.py` | `python -m one_c_autoresearch checks research --repo-path <target-repo>` |
+| Queue workflow | `docs/method/queue-design.md`, `templates/research-repo/analysis/queue/*` | Queue docs, queue scripts, queue skill | `python -m one_c_autoresearch checks doctor`, generated repo doctor |
+| Manifest/MCP/web policy | `project.example.toml`, `templates/research-repo/project.toml` | Manifests, `src/one_c_autoresearch/doctor.py`, research `AGENTS.md`, optional `.codex/1c-mcp.toml` checks | `python -m one_c_autoresearch doctor --json --deep`, targeted doctor smoke tests |
+| Agent instructions | `AGENTS.md`, `docs/agent/index.md` | Root and template `AGENTS.md`, `docs/agent/*`, `.agents/skills/*` | `python -m one_c_autoresearch checks template`, generated repo validation |
 
 ## System Of Record
 

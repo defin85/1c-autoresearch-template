@@ -28,7 +28,7 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 
 See `docs/agent/verification.md` for the full verification runbook.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-ResearchRepo.ps1
+```bash
+python -m one_c_autoresearch doctor
+python -m one_c_autoresearch checks research
 ```

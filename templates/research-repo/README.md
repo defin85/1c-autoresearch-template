@@ -10,21 +10,21 @@ Source paths are declared in `project.toml`.
 
 Show the next queue task without claiming it:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\queue\Get-NextAnalysisTask.ps1
+```bash
+python -m one_c_autoresearch queue get
 ```
 
 Claim one task when starting work:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\queue\Claim-NextAnalysisTask.ps1
+```bash
+python -m one_c_autoresearch queue claim
 ```
 
 Validate the repository:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-ResearchRepo.ps1
+```bash
+python -m one_c_autoresearch doctor
+python -m one_c_autoresearch checks research
 ```
 
 ## Layout

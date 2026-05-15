@@ -12,12 +12,12 @@ This directory stores the queue state outside the Codex context window.
 
 ## Next Task
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\queue\Claim-NextAnalysisTask.ps1
+```bash
+python -m one_c_autoresearch queue claim
 ```
 
 ## Core Rule
 
 Process one task per run. If new work appears, create a follow-up task instead of expanding scope.
-Use `Get-NextAnalysisTask.ps1` for read-only inspection and
-`Claim-NextAnalysisTask.ps1` when starting work.
+Use `get_next_analysis_task.py` for read-only inspection and
+`claim_next_analysis_task.py` when starting work.

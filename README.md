@@ -40,30 +40,30 @@ E:\Projects\<customer_cfe>             # extension source dump
 
 ## Create a Research Repo
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bootstrap\New-1cResearchRepo.ps1 `
-  -TargetPath E:\Projects\do_21_research `
-  -ProjectId do21-traitek `
-  -Product "1C Document Management" `
-  -BaselineVersion "2.1" `
-  -TargetVersion "2.1" `
-  -NextVendorVersion "3.0" `
-  -VendorBaseline "E:\Projects\do_21_demo" `
-  -TargetCf "E:\Projects\do_21_traitek\cf" `
-  -TargetCfe "E:\Projects\do_21_traitek\cfe" `
-  -NextVendor "E:\Projects\do_30_demo" `
-  -RlmVendorBaseline do_21_demo `
-  -RlmTargetCf do_21_traitek_cf `
-  -RlmTargetCfe do_21_traitek_cfe `
-  -RlmNextVendor do_30_demo `
-  -InitGit
+```bash
+python -m one_c_autoresearch new-repo \
+  --target-path ./do_21_research \
+  --project-id do21-traitek \
+  --product "1C Document Management" \
+  --baseline-version "2.1" \
+  --target-version "2.1" \
+  --next-vendor-version "3.0" \
+  --vendor-baseline ./do_21_demo \
+  --target-cf ./do_21_traitek/cf \
+  --target-cfe ./do_21_traitek/cfe \
+  --next-vendor ./do_30_demo \
+  --rlm-vendor-baseline do_21_demo \
+  --rlm-target-cf do_21_traitek_cf \
+  --rlm-target-cfe do_21_traitek_cfe \
+  --rlm-next-vendor do_30_demo \
+  --init-git
 ```
 
 Validate:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-ResearchRepo.ps1 -RepoPath E:\Projects\do_21_research
-powershell -NoProfile -ExecutionPolicy Bypass -File E:\Projects\do_21_research\scripts\doctor.ps1
+```bash
+python -m one_c_autoresearch checks research --repo-path ./do_21_research
+python -m one_c_autoresearch doctor --repo-path ./do_21_research
 ```
 
 ## Research Repo Contract
@@ -94,7 +94,7 @@ scripts/
 
 1. Read `project.toml`.
 2. Read `analysis/queue/README.md`, `task-schema.md`, `review-checklist.md`, and `tasks.jsonl`.
-3. Claim one pending task using `scripts/queue/Claim-NextAnalysisTask.ps1`.
+3. Claim one pending task using `scripts/queue/claim_next_analysis_task.py`.
 4. Process exactly the claimed task.
 5. Use static indexes and 1C source trees first.
 6. Write evidence under `analysis/features/<feature-id>/`.
@@ -109,24 +109,24 @@ See `docs/agent/verification.md` for the canonical verification matrix.
 
 Run from this template repo:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Json -Deep -Strict
+```bash
+python -m one_c_autoresearch doctor --json --deep --strict
 ```
 
 Run from a concrete research repo:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1
+```bash
+python -m one_c_autoresearch doctor
 ```
 
 Check another repo explicitly:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -RepoPath E:\Projects\do_21_research
+```bash
+python -m one_c_autoresearch doctor --repo-path ./do_21_research
 ```
 
 Useful flags:
 
-- `-Json`: machine-readable output for automation.
-- `-Deep`: also checks source path existence and basic tools.
-- `-Strict`: returns exit code `2` when warnings exist.
+- `--json`: machine-readable output for automation.
+- `--deep`: also checks source path existence and basic tools.
+- `--strict`: returns exit code `2` when warnings exist.

@@ -31,15 +31,15 @@ This repository is a clean template for reproducible 1C autoresearch projects.
 
 Run after template changes:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-Template.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-Doctor.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Json -Deep -Strict
+```bash
+python -m one_c_autoresearch checks template
+python -m one_c_autoresearch checks doctor
+python -m one_c_autoresearch doctor --json --deep --strict
 ```
 
 Run after creating a concrete research repo:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-ResearchRepo.ps1 -RepoPath <target-repo>
-powershell -NoProfile -ExecutionPolicy Bypass -File <target-repo>\scripts\doctor.ps1
+```bash
+python -m one_c_autoresearch checks research --repo-path <target-repo>
+python -m one_c_autoresearch doctor --repo-path <target-repo>
 ```

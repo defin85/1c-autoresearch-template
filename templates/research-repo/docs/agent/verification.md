@@ -6,27 +6,27 @@ This is the canonical verification matrix for a concrete 1C autoresearch reposit
 
 Run from the repository root:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-ResearchRepo.ps1
+```bash
+python -m one_c_autoresearch doctor
+python -m one_c_autoresearch checks research
 ```
 
 Use the doctor JSON output for automation:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Json
+```bash
+python -m one_c_autoresearch doctor --json
 ```
 
-Use `-Deep` when source paths, local tools, or environment assumptions matter:
+Use `--deep` when source paths, local tools, or environment assumptions matter:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Deep
+```bash
+python -m one_c_autoresearch doctor --deep
 ```
 
-Use `-Strict` when warnings should block automated continuation:
+Use `--strict` when warnings should block automated continuation:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Deep -Strict
+```bash
+python -m one_c_autoresearch doctor --deep --strict
 ```
 
 ## MCP Manifest Promotion
@@ -35,8 +35,8 @@ When live 1C MCP or web evidence is enabled, copy `.codex/1c-mcp.example.toml`
 to `.codex/1c-mcp.toml`, fill in the active MCP server, URL, service root,
 RLM project, web URL, username, and credential file, then run:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Json -Deep
+```bash
+python -m one_c_autoresearch doctor --json --deep
 ```
 
 Do not use live 1C evidence until the local manifest matches `project.toml`.
@@ -45,8 +45,8 @@ Do not use live 1C evidence until the local manifest matches `project.toml`.
 
 1. Confirm the claimed task by reading `analysis/queue/tasks.jsonl`.
 2. Confirm expected evidence exists under `analysis/features/<feature-id>/`.
-3. Run `scripts\doctor.ps1`.
-4. Run `scripts\checks\Test-ResearchRepo.ps1`.
+3. Run `python -m one_c_autoresearch doctor`.
+4. Run `python -m one_c_autoresearch checks research`.
 5. Record unresolved runtime dependencies in the feature pack and queue status before stopping.
 
 ## Health Gate Meaning
@@ -55,5 +55,5 @@ Do not use live 1C evidence until the local manifest matches `project.toml`.
 - `status = warn`: repository is usable, but warnings must be reported before claiming health.
 - `status = fail`: stop autonomous work and fix the contract issue first.
 
-The doctor validates required paths, `project.toml`, queue schema, task dependencies, stale claims, expected outputs, evidence pack CSV headers, unresolved placeholders, MCP/web policy, and optional tools when `-Deep` is used.
+The doctor validates required paths, `project.toml`, queue schema, task dependencies, stale claims, expected outputs, evidence pack CSV headers, unresolved placeholders, MCP/web policy, and optional tools when `--deep` is used.
 When `.codex/1c-mcp.toml` exists, the doctor also compares its MCP server, URL, service root, active RLM project, and web URL with `project.toml`.
