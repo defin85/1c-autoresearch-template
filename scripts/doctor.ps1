@@ -13,6 +13,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$canonicalEvidenceHeader = 'feature_id,claim_id,source_kind,source_path,line_start,line_end,evidence_type,confidence,summary,notes'
+$canonicalFeatureCandidatesHeader = 'feature_id,title,source_bucket,classification,confidence,summary,next_step'
+
 if (-not $RepoPath) {
     $RepoPath = Join-Path $PSScriptRoot '..'
 }
@@ -318,6 +321,31 @@ function Test-LocalMcpManifest {
     if ($mismatchCount -eq 0 -and $missingCount -eq 0 -and $uncheckedCount -eq 0) {
         Add-Check 'manifest.mcp.local_match' ok "Repo-local .codex/1c-mcp.toml matches project.toml MCP settings"
     }
+
+    $localRlmProject = Get-TomlValue -Manifest $localManifest -Section '_root' -Key 'rlm_project'
+    $targetRlmProject = Get-TomlValue -Manifest $Manifest -Section 'rlm' -Key 'target_cf'
+    if ([string]::IsNullOrWhiteSpace($localRlmProject)) {
+        Add-Check 'manifest.local_mcp.rlm_project' warn ".codex/1c-mcp.toml is missing rlm_project"
+    } elseif (-not [string]::IsNullOrWhiteSpace($targetRlmProject) -and $localRlmProject -ne $targetRlmProject) {
+        Add-Check 'manifest.local_mcp.rlm_mismatch' fail ".codex/1c-mcp.toml rlm_project differs from project.toml rlm.target_cf: project.toml=$targetRlmProject local=$localRlmProject"
+    } else {
+        Add-Check 'manifest.local_mcp.rlm_match' ok "Repo-local .codex/1c-mcp.toml matches project.toml rlm.target_cf"
+    }
+
+    $localInfobase = Get-TomlValue -Manifest $localManifest -Section '_root' -Key 'infobase'
+    if ([string]::IsNullOrWhiteSpace($localInfobase)) {
+        Add-Check 'manifest.local_mcp.infobase' warn ".codex/1c-mcp.toml is missing infobase"
+    }
+
+    if (Test-TomlEnabled -Manifest $Manifest -Section 'web') {
+        $projectWebUrl = Get-TomlValue -Manifest $Manifest -Section 'web' -Key 'url'
+        $localWebUrl = Get-TomlValue -Manifest $localManifest -Section '_root' -Key 'web_url'
+        if ([string]::IsNullOrWhiteSpace($localWebUrl)) {
+            Add-Check 'manifest.local_mcp.web_url' warn ".codex/1c-mcp.toml is missing web_url while project.toml has web.enabled=true"
+        } elseif (-not [string]::IsNullOrWhiteSpace($projectWebUrl) -and $localWebUrl -ne $projectWebUrl) {
+            Add-Check 'manifest.local_mcp.web_mismatch' fail ".codex/1c-mcp.toml web_url differs from project.toml web.url: project.toml=$projectWebUrl local=$localWebUrl"
+        }
+    }
 }
 
 function Test-Queue {
@@ -421,6 +449,55 @@ function Test-Queue {
     if (($checks | Where-Object { $_.id -like 'queue.duplicate_id' }).Count -eq 0) {
         Add-Check 'queue.unique_ids' ok "Task ids are unique"
     }
+
+    $script:lastQueueTasks = @($tasks)
+}
+
+function Test-EvidencePacks {
+    param([object[]]$Tasks)
+
+    $requiredFeatureFiles = @('brief.md', 'findings.md', 'evidence.csv', 'open-questions.md', 'review.md')
+
+    foreach ($task in @($Tasks)) {
+        if (@('evidence_pack', 'drafted', 'needs_review', 'done') -notcontains $task.status) {
+            continue
+        }
+        if (-not $task.PSObject.Properties.Name.Contains('feature_id') -or [string]::IsNullOrWhiteSpace([string]$task.feature_id)) {
+            continue
+        }
+
+        $featureId = [string]$task.feature_id
+        $featurePath = Join-Path $script:root (Join-Path 'analysis\features' $featureId)
+        if (-not (Test-Path -LiteralPath $featurePath)) {
+            Add-Check 'evidence_pack.missing_folder' warn "Task $($task.id) has status $($task.status) but feature folder is missing: analysis/features/$featureId"
+            continue
+        }
+
+        foreach ($requiredFile in $requiredFeatureFiles) {
+            $requiredPath = Join-Path $featurePath $requiredFile
+            if (-not (Test-Path -LiteralPath $requiredPath)) {
+                Add-Check 'evidence_pack.missing_required_file' warn "Task $($task.id) feature pack is missing required file: analysis/features/$featureId/$requiredFile"
+            }
+        }
+
+        $evidencePath = Join-Path $featurePath 'evidence.csv'
+        if (-not (Test-Path -LiteralPath $evidencePath)) {
+            Add-Check 'evidence_pack.missing_evidence' warn "Task $($task.id) has status $($task.status) but evidence.csv is missing"
+        } else {
+            $header = (Get-Content -LiteralPath $evidencePath -TotalCount 1)
+            if ($header -ne $script:canonicalEvidenceHeader) {
+                Add-Check 'evidence_pack.invalid_evidence_header' warn "Task $($task.id) evidence.csv header does not match docs/method/evidence-pack-schema.md"
+            }
+        }
+
+        $featureCandidatesPath = Join-Path $featurePath 'feature-candidates.csv'
+        if (Test-Path -LiteralPath $featureCandidatesPath) {
+            $featureCandidatesHeader = (Get-Content -LiteralPath $featureCandidatesPath -TotalCount 1)
+            if ($featureCandidatesHeader -ne $script:canonicalFeatureCandidatesHeader) {
+                Add-Check 'evidence_pack.invalid_feature_candidates_header' warn "Task $($task.id) feature-candidates.csv header does not match docs/method/evidence-pack-schema.md"
+            }
+        }
+    }
 }
 
 function Test-QueueCycles {
@@ -505,16 +582,41 @@ function Test-TemplateRepo {
         'docs\agent\repo-map.md',
         'docs\agent\verification.md',
         'docs\method\1c-autoresearch-process.md',
+        'docs\method\evidence-pack-schema.md',
         'docs\method\queue-design.md',
+        'templates\research-repo\.gitignore',
+        'templates\research-repo\AGENTS.md',
+        'templates\research-repo\README.md',
         'templates\research-repo\project.toml',
+        'templates\research-repo\.codex\1c-mcp.example.toml',
         'templates\research-repo\docs\agent\index.md',
         'templates\research-repo\docs\agent\repo-map.md',
         'templates\research-repo\docs\agent\verification.md',
+        'templates\research-repo\docs\method\1c-autoresearch-process.md',
+        'templates\research-repo\docs\method\evidence-pack-schema.md',
         'templates\research-repo\analysis\runs\README.md',
+        'templates\research-repo\analysis\cache\AGENTS.md',
+        'templates\research-repo\analysis\cache\README.md',
+        'templates\research-repo\analysis\features\AGENTS.md',
+        'templates\research-repo\analysis\features\README.md',
+        'templates\research-repo\analysis\features\_templates\brief.md',
+        'templates\research-repo\analysis\features\_templates\evidence.csv',
+        'templates\research-repo\analysis\features\_templates\feature-candidates.csv',
+        'templates\research-repo\analysis\features\_templates\findings.md',
+        'templates\research-repo\analysis\features\_templates\open-questions.md',
+        'templates\research-repo\analysis\features\_templates\review.md',
+        'templates\research-repo\analysis\queue\README.md',
+        'templates\research-repo\analysis\queue\review-checklist.md',
         'templates\research-repo\analysis\queue\runs\README.md',
+        'templates\research-repo\analysis\queue\task-schema.md',
         'templates\research-repo\analysis\queue\tasks.jsonl',
+        'templates\research-repo\analysis\queue\worker-prompt.md',
+        'templates\research-repo\outputs\AGENTS.md',
+        'templates\research-repo\outputs\README.md',
+        'templates\research-repo\scripts\queue\Claim-NextAnalysisTask.ps1',
         'templates\research-repo\scripts\queue\Get-NextAnalysisTask.ps1',
         'templates\research-repo\scripts\queue\Set-AnalysisTaskStatus.ps1',
+        'templates\research-repo\scripts\checks\Test-ResearchRepo.ps1',
         'templates\research-repo\.agents\skills\1c-autoresearch-queue-worker\SKILL.md',
         'scripts\doctor.ps1',
         'scripts\bootstrap\New-1cResearchRepo.ps1',
@@ -539,19 +641,35 @@ function Test-ResearchRepo {
         'project.toml',
         'AGENTS.md',
         'README.md',
+        '.gitignore',
+        '.codex\1c-mcp.example.toml',
         'docs\agent\index.md',
         'docs\agent\repo-map.md',
         'docs\agent\verification.md',
+        'docs\method\1c-autoresearch-process.md',
+        'docs\method\evidence-pack-schema.md',
         'analysis\runs\README.md',
+        'analysis\queue\README.md',
         'analysis\queue\tasks.jsonl',
         'analysis\queue\task-schema.md',
         'analysis\queue\review-checklist.md',
         'analysis\queue\runs\README.md',
+        'analysis\queue\worker-prompt.md',
+        'analysis\cache\AGENTS.md',
+        'analysis\features\AGENTS.md',
         'analysis\features\README.md',
+        'analysis\features\_templates\brief.md',
+        'analysis\features\_templates\evidence.csv',
+        'analysis\features\_templates\feature-candidates.csv',
+        'analysis\features\_templates\findings.md',
+        'analysis\features\_templates\open-questions.md',
+        'analysis\features\_templates\review.md',
         'analysis\cache\README.md',
+        'outputs\AGENTS.md',
         'outputs\README.md',
         '.agents\skills\1c-autoresearch-queue-worker\SKILL.md',
         'scripts\doctor.ps1',
+        'scripts\queue\Claim-NextAnalysisTask.ps1',
         'scripts\queue\Get-NextAnalysisTask.ps1',
         'scripts\queue\Set-AnalysisTaskStatus.ps1',
         'scripts\checks\Test-ResearchRepo.ps1'
@@ -561,6 +679,7 @@ function Test-ResearchRepo {
 
     Test-ProjectToml 'project.toml' | Out-Null
     Test-Queue 'analysis\queue\tasks.jsonl'
+    Test-EvidencePacks -Tasks $script:lastQueueTasks
     Test-UnresolvedPlaceholders
 }
 

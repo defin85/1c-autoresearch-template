@@ -16,8 +16,9 @@ For concrete research repos created from this template:
 2. Read `docs/agent/repo-map.md` and `docs/agent/verification.md`.
 3. Read `analysis/queue/README.md`.
 4. Use `$1c-autoresearch-queue-worker` when processing queue tasks. If the skill selector is unavailable, read `.agents/skills/1c-autoresearch-queue-worker/SKILL.md` in the generated research repo and follow it directly.
-5. Use `scripts/queue/Get-NextAnalysisTask.ps1` to select one task.
+5. Use `scripts/queue/Claim-NextAnalysisTask.ps1` to claim one task.
 6. Write evidence under `analysis/features/<feature-id>/`.
 7. Validate with `scripts/doctor.ps1` and `scripts/checks/Test-ResearchRepo.ps1`.
+8. Update the selected task status and stop.
 
 Do not treat this template as an evidence source for any customer project.

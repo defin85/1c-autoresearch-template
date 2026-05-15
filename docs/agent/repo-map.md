@@ -10,7 +10,7 @@ This repository is a reusable template for concrete 1C autoresearch repositories
 | `README.md` | Human and agent overview of the template contract. | Public workflow, bootstrap usage, layout, or high-level process changes. |
 | `project.example.toml` | Example manifest for concrete research repositories. | Manifest schema or source/MCP/web policy changes. |
 | `docs/agent/` | Agent navigation, repo map, and verification runbook. | Codex onboarding or repeatable agent workflows change. |
-| `docs/method/` | Reusable 1C analysis methodology. | Evidence levels, queue design, output contract, or analysis method changes. |
+| `docs/method/` | Reusable 1C analysis methodology and evidence pack schema. | Evidence levels, queue design, output contract, or analysis method changes. |
 | `scripts/bootstrap/` | Creates concrete research repositories from `templates/research-repo/`. | Bootstrap arguments, template copying, or token replacement changes. |
 | `scripts/checks/` | Template and generated-repo validation tests. | Validation rules, smoke tests, or doctor expectations change. |
 | `scripts/doctor.ps1` | Primary health check for both template and research repositories. | Repository contract, queue validation, manifest policy, or automation output changes. |
@@ -34,6 +34,7 @@ This repository is a reusable template for concrete 1C autoresearch repositories
 - `docs/agent/repo-map.md`: where to look and what to edit.
 - `docs/agent/verification.md`: canonical verification matrix.
 - `docs/method/1c-autoresearch-process.md`: analysis method and feature output contract.
+- `docs/method/evidence-pack-schema.md`: canonical feature pack CSV headers and file contract.
 - `docs/method/queue-design.md`: queue semantics and worker rules.
 - `templates/research-repo/`: generated research repository contract.
 

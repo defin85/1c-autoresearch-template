@@ -34,7 +34,7 @@ Run after template changes:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-Template.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\checks\Test-Doctor.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Json -Deep -Strict
 ```
 
 Run after creating a concrete research repo:

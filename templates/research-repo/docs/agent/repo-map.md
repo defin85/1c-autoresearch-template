@@ -13,11 +13,11 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 | `docs/agent/` | Agent router, repo map, and verification runbook. | Agent workflow or navigation changes. |
 | `docs/method/` | Project-local copy of the reusable analysis method. | Method needs project-specific clarification. |
 | `analysis/queue/` | File-backed queue state and worker contract. | Tasks, statuses, schema, or review rules change. |
-| `analysis/features/` | Feature evidence packs. | A queue task produces or updates feature-level evidence. |
+| `analysis/features/` | Feature evidence packs and file templates. | A queue task produces or updates feature-level evidence. |
 | `analysis/cache/` | Generated indexes and noisy intermediate artifacts. | Static analysis or comparison tools produce machine data. |
 | `analysis/runs/` | Run logs for task execution. | A worker run needs an auditable trace. |
 | `outputs/` | Human-facing deliverables. | Final reports, question registers, or backlog seeds are produced. |
-| `scripts/queue/` | Queue selection and status update helpers. | Queue mechanics change. |
+| `scripts/queue/` | Atomic claim, read-only selection, and status update helpers. | Queue mechanics change. |
 | `scripts/checks/` and `scripts/doctor.ps1` | Repository health checks. | Validation contract changes. |
 | `.agents/skills/` | Repo-local Codex workflows. | A repeatable agent workflow should be discoverable as a skill. |
 
@@ -25,11 +25,11 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 
 1. Read `project.toml`.
 2. Read `analysis/queue/README.md`, `task-schema.md`, `review-checklist.md`, and `tasks.jsonl`.
-3. Use `scripts/queue/Get-NextAnalysisTask.ps1` to select one task.
-4. Claim only that task with `scripts/queue/Set-AnalysisTaskStatus.ps1`.
+3. Use `scripts/queue/Claim-NextAnalysisTask.ps1` to atomically claim one task.
+4. If no task is returned, stop without editing queue state.
 5. Write evidence under `analysis/features/<feature-id>/`.
-6. Update the selected task status and stop.
-7. Run `scripts/doctor.ps1` before claiming repository health.
+6. Run `scripts/doctor.ps1` and record warnings or failures.
+7. Update the selected task status and stop.
 
 ## System Of Record
 
@@ -37,6 +37,7 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 - `.codex/1c-mcp.toml`: active MCP/web target when present; it must match `project.toml` before live evidence is used.
 - `analysis/queue/tasks.jsonl`: current queue state.
 - `analysis/features/`: durable feature evidence.
+- `docs/method/evidence-pack-schema.md`: canonical CSV headers and feature pack file contract.
 - `outputs/`: final human-facing deliverables.
 - `docs/agent/verification.md`: validation commands and health gate meaning.
 

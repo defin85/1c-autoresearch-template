@@ -94,11 +94,12 @@ scripts/
 
 1. Read `project.toml`.
 2. Read `analysis/queue/README.md`, `task-schema.md`, `review-checklist.md`, and `tasks.jsonl`.
-3. Select one pending task using `scripts/queue/Get-NextAnalysisTask.ps1`.
-4. Claim exactly one task.
+3. Claim one pending task using `scripts/queue/Claim-NextAnalysisTask.ps1`.
+4. Process exactly the claimed task.
 5. Use static indexes and 1C source trees first.
 6. Write evidence under `analysis/features/<feature-id>/`.
-7. Update the task status and stop.
+7. Run the generated repo doctor.
+8. Update the task status and stop.
 
 The queue is deliberately file-backed. It is slower than a broker but transparent, diffable, and easy for Codex automation to resume.
 
@@ -109,7 +110,7 @@ See `docs/agent/verification.md` for the canonical verification matrix.
 Run from this template repo:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Json -Deep -Strict
 ```
 
 Run from a concrete research repo:

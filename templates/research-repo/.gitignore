@@ -9,12 +9,15 @@ __pycache__/
 node_modules/
 
 # Generated local work
+*.jsonl.lock
 analysis/runs/**
 !analysis/runs/
 !analysis/runs/README.md
 analysis/queue/runs/**
 !analysis/queue/runs/
 !analysis/queue/runs/README.md
+analysis/cache/indexes/**
+analysis/cache/noise/**
 
 # Keep generated Excel/CSV outputs only when intentionally reviewed.
 ~$*.xlsx

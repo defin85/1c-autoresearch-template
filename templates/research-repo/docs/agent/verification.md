@@ -29,9 +29,21 @@ Use `-Strict` when warnings should block automated continuation:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Deep -Strict
 ```
 
+## MCP Manifest Promotion
+
+When live 1C MCP or web evidence is enabled, copy `.codex/1c-mcp.example.toml`
+to `.codex/1c-mcp.toml`, fill in the active MCP server, URL, service root,
+RLM project, web URL, username, and credential file, then run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Json -Deep
+```
+
+Do not use live 1C evidence until the local manifest matches `project.toml`.
+
 ## Before Claiming A Queue Task Complete
 
-1. Confirm the task status and selected task with `scripts/queue/Get-NextAnalysisTask.ps1` or by reading `analysis/queue/tasks.jsonl`.
+1. Confirm the claimed task by reading `analysis/queue/tasks.jsonl`.
 2. Confirm expected evidence exists under `analysis/features/<feature-id>/`.
 3. Run `scripts\doctor.ps1`.
 4. Run `scripts\checks\Test-ResearchRepo.ps1`.
@@ -43,5 +55,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Deep -St
 - `status = warn`: repository is usable, but warnings must be reported before claiming health.
 - `status = fail`: stop autonomous work and fix the contract issue first.
 
-The doctor validates required paths, `project.toml`, queue schema, task dependencies, stale claims, expected outputs, unresolved placeholders, MCP/web policy, and optional tools when `-Deep` is used.
-When `.codex/1c-mcp.toml` exists, the doctor also compares its MCP server, URL, and service root with `project.toml`.
+The doctor validates required paths, `project.toml`, queue schema, task dependencies, stale claims, expected outputs, evidence pack CSV headers, unresolved placeholders, MCP/web policy, and optional tools when `-Deep` is used.
+When `.codex/1c-mcp.toml` exists, the doctor also compares its MCP server, URL, service root, active RLM project, and web URL with `project.toml`.

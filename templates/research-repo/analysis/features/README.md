@@ -13,3 +13,5 @@ analysis/features/<feature-id>/
 ```
 
 The feature pack must be readable without reloading the full analysis history.
+Use `docs/method/evidence-pack-schema.md` and `_templates/` for canonical file
+headers and section structure.

@@ -58,7 +58,7 @@ Each feature pack should be understandable without re-reading the full repositor
 
 - `brief.md`: business meaning and scope.
 - `findings.md`: grouped functional findings.
-- `evidence.csv`: machine-readable source evidence.
+- `evidence.csv`: machine-readable source evidence following `docs/method/evidence-pack-schema.md`.
 - `open-questions.md`: unresolved facts and required evidence.
 - `review.md`: independent review result.
 - `artifacts/`: optional Excel/CSV/raw extracts.

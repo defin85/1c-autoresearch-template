@@ -8,10 +8,16 @@ Source paths are declared in `project.toml`.
 
 ## First Commands
 
-Show the next queue task:
+Show the next queue task without claiming it:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\queue\Get-NextAnalysisTask.ps1
+```
+
+Claim one task when starting work:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\queue\Claim-NextAnalysisTask.ps1
 ```
 
 Validate the repository:

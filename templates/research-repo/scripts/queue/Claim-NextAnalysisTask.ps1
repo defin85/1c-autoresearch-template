@@ -1,15 +1,8 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$Id,
-
-    [Parameter(Mandatory = $true)]
-    [ValidateSet('pending', 'claimed', 'evidence_pack', 'drafted', 'needs_review', 'needs_followup', 'blocked', 'done', 'skipped')]
-    [string]$Status,
-
     [string]$QueuePath,
+    [string]$Status = 'pending',
+    [string]$Type,
     [string]$ClaimedBy = 'codex',
-    [string]$ResultSummary,
-    [string]$ExpectedStatus,
     [int]$LockTimeoutSeconds = 10
 )
 
@@ -33,6 +26,17 @@ function Set-JsonProperty {
     } else {
         $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
     }
+}
+
+function Get-ArrayValue {
+    param([object]$Value)
+    if ($null -eq $Value) {
+        return @()
+    }
+    if ($Value -is [System.Array]) {
+        return @($Value)
+    }
+    return @($Value)
 }
 
 function Invoke-WithQueueLock {
@@ -81,53 +85,64 @@ function Write-QueueLines {
 }
 
 $resolvedQueuePath = Resolve-Path -LiteralPath $QueuePath
-$now = (Get-Date).ToUniversalTime().ToString("o")
+$script:claimedTask = $null
 
-$script:found = $false
-$script:updatedTask = $null
 Invoke-WithQueueLock -Path $resolvedQueuePath -Body {
-    $updatedLines = New-Object System.Collections.Generic.List[string]
+    $tasks = @()
 
     Get-Content -LiteralPath $resolvedQueuePath | ForEach-Object {
         $line = $_.Trim()
         if ($line.Length -eq 0) {
             return
         }
-
-        $task = $line | ConvertFrom-Json
-        if ($task.id -eq $Id) {
-            $script:found = $true
-            if ($ExpectedStatus -and $task.status -ne $ExpectedStatus) {
-                throw "Task $Id expected status '$ExpectedStatus' but found '$($task.status)'"
-            }
-
-            Set-JsonProperty -Object $task -Name 'status' -Value $Status
-            Set-JsonProperty -Object $task -Name 'updated_at' -Value $now
-
-            if ($Status -eq 'claimed') {
-                Set-JsonProperty -Object $task -Name 'claimed_by' -Value $ClaimedBy
-                Set-JsonProperty -Object $task -Name 'claimed_at' -Value $now
-            }
-
-            if ($Status -eq 'done' -or $Status -eq 'skipped') {
-                Set-JsonProperty -Object $task -Name 'completed_at' -Value $now
-            }
-
-            if ($ResultSummary) {
-                Set-JsonProperty -Object $task -Name 'result_summary' -Value $ResultSummary
-            }
-
-            $script:updatedTask = $task
-        }
-
-        $updatedLines.Add(($task | ConvertTo-Json -Depth 20 -Compress))
+        $tasks += $line | ConvertFrom-Json
     }
 
-    if (-not $script:found) {
-        throw "Task not found: $Id"
+    $doneIds = @{}
+    foreach ($task in $tasks) {
+        if ($task.status -eq 'done' -or $task.status -eq 'skipped') {
+            $doneIds[$task.id] = $true
+        }
+    }
+
+    $candidates = $tasks | Where-Object {
+        if ($_.status -ne $Status) {
+            return $false
+        }
+        if ($Type -and $_.type -ne $Type) {
+            return $false
+        }
+        foreach ($dependency in (Get-ArrayValue $_.dependencies)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$dependency) -and -not $doneIds.ContainsKey([string]$dependency)) {
+                return $false
+            }
+        }
+        return $true
+    }
+
+    $next = $candidates | Sort-Object @{ Expression = 'priority'; Descending = $true }, @{ Expression = 'id'; Descending = $false } | Select-Object -First 1
+    if (-not $next) {
+        return
+    }
+
+    $now = (Get-Date).ToUniversalTime().ToString("o")
+    Set-JsonProperty -Object $next -Name 'status' -Value 'claimed'
+    Set-JsonProperty -Object $next -Name 'updated_at' -Value $now
+    Set-JsonProperty -Object $next -Name 'claimed_by' -Value $ClaimedBy
+    Set-JsonProperty -Object $next -Name 'claimed_at' -Value $now
+    $script:claimedTask = $next
+
+    $updatedLines = New-Object System.Collections.Generic.List[string]
+    foreach ($task in $tasks) {
+        $updatedLines.Add(($task | ConvertTo-Json -Depth 20 -Compress))
     }
 
     Write-QueueLines -Path $resolvedQueuePath -Lines $updatedLines
 }
 
-$script:updatedTask | ConvertTo-Json -Depth 20
+if ($null -eq $script:claimedTask) {
+    Write-Output '{}'
+    exit 0
+}
+
+$script:claimedTask | ConvertTo-Json -Depth 20

@@ -9,7 +9,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ..\..\scripts\bootstrap\New-
   -Product "1C Document Management" `
   -BaselineVersion "2.1" `
   -TargetVersion "2.1" `
+  -NextVendorVersion "3.0" `
   -VendorBaseline E:\Projects\vendor `
   -TargetCf E:\Projects\customer\cf `
-  -TargetCfe E:\Projects\customer\cfe
+  -TargetCfe E:\Projects\customer\cfe `
+  -NextVendor E:\Projects\vendor30 `
+  -RlmVendorBaseline vendor `
+  -RlmTargetCf customer_cf `
+  -RlmTargetCfe customer_cfe `
+  -RlmNextVendor vendor30
 ```

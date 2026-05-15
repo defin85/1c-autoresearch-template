@@ -13,9 +13,11 @@ This directory stores the queue state outside the Codex context window.
 ## Next Task
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\queue\Get-NextAnalysisTask.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\queue\Claim-NextAnalysisTask.ps1
 ```
 
 ## Core Rule
 
 Process one task per run. If new work appears, create a follow-up task instead of expanding scope.
+Use `Get-NextAnalysisTask.ps1` for read-only inspection and
+`Claim-NextAnalysisTask.ps1` when starting work.
