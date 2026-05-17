@@ -11,4 +11,6 @@ Read `docs/agent/repo-map.md` before choosing files. Read `docs/agent/verificati
 7. Run `python -m one_c_autoresearch doctor` and `python -m one_c_autoresearch checks research`.
 8. Update the selected task status and stop.
 
+For end-to-end customization-map work, read `docs/method/autopilot-customization-map.md`, initialize with `python -m one_c_autoresearch autopilot scaffold --enable-gate` when needed, and stop only after `python -m one_c_autoresearch doctor --deep --strict` proves complete diff coverage.
+
 Do not use live 1C MCP or web evidence unless the task explicitly allows it and `project.toml` identifies the target.

@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import re
 import sys
+import csv
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .autopilot import DIFF_INVENTORY_HEADER, FEATURE_MAP_HEADER, OPEN_QUESTIONS_HEADER
 from .common import (
     CheckSet,
     as_list,
@@ -24,6 +27,8 @@ CANONICAL_EVIDENCE_HEADER = "feature_id,claim_id,source_kind,source_path,line_st
 CANONICAL_FEATURE_CANDIDATES_HEADER = "feature_id,title,source_bucket,classification,confidence,summary,next_step"
 VALID_STATUSES = {"pending", "claimed", "evidence_pack", "drafted", "needs_review", "needs_followup", "blocked", "done", "skipped"}
 VALID_TYPES = {"discovery", "deep_dive", "review", "migration_map", "packaging", "needs_infobase_data"}
+AUTOPILOT_DIFF_STATUSES = {"mapped_to_feature", "technical_noise_removed", "requires_1c_review", "blocked_by_infobase_data"}
+AUTOPILOT_FEATURE_STATUSES = {"complete", "blocked_by_infobase_data", "requires_1c_review", "out_of_scope"}
 
 TEMPLATE_REQUIRED_PATHS = [
     ".github/workflows/verify.yml",
@@ -36,6 +41,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "src/one_c_autoresearch/__init__.py",
     "src/one_c_autoresearch/__main__.py",
     "src/one_c_autoresearch/cli.py",
+    "src/one_c_autoresearch/autopilot.py",
     "src/one_c_autoresearch/doctor.py",
     "src/one_c_autoresearch/bootstrap.py",
     "src/one_c_autoresearch/queue.py",
@@ -45,6 +51,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "docs/agent/verification.md",
     "docs/method/1c-autoresearch-process.md",
     "docs/method/evidence-pack-schema.md",
+    "docs/method/autopilot-customization-map.md",
     "docs/method/queue-design.md",
     "templates/research-repo/.gitignore",
     "templates/research-repo/AGENTS.md",
@@ -56,6 +63,10 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/docs/agent/verification.md",
     "templates/research-repo/docs/method/1c-autoresearch-process.md",
     "templates/research-repo/docs/method/evidence-pack-schema.md",
+    "templates/research-repo/docs/method/autopilot-customization-map.md",
+    "templates/research-repo/analysis/indexes/README.md",
+    "templates/research-repo/analysis/indexes/diff-inventory.csv",
+    "templates/research-repo/analysis/indexes/feature-map.csv",
     "templates/research-repo/analysis/runs/README.md",
     "templates/research-repo/analysis/cache/AGENTS.md",
     "templates/research-repo/analysis/cache/README.md",
@@ -75,6 +86,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/analysis/queue/worker-prompt.md",
     "templates/research-repo/outputs/AGENTS.md",
     "templates/research-repo/outputs/README.md",
+    "templates/research-repo/outputs/open-questions.csv",
     "templates/research-repo/.agents/skills/1c-autoresearch-queue-worker/SKILL.md",
     "scripts/doctor.py",
     "scripts/bootstrap/new_research_repo.py",
@@ -94,12 +106,17 @@ RESEARCH_REQUIRED_PATHS = [
     "one_c_autoresearch/__main__.py",
     "src/one_c_autoresearch/__init__.py",
     "src/one_c_autoresearch/__main__.py",
+    "src/one_c_autoresearch/autopilot.py",
     "src/one_c_autoresearch/cli.py",
     "docs/agent/index.md",
     "docs/agent/repo-map.md",
     "docs/agent/verification.md",
     "docs/method/1c-autoresearch-process.md",
     "docs/method/evidence-pack-schema.md",
+    "docs/method/autopilot-customization-map.md",
+    "analysis/indexes/README.md",
+    "analysis/indexes/diff-inventory.csv",
+    "analysis/indexes/feature-map.csv",
     "analysis/runs/README.md",
     "analysis/queue/README.md",
     "analysis/queue/tasks.jsonl",
@@ -119,6 +136,7 @@ RESEARCH_REQUIRED_PATHS = [
     "analysis/features/_templates/review.md",
     "outputs/AGENTS.md",
     "outputs/README.md",
+    "outputs/open-questions.csv",
     ".agents/skills/1c-autoresearch-queue-worker/SKILL.md",
     "scripts/doctor.py",
     "scripts/queue/claim_next_analysis_task.py",
@@ -175,7 +193,7 @@ class Doctor:
             self.checks.add("manifest.parse", "fail", f"Could not parse {relative}: {exc}")
             return None
 
-        for section in ("project", "paths", "rlm", "mcp", "web", "policy"):
+        for section in ("project", "paths", "rlm", "mcp", "web", "policy", "autopilot"):
             status = "ok" if section in manifest else "fail"
             message = f"Found [{section}]" if section in manifest else f"Missing section [{section}]"
             self.checks.add(f"manifest.section.{section}", status, message)
@@ -385,6 +403,165 @@ class Doctor:
             if candidates.exists() and candidates.read_text(encoding="utf-8-sig").splitlines()[0] != CANONICAL_FEATURE_CANDIDATES_HEADER:
                 self.checks.add("evidence_pack.invalid_feature_candidates_header", "warn", f"Task {task.get('id')} feature-candidates.csv header does not match docs/method/evidence-pack-schema.md")
 
+    def read_csv_rows(self, relative: str, expected_header: str, check_prefix: str) -> list[dict[str, str]]:
+        path = repo_path(self.root, relative)
+        if not path.exists():
+            self.checks.add(f"{check_prefix}.exists", "fail", f"Missing required CSV: {relative}")
+            return []
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        if not lines:
+            self.checks.add(f"{check_prefix}.not_empty", "fail", f"CSV is empty: {relative}")
+            return []
+        if lines[0] != expected_header:
+            self.checks.add(f"{check_prefix}.header", "fail", f"CSV header does not match contract: {relative}")
+            return []
+        self.checks.add(f"{check_prefix}.header", "ok", f"CSV header matches contract: {relative}")
+        with path.open("r", encoding="utf-8-sig", newline="") as fh:
+            return list(csv.DictReader(fh))
+
+    def test_xlsx_file(self, relative: str, check_id: str) -> None:
+        path = repo_path(self.root, relative)
+        if not path.exists():
+            self.checks.add(check_id, "fail", f"Missing required XLSX deliverable: {relative}")
+            return
+        try:
+            with zipfile.ZipFile(path) as zf:
+                names = set(zf.namelist())
+            required = {"[Content_Types].xml", "xl/workbook.xml"}
+            if required.issubset(names):
+                self.checks.add(check_id, "ok", f"XLSX deliverable is a readable workbook: {relative}")
+            else:
+                self.checks.add(check_id, "fail", f"XLSX deliverable is missing workbook parts: {relative}")
+        except Exception as exc:
+            self.checks.add(check_id, "fail", f"XLSX deliverable is not readable: {relative}: {exc}")
+
+    def test_final_text_has_no_todos(self, relative: str) -> None:
+        path = repo_path(self.root, relative)
+        if not path.exists():
+            self.checks.add("autopilot.final_text.exists", "fail", f"Missing final text artifact: {relative}")
+            return
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if re.search(r"\b(TODO|FIXME)\b", text, re.IGNORECASE):
+            self.checks.add("autopilot.final_text.todo", "fail", f"Final artifact contains TODO/FIXME marker: {relative}")
+        else:
+            self.checks.add(f"autopilot.final_text.no_todo.{rel_id(relative)}", "ok", f"Final artifact has no TODO/FIXME markers: {relative}")
+
+    def test_feature_pack_from_map(self, feature_id: str, feature_path_text: str) -> None:
+        feature_path = repo_path(self.root, feature_path_text or f"analysis/features/{feature_id}")
+        if not feature_path.exists():
+            self.checks.add("autopilot.feature_pack.exists", "fail", f"Feature map references missing evidence pack: {feature_path.relative_to(self.root).as_posix() if feature_path.is_relative_to(self.root) else feature_path}")
+            return
+        for required_file in ("brief.md", "findings.md", "evidence.csv", "open-questions.md", "review.md"):
+            if not (feature_path / required_file).exists():
+                self.checks.add("autopilot.feature_pack.required_file", "fail", f"Feature pack {feature_id} is missing {required_file}")
+        evidence = feature_path / "evidence.csv"
+        if not evidence.exists():
+            return
+        rows = self.read_csv_rows(evidence.relative_to(self.root).as_posix(), CANONICAL_EVIDENCE_HEADER, f"autopilot.feature_pack.evidence.{rel_id(feature_id)}")
+        data_rows = 0
+        for row in rows:
+            if not any((value or "").strip() for value in row.values()):
+                continue
+            data_rows += 1
+            if not (row.get("source_kind", "").strip() and row.get("source_path", "").strip() and row.get("summary", "").strip()):
+                self.checks.add("autopilot.evidence.missing_source", "fail", f"Feature {feature_id} evidence row lacks source_kind, source_path, or summary")
+        if data_rows:
+            self.checks.add(f"autopilot.feature_pack.evidence_rows.{rel_id(feature_id)}", "ok", f"Feature {feature_id} has {data_rows} evidence row(s)")
+        else:
+            self.checks.add("autopilot.feature_pack.evidence_rows", "fail", f"Feature {feature_id} has no evidence rows")
+
+    def test_autopilot_contract(self, manifest: dict[str, Any] | None) -> None:
+        if not manifest or not toml_enabled(manifest, "autopilot"):
+            self.checks.add("autopilot.enabled", "ok", "Autopilot final gate is disabled")
+            return
+        self.checks.add("autopilot.enabled", "ok", "Autopilot final gate is enabled")
+        for relative in (
+            "analysis/indexes/diff-inventory.csv",
+            "analysis/indexes/feature-map.csv",
+            "outputs/customization-map.md",
+            "outputs/customization-map.xlsx",
+            "outputs/open-questions.csv",
+            "outputs/open-questions.xlsx",
+            "analysis/final-audit.md",
+        ):
+            self.require_path(relative, "autopilot")
+
+        diff_rows = self.read_csv_rows("analysis/indexes/diff-inventory.csv", DIFF_INVENTORY_HEADER, "autopilot.diff_inventory")
+        feature_rows = self.read_csv_rows("analysis/indexes/feature-map.csv", FEATURE_MAP_HEADER, "autopilot.feature_map")
+        open_question_rows = self.read_csv_rows("outputs/open-questions.csv", OPEN_QUESTIONS_HEADER, "autopilot.open_questions")
+        self.test_xlsx_file("outputs/customization-map.xlsx", "autopilot.outputs.customization_map_xlsx")
+        self.test_xlsx_file("outputs/open-questions.xlsx", "autopilot.outputs.open_questions_xlsx")
+        self.test_final_text_has_no_todos("outputs/customization-map.md")
+        self.test_final_text_has_no_todos("analysis/final-audit.md")
+
+        if not diff_rows:
+            self.checks.add("autopilot.diff_inventory.rows", "fail", "Diff inventory has no classified rows")
+        else:
+            self.checks.add("autopilot.diff_inventory.rows", "ok", f"Diff inventory has {len(diff_rows)} row(s)")
+        unclassified = 0
+        for row in diff_rows:
+            status = row.get("status", "").strip()
+            diff_id = row.get("diff_id", "").strip() or "<empty diff_id>"
+            if status not in AUTOPILOT_DIFF_STATUSES:
+                unclassified += 1
+                self.checks.add("autopilot.diff_inventory.unclassified", "fail", f"Diff row {diff_id} has invalid or unclassified status: {status or '<empty>'}")
+            if not row.get("classification", "").strip():
+                self.checks.add("autopilot.diff_inventory.missing_classification", "fail", f"Diff row {diff_id} has empty classification")
+            if status in {"mapped_to_feature", "blocked_by_infobase_data", "requires_1c_review"} and not row.get("feature_id", "").strip():
+                self.checks.add("autopilot.diff_inventory.missing_feature", "fail", f"Diff row {diff_id} requires a feature_id for status {status}")
+            if not row.get("summary", "").strip():
+                self.checks.add("autopilot.diff_inventory.missing_summary", "fail", f"Diff row {diff_id} has empty summary")
+        if diff_rows and unclassified == 0:
+            self.checks.add("autopilot.diff_inventory.coverage", "ok", "Every diff inventory row has a classified autopilot status")
+
+        if not feature_rows:
+            self.checks.add("autopilot.feature_map.rows", "fail", "Feature map has no feature rows")
+        else:
+            self.checks.add("autopilot.feature_map.rows", "ok", f"Feature map has {len(feature_rows)} row(s)")
+        feature_ids = {row.get("feature_id", "").strip() for row in feature_rows if row.get("feature_id", "").strip()}
+        for row in feature_rows:
+            feature_id = row.get("feature_id", "").strip()
+            if not feature_id:
+                self.checks.add("autopilot.feature_map.feature_id", "fail", "Feature map row has empty feature_id")
+                continue
+            status = row.get("status", "").strip()
+            if status not in AUTOPILOT_FEATURE_STATUSES:
+                self.checks.add("autopilot.feature_map.status", "fail", f"Feature {feature_id} has invalid status: {status or '<empty>'}")
+            if not row.get("classification", "").strip():
+                self.checks.add("autopilot.feature_map.classification", "fail", f"Feature {feature_id} has empty classification")
+            if not row.get("summary", "").strip():
+                self.checks.add("autopilot.feature_map.summary", "fail", f"Feature {feature_id} has empty summary")
+            if status in {"complete", "blocked_by_infobase_data", "requires_1c_review"}:
+                self.test_feature_pack_from_map(feature_id, row.get("evidence_pack_path", "").strip())
+        for row in diff_rows:
+            feature_id = row.get("feature_id", "").strip()
+            status = row.get("status", "").strip()
+            if feature_id and status != "technical_noise_removed" and feature_id not in feature_ids:
+                self.checks.add("autopilot.coverage.unknown_feature", "fail", f"Diff row {row.get('diff_id', '<empty diff_id>')} references feature not present in feature-map.csv: {feature_id}")
+
+        for row in open_question_rows:
+            if not any((value or "").strip() for value in row.values()):
+                continue
+            question_id = row.get("question_id", "").strip() or "<empty question_id>"
+            for field in ("reason", "closure_method", "impact"):
+                if not row.get(field, "").strip():
+                    self.checks.add("autopilot.open_questions.required_fields", "fail", f"Open question {question_id} is missing {field}")
+            status = row.get("status", "").strip()
+            if status not in {"open_question", "blocked_by_infobase_data", "closed"}:
+                self.checks.add("autopilot.open_questions.status", "fail", f"Open question {question_id} has invalid status: {status or '<empty>'}")
+
+        audit = repo_path(self.root, "analysis/final-audit.md")
+        if audit.exists():
+            text = audit.read_text(encoding="utf-8", errors="ignore")
+            if not re.search(r"(?im)^Coverage status:\s*complete\s*$", text):
+                self.checks.add("autopilot.final_audit.coverage_status", "fail", "Final audit must contain 'Coverage status: complete'")
+            else:
+                self.checks.add("autopilot.final_audit.coverage_status", "ok", "Final audit declares complete coverage")
+            if not re.search(r"(?im)^Unclassified diff entries:\s*0\s*$", text):
+                self.checks.add("autopilot.final_audit.unclassified_zero", "fail", "Final audit must contain 'Unclassified diff entries: 0'")
+            else:
+                self.checks.add("autopilot.final_audit.unclassified_zero", "ok", "Final audit declares zero unclassified diff entries")
+
     def test_unresolved_placeholders(self) -> None:
         found = False
         for path in self.root.rglob("*"):
@@ -413,9 +590,10 @@ class Doctor:
     def test_research_repo(self) -> None:
         for path in RESEARCH_REQUIRED_PATHS:
             self.require_path(path, "research")
-        self.test_project_toml("project.toml")
+        manifest = self.test_project_toml("project.toml")
         self.test_queue("analysis/queue/tasks.jsonl")
         self.test_evidence_packs()
+        self.test_autopilot_contract(manifest)
         self.test_unresolved_placeholders()
 
     def run(self) -> dict[str, Any]:

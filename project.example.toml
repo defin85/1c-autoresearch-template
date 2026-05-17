@@ -36,3 +36,13 @@ static_sources_first = true
 allow_live_infobase_evidence = false
 mark_runtime_data_dependencies = true
 default_confidence_for_inference = "medium"
+
+[autopilot]
+enabled = false
+diff_inventory = "analysis/indexes/diff-inventory.csv"
+feature_map = "analysis/indexes/feature-map.csv"
+customization_map_md = "outputs/customization-map.md"
+customization_map_xlsx = "outputs/customization-map.xlsx"
+open_questions_csv = "outputs/open-questions.csv"
+open_questions_xlsx = "outputs/open-questions.xlsx"
+final_audit = "analysis/final-audit.md"

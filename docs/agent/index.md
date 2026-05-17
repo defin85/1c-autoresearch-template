@@ -21,4 +21,6 @@ For concrete research repos created from this template:
 7. Validate with `python -m one_c_autoresearch doctor` and `python -m one_c_autoresearch checks research`.
 8. Update the selected task status and stop.
 
+For end-to-end customization-map work, read `docs/method/autopilot-customization-map.md` after `project.toml`, initialize with `python -m one_c_autoresearch autopilot scaffold --enable-gate` when needed, and stop only after `python -m one_c_autoresearch doctor --deep --strict` proves complete diff coverage.
+
 Do not treat this template as an evidence source for any customer project.

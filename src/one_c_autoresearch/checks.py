@@ -10,6 +10,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .autopilot import (
+    DIFF_INVENTORY_HEADER,
+    FEATURE_MAP_HEADER,
+    OPEN_QUESTIONS_HEADER,
+    scaffold_autopilot,
+    write_minimal_xlsx,
+)
 from .bootstrap import create_research_repo
 from .common import current_module_command, git_check_ignored, read_jsonl, repo_path
 from .doctor import run_doctor
@@ -60,6 +67,7 @@ def test_template(args: argparse.Namespace) -> int:
         "one_c_autoresearch/__main__.py",
         "project.example.toml",
         "src/one_c_autoresearch/cli.py",
+        "src/one_c_autoresearch/autopilot.py",
         "src/one_c_autoresearch/doctor.py",
         "src/one_c_autoresearch/bootstrap.py",
         "src/one_c_autoresearch/queue.py",
@@ -74,6 +82,10 @@ def test_template(args: argparse.Namespace) -> int:
         "templates/research-repo/docs/agent/verification.md",
         "templates/research-repo/docs/method/1c-autoresearch-process.md",
         "templates/research-repo/docs/method/evidence-pack-schema.md",
+        "templates/research-repo/docs/method/autopilot-customization-map.md",
+        "templates/research-repo/analysis/indexes/README.md",
+        "templates/research-repo/analysis/indexes/diff-inventory.csv",
+        "templates/research-repo/analysis/indexes/feature-map.csv",
         "templates/research-repo/analysis/runs/README.md",
         "templates/research-repo/analysis/cache/AGENTS.md",
         "templates/research-repo/analysis/cache/README.md",
@@ -93,6 +105,7 @@ def test_template(args: argparse.Namespace) -> int:
         "templates/research-repo/analysis/queue/worker-prompt.md",
         "templates/research-repo/outputs/AGENTS.md",
         "templates/research-repo/outputs/README.md",
+        "templates/research-repo/outputs/open-questions.csv",
         "templates/research-repo/scripts/queue/claim_next_analysis_task.py",
         "templates/research-repo/scripts/queue/get_next_analysis_task.py",
         "templates/research-repo/scripts/queue/set_analysis_task_status.py",
@@ -118,8 +131,15 @@ def test_template(args: argparse.Namespace) -> int:
     require_text(root, "templates/research-repo/.agents/skills/1c-autoresearch-queue-worker/SKILL.md", r"python -m one_c_autoresearch doctor", "Queue worker skill should verify before marking a task complete.", errors)
     require_text(root, "templates/research-repo/analysis/features/_templates/evidence.csv", r"^feature_id,claim_id,source_kind,source_path,line_start,line_end,evidence_type,confidence,summary,notes$", "Evidence CSV template should expose the canonical header.", errors)
     require_text(root, "templates/research-repo/analysis/features/_templates/feature-candidates.csv", r"^feature_id,title,source_bucket,classification,confidence,summary,next_step$", "Feature candidate CSV template should expose the canonical header.", errors)
+    require_text(root, "templates/research-repo/analysis/indexes/diff-inventory.csv", r"^diff_id,source,change_type,path,object_kind,object_name,area,feature_id,classification,confidence,status,summary,evidence_ref,notes$", "Diff inventory template should expose the canonical autopilot header.", errors)
+    require_text(root, "templates/research-repo/analysis/indexes/feature-map.csv", r"^feature_id,title,domain,source_bucket,classification,confidence,status,owner,summary,evidence_pack_path,open_questions_path,outputs,notes$", "Feature map template should expose the canonical autopilot header.", errors)
+    require_text(root, "templates/research-repo/outputs/open-questions.csv", r"^question_id,feature_id,status,reason,closure_method,impact,source_ref,owner,notes$", "Open questions template should expose the canonical autopilot header.", errors)
+    require_text(root, "templates/research-repo/project.toml", r"(?m)^\[autopilot\]$", "Generated manifest should include the autopilot final-gate section.", errors)
+    require_text(root, "docs/method/autopilot-customization-map.md", r"Coverage status: complete", "Autopilot runbook should document the final audit coverage marker.", errors)
+    require_text(root, "src/one_c_autoresearch/cli.py", r"autopilot", "CLI should expose an autopilot command group.", errors)
     require_same_content(root, "docs/method/1c-autoresearch-process.md", "templates/research-repo/docs/method/1c-autoresearch-process.md", "Generated research methodology must match the template system-of-record document.", errors)
     require_same_content(root, "docs/method/evidence-pack-schema.md", "templates/research-repo/docs/method/evidence-pack-schema.md", "Generated evidence pack schema must match the template system-of-record document.", errors)
+    require_same_content(root, "docs/method/autopilot-customization-map.md", "templates/research-repo/docs/method/autopilot-customization-map.md", "Generated autopilot runbook must match the template system-of-record document.", errors)
     try:
         read_jsonl(repo_path(root, "templates/research-repo/analysis/queue/tasks.jsonl"))
     except Exception as exc:
@@ -180,10 +200,14 @@ def test_doctor(args: argparse.Namespace) -> int:
             "scripts/doctor.py",
             ".codex/1c-mcp.example.toml",
             "analysis/runs/README.md",
+            "analysis/indexes/README.md",
+            "analysis/indexes/diff-inventory.csv",
+            "analysis/indexes/feature-map.csv",
             "analysis/cache/AGENTS.md",
             "analysis/features/AGENTS.md",
             "analysis/features/_templates/evidence.csv",
             "analysis/queue/runs/README.md",
+            "outputs/open-questions.csv",
             "outputs/AGENTS.md",
             "scripts/queue/claim_next_analysis_task.py",
         ):
@@ -193,6 +217,57 @@ def test_doctor(args: argparse.Namespace) -> int:
         research = run_doctor(temp_repo)
         require(research["repo_kind"] == "research", "Embedded doctor should detect repo_kind=research", errors)
         require(research["status"] == "ok", "Embedded doctor should report status=ok without --deep", errors)
+        scaffold_repo = base / "scaffold-autopilot"
+        copy_smoke_repo(temp_repo, scaffold_repo)
+        scaffold_autopilot(argparse.Namespace(repo_path=str(scaffold_repo), force=True, enable_gate=True))
+        scaffolded = run_doctor(scaffold_repo)
+        require(scaffolded["status"] == "fail", "Autopilot gate should fail on scaffold-only artifacts", errors)
+        require(any(check["id"] == "autopilot.diff_inventory.rows" and check["status"] == "fail" for check in scaffolded["checks"]), "Autopilot gate should require classified diff rows", errors)
+
+        complete_repo = base / "complete-autopilot"
+        copy_smoke_repo(scaffold_repo, complete_repo)
+        repo_path(complete_repo, "analysis/indexes/diff-inventory.csv").write_text(
+            DIFF_INVENTORY_HEADER
+            + "\nD-0001,target_cf,M,cf/CommonModules/Example/Ext/Module.bsl,CommonModule,Example,bsl,feature-a,covered_by_existing_customization,high,mapped_to_feature,Example behavior changed,analysis/features/feature-a/evidence.csv#E-001,\n",
+            encoding="utf-8",
+        )
+        repo_path(complete_repo, "analysis/indexes/feature-map.csv").write_text(
+            FEATURE_MAP_HEADER
+            + "\nfeature-a,Example feature,Documents,target_cf,covered_by_existing_customization,high,complete,codex,Example customization,analysis/features/feature-a,analysis/features/feature-a/open-questions.md,outputs/customization-map.md,\n",
+            encoding="utf-8",
+        )
+        feature = repo_path(complete_repo, "analysis/features/feature-a")
+        feature.mkdir(parents=True, exist_ok=True)
+        (feature / "brief.md").write_text("# Brief\n\nExample feature.\n", encoding="utf-8")
+        (feature / "findings.md").write_text("# Findings\n\n- F-001: Example behavior changed.\n", encoding="utf-8")
+        (feature / "evidence.csv").write_text(
+            "feature_id,claim_id,source_kind,source_path,line_start,line_end,evidence_type,confidence,summary,notes\n"
+            "feature-a,F-001,target_cf,cf/CommonModules/Example/Ext/Module.bsl,1,3,bsl,high,Example behavior changed,\n",
+            encoding="utf-8",
+        )
+        (feature / "open-questions.md").write_text("# Open Questions\n\nNo open questions.\n", encoding="utf-8")
+        (feature / "review.md").write_text("# Review\n\nPassed.\n", encoding="utf-8")
+        repo_path(complete_repo, "outputs/customization-map.md").write_text("# Customization Map\n\nCoverage status: complete\n\nFeature A is mapped.\n", encoding="utf-8")
+        repo_path(complete_repo, "outputs/open-questions.csv").write_text(OPEN_QUESTIONS_HEADER + "\n", encoding="utf-8")
+        write_minimal_xlsx(repo_path(complete_repo, "outputs/customization-map.xlsx"), [FEATURE_MAP_HEADER.split(","), ["feature-a", "Example feature"]], force=True)
+        write_minimal_xlsx(repo_path(complete_repo, "outputs/open-questions.xlsx"), [OPEN_QUESTIONS_HEADER.split(",")], force=True)
+        repo_path(complete_repo, "analysis/final-audit.md").write_text(
+            "# Final Audit\n\nCoverage status: complete\n\nUnclassified diff entries: 0\n\nStarting diff entries: 1\nFinal diff entries: 1\nOpen questions: 0\n",
+            encoding="utf-8",
+        )
+        complete = run_doctor(complete_repo)
+        require(complete["status"] == "ok", "Autopilot gate should pass on a complete customization map", errors)
+
+        bad_question_repo = base / "bad-open-question"
+        copy_smoke_repo(complete_repo, bad_question_repo)
+        repo_path(bad_question_repo, "outputs/open-questions.csv").write_text(
+            OPEN_QUESTIONS_HEADER + "\nOQ-1,feature-a,open_question,,,,source,codex,\n",
+            encoding="utf-8",
+        )
+        bad_question = run_doctor(bad_question_repo)
+        require(bad_question["status"] == "fail", "Autopilot gate should fail when open questions lack reason, closure method, or impact", errors)
+        require(any(check["id"] == "autopilot.open_questions.required_fields" for check in bad_question["checks"]), "Autopilot gate should report incomplete open questions", errors)
+
         queue_path = repo_path(temp_repo, "analysis/queue/tasks.jsonl")
         claimed = claim_next_task(queue_path, claimed_by="worker-a")
         require(claimed.get("id") == "Q-0001", "claim_next_task should return Q-0001", errors)
@@ -260,7 +335,7 @@ def test_doctor(args: argparse.Namespace) -> int:
         mcp_warn_repo = base / "mcp-warn"
         copy_smoke_repo(temp_repo, mcp_warn_repo)
         toml_path = repo_path(mcp_warn_repo, "project.toml")
-        toml_path.write_text(re.sub(r"(?m)^enabled = false", "enabled = true", toml_path.read_text(encoding="utf-8")), encoding="utf-8")
+        toml_path.write_text(re.sub(r"(?m)^enabled = false", "enabled = true", toml_path.read_text(encoding="utf-8"), count=2), encoding="utf-8")
         mcp_warn = run_doctor(mcp_warn_repo)
         require(mcp_warn["status"] == "warn", "Doctor should warn when MCP or web access is enabled but incomplete", errors)
         require(any(check["id"].startswith("manifest.mcp.") and check["status"] == "warn" for check in mcp_warn["checks"]), "Doctor should emit MCP configuration warnings", errors)

@@ -4,6 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from .autopilot import scaffold_autopilot
 from .bootstrap import create_research_repo
 from .checks import run_check, test_doctor, test_research_repo, test_template
 from .doctor import print_doctor, run_doctor
@@ -57,6 +58,14 @@ def build_parser() -> argparse.ArgumentParser:
     new_repo = sub.add_parser("new-repo")
     add_new_repo_args(new_repo)
     new_repo.set_defaults(func=create_research_repo)
+
+    autopilot = sub.add_parser("autopilot")
+    autopilot_sub = autopilot.add_subparsers(dest="autopilot_command", required=True)
+    scaffold = autopilot_sub.add_parser("scaffold")
+    scaffold.add_argument("--repo-path", default=".")
+    scaffold.add_argument("--force", action="store_true")
+    scaffold.add_argument("--enable-gate", action="store_true")
+    scaffold.set_defaults(func=scaffold_autopilot)
 
     queue = sub.add_parser("queue")
     queue_sub = queue.add_subparsers(dest="queue_command", required=True)

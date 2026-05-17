@@ -41,3 +41,13 @@ scripts/             queue and validation helpers
 ```
 
 Agent navigation starts in `docs/agent/repo-map.md`. Verification details live in `docs/agent/verification.md`.
+
+## Autopilot Customization Map
+
+For an end-to-end final customization map, use:
+
+```bash
+python -m one_c_autoresearch autopilot scaffold --enable-gate
+```
+
+Then follow `docs/method/autopilot-customization-map.md`. With `autopilot.enabled=true`, `python -m one_c_autoresearch doctor --deep --strict` fails until every diff entry is classified, every feature pack has evidence, final outputs exist, and `analysis/final-audit.md` declares complete coverage.

@@ -38,6 +38,11 @@ When behavior depends on infobase data, mark it as `needs_infobase_data`.
    - requires development;
    - disputed or requires clarification.
 
+For an autonomous final customization map, use the stricter contract in
+`docs/method/autopilot-customization-map.md`. That workflow adds a physical
+clean-rebase stage, mandatory diff-inventory coverage, final outputs, and a
+doctor gate that rejects unclassified diff entries.
+
 ## Deep Dive Coverage
 
 For each feature, inspect:
@@ -62,3 +67,11 @@ Each feature pack should be understandable without re-reading the full repositor
 - `open-questions.md`: unresolved facts and required evidence.
 - `review.md`: independent review result.
 - `artifacts/`: optional Excel/CSV/raw extracts.
+
+The final map deliverables are generated from feature packs and indexes:
+
+- `outputs/customization-map.md`
+- `outputs/customization-map.xlsx`
+- `outputs/open-questions.csv`
+- `outputs/open-questions.xlsx`
+- `analysis/final-audit.md`

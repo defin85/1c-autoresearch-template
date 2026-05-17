@@ -14,6 +14,7 @@ This repository is a reusable template for concrete 1C autoresearch repositories
 | `scripts/bootstrap/` | Creates concrete research repositories from `templates/research-repo/`. | Bootstrap arguments, template copying, or token replacement changes. |
 | `scripts/checks/` | Template and generated-repo validation tests. | Validation rules, smoke tests, or doctor expectations change. |
 | `scripts/doctor.py` | Primary health check for both template and research repositories. | Repository contract, queue validation, manifest policy, or automation output changes. |
+| `src/one_c_autoresearch/autopilot.py` | Autopilot customization-map scaffold helpers and artifact headers. | Final-map artifact contract or scaffold behavior changes. |
 | `templates/research-repo/` | Files copied into a concrete research repository. | Concrete project layout, queue workflow, or generated repo instructions change. |
 | `examples/` | Small examples of intended command shapes. | User-facing examples need to reflect current bootstrap arguments. |
 
@@ -25,6 +26,7 @@ This repository is a reusable template for concrete 1C autoresearch repositories
 | Bootstrap behavior | `README.md`, `scripts/bootstrap/new_research_repo.py` | `scripts/bootstrap/new_research_repo.py`, `templates/research-repo/*` | `python -m one_c_autoresearch checks doctor` |
 | Research repo contract | `templates/research-repo/AGENTS.md`, `templates/research-repo/project.toml` | `templates/research-repo/*`, `scripts/checks/test_research_repo.py`, `scripts/doctor.py` | `python -m one_c_autoresearch checks research --repo-path <target-repo>` |
 | Queue workflow | `docs/method/queue-design.md`, `templates/research-repo/analysis/queue/*` | Queue docs, queue scripts, queue skill | `python -m one_c_autoresearch checks doctor`, generated repo doctor |
+| Autopilot customization map | `docs/method/autopilot-customization-map.md` | `src/one_c_autoresearch/autopilot.py`, `src/one_c_autoresearch/doctor.py`, `templates/research-repo/analysis/indexes/*`, `templates/research-repo/outputs/*` | `python -m one_c_autoresearch checks doctor`, generated repo doctor with `autopilot.enabled=true` |
 | Manifest/MCP/web policy | `project.example.toml`, `templates/research-repo/project.toml` | Manifests, `src/one_c_autoresearch/doctor.py`, research `AGENTS.md`, optional `.codex/1c-mcp.toml` checks | `python -m one_c_autoresearch doctor --json --deep`, targeted doctor smoke tests |
 | Agent instructions | `AGENTS.md`, `docs/agent/index.md` | Root and template `AGENTS.md`, `docs/agent/*`, `.agents/skills/*` | `python -m one_c_autoresearch checks template`, generated repo validation |
 
@@ -35,6 +37,7 @@ This repository is a reusable template for concrete 1C autoresearch repositories
 - `docs/agent/verification.md`: canonical verification matrix.
 - `docs/method/1c-autoresearch-process.md`: analysis method and feature output contract.
 - `docs/method/evidence-pack-schema.md`: canonical feature pack CSV headers and file contract.
+- `docs/method/autopilot-customization-map.md`: end-to-end final customization-map contract and doctor-gated completion rules.
 - `docs/method/queue-design.md`: queue semantics and worker rules.
 - `templates/research-repo/`: generated research repository contract.
 

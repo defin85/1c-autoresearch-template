@@ -9,6 +9,7 @@ Use it when you need to compare a vendor baseline, a customer-modified 1C config
 - A project manifest contract: `project.toml`.
 - A file-backed analysis queue for loopback/autonomous Codex runs.
 - Feature evidence packs for deep dives.
+- An autopilot customization-map contract with strict completion gates.
 - Quality gates for static 1C source analysis.
 - Bootstrap and validation scripts for new research repositories.
 - A small method layer for standard-vs-custom-vs-next-release gap analysis.
@@ -93,13 +94,11 @@ scripts/
 ## Agent Loop
 
 1. Read `project.toml`.
-2. Read `analysis/queue/README.md`, `task-schema.md`, `review-checklist.md`, and `tasks.jsonl`.
-3. Claim one pending task using `scripts/queue/claim_next_analysis_task.py`.
-4. Process exactly the claimed task.
-5. Use static indexes and 1C source trees first.
-6. Write evidence under `analysis/features/<feature-id>/`.
-7. Run the generated repo doctor.
-8. Update the task status and stop.
+2. For queue work, read `analysis/queue/README.md`, `task-schema.md`, `review-checklist.md`, and `tasks.jsonl`.
+3. For end-to-end customization maps, read `docs/method/autopilot-customization-map.md` and use `python -m one_c_autoresearch autopilot scaffold --enable-gate` in the concrete research repo.
+4. Build the clean diff, classify every diff entry, group entries into features, write evidence packs, generate final outputs, and write `analysis/final-audit.md`.
+5. Run the generated repo doctor. With `autopilot.enabled=true`, it must prove every diff entry is classified before final delivery.
+6. Update queue task status only after verification passes.
 
 The queue is deliberately file-backed. It is slower than a broker but transparent, diffable, and easy for Codex automation to resume.
 
@@ -123,6 +122,12 @@ Check another repo explicitly:
 
 ```bash
 python -m one_c_autoresearch doctor --repo-path ./do_21_research
+```
+
+Scaffold the final customization-map contract in a concrete research repo:
+
+```bash
+python -m one_c_autoresearch autopilot scaffold --repo-path ./do_21_research --enable-gate
 ```
 
 Useful flags:

@@ -17,6 +17,9 @@ review.md
 
 Task-specific discovery packs may also produce `feature-candidates.csv`.
 
+Autopilot final-map indexes use separate contracts in
+`docs/method/autopilot-customization-map.md`.
+
 ## evidence.csv
 
 Canonical header:

@@ -49,11 +49,28 @@ Do not use live 1C evidence until the local manifest matches `project.toml`.
 4. Run `python -m one_c_autoresearch checks research`.
 5. Record unresolved runtime dependencies in the feature pack and queue status before stopping.
 
+## Autopilot Final Gate
+
+For an end-to-end customization map, initialize and enable the final gate:
+
+```bash
+python -m one_c_autoresearch autopilot scaffold --enable-gate
+```
+
+After `autopilot.enabled=true`, `doctor` fails until:
+
+- `analysis/indexes/diff-inventory.csv` has no unclassified diff entries;
+- `analysis/indexes/feature-map.csv` maps every non-noise feature to a complete evidence pack;
+- final Markdown and XLSX outputs exist;
+- open questions have reason, closure method, and impact;
+- `analysis/final-audit.md` contains `Coverage status: complete` and `Unclassified diff entries: 0`;
+- final text artifacts contain no `TODO` or `FIXME` markers.
+
 ## Health Gate Meaning
 
 - `status = ok`: repository contract is healthy.
 - `status = warn`: repository is usable, but warnings must be reported before claiming health.
 - `status = fail`: stop autonomous work and fix the contract issue first.
 
-The doctor validates required paths, `project.toml`, queue schema, task dependencies, stale claims, expected outputs, evidence pack CSV headers, unresolved placeholders, MCP/web policy, and optional tools when `--deep` is used.
+The doctor validates required paths, `project.toml`, queue schema, task dependencies, stale claims, expected outputs, evidence pack CSV headers, autopilot final-map coverage, unresolved placeholders, MCP/web policy, and optional tools when `--deep` is used.
 When `.codex/1c-mcp.toml` exists, the doctor also compares its MCP server, URL, service root, active RLM project, and web URL with `project.toml`.
