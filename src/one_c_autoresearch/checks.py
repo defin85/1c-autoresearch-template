@@ -21,6 +21,12 @@ from .bootstrap import create_research_repo
 from .common import current_module_command, git_check_ignored, read_jsonl, repo_path
 from .doctor import run_doctor
 from .queue import claim_next_task, set_task_status
+from .reverse_map import (
+    REVERSE_MAP_COVERAGE_HEADER,
+    get_next_reverse_map_workitem,
+    scaffold_reverse_map,
+    seed_reverse_map_workitems,
+)
 
 
 class CheckFailure(Exception):
@@ -68,6 +74,7 @@ def test_template(args: argparse.Namespace) -> int:
         "project.example.toml",
         "src/one_c_autoresearch/cli.py",
         "src/one_c_autoresearch/autopilot.py",
+        "src/one_c_autoresearch/reverse_map.py",
         "src/one_c_autoresearch/doctor.py",
         "src/one_c_autoresearch/bootstrap.py",
         "src/one_c_autoresearch/queue.py",
@@ -83,9 +90,18 @@ def test_template(args: argparse.Namespace) -> int:
         "templates/research-repo/docs/method/1c-autoresearch-process.md",
         "templates/research-repo/docs/method/evidence-pack-schema.md",
         "templates/research-repo/docs/method/autopilot-customization-map.md",
+        "templates/research-repo/docs/method/reverse-functional-map.md",
         "templates/research-repo/analysis/indexes/README.md",
         "templates/research-repo/analysis/indexes/diff-inventory.csv",
         "templates/research-repo/analysis/indexes/feature-map.csv",
+        "templates/research-repo/analysis/reverse-map/README.md",
+        "templates/research-repo/analysis/reverse-map/state.md",
+        "templates/research-repo/analysis/reverse-map/coverage.csv",
+        "templates/research-repo/analysis/reverse-map/workitems.jsonl",
+        "templates/research-repo/analysis/reverse-map/decisions.csv",
+        "templates/research-repo/analysis/reverse-map/unresolved.csv",
+        "templates/research-repo/analysis/reverse-map/scenarios/README.md",
+        "templates/research-repo/analysis/reverse-map/outputs/README.md",
         "templates/research-repo/analysis/runs/README.md",
         "templates/research-repo/analysis/cache/AGENTS.md",
         "templates/research-repo/analysis/cache/README.md",
@@ -134,12 +150,18 @@ def test_template(args: argparse.Namespace) -> int:
     require_text(root, "templates/research-repo/analysis/indexes/diff-inventory.csv", r"^diff_id,source,change_type,path,object_kind,object_name,area,feature_id,classification,confidence,status,summary,evidence_ref,notes$", "Diff inventory template should expose the canonical autopilot header.", errors)
     require_text(root, "templates/research-repo/analysis/indexes/feature-map.csv", r"^feature_id,title,domain,source_bucket,classification,confidence,status,owner,summary,evidence_pack_path,open_questions_path,outputs,notes$", "Feature map template should expose the canonical autopilot header.", errors)
     require_text(root, "templates/research-repo/outputs/open-questions.csv", r"^question_id,feature_id,status,reason,closure_method,impact,source_ref,owner,notes$", "Open questions template should expose the canonical autopilot header.", errors)
+    require_text(root, "templates/research-repo/analysis/reverse-map/coverage.csv", rf"^{re.escape(REVERSE_MAP_COVERAGE_HEADER)}$", "Reverse-map coverage template should expose the canonical header.", errors)
     require_text(root, "templates/research-repo/project.toml", r"(?m)^\[autopilot\]$", "Generated manifest should include the autopilot final-gate section.", errors)
+    require_text(root, "templates/research-repo/docs/agent/index.md", r"reverse-map claim", "Agent router should document the reverse-map continuation command.", errors)
+    require_text(root, "templates/research-repo/AGENTS.md", r"analysis/reverse-map", "Generated AGENTS should identify reverse-map state as source of truth.", errors)
+    require_text(root, "templates/research-repo/README.md", r"reverse-map", "Generated README should expose reverse-map continuation commands.", errors)
+    require_text(root, "src/one_c_autoresearch/cli.py", r"reverse-map", "CLI should expose a reverse-map command group.", errors)
     require_text(root, "docs/method/autopilot-customization-map.md", r"Coverage status: complete", "Autopilot runbook should document the final audit coverage marker.", errors)
     require_text(root, "src/one_c_autoresearch/cli.py", r"autopilot", "CLI should expose an autopilot command group.", errors)
     require_same_content(root, "docs/method/1c-autoresearch-process.md", "templates/research-repo/docs/method/1c-autoresearch-process.md", "Generated research methodology must match the template system-of-record document.", errors)
     require_same_content(root, "docs/method/evidence-pack-schema.md", "templates/research-repo/docs/method/evidence-pack-schema.md", "Generated evidence pack schema must match the template system-of-record document.", errors)
     require_same_content(root, "docs/method/autopilot-customization-map.md", "templates/research-repo/docs/method/autopilot-customization-map.md", "Generated autopilot runbook must match the template system-of-record document.", errors)
+    require_same_content(root, "docs/method/reverse-functional-map.md", "templates/research-repo/docs/method/reverse-functional-map.md", "Generated reverse-map runbook must match the template system-of-record document.", errors)
     try:
         read_jsonl(repo_path(root, "templates/research-repo/analysis/queue/tasks.jsonl"))
     except Exception as exc:
@@ -203,6 +225,14 @@ def test_doctor(args: argparse.Namespace) -> int:
             "analysis/indexes/README.md",
             "analysis/indexes/diff-inventory.csv",
             "analysis/indexes/feature-map.csv",
+            "analysis/reverse-map/README.md",
+            "analysis/reverse-map/state.md",
+            "analysis/reverse-map/coverage.csv",
+            "analysis/reverse-map/workitems.jsonl",
+            "analysis/reverse-map/decisions.csv",
+            "analysis/reverse-map/unresolved.csv",
+            "analysis/reverse-map/scenarios/README.md",
+            "analysis/reverse-map/outputs/README.md",
             "analysis/cache/AGENTS.md",
             "analysis/features/AGENTS.md",
             "analysis/features/_templates/evidence.csv",
@@ -255,6 +285,7 @@ def test_doctor(args: argparse.Namespace) -> int:
             "# Final Audit\n\nCoverage status: complete\n\nUnclassified diff entries: 0\n\nStarting diff entries: 1\nFinal diff entries: 1\nOpen questions: 0\n",
             encoding="utf-8",
         )
+        seed_reverse_map_workitems(complete_repo)
         complete = run_doctor(complete_repo)
         require(complete["status"] == "ok", "Autopilot gate should pass on a complete customization map", errors)
 
@@ -267,6 +298,26 @@ def test_doctor(args: argparse.Namespace) -> int:
         bad_question = run_doctor(bad_question_repo)
         require(bad_question["status"] == "fail", "Autopilot gate should fail when open questions lack reason, closure method, or impact", errors)
         require(any(check["id"] == "autopilot.open_questions.required_fields" for check in bad_question["checks"]), "Autopilot gate should report incomplete open questions", errors)
+
+        reverse_repo = base / "reverse-map"
+        copy_smoke_repo(temp_repo, reverse_repo)
+        repo_path(reverse_repo, "analysis/indexes/diff-inventory.csv").write_text(
+            DIFF_INVENTORY_HEADER
+            + "\nD-0001,clean-rebase,A,Catalogs/Example.xml,Catalogs,Catalogs.Example,Documents,feature-a,confirmed business feature,high,mapped_to_feature,Example object,analysis/features/feature-a/evidence.csv,\n"
+            + "D-0002,clean-rebase,M,Catalogs/Example/Ext/ObjectModule.bsl,Catalogs,Catalogs.Example,Documents,feature-a,confirmed business feature,high,mapped_to_feature,Example logic,analysis/features/feature-a/evidence.csv,\n",
+            encoding="utf-8",
+        )
+        scaffold_reverse_map(argparse.Namespace(repo_path=str(reverse_repo), force=True))
+        created = seed_reverse_map_workitems(reverse_repo)
+        require(created == 1, "Reverse-map seed should create one workitem for the uncovered feature group", errors)
+        coverage_lines = repo_path(reverse_repo, "analysis/reverse-map/coverage.csv").read_text(encoding="utf-8-sig").splitlines()
+        require(coverage_lines[0] == REVERSE_MAP_COVERAGE_HEADER, "Reverse-map coverage should keep the canonical header", errors)
+        require(len(coverage_lines) == 3, "Reverse-map coverage should contain every diff row plus header", errors)
+        next_workitem = get_next_reverse_map_workitem(reverse_repo)
+        require(next_workitem.get("id") == "RM-0001", "Reverse-map next should return the first generated workitem", errors)
+        require(next_workitem.get("status") == "pending", "Reverse-map generated workitem should be pending", errors)
+        reverse_doctor = run_doctor(reverse_repo, mode="research")
+        require(reverse_doctor["status"] != "fail", "Doctor should not fail on initialized reverse-map state with pending work", errors)
 
         queue_path = repo_path(temp_repo, "analysis/queue/tasks.jsonl")
         claimed = claim_next_task(queue_path, claimed_by="worker-a")

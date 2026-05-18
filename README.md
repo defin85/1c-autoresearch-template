@@ -10,6 +10,7 @@ Use it when you need to compare a vendor baseline, a customer-modified 1C config
 - A file-backed analysis queue for loopback/autonomous Codex runs.
 - Feature evidence packs for deep dives.
 - An autopilot customization-map contract with strict completion gates.
+- A reverse functional mapping state machine for long-running fact-to-intent research.
 - Quality gates for static 1C source analysis.
 - Bootstrap and validation scripts for new research repositories.
 - A small method layer for standard-vs-custom-vs-next-release gap analysis.
@@ -83,6 +84,7 @@ analysis/
     indexes/
     noise/
   queue/
+  reverse-map/
   features/
   runs/
 outputs/
@@ -95,10 +97,11 @@ scripts/
 
 1. Read `project.toml`.
 2. For queue work, read `analysis/queue/README.md`, `task-schema.md`, `review-checklist.md`, and `tasks.jsonl`.
-3. For end-to-end customization maps, read `docs/method/autopilot-customization-map.md` and use `python -m one_c_autoresearch autopilot scaffold --enable-gate` in the concrete research repo.
-4. Build the clean diff, classify every diff entry, group entries into features, write evidence packs, generate final outputs, and write `analysis/final-audit.md`.
-5. Run the generated repo doctor. With `autopilot.enabled=true`, it must prove every diff entry is classified before final delivery.
-6. Update queue task status only after verification passes.
+3. For reverse functional mapping continuation, read `analysis/reverse-map/state.md` and use `python -m one_c_autoresearch reverse-map claim` in the concrete research repo.
+4. For end-to-end customization maps, read `docs/method/autopilot-customization-map.md` and use `python -m one_c_autoresearch autopilot scaffold --enable-gate` in the concrete research repo.
+5. Build the clean diff, classify every diff entry, group entries into features, write evidence packs, generate final outputs, and write `analysis/final-audit.md`.
+6. Run the generated repo doctor. With `autopilot.enabled=true`, it must prove every diff entry is classified before final delivery.
+7. Update queue or reverse-map workitem status only after verification passes.
 
 The queue is deliberately file-backed. It is slower than a broker but transparent, diffable, and easy for Codex automation to resume.
 
@@ -128,6 +131,12 @@ Scaffold the final customization-map contract in a concrete research repo:
 
 ```bash
 python -m one_c_autoresearch autopilot scaffold --repo-path ./do_21_research --enable-gate
+```
+
+Continue reverse functional mapping in a concrete research repo:
+
+```bash
+python -m one_c_autoresearch reverse-map claim --repo-path ./do_21_research
 ```
 
 Useful flags:

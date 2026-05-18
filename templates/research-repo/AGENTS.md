@@ -8,6 +8,7 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 - `.codex/1c-mcp.toml`, when present, is the repo-local source of truth for the active 1C MCP/web target and must match `project.toml`.
 - `analysis/queue/tasks.jsonl` is the current analysis queue.
 - `analysis/indexes/diff-inventory.csv` and `analysis/indexes/feature-map.csv` are the source of truth for the autopilot final customization map when `autopilot.enabled=true`.
+- `analysis/reverse-map/` is the durable state for long-running fact-to-intent reverse mapping. Agent context is disposable; continuation must read this folder.
 - `analysis/features/` contains feature-level evidence packs.
 - `outputs/` contains human-facing deliverables.
 - `docs/agent/repo-map.md` maps agent entry points and change routing.
@@ -17,6 +18,7 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 
 - Process one queue task at a time.
 - Use `$1c-autoresearch-queue-worker` when selecting, claiming, executing, or updating queue tasks.
+- For reverse engineering continuation triggers such as `/goal Исследование`, follow `docs/method/reverse-functional-map.md`: run `python -m one_c_autoresearch reverse-map claim`, process one workitem, update reverse-map state, verify, and stop.
 - For an end-to-end customization map, follow `docs/method/autopilot-customization-map.md` instead of stopping after a single queue task.
 - Prefer static source evidence and generated indexes before live 1C access.
 - Do not use unrelated 1C MCP servers as evidence.

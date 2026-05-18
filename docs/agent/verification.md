@@ -59,7 +59,7 @@ python -m one_c_autoresearch doctor --repo-path <target-repo> --deep
 | `scripts/checks/test_template.py` | Required template and generated-repo paths, method-doc drift checks, and template queue JSONL parseability. |
 | `scripts/checks/test_doctor.py` | End-to-end doctor smoke test, bootstrap output, placeholder replacement, queue validation, and manifest policy diagnostics. |
 | `scripts/checks/test_research_repo.py` | Delegates generated repository health to `python -m one_c_autoresearch doctor --mode research`. |
-| `scripts/doctor.py` | Primary health gate for template or research repos: required paths, manifest sections, queue schema, dependency cycles, stale claims, expected outputs, evidence pack CSV headers, autopilot final-map coverage, unresolved placeholders, MCP/web policy, optional `.codex/1c-mcp.toml` consistency, and optional tool checks. |
+| `scripts/doctor.py` | Primary health gate for template or research repos: required paths, manifest sections, queue schema, dependency cycles, stale claims, expected outputs, evidence pack CSV headers, reverse-map coverage state, autopilot final-map coverage, unresolved placeholders, MCP/web policy, optional `.codex/1c-mcp.toml` consistency, and optional tool checks. |
 
 ## Autopilot Final Gate
 
@@ -78,6 +78,23 @@ After `autopilot.enabled=true`, `doctor` fails until:
 - every open question has reason, closure method, and impact;
 - `analysis/final-audit.md` contains `Coverage status: complete` and `Unclassified diff entries: 0`;
 - final text artifacts contain no `TODO` or `FIXME` markers.
+
+## Reverse Functional Map
+
+In a generated research repo, initialize reverse-map state with:
+
+```bash
+python -m one_c_autoresearch reverse-map scaffold
+python -m one_c_autoresearch reverse-map seed
+```
+
+Continue one durable workitem with:
+
+```bash
+python -m one_c_autoresearch reverse-map claim
+```
+
+The doctor checks that `analysis/reverse-map/coverage.csv` covers every diff row from `analysis/indexes/diff-inventory.csv`, workitems parse, statuses are valid, and reverse-map CSV headers match the contract. Open work is represented in state files rather than hidden in agent context.
 
 ## Expected Result
 

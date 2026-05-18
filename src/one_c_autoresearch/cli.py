@@ -9,6 +9,14 @@ from .bootstrap import create_research_repo
 from .checks import run_check, test_doctor, test_research_repo, test_template
 from .doctor import print_doctor, run_doctor
 from .queue import claim_command, get_command, set_status_command
+from .reverse_map import (
+    claim_command as reverse_map_claim_command,
+    next_command as reverse_map_next_command,
+    scaffold_reverse_map,
+    seed_command as reverse_map_seed_command,
+    set_status_command as reverse_map_set_status_command,
+    status_command as reverse_map_status_command,
+)
 
 
 def add_new_repo_args(parser: argparse.ArgumentParser) -> None:
@@ -66,6 +74,40 @@ def build_parser() -> argparse.ArgumentParser:
     scaffold.add_argument("--force", action="store_true")
     scaffold.add_argument("--enable-gate", action="store_true")
     scaffold.set_defaults(func=scaffold_autopilot)
+
+    reverse_map = sub.add_parser("reverse-map")
+    reverse_map_sub = reverse_map.add_subparsers(dest="reverse_map_command", required=True)
+    reverse_scaffold = reverse_map_sub.add_parser("scaffold")
+    reverse_scaffold.add_argument("--repo-path", default=".")
+    reverse_scaffold.add_argument("--force", action="store_true")
+    reverse_scaffold.set_defaults(func=scaffold_reverse_map)
+
+    reverse_seed = reverse_map_sub.add_parser("seed")
+    reverse_seed.add_argument("--repo-path", default=".")
+    reverse_seed.set_defaults(func=reverse_map_seed_command)
+
+    reverse_next = reverse_map_sub.add_parser("next")
+    reverse_next.add_argument("--repo-path", default=".")
+    reverse_next.set_defaults(func=reverse_map_next_command)
+
+    reverse_claim = reverse_map_sub.add_parser("claim")
+    reverse_claim.add_argument("--repo-path", default=".")
+    reverse_claim.add_argument("--claimed-by", default="codex")
+    reverse_claim.add_argument("--lock-timeout-seconds", type=int, default=10)
+    reverse_claim.set_defaults(func=reverse_map_claim_command)
+
+    reverse_set_status = reverse_map_sub.add_parser("set-status")
+    reverse_set_status.add_argument("--repo-path", default=".")
+    reverse_set_status.add_argument("--id", required=True)
+    reverse_set_status.add_argument("--status", required=True)
+    reverse_set_status.add_argument("--result-summary", default=None)
+    reverse_set_status.add_argument("--expected-status", default=None)
+    reverse_set_status.add_argument("--lock-timeout-seconds", type=int, default=10)
+    reverse_set_status.set_defaults(func=reverse_map_set_status_command)
+
+    reverse_status = reverse_map_sub.add_parser("status")
+    reverse_status.add_argument("--repo-path", default=".")
+    reverse_status.set_defaults(func=reverse_map_status_command)
 
     queue = sub.add_parser("queue")
     queue_sub = queue.add_subparsers(dest="queue_command", required=True)

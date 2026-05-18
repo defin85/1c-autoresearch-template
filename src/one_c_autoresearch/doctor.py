@@ -22,6 +22,13 @@ from .common import (
     toml_value,
     utc_now_iso,
 )
+from .reverse_map import (
+    REVERSE_MAP_COVERAGE_HEADER,
+    REVERSE_MAP_DECISIONS_HEADER,
+    REVERSE_MAP_STATUSES,
+    REVERSE_MAP_UNRESOLVED_HEADER,
+    REVERSE_MAP_WORKITEM_STATUSES,
+)
 
 CANONICAL_EVIDENCE_HEADER = "feature_id,claim_id,source_kind,source_path,line_start,line_end,evidence_type,confidence,summary,notes"
 CANONICAL_FEATURE_CANDIDATES_HEADER = "feature_id,title,source_bucket,classification,confidence,summary,next_step"
@@ -42,6 +49,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "src/one_c_autoresearch/__main__.py",
     "src/one_c_autoresearch/cli.py",
     "src/one_c_autoresearch/autopilot.py",
+    "src/one_c_autoresearch/reverse_map.py",
     "src/one_c_autoresearch/doctor.py",
     "src/one_c_autoresearch/bootstrap.py",
     "src/one_c_autoresearch/queue.py",
@@ -52,6 +60,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "docs/method/1c-autoresearch-process.md",
     "docs/method/evidence-pack-schema.md",
     "docs/method/autopilot-customization-map.md",
+    "docs/method/reverse-functional-map.md",
     "docs/method/queue-design.md",
     "templates/research-repo/.gitignore",
     "templates/research-repo/AGENTS.md",
@@ -64,9 +73,18 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/docs/method/1c-autoresearch-process.md",
     "templates/research-repo/docs/method/evidence-pack-schema.md",
     "templates/research-repo/docs/method/autopilot-customization-map.md",
+    "templates/research-repo/docs/method/reverse-functional-map.md",
     "templates/research-repo/analysis/indexes/README.md",
     "templates/research-repo/analysis/indexes/diff-inventory.csv",
     "templates/research-repo/analysis/indexes/feature-map.csv",
+    "templates/research-repo/analysis/reverse-map/README.md",
+    "templates/research-repo/analysis/reverse-map/state.md",
+    "templates/research-repo/analysis/reverse-map/coverage.csv",
+    "templates/research-repo/analysis/reverse-map/workitems.jsonl",
+    "templates/research-repo/analysis/reverse-map/decisions.csv",
+    "templates/research-repo/analysis/reverse-map/unresolved.csv",
+    "templates/research-repo/analysis/reverse-map/scenarios/README.md",
+    "templates/research-repo/analysis/reverse-map/outputs/README.md",
     "templates/research-repo/analysis/runs/README.md",
     "templates/research-repo/analysis/cache/AGENTS.md",
     "templates/research-repo/analysis/cache/README.md",
@@ -107,6 +125,7 @@ RESEARCH_REQUIRED_PATHS = [
     "src/one_c_autoresearch/__init__.py",
     "src/one_c_autoresearch/__main__.py",
     "src/one_c_autoresearch/autopilot.py",
+    "src/one_c_autoresearch/reverse_map.py",
     "src/one_c_autoresearch/cli.py",
     "docs/agent/index.md",
     "docs/agent/repo-map.md",
@@ -114,9 +133,18 @@ RESEARCH_REQUIRED_PATHS = [
     "docs/method/1c-autoresearch-process.md",
     "docs/method/evidence-pack-schema.md",
     "docs/method/autopilot-customization-map.md",
+    "docs/method/reverse-functional-map.md",
     "analysis/indexes/README.md",
     "analysis/indexes/diff-inventory.csv",
     "analysis/indexes/feature-map.csv",
+    "analysis/reverse-map/README.md",
+    "analysis/reverse-map/state.md",
+    "analysis/reverse-map/coverage.csv",
+    "analysis/reverse-map/workitems.jsonl",
+    "analysis/reverse-map/decisions.csv",
+    "analysis/reverse-map/unresolved.csv",
+    "analysis/reverse-map/scenarios/README.md",
+    "analysis/reverse-map/outputs/README.md",
     "analysis/runs/README.md",
     "analysis/queue/README.md",
     "analysis/queue/tasks.jsonl",
@@ -562,6 +590,78 @@ class Doctor:
             else:
                 self.checks.add("autopilot.final_audit.unclassified_zero", "ok", "Final audit declares zero unclassified diff entries")
 
+    def test_reverse_map_contract(self) -> None:
+        for relative in (
+            "analysis/reverse-map/README.md",
+            "analysis/reverse-map/state.md",
+            "analysis/reverse-map/coverage.csv",
+            "analysis/reverse-map/workitems.jsonl",
+            "analysis/reverse-map/decisions.csv",
+            "analysis/reverse-map/unresolved.csv",
+            "analysis/reverse-map/scenarios/README.md",
+            "analysis/reverse-map/outputs/README.md",
+        ):
+            self.require_path(relative, "reverse_map")
+
+        coverage_rows = self.read_csv_rows("analysis/reverse-map/coverage.csv", REVERSE_MAP_COVERAGE_HEADER, "reverse_map.coverage")
+        self.read_csv_rows("analysis/reverse-map/decisions.csv", REVERSE_MAP_DECISIONS_HEADER, "reverse_map.decisions")
+        self.read_csv_rows("analysis/reverse-map/unresolved.csv", REVERSE_MAP_UNRESOLVED_HEADER, "reverse_map.unresolved")
+
+        workitems_path = repo_path(self.root, "analysis/reverse-map/workitems.jsonl")
+        workitems: list[dict[str, Any]] = []
+        if workitems_path.exists():
+            try:
+                workitems = [item for _, item in read_jsonl(workitems_path)]
+                self.checks.add("reverse_map.workitems.parse", "ok", "Reverse-map workitems JSONL parses")
+            except Exception as exc:
+                self.checks.add("reverse_map.workitems.parse", "fail", f"Invalid reverse-map workitems JSONL: {exc}")
+        ids: set[str] = set()
+        for item in workitems:
+            workitem_id = str(item.get("id", "")).strip()
+            if not workitem_id:
+                self.checks.add("reverse_map.workitems.id", "fail", "Reverse-map workitem has empty id")
+            elif workitem_id in ids:
+                self.checks.add("reverse_map.workitems.duplicate_id", "fail", f"Duplicate reverse-map workitem id: {workitem_id}")
+            else:
+                ids.add(workitem_id)
+            status = str(item.get("status", "")).strip()
+            if status not in REVERSE_MAP_WORKITEM_STATUSES:
+                self.checks.add("reverse_map.workitems.status", "fail", f"Reverse-map workitem {workitem_id or '<empty>'} has invalid status: {status or '<empty>'}")
+            if not as_list(item.get("source_diff_ids")):
+                self.checks.add("reverse_map.workitems.source_diff_ids", "warn", f"Reverse-map workitem {workitem_id or '<empty>'} has no source_diff_ids")
+        if not workitems:
+            self.checks.add("reverse_map.workitems.empty", "ok", "Reverse-map has no workitems yet")
+        elif not any(check["id"] == "reverse_map.workitems.duplicate_id" for check in self.checks.checks):
+            self.checks.add("reverse_map.workitems.unique_ids", "ok", "Reverse-map workitem ids are unique")
+
+        coverage_ids: set[str] = set()
+        coverage_by_status: dict[str, int] = {}
+        for row in coverage_rows:
+            if not any((value or "").strip() for value in row.values()):
+                continue
+            diff_id = row.get("diff_id", "").strip()
+            if diff_id:
+                coverage_ids.add(diff_id)
+            status = row.get("status", "").strip()
+            coverage_by_status[status or "<empty>"] = coverage_by_status.get(status or "<empty>", 0) + 1
+            if status not in REVERSE_MAP_STATUSES:
+                self.checks.add("reverse_map.coverage.status", "fail", f"Reverse-map coverage row {diff_id or '<empty>'} has invalid status: {status or '<empty>'}")
+            if status in {"assigned", "confirmed_in_scenario", "supporting_shared", "needs_manual_review", "needs_infobase_data"} and not row.get("workitem_id", "").strip():
+                self.checks.add("reverse_map.coverage.workitem_id", "fail", f"Reverse-map coverage row {diff_id or '<empty>'} with status {status} lacks workitem_id")
+        self.checks.add("reverse_map.coverage.rows", "ok", f"Reverse-map coverage has {len(coverage_ids)} diff row(s)")
+        if coverage_by_status:
+            self.checks.add("reverse_map.coverage.status_counts", "ok", "Reverse-map coverage status counts", coverage_by_status)
+
+        diff_path = repo_path(self.root, "analysis/indexes/diff-inventory.csv")
+        if diff_path.exists() and diff_path.read_text(encoding="utf-8-sig").splitlines()[:1] == [DIFF_INVENTORY_HEADER]:
+            with diff_path.open("r", encoding="utf-8-sig", newline="") as fh:
+                diff_ids = {row.get("diff_id", "").strip() for row in csv.DictReader(fh) if row.get("diff_id", "").strip()}
+            missing = sorted(diff_ids - coverage_ids)
+            if missing:
+                self.checks.add("reverse_map.coverage.missing_diff", "fail", f"Reverse-map coverage is missing {len(missing)} diff row(s); run `python -m one_c_autoresearch reverse-map seed`")
+            else:
+                self.checks.add("reverse_map.coverage.diff_complete", "ok", "Reverse-map coverage contains every diff inventory row")
+
     def test_unresolved_placeholders(self) -> None:
         found = False
         for path in self.root.rglob("*"):
@@ -593,6 +693,7 @@ class Doctor:
         manifest = self.test_project_toml("project.toml")
         self.test_queue("analysis/queue/tasks.jsonl")
         self.test_evidence_packs()
+        self.test_reverse_map_contract()
         self.test_autopilot_contract(manifest)
         self.test_unresolved_placeholders()
 

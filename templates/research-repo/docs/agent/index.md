@@ -13,4 +13,6 @@ Read `docs/agent/repo-map.md` before choosing files. Read `docs/agent/verificati
 
 For end-to-end customization-map work, read `docs/method/autopilot-customization-map.md`, initialize with `python -m one_c_autoresearch autopilot scaffold --enable-gate` when needed, and stop only after `python -m one_c_autoresearch doctor --deep --strict` proves complete diff coverage.
 
+For long-running reverse functional mapping, read `docs/method/reverse-functional-map.md` and `analysis/reverse-map/state.md`, then run `python -m one_c_autoresearch reverse-map claim`. If a workitem is returned, process exactly that workitem, update `analysis/reverse-map/coverage.csv`, `decisions.csv`, `unresolved.csv`, scenario artifacts, run verification, and stop.
+
 Do not use live 1C MCP or web evidence unless the task explicitly allows it and `project.toml` identifies the target.

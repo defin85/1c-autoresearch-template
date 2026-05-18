@@ -66,6 +66,23 @@ After `autopilot.enabled=true`, `doctor` fails until:
 - `analysis/final-audit.md` contains `Coverage status: complete` and `Unclassified diff entries: 0`;
 - final text artifacts contain no `TODO` or `FIXME` markers.
 
+## Reverse-Map Continuation Gate
+
+For long-running reverse functional mapping, initialize state when needed:
+
+```bash
+python -m one_c_autoresearch reverse-map scaffold
+python -m one_c_autoresearch reverse-map seed
+```
+
+Continue one workitem:
+
+```bash
+python -m one_c_autoresearch reverse-map claim
+```
+
+The standard doctor validates that `analysis/reverse-map/coverage.csv` covers every diff row from `analysis/indexes/diff-inventory.csv`, workitems parse, statuses are valid, and reverse-map CSV headers match the contract. Open work is allowed; it is represented by `assigned`, `needs_manual_review`, or `needs_infobase_data` instead of disappearing from coverage.
+
 ## Health Gate Meaning
 
 - `status = ok`: repository contract is healthy.

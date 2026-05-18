@@ -13,6 +13,7 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 | `docs/agent/` | Agent router, repo map, and verification runbook. | Agent workflow or navigation changes. |
 | `docs/method/` | Project-local copy of the reusable analysis method. | Method needs project-specific clarification. |
 | `analysis/queue/` | File-backed queue state and worker contract. | Tasks, statuses, schema, or review rules change. |
+| `analysis/reverse-map/` | Durable fact-to-intent reverse mapping state: coverage, workitems, decisions, unresolved items, and scenario outputs. | Continuing or auditing long-running reverse engineering work. |
 | `analysis/indexes/` | Reviewable autopilot indexes: diff inventory and feature map. | Diff entries are classified or functional features are grouped. |
 | `analysis/features/` | Feature evidence packs and file templates. | A queue task produces or updates feature-level evidence. |
 | `analysis/cache/` | Generated indexes and noisy intermediate artifacts. | Static analysis or comparison tools produce machine data. |
@@ -46,11 +47,24 @@ Use this route when the goal is the final end-to-end customization map rather th
 8. Write `analysis/final-audit.md`.
 9. Run `python -m one_c_autoresearch doctor --deep --strict`; do not claim completion until it passes.
 
+## Reverse-Map Route
+
+Use this route when a continuation trigger such as `/goal Исследование` asks the agent to keep reconstructing functional intent from existing customizations:
+
+1. Read `project.toml`, `docs/method/reverse-functional-map.md`, and `analysis/reverse-map/state.md`.
+2. Run `python -m one_c_autoresearch reverse-map claim`.
+3. If a workitem is returned, inspect its `source_diff_ids`, source objects, metadata, BSL, forms, roles, scheduled jobs, and overrides.
+4. Record evidence and decisions under `analysis/reverse-map/`.
+5. Mark runtime-only gaps in `unresolved.csv`.
+6. Run `python -m one_c_autoresearch doctor` and `python -m one_c_autoresearch checks research`.
+7. Advance the workitem status with `python -m one_c_autoresearch reverse-map set-status` and stop.
+
 ## System Of Record
 
 - `project.toml`: active source paths, RLM projects, MCP/web target, and evidence policy.
 - `.codex/1c-mcp.toml`: active MCP/web target when present; it must match `project.toml` before live evidence is used.
 - `analysis/queue/tasks.jsonl`: current queue state.
+- `analysis/reverse-map/`: durable continuation state for reverse functional mapping.
 - `analysis/indexes/diff-inventory.csv`: every clean diff entry and its classification status.
 - `analysis/indexes/feature-map.csv`: functional grouping for the final customization map.
 - `analysis/features/`: durable feature evidence.

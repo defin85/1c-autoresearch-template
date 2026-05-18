@@ -27,11 +27,20 @@ python -m one_c_autoresearch doctor
 python -m one_c_autoresearch checks research
 ```
 
+Continue reverse functional mapping:
+
+```bash
+python -m one_c_autoresearch reverse-map claim
+```
+
+If the reverse-map queue is empty, the command seeds workitems from uncovered rows in `analysis/indexes/diff-inventory.csv`.
+
 ## Layout
 
 ```text
 analysis/cache/      generated indexes and noisy machine data
 analysis/queue/      file-backed work queue
+analysis/reverse-map/ durable state for fact-to-intent reverse mapping
 analysis/features/   feature evidence packs
 analysis/runs/       run logs
 outputs/             human-facing deliverables

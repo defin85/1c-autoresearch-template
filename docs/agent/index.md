@@ -23,4 +23,6 @@ For concrete research repos created from this template:
 
 For end-to-end customization-map work, read `docs/method/autopilot-customization-map.md` after `project.toml`, initialize with `python -m one_c_autoresearch autopilot scaffold --enable-gate` when needed, and stop only after `python -m one_c_autoresearch doctor --deep --strict` proves complete diff coverage.
 
+For reverse functional mapping continuation, read `docs/method/reverse-functional-map.md` and the concrete repo's `analysis/reverse-map/state.md`, then run `python -m one_c_autoresearch reverse-map claim`. Process one returned workitem, update reverse-map state, verify, and stop.
+
 Do not treat this template as an evidence source for any customer project.
