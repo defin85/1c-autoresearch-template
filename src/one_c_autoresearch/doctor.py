@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .autopilot import DIFF_INVENTORY_HEADER, FEATURE_MAP_HEADER, OPEN_QUESTIONS_HEADER
+from .autopilot import DIFF_INVENTORY_HEADER, FEATURE_MAP_HEADER, FINAL_DIFF_INVENTORY_HEADER, OPEN_QUESTIONS_HEADER
 from .common import (
     CheckSet,
     as_list,
@@ -29,13 +29,21 @@ from .reverse_map import (
     REVERSE_MAP_UNRESOLVED_HEADER,
     REVERSE_MAP_WORKITEM_STATUSES,
 )
+from .final_gate import FINAL_FEATURE_MAP_HEADER
 
 CANONICAL_EVIDENCE_HEADER = "feature_id,claim_id,source_kind,source_path,line_start,line_end,evidence_type,confidence,summary,notes"
 CANONICAL_FEATURE_CANDIDATES_HEADER = "feature_id,title,source_bucket,classification,confidence,summary,next_step"
 VALID_STATUSES = {"pending", "claimed", "evidence_pack", "drafted", "needs_review", "needs_followup", "blocked", "done", "skipped"}
 VALID_TYPES = {"discovery", "deep_dive", "review", "migration_map", "packaging", "needs_infobase_data"}
 AUTOPILOT_DIFF_STATUSES = {"mapped_to_feature", "technical_noise_removed", "requires_1c_review", "blocked_by_infobase_data"}
-AUTOPILOT_FEATURE_STATUSES = {"complete", "blocked_by_infobase_data", "requires_1c_review", "out_of_scope"}
+AUTOPILOT_FEATURE_STATUSES = {
+    "complete",
+    "blocked_by_infobase_data",
+    "requires_1c_review",
+    "requires_runtime_verification",
+    "needs_reclassification",
+    "out_of_scope",
+}
 
 TEMPLATE_REQUIRED_PATHS = [
     ".github/workflows/verify.yml",
@@ -49,6 +57,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "src/one_c_autoresearch/__main__.py",
     "src/one_c_autoresearch/cli.py",
     "src/one_c_autoresearch/autopilot.py",
+    "src/one_c_autoresearch/final_gate.py",
     "src/one_c_autoresearch/reverse_map.py",
     "src/one_c_autoresearch/doctor.py",
     "src/one_c_autoresearch/bootstrap.py",
@@ -77,6 +86,8 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/analysis/indexes/README.md",
     "templates/research-repo/analysis/indexes/diff-inventory.csv",
     "templates/research-repo/analysis/indexes/feature-map.csv",
+    "templates/research-repo/analysis/indexes/final-diff-inventory.csv",
+    "templates/research-repo/analysis/indexes/final-feature-map.csv",
     "templates/research-repo/analysis/reverse-map/README.md",
     "templates/research-repo/analysis/reverse-map/state.md",
     "templates/research-repo/analysis/reverse-map/coverage.csv",
@@ -125,6 +136,7 @@ RESEARCH_REQUIRED_PATHS = [
     "src/one_c_autoresearch/__init__.py",
     "src/one_c_autoresearch/__main__.py",
     "src/one_c_autoresearch/autopilot.py",
+    "src/one_c_autoresearch/final_gate.py",
     "src/one_c_autoresearch/reverse_map.py",
     "src/one_c_autoresearch/cli.py",
     "docs/agent/index.md",
@@ -137,6 +149,8 @@ RESEARCH_REQUIRED_PATHS = [
     "analysis/indexes/README.md",
     "analysis/indexes/diff-inventory.csv",
     "analysis/indexes/feature-map.csv",
+    "analysis/indexes/final-diff-inventory.csv",
+    "analysis/indexes/final-feature-map.csv",
     "analysis/reverse-map/README.md",
     "analysis/reverse-map/state.md",
     "analysis/reverse-map/coverage.csv",
@@ -506,6 +520,8 @@ class Doctor:
         for relative in (
             "analysis/indexes/diff-inventory.csv",
             "analysis/indexes/feature-map.csv",
+            "analysis/indexes/final-diff-inventory.csv",
+            "analysis/indexes/final-feature-map.csv",
             "outputs/customization-map.md",
             "outputs/customization-map.xlsx",
             "outputs/open-questions.csv",
@@ -516,7 +532,11 @@ class Doctor:
 
         diff_rows = self.read_csv_rows("analysis/indexes/diff-inventory.csv", DIFF_INVENTORY_HEADER, "autopilot.diff_inventory")
         feature_rows = self.read_csv_rows("analysis/indexes/feature-map.csv", FEATURE_MAP_HEADER, "autopilot.feature_map")
+        final_diff_rows = self.read_csv_rows("analysis/indexes/final-diff-inventory.csv", FINAL_DIFF_INVENTORY_HEADER, "final_gate.diff_inventory")
+        final_feature_rows = self.read_csv_rows("analysis/indexes/final-feature-map.csv", FINAL_FEATURE_MAP_HEADER, "final_gate.feature_map")
         open_question_rows = self.read_csv_rows("outputs/open-questions.csv", OPEN_QUESTIONS_HEADER, "autopilot.open_questions")
+        coverage_rows = self.read_csv_rows("analysis/reverse-map/coverage.csv", REVERSE_MAP_COVERAGE_HEADER, "final_gate.coverage")
+        unresolved_rows = self.read_csv_rows("analysis/reverse-map/unresolved.csv", REVERSE_MAP_UNRESOLVED_HEADER, "final_gate.unresolved")
         self.test_xlsx_file("outputs/customization-map.xlsx", "autopilot.outputs.customization_map_xlsx")
         self.test_xlsx_file("outputs/open-questions.xlsx", "autopilot.outputs.open_questions_xlsx")
         self.test_final_text_has_no_todos("outputs/customization-map.md")
@@ -567,6 +587,48 @@ class Doctor:
             if feature_id and status != "technical_noise_removed" and feature_id not in feature_ids:
                 self.checks.add("autopilot.coverage.unknown_feature", "fail", f"Diff row {row.get('diff_id', '<empty diff_id>')} references feature not present in feature-map.csv: {feature_id}")
 
+        final_diff_ids = {row.get("diff_id", "").strip() for row in final_diff_rows if row.get("diff_id", "").strip()}
+        primary_diff_ids = {row.get("diff_id", "").strip() for row in diff_rows if row.get("diff_id", "").strip()}
+        if primary_diff_ids and final_diff_ids != primary_diff_ids:
+            missing = sorted(primary_diff_ids - final_diff_ids)
+            extra = sorted(final_diff_ids - primary_diff_ids)
+            self.checks.add("final_gate.diff_inventory.coverage", "fail", f"Final-gate diff inventory must cover every primary diff row; missing={len(missing)} extra={len(extra)}")
+        elif primary_diff_ids:
+            self.checks.add("final_gate.diff_inventory.coverage", "ok", "Final-gate diff inventory covers every primary diff row")
+
+        coverage_by_diff = {row.get("diff_id", "").strip(): row for row in coverage_rows if row.get("diff_id", "").strip()}
+        stale_rows = []
+        for row in final_diff_rows:
+            diff_id = row.get("diff_id", "").strip()
+            coverage = coverage_by_diff.get(diff_id, {})
+            if coverage and row.get("reverse_status", "").strip() != coverage.get("status", "").strip():
+                stale_rows.append(diff_id)
+        if stale_rows:
+            self.checks.add("final_gate.diff_inventory.stale", "fail", f"Final-gate diff inventory is stale for {len(stale_rows)} reverse-map row(s); rerun `python -m one_c_autoresearch final-gate build`")
+        elif final_diff_rows:
+            self.checks.add("final_gate.diff_inventory.fresh", "ok", "Final-gate diff inventory matches current reverse-map coverage statuses")
+
+        final_feature_by_id = {row.get("feature_id", "").strip(): row for row in final_feature_rows if row.get("feature_id", "").strip()}
+        for row in final_feature_rows:
+            feature_id = row.get("feature_id", "").strip()
+            status = row.get("status", "").strip()
+            if status not in AUTOPILOT_FEATURE_STATUSES:
+                self.checks.add("final_gate.feature_map.status", "fail", f"Final feature {feature_id or '<empty feature_id>'} has invalid status: {status or '<empty>'}")
+        for row in final_diff_rows:
+            action = row.get("final_action", "").strip()
+            feature_id = row.get("feature_id", "").strip()
+            final_status = row.get("final_status", "").strip()
+            feature = final_feature_by_id.get(feature_id)
+            if action == "block" and feature and feature.get("status", "").strip() == "complete":
+                self.checks.add("final_gate.feature_blocked", "fail", f"Feature {feature_id} is complete but diff row {row.get('diff_id', '<empty diff_id>')} is blocked by reverse-map status {row.get('reverse_status', '<empty>')}")
+            if action == "block" and final_status not in {"requires_1c_review", "blocked_by_infobase_data", "requires_runtime_verification", "needs_reclassification"}:
+                self.checks.add("final_gate.diff_block_status", "fail", f"Blocked diff row {row.get('diff_id', '<empty diff_id>')} has invalid final_status: {final_status or '<empty>'}")
+        blocking_final_rows = [row for row in final_diff_rows if row.get("final_action", "").strip() == "block"]
+        if blocking_final_rows:
+            self.checks.add("final_gate.blocking_rows", "fail", f"Final publication is blocked by {len(blocking_final_rows)} reverse-map row(s)")
+        if final_diff_rows and not any(check["id"] == "final_gate.feature_blocked" for check in self.checks.checks):
+            self.checks.add("final_gate.feature_blocking", "ok", "Final feature statuses account for reverse-map blockers")
+
         for row in open_question_rows:
             if not any((value or "").strip() for value in row.values()):
                 continue
@@ -578,10 +640,33 @@ class Doctor:
             if status not in {"open_question", "blocked_by_infobase_data", "closed"}:
                 self.checks.add("autopilot.open_questions.status", "fail", f"Open question {question_id} has invalid status: {status or '<empty>'}")
 
+        unresolved_ids = {row.get("item_id", "").strip() for row in unresolved_rows if row.get("item_id", "").strip()}
+        if unresolved_ids:
+            open_question_refs = {
+                row.get("question_id", "").strip()
+                for row in open_question_rows
+                if row.get("question_id", "").strip()
+            }
+            open_question_refs.update(
+                ref.rsplit("#", 1)[-1]
+                for ref in (row.get("source_ref", "").strip() for row in open_question_rows)
+                if "#" in ref
+            )
+            missing = sorted(unresolved_ids - open_question_refs)
+            if missing:
+                self.checks.add("final_gate.open_questions.unresolved_coverage", "fail", f"Open questions do not cover {len(missing)} reverse-map unresolved item(s)")
+            else:
+                self.checks.add("final_gate.open_questions.unresolved_coverage", "ok", "Open questions cover every reverse-map unresolved item")
+
         audit = repo_path(self.root, "analysis/final-audit.md")
         if audit.exists():
             text = audit.read_text(encoding="utf-8", errors="ignore")
-            if not re.search(r"(?im)^Coverage status:\s*complete\s*$", text):
+            audit_declares_complete = bool(re.search(r"(?im)^Coverage status:\s*complete\s*$", text))
+            if blocking_final_rows and audit_declares_complete:
+                self.checks.add("final_gate.final_audit.blocked_complete", "fail", "Final audit declares complete coverage while final-gate has blocking rows")
+            elif blocking_final_rows:
+                self.checks.add("final_gate.final_audit.blocked_status", "ok", "Final audit does not claim complete coverage while final-gate has blocking rows")
+            elif not audit_declares_complete:
                 self.checks.add("autopilot.final_audit.coverage_status", "fail", "Final audit must contain 'Coverage status: complete'")
             else:
                 self.checks.add("autopilot.final_audit.coverage_status", "ok", "Final audit declares complete coverage")

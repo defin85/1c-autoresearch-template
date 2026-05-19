@@ -35,6 +35,9 @@ REVERSE_MAP_STATUSES = {
     "technical_noise",
     "needs_infobase_data",
     "needs_manual_review",
+    "needs_runtime_verification",
+    "needs_reclassification",
+    "cross_scenario_reclassification",
     "out_of_scope",
 }
 

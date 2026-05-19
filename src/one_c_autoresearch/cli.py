@@ -8,6 +8,9 @@ from .autopilot import scaffold_autopilot
 from .bootstrap import create_research_repo
 from .checks import run_check, test_doctor, test_research_repo, test_template
 from .doctor import print_doctor, run_doctor
+from .final_gate import build_command as final_gate_build_command
+from .final_gate import status_command as final_gate_status_command
+from .final_gate import verify_command as final_gate_verify_command
 from .queue import claim_command, get_command, set_status_command
 from .reverse_map import (
     claim_command as reverse_map_claim_command,
@@ -74,6 +77,19 @@ def build_parser() -> argparse.ArgumentParser:
     scaffold.add_argument("--force", action="store_true")
     scaffold.add_argument("--enable-gate", action="store_true")
     scaffold.set_defaults(func=scaffold_autopilot)
+
+    final_gate = sub.add_parser("final-gate")
+    final_gate_sub = final_gate.add_subparsers(dest="final_gate_command", required=True)
+    final_gate_build = final_gate_sub.add_parser("build")
+    final_gate_build.add_argument("--repo-path", default=".")
+    final_gate_build.add_argument("--strict", action="store_true")
+    final_gate_build.set_defaults(func=final_gate_build_command)
+    final_gate_status = final_gate_sub.add_parser("status")
+    final_gate_status.add_argument("--repo-path", default=".")
+    final_gate_status.set_defaults(func=final_gate_status_command)
+    final_gate_verify = final_gate_sub.add_parser("verify")
+    final_gate_verify.add_argument("--repo-path", default=".")
+    final_gate_verify.set_defaults(func=final_gate_verify_command)
 
     reverse_map = sub.add_parser("reverse-map")
     reverse_map_sub = reverse_map.add_subparsers(dest="reverse_map_command", required=True)

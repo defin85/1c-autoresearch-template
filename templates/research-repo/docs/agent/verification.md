@@ -1,57 +1,50 @@
 # Verification Runbook
 
-This is the canonical verification matrix for a concrete 1C autoresearch repository.
+This is the canonical verification matrix for this concrete research repo.
 
-## Standard Health Check
+For machine-readable automation output:
 
-Run from the repository root:
+```bash
+python -m one_c_autoresearch doctor --json
+```
+
+Use `--deep` when source paths, tooling, or local environment assumptions matter:
+
+```bash
+python -m one_c_autoresearch doctor --json --deep
+```
+
+Use `--strict` in CI or pre-merge automation when warnings should block the change:
+
+```bash
+python -m one_c_autoresearch doctor --deep --strict
+```
+
+## Research Repo
 
 ```bash
 python -m one_c_autoresearch doctor
 python -m one_c_autoresearch checks research
 ```
 
-Use the doctor JSON output for automation:
-
-```bash
-python -m one_c_autoresearch doctor --json
-```
-
-Use `--deep` when source paths, local tools, or environment assumptions matter:
+For deeper source-path and tool checks:
 
 ```bash
 python -m one_c_autoresearch doctor --deep
 ```
 
-Use `--strict` when warnings should block automated continuation:
+If live 1C MCP access is needed, copy `.codex/1c-mcp.example.toml` to `.codex/1c-mcp.toml` in the generated repo and make it match `project.toml` before using it as evidence.
 
-```bash
-python -m one_c_autoresearch doctor --deep --strict
-```
+## What Each Check Covers
 
-## MCP Manifest Promotion
-
-When live 1C MCP or web evidence is enabled, copy `.codex/1c-mcp.example.toml`
-to `.codex/1c-mcp.toml`, fill in the active MCP server, URL, service root,
-RLM project, web URL, username, and credential file, then run:
-
-```bash
-python -m one_c_autoresearch doctor --json --deep
-```
-
-Do not use live 1C evidence until the local manifest matches `project.toml`.
-
-## Before Claiming A Queue Task Complete
-
-1. Confirm the claimed task by reading `analysis/queue/tasks.jsonl`.
-2. Confirm expected evidence exists under `analysis/features/<feature-id>/`.
-3. Run `python -m one_c_autoresearch doctor`.
-4. Run `python -m one_c_autoresearch checks research`.
-5. Record unresolved runtime dependencies in the feature pack and queue status before stopping.
+| Check | Scope |
+| --- | --- |
+| `scripts/checks/test_research_repo.py` | Delegates generated repository health to `python -m one_c_autoresearch doctor --mode research`. |
+| `scripts/doctor.py` | Primary health gate for research repos: required paths, manifest sections, queue schema, dependency cycles, expected outputs, evidence pack CSV headers, reverse-map coverage state, autopilot final-map coverage, unresolved placeholders, MCP/web policy, optional `.codex/1c-mcp.toml` consistency, and optional tool checks. |
 
 ## Autopilot Final Gate
 
-For an end-to-end customization map, initialize and enable the final gate:
+In a generated research repo, enable the end-to-end final-map gate with:
 
 ```bash
 python -m one_c_autoresearch autopilot scaffold --enable-gate
@@ -61,33 +54,50 @@ After `autopilot.enabled=true`, `doctor` fails until:
 
 - `analysis/indexes/diff-inventory.csv` has no unclassified diff entries;
 - `analysis/indexes/feature-map.csv` maps every non-noise feature to a complete evidence pack;
-- final Markdown and XLSX outputs exist;
-- open questions have reason, closure method, and impact;
+- `analysis/indexes/final-diff-inventory.csv` and `analysis/indexes/final-feature-map.csv` are generated from current reverse-map coverage;
+- final-gate rows have no reverse-map blockers for claims published as complete;
+- `outputs/customization-map.md` and `outputs/customization-map.xlsx` exist;
+- `outputs/open-questions.csv` and `outputs/open-questions.xlsx` exist;
+- `outputs/open-questions.csv` covers every item in `analysis/reverse-map/unresolved.csv`;
+- every open question has reason, closure method, and impact;
 - `analysis/final-audit.md` contains `Coverage status: complete` and `Unclassified diff entries: 0`;
 - final text artifacts contain no `TODO` or `FIXME` markers.
 
-## Reverse-Map Continuation Gate
+Build and verify the publishable layer before final output generation:
 
-For long-running reverse functional mapping, initialize state when needed:
+```bash
+python -m one_c_autoresearch final-gate build
+python -m one_c_autoresearch final-gate verify
+```
+
+## Reverse Functional Map
+
+In a generated research repo, initialize reverse-map state with:
 
 ```bash
 python -m one_c_autoresearch reverse-map scaffold
 python -m one_c_autoresearch reverse-map seed
 ```
 
-Continue one workitem:
+Continue one durable workitem with:
 
 ```bash
 python -m one_c_autoresearch reverse-map claim
 ```
 
-The standard doctor validates that `analysis/reverse-map/coverage.csv` covers every diff row from `analysis/indexes/diff-inventory.csv`, workitems parse, statuses are valid, and reverse-map CSV headers match the contract. Open work is allowed; it is represented by `assigned`, `needs_manual_review`, or `needs_infobase_data` instead of disappearing from coverage.
+After each workitem, run:
 
-## Health Gate Meaning
+```bash
+python -m one_c_autoresearch final-gate status
+python -m one_c_autoresearch doctor
+```
+
+The doctor checks that `analysis/reverse-map/coverage.csv` covers every diff row from `analysis/indexes/diff-inventory.csv`, workitems parse, statuses are valid, reverse-map CSV headers match the contract, and final-gate outputs are fresh when autopilot publication is enabled. Open work is represented in state files rather than hidden in agent context.
+
+## Expected Result
 
 - `status = ok`: repository contract is healthy.
-- `status = warn`: repository is usable, but warnings must be reported before claiming health.
-- `status = fail`: stop autonomous work and fix the contract issue first.
+- `status = warn`: repository is usable, but an agent should report the warning before claiming full health.
+- `status = fail`: do not continue autonomous work until the failure is fixed.
 
-The doctor validates required paths, `project.toml`, queue schema, task dependencies, stale claims, expected outputs, evidence pack CSV headers, autopilot final-map coverage, unresolved placeholders, MCP/web policy, and optional tools when `--deep` is used.
-When `.codex/1c-mcp.toml` exists, the doctor also compares its MCP server, URL, service root, active RLM project, and web URL with `project.toml`.
+When verification rules change, update this file and the repo-local tooling together.

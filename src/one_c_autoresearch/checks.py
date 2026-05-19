@@ -13,6 +13,7 @@ from typing import Any
 from .autopilot import (
     DIFF_INVENTORY_HEADER,
     FEATURE_MAP_HEADER,
+    FINAL_DIFF_INVENTORY_HEADER,
     OPEN_QUESTIONS_HEADER,
     scaffold_autopilot,
     write_minimal_xlsx,
@@ -20,6 +21,7 @@ from .autopilot import (
 from .bootstrap import create_research_repo
 from .common import current_module_command, git_check_ignored, read_jsonl, repo_path
 from .doctor import run_doctor
+from .final_gate import build_final_gate
 from .queue import claim_next_task, set_task_status
 from .reverse_map import (
     REVERSE_MAP_COVERAGE_HEADER,
@@ -74,6 +76,7 @@ def test_template(args: argparse.Namespace) -> int:
         "project.example.toml",
         "src/one_c_autoresearch/cli.py",
         "src/one_c_autoresearch/autopilot.py",
+        "src/one_c_autoresearch/final_gate.py",
         "src/one_c_autoresearch/reverse_map.py",
         "src/one_c_autoresearch/doctor.py",
         "src/one_c_autoresearch/bootstrap.py",
@@ -94,6 +97,8 @@ def test_template(args: argparse.Namespace) -> int:
         "templates/research-repo/analysis/indexes/README.md",
         "templates/research-repo/analysis/indexes/diff-inventory.csv",
         "templates/research-repo/analysis/indexes/feature-map.csv",
+        "templates/research-repo/analysis/indexes/final-diff-inventory.csv",
+        "templates/research-repo/analysis/indexes/final-feature-map.csv",
         "templates/research-repo/analysis/reverse-map/README.md",
         "templates/research-repo/analysis/reverse-map/state.md",
         "templates/research-repo/analysis/reverse-map/coverage.csv",
@@ -149,6 +154,8 @@ def test_template(args: argparse.Namespace) -> int:
     require_text(root, "templates/research-repo/analysis/features/_templates/feature-candidates.csv", r"^feature_id,title,source_bucket,classification,confidence,summary,next_step$", "Feature candidate CSV template should expose the canonical header.", errors)
     require_text(root, "templates/research-repo/analysis/indexes/diff-inventory.csv", r"^diff_id,source,change_type,path,object_kind,object_name,area,feature_id,classification,confidence,status,summary,evidence_ref,notes$", "Diff inventory template should expose the canonical autopilot header.", errors)
     require_text(root, "templates/research-repo/analysis/indexes/feature-map.csv", r"^feature_id,title,domain,source_bucket,classification,confidence,status,owner,summary,evidence_pack_path,open_questions_path,outputs,notes$", "Feature map template should expose the canonical autopilot header.", errors)
+    require_text(root, "templates/research-repo/analysis/indexes/final-diff-inventory.csv", rf"^{re.escape(FINAL_DIFF_INVENTORY_HEADER)}$", "Final diff inventory template should expose the canonical final-gate header.", errors)
+    require_text(root, "templates/research-repo/analysis/indexes/final-feature-map.csv", r"^feature_id,title,domain,source_bucket,classification,confidence,status,owner,summary,evidence_pack_path,open_questions_path,outputs,notes$", "Final feature map template should expose the canonical final-gate header.", errors)
     require_text(root, "templates/research-repo/outputs/open-questions.csv", r"^question_id,feature_id,status,reason,closure_method,impact,source_ref,owner,notes$", "Open questions template should expose the canonical autopilot header.", errors)
     require_text(root, "templates/research-repo/analysis/reverse-map/coverage.csv", rf"^{re.escape(REVERSE_MAP_COVERAGE_HEADER)}$", "Reverse-map coverage template should expose the canonical header.", errors)
     require_text(root, "templates/research-repo/project.toml", r"(?m)^\[autopilot\]$", "Generated manifest should include the autopilot final-gate section.", errors)
@@ -156,6 +163,7 @@ def test_template(args: argparse.Namespace) -> int:
     require_text(root, "templates/research-repo/AGENTS.md", r"analysis/reverse-map", "Generated AGENTS should identify reverse-map state as source of truth.", errors)
     require_text(root, "templates/research-repo/README.md", r"reverse-map", "Generated README should expose reverse-map continuation commands.", errors)
     require_text(root, "src/one_c_autoresearch/cli.py", r"reverse-map", "CLI should expose a reverse-map command group.", errors)
+    require_text(root, "src/one_c_autoresearch/cli.py", r"final-gate", "CLI should expose a final-gate command group.", errors)
     require_text(root, "docs/method/autopilot-customization-map.md", r"Coverage status: complete", "Autopilot runbook should document the final audit coverage marker.", errors)
     require_text(root, "src/one_c_autoresearch/cli.py", r"autopilot", "CLI should expose an autopilot command group.", errors)
     require_same_content(root, "docs/method/1c-autoresearch-process.md", "templates/research-repo/docs/method/1c-autoresearch-process.md", "Generated research methodology must match the template system-of-record document.", errors)
@@ -286,8 +294,29 @@ def test_doctor(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
         seed_reverse_map_workitems(complete_repo)
+        repo_path(complete_repo, "analysis/reverse-map/coverage.csv").write_text(
+            REVERSE_MAP_COVERAGE_HEADER
+            + "\nD-0001,target_cf,M,cf/CommonModules/Example/Ext/Module.bsl,CommonModule,Example,bsl,feature-a,feature-a,RM-0001,confirmed_in_scenario,high,analysis/features/feature-a/evidence.csv,analysis/reverse-map/decisions.csv#RM-0001,Confirmed by smoke test\n",
+            encoding="utf-8",
+        )
+        build_final_gate(complete_repo)
         complete = run_doctor(complete_repo)
         require(complete["status"] == "ok", "Autopilot gate should pass on a complete customization map", errors)
+
+        reverse_blocked_final_repo = base / "reverse-blocked-final"
+        copy_smoke_repo(complete_repo, reverse_blocked_final_repo)
+        repo_path(reverse_blocked_final_repo, "analysis/reverse-map/coverage.csv").write_text(
+            REVERSE_MAP_COVERAGE_HEADER
+            + "\nD-0001,target_cf,M,cf/CommonModules/Example/Ext/Module.bsl,CommonModule,Example,bsl,feature-a,feature-a,RM-0001,needs_manual_review,high,analysis/features/feature-a/evidence.csv,analysis/reverse-map/decisions.csv#RM-0001,Manual review required\n",
+            encoding="utf-8",
+        )
+        reverse_blocked_final = run_doctor(reverse_blocked_final_repo)
+        require(reverse_blocked_final["status"] == "fail", "Autopilot final gate should fail when final outputs claim complete but reverse-map blocks a diff row", errors)
+        require(
+            any(check["id"] == "final_gate.diff_inventory.stale" for check in reverse_blocked_final["checks"]),
+            "Doctor should report final_gate.diff_inventory.stale for changed reverse-map blockers",
+            errors,
+        )
 
         bad_question_repo = base / "bad-open-question"
         copy_smoke_repo(complete_repo, bad_question_repo)

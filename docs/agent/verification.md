@@ -52,6 +52,8 @@ For deeper source-path and tool checks:
 python -m one_c_autoresearch doctor --repo-path <target-repo> --deep
 ```
 
+If live 1C MCP access is needed, copy `.codex/1c-mcp.example.toml` to `.codex/1c-mcp.toml` in the generated repo and make it match `project.toml` before using it as evidence.
+
 ## What Each Check Covers
 
 | Check | Scope |
@@ -73,11 +75,21 @@ After `autopilot.enabled=true`, `doctor` fails until:
 
 - `analysis/indexes/diff-inventory.csv` has no unclassified diff entries;
 - `analysis/indexes/feature-map.csv` maps every non-noise feature to a complete evidence pack;
+- `analysis/indexes/final-diff-inventory.csv` and `analysis/indexes/final-feature-map.csv` are generated from current reverse-map coverage;
+- final-gate rows have no reverse-map blockers for claims published as complete;
 - `outputs/customization-map.md` and `outputs/customization-map.xlsx` exist;
 - `outputs/open-questions.csv` and `outputs/open-questions.xlsx` exist;
+- `outputs/open-questions.csv` covers every item in `analysis/reverse-map/unresolved.csv`;
 - every open question has reason, closure method, and impact;
 - `analysis/final-audit.md` contains `Coverage status: complete` and `Unclassified diff entries: 0`;
 - final text artifacts contain no `TODO` or `FIXME` markers.
+
+Build and verify the publishable layer before final output generation:
+
+```bash
+python -m one_c_autoresearch final-gate build
+python -m one_c_autoresearch final-gate verify
+```
 
 ## Reverse Functional Map
 
@@ -94,7 +106,14 @@ Continue one durable workitem with:
 python -m one_c_autoresearch reverse-map claim
 ```
 
-The doctor checks that `analysis/reverse-map/coverage.csv` covers every diff row from `analysis/indexes/diff-inventory.csv`, workitems parse, statuses are valid, and reverse-map CSV headers match the contract. Open work is represented in state files rather than hidden in agent context.
+After each workitem, run:
+
+```bash
+python -m one_c_autoresearch final-gate status
+python -m one_c_autoresearch doctor
+```
+
+The doctor checks that `analysis/reverse-map/coverage.csv` covers every diff row from `analysis/indexes/diff-inventory.csv`, workitems parse, statuses are valid, reverse-map CSV headers match the contract, and final-gate outputs are fresh when autopilot publication is enabled. Open work is represented in state files rather than hidden in agent context.
 
 ## Expected Result
 

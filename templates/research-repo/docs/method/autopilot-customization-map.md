@@ -23,17 +23,21 @@ Declare inputs in `project.toml`:
 3. **Physical clean rebase**: create or reuse a cleaned comparison repo where the custom configuration is physically cleaned against the vendor baseline. The final analysis must use this clean diff, not raw dump noise.
 4. **Diff inventory**: classify every diff entry in `analysis/indexes/diff-inventory.csv`.
 5. **Feature discovery**: group classified diff entries into functional features in `analysis/indexes/feature-map.csv`.
-6. **Feature deep dives**: create evidence packs under `analysis/features/<feature-id>/` for every non-noise feature.
-7. **Infobase evidence**: use live infobase data when allowed. If runtime evidence is unavailable, write formal open questions instead of TODO items.
-8. **Final map generation**: produce the Markdown and XLSX deliverables under `outputs/`.
-9. **Final audit**: write `analysis/final-audit.md` with coverage counts and completion evidence.
-10. **Doctor gate**: run `python -m one_c_autoresearch doctor --deep --strict`. With `autopilot.enabled=true`, the gate must prove that every diff entry is classified.
+6. **Reverse functional map**: review the primary classifications under `analysis/reverse-map/`; this state is the source of truth for downgrades, reassignment, runtime blockers, and manual-review blockers.
+7. **Final gate normalization**: run `python -m one_c_autoresearch final-gate build`. Final deliverables must read `analysis/indexes/final-diff-inventory.csv` and `analysis/indexes/final-feature-map.csv`, not the primary inventory directly.
+8. **Feature deep dives**: create evidence packs under `analysis/features/<feature-id>/` for every publishable non-noise feature.
+9. **Infobase evidence**: use live infobase data when allowed. If runtime evidence is unavailable, write formal open questions instead of TODO items.
+10. **Final map generation**: produce the Markdown and XLSX deliverables under `outputs/` from the final-gate layer.
+11. **Final audit**: write `analysis/final-audit.md` with coverage counts and completion evidence.
+12. **Doctor gate**: run `python -m one_c_autoresearch doctor --deep --strict`. With `autopilot.enabled=true`, the gate must prove that every diff entry is classified and every final claim is consistent with reverse-map decisions.
 
 ## Required Artifacts
 
 ```text
 analysis/indexes/diff-inventory.csv
 analysis/indexes/feature-map.csv
+analysis/indexes/final-diff-inventory.csv
+analysis/indexes/final-feature-map.csv
 analysis/features/<feature-id>/brief.md
 analysis/features/<feature-id>/findings.md
 analysis/features/<feature-id>/evidence.csv
@@ -63,6 +67,31 @@ Allowed `status` values:
 
 No row may remain empty, unclassified, or assigned to a missing feature.
 
+## Final Gate Contract
+
+`analysis/indexes/final-diff-inventory.csv` must use this header:
+
+```csv
+diff_id,source,change_type,path,object_kind,object_name,area,feature_id,classification,confidence,status,summary,evidence_ref,notes,reverse_status,reverse_confidence,reverse_scenario_id,final_feature_id,final_status,final_action,blocking_reason
+```
+
+The final gate joins primary diff rows with `analysis/reverse-map/coverage.csv`.
+
+- `confirmed_in_scenario` and `supporting_shared` allow publication.
+- `needs_manual_review`, `needs_infobase_data`, `needs_runtime_verification`, `needs_reclassification`, and `cross_scenario_reclassification` block or downgrade the feature.
+- `technical_noise` and `out_of_scope` are excluded from business counts.
+- `technical_platform` is supporting/platform evidence only, not standalone business functionality.
+- `belongs_to_other_scenario` moves the row out of the source feature.
+
+Run:
+
+```bash
+python -m one_c_autoresearch final-gate build
+python -m one_c_autoresearch final-gate verify
+```
+
+`verify` returns non-zero while final publication is blocked by reverse-map rows.
+
 ## Feature Map Contract
 
 `analysis/indexes/feature-map.csv` must use this header:
@@ -76,6 +105,8 @@ Allowed `status` values:
 - `complete`
 - `blocked_by_infobase_data`
 - `requires_1c_review`
+- `requires_runtime_verification`
+- `needs_reclassification`
 - `out_of_scope`
 
 Every feature that is not `out_of_scope` must point to a complete evidence pack.

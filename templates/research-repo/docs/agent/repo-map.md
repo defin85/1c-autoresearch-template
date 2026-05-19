@@ -14,7 +14,7 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 | `docs/method/` | Project-local copy of the reusable analysis method. | Method needs project-specific clarification. |
 | `analysis/queue/` | File-backed queue state and worker contract. | Tasks, statuses, schema, or review rules change. |
 | `analysis/reverse-map/` | Durable fact-to-intent reverse mapping state: coverage, workitems, decisions, unresolved items, and scenario outputs. | Continuing or auditing long-running reverse engineering work. |
-| `analysis/indexes/` | Reviewable autopilot indexes: diff inventory and feature map. | Diff entries are classified or functional features are grouped. |
+| `analysis/indexes/` | Reviewable autopilot indexes: primary diff/feature maps and final-gate normalized maps. | Diff entries are classified, reverse-map decisions are normalized, or functional features are grouped. |
 | `analysis/features/` | Feature evidence packs and file templates. | A queue task produces or updates feature-level evidence. |
 | `analysis/cache/` | Generated indexes and noisy intermediate artifacts. | Static analysis or comparison tools produce machine data. |
 | `analysis/runs/` | Run logs for task execution. | A worker run needs an auditable trace. |
@@ -42,10 +42,12 @@ Use this route when the goal is the final end-to-end customization map rather th
 3. Build or reuse the physical clean-rebase comparison.
 4. Classify every clean diff entry in `analysis/indexes/diff-inventory.csv`.
 5. Group real customizations in `analysis/indexes/feature-map.csv`.
-6. Create complete evidence packs under `analysis/features/<feature-id>/`.
-7. Generate `outputs/customization-map.md`, `outputs/customization-map.xlsx`, `outputs/open-questions.csv`, and `outputs/open-questions.xlsx`.
-8. Write `analysis/final-audit.md`.
-9. Run `python -m one_c_autoresearch doctor --deep --strict`; do not claim completion until it passes.
+6. Complete reverse-map coverage and decisions under `analysis/reverse-map/`.
+7. Run `python -m one_c_autoresearch final-gate build`.
+8. Create complete evidence packs under `analysis/features/<feature-id>/`.
+9. Generate `outputs/customization-map.md`, `outputs/customization-map.xlsx`, `outputs/open-questions.csv`, and `outputs/open-questions.xlsx` from the final-gate layer.
+10. Write `analysis/final-audit.md`.
+11. Run `python -m one_c_autoresearch doctor --deep --strict`; do not claim completion until it passes.
 
 ## Reverse-Map Route
 
@@ -56,8 +58,9 @@ Use this route when a continuation trigger such as `/goal Исследовани
 3. If a workitem is returned, inspect its `source_diff_ids`, source objects, metadata, BSL, forms, roles, scheduled jobs, and overrides.
 4. Record evidence and decisions under `analysis/reverse-map/`.
 5. Mark runtime-only gaps in `unresolved.csv`.
-6. Run `python -m one_c_autoresearch doctor` and `python -m one_c_autoresearch checks research`.
-7. Advance the workitem status with `python -m one_c_autoresearch reverse-map set-status` and stop.
+6. Run `python -m one_c_autoresearch final-gate status`.
+7. Run `python -m one_c_autoresearch doctor` and `python -m one_c_autoresearch checks research`.
+8. Advance the workitem status with `python -m one_c_autoresearch reverse-map set-status` and stop.
 
 ## System Of Record
 
@@ -67,6 +70,8 @@ Use this route when a continuation trigger such as `/goal Исследовани
 - `analysis/reverse-map/`: durable continuation state for reverse functional mapping.
 - `analysis/indexes/diff-inventory.csv`: every clean diff entry and its classification status.
 - `analysis/indexes/feature-map.csv`: functional grouping for the final customization map.
+- `analysis/indexes/final-diff-inventory.csv`: publishable row-level map after reverse-map normalization.
+- `analysis/indexes/final-feature-map.csv`: publishable feature-level map after reverse-map normalization.
 - `analysis/features/`: durable feature evidence.
 - `docs/method/evidence-pack-schema.md`: canonical CSV headers and feature pack file contract.
 - `docs/method/autopilot-customization-map.md`: final-map pipeline and completion gate.
