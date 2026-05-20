@@ -77,6 +77,7 @@ def test_template(args: argparse.Namespace) -> int:
         "src/one_c_autoresearch/cli.py",
         "src/one_c_autoresearch/autopilot.py",
         "src/one_c_autoresearch/final_gate.py",
+        "src/one_c_autoresearch/review_dashboard.py",
         "src/one_c_autoresearch/reverse_map.py",
         "src/one_c_autoresearch/doctor.py",
         "src/one_c_autoresearch/bootstrap.py",
@@ -126,6 +127,7 @@ def test_template(args: argparse.Namespace) -> int:
         "templates/research-repo/analysis/queue/worker-prompt.md",
         "templates/research-repo/outputs/AGENTS.md",
         "templates/research-repo/outputs/README.md",
+        "templates/research-repo/outputs/review/README.md",
         "templates/research-repo/outputs/open-questions.csv",
         "templates/research-repo/scripts/queue/claim_next_analysis_task.py",
         "templates/research-repo/scripts/queue/get_next_analysis_task.py",
@@ -164,6 +166,8 @@ def test_template(args: argparse.Namespace) -> int:
     require_text(root, "templates/research-repo/README.md", r"reverse-map", "Generated README should expose reverse-map continuation commands.", errors)
     require_text(root, "src/one_c_autoresearch/cli.py", r"reverse-map", "CLI should expose a reverse-map command group.", errors)
     require_text(root, "src/one_c_autoresearch/cli.py", r"final-gate", "CLI should expose a final-gate command group.", errors)
+    require_text(root, "src/one_c_autoresearch/cli.py", r"review-dashboard", "CLI should expose a review-dashboard command group.", errors)
+    require_text(root, "templates/research-repo/outputs/review/README.md", r"review-dashboard build", "Generated outputs/review README should document the dashboard build command.", errors)
     require_text(root, "docs/method/autopilot-customization-map.md", r"Coverage status: complete", "Autopilot runbook should document the final audit coverage marker.", errors)
     require_text(root, "src/one_c_autoresearch/cli.py", r"autopilot", "CLI should expose an autopilot command group.", errors)
     require_same_content(root, "docs/method/1c-autoresearch-process.md", "templates/research-repo/docs/method/1c-autoresearch-process.md", "Generated research methodology must match the template system-of-record document.", errors)
@@ -300,6 +304,27 @@ def test_doctor(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
         build_final_gate(complete_repo)
+        dashboard = subprocess.run(
+            current_module_command("review-dashboard", "build", "--repo-path", str(complete_repo)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        require(dashboard.returncode == 0, f"Review dashboard build should pass: stdout={dashboard.stdout} stderr={dashboard.stderr}", errors)
+        dashboard_html = repo_path(complete_repo, "outputs/review/index.html")
+        dashboard_data = repo_path(complete_repo, "outputs/review/data.json")
+        require(dashboard_html.exists(), "Review dashboard should generate outputs/review/index.html", errors)
+        require(dashboard_data.exists(), "Review dashboard should generate outputs/review/data.json", errors)
+        if dashboard_html.exists():
+            html = dashboard_html.read_text(encoding="utf-8")
+            require("Карта доработок" in html, "Review dashboard should contain a Russian customization-map heading", errors)
+            require("Example feature" in html, "Review dashboard should contain feature titles", errors)
+            require("Что важно для перехода на ДО 3.0" in html, "Review dashboard should expose the migration-impact section", errors)
+        if dashboard_data.exists():
+            data = json.loads(dashboard_data.read_text(encoding="utf-8"))
+            require(data.get("summary", {}).get("feature_count") == 1, "Review dashboard data should include the feature count", errors)
+            require(data.get("features", [{}])[0].get("evidence_count") == 1, "Review dashboard data should include evidence counts", errors)
         complete = run_doctor(complete_repo)
         require(complete["status"] == "ok", "Autopilot gate should pass on a complete customization map", errors)
 

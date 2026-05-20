@@ -12,6 +12,7 @@ from .final_gate import build_command as final_gate_build_command
 from .final_gate import status_command as final_gate_status_command
 from .final_gate import verify_command as final_gate_verify_command
 from .queue import claim_command, get_command, set_status_command
+from .review_dashboard import build_command as review_dashboard_build_command
 from .reverse_map import (
     claim_command as reverse_map_claim_command,
     next_command as reverse_map_next_command,
@@ -90,6 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
     final_gate_verify = final_gate_sub.add_parser("verify")
     final_gate_verify.add_argument("--repo-path", default=".")
     final_gate_verify.set_defaults(func=final_gate_verify_command)
+
+    review_dashboard = sub.add_parser("review-dashboard")
+    review_dashboard_sub = review_dashboard.add_subparsers(dest="review_dashboard_command", required=True)
+    review_dashboard_build = review_dashboard_sub.add_parser("build")
+    review_dashboard_build.add_argument("--repo-path", default=".")
+    review_dashboard_build.add_argument("--output-dir", default="")
+    review_dashboard_build.set_defaults(func=review_dashboard_build_command)
 
     reverse_map = sub.add_parser("reverse-map")
     reverse_map_sub = reverse_map.add_subparsers(dest="reverse_map_command", required=True)

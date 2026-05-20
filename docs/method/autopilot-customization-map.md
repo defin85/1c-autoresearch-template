@@ -29,7 +29,8 @@ Declare inputs in `project.toml`:
 9. **Infobase evidence**: use live infobase data when allowed. If runtime evidence is unavailable, write formal open questions instead of TODO items.
 10. **Final map generation**: produce the Markdown and XLSX deliverables under `outputs/` from the final-gate layer.
 11. **Final audit**: write `analysis/final-audit.md` with coverage counts and completion evidence.
-12. **Doctor gate**: run `python -m one_c_autoresearch doctor --deep --strict`. With `autopilot.enabled=true`, the gate must prove that every diff entry is classified and every final claim is consistent with reverse-map decisions.
+12. **Analyst review dashboard**: run `python -m one_c_autoresearch review-dashboard build` to generate the static analyst surface under `outputs/review/`.
+13. **Doctor gate**: run `python -m one_c_autoresearch doctor --deep --strict`. With `autopilot.enabled=true`, the gate must prove that every diff entry is classified and every final claim is consistent with reverse-map decisions.
 
 ## Required Artifacts
 
@@ -47,6 +48,8 @@ outputs/customization-map.md
 outputs/customization-map.xlsx
 outputs/open-questions.csv
 outputs/open-questions.xlsx
+outputs/review/index.html
+outputs/review/data.json
 analysis/final-audit.md
 ```
 
@@ -149,3 +152,18 @@ python -m one_c_autoresearch autopilot scaffold --enable-gate
 ```
 
 The scaffold creates the required index and output paths. Enabling the gate intentionally makes `doctor` fail until the final map is complete.
+
+## Review Dashboard
+
+Generate the static analyst review dashboard after final-gate normalization and final outputs are current:
+
+```bash
+python -m one_c_autoresearch review-dashboard build
+```
+
+The command writes:
+
+- `outputs/review/index.html`: a self-contained Russian-language review surface with summary metrics, BF block details, evidence samples, open questions, infobase/runtime checks, and migration-impact notes for the move to a newer release such as ДО 3.0.
+- `outputs/review/data.json`: the reproducible data snapshot used by the HTML page.
+
+The dashboard is not a separate source of truth. It must be regenerated from `analysis/indexes/`, `analysis/reverse-map/`, scenario summaries/evidence, `outputs/open-questions.*`, `outputs/customization-map.*`, and `analysis/final-audit.md`.
