@@ -624,6 +624,14 @@ def dashboard_html(data: dict[str, Any]) -> str:
       padding: 8px 0 0;
       color: var(--muted);
     }}
+    .customization-body {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.5fr) minmax(280px, 0.9fr);
+      gap: 16px;
+      margin-top: 12px;
+    }}
+    .customization-block h3 {{ margin-top: 0; }}
+    .object-links {{ display: flex; flex-wrap: wrap; gap: 6px; }}
     .feature-head {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -667,6 +675,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
       .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .toolbar {{ grid-template-columns: 1fr; }}
       .section-grid {{ grid-template-columns: 1fr; }}
+      .customization-body {{ grid-template-columns: 1fr; }}
     }}
     @media (max-width: 1400px) and (min-width: 1101px) {{
       .toolbar {{ grid-template-columns: 1fr 1fr; }}
@@ -682,8 +691,9 @@ def dashboard_html(data: dict[str, Any]) -> str:
       <div class="subtle" id="project-caption"></div>
       <nav class="nav">
         <a href="#summary">Свод <span id="nav-feature-count"></span></a>
-        <a href="#detail-maps">Карты доработок <span id="nav-detail-count"></span></a>
-        <a href="#features">Блоки BF <span id="nav-open-count"></span></a>
+        <a href="#customizations">Доработки <span id="nav-customization-count"></span></a>
+        <a href="#detail-maps">Техкарты <span id="nav-detail-count"></span></a>
+        <a href="#features">Детализация BF <span id="nav-open-count"></span></a>
         <a href="#questions">Открытые вопросы</a>
         <a href="#migration">Переход на ДО 3.0</a>
         <a href="#audit">Финальный аудит</a>
@@ -706,8 +716,13 @@ def dashboard_html(data: dict[str, Any]) -> str:
         <div class="grid metrics" id="metrics"></div>
       </section>
 
+      <section id="customizations">
+        <h2>Собственно доработки</h2>
+        <div class="feature-list" id="customization-list"></div>
+      </section>
+
       <section id="detail-maps">
-        <h2>Карты доработок</h2>
+        <h2>Карты доработок: техническая детализация объектов</h2>
         <div class="toolbar">
           <input id="detail-search" type="search" placeholder="Поиск по карте, объекту, правилу, источнику">
           <select id="detail-type-filter"><option value="">Все типы</option></select>
@@ -805,6 +820,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
       byId("project-caption").textContent = [project.id, project.product].filter(Boolean).join(" · ");
       byId("generated-at").textContent = `Сформировано: ${{data.generated_at || ""}}`;
       byId("nav-feature-count").textContent = data.summary.feature_count || 0;
+      byId("nav-customization-count").textContent = data.summary.feature_count || 0;
       byId("nav-detail-count").textContent = data.summary.detail_map_count || 0;
       byId("nav-open-count").textContent = data.summary.open_question_count || 0;
     }}
@@ -835,6 +851,77 @@ def dashboard_html(data: dict[str, Any]) -> str:
       byId("detail-generation-filter").innerHTML += detailGenerationModes.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
       byId("detail-status-filter").innerHTML += detailStatuses.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
       byId("detail-feature-filter").innerHTML += detailFeatures.map((value) => `<option value="${{esc(value)}}">${{esc(value)}}</option>`).join("");
+    }}
+
+    function detailMapWeight(map) {{
+      const count = Object.values(map.counts || {{}}).reduce((total, value) => total + Number(value || 0), 0);
+      const modeBonus = map.generation_mode === "enriched" ? 10000 : 0;
+      const typePenalty = map.type === "other" ? -100 : 0;
+      return modeBonus + typePenalty + count;
+    }}
+
+    function detailMapsForFeature(feature) {{
+      return (feature.detail_maps || [])
+        .map((item) => detailMapBySlug.get(item.slug))
+        .filter(Boolean)
+        .sort((left, right) => detailMapWeight(right) - detailMapWeight(left) || String(left.title).localeCompare(String(right.title), "ru"));
+    }}
+
+    function customizationTypeBadges(maps) {{
+      const counts = new Map();
+      maps.forEach((map) => counts.set(map.type_label, (counts.get(map.type_label) || 0) + 1));
+      const entries = [...counts.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], "ru"));
+      return entries.map(([label, count]) => `<span class="badge">${{esc(label)}}: ${{count}}</span>`).join(" ") || '<span class="badge">объекты не выделены</span>';
+    }}
+
+    function keyObjectLinks(maps) {{
+      const visible = maps.slice(0, 8);
+      const links = visible.map((map) => `<a class="badge ${{badgeClass(map.status)}}" href="#detail-${{esc(map.slug)}}">${{esc(map.title)}}</a>`);
+      if (maps.length > visible.length) links.push(`<span class="badge">еще ${{maps.length - visible.length}}</span>`);
+      return links.join(" ") || '<span class="empty">Ключевые объекты не выделены.</span>';
+    }}
+
+    function renderCustomizationGroup(feature) {{
+      const maps = detailMapsForFeature(feature);
+      const risks = (feature.migration_risks || []).slice(0, 2).map((risk) => `<li>${{esc(risk)}}</li>`).join("") || "<li>Отдельные риски перехода не выделены текущими артефактами.</li>";
+      return `<article class="feature" id="customization-${{esc(feature.feature_id)}}">
+        <div class="feature-head">
+          <div>
+            <div class="title-row">
+              <span class="feature-title">${{esc(feature.feature_id)}} · ${{esc(feature.title)}}</span>
+              <span class="badge ${{badgeClass(feature.status)}}">${{esc(feature.status_label)}}</span>
+              <span class="badge">${{esc(feature.confidence_label)}}</span>
+            </div>
+            <div class="subtle">${{esc(feature.domain)}} · ${{esc(feature.classification_label)}}</div>
+          </div>
+          <div class="badges">
+            <span class="badge">техкарт: ${{maps.length}}</span>
+            <span class="badge">вопросы: ${{feature.open_questions_count || 0}}</span>
+            <span class="badge">ИБ/UI: ${{feature.infobase_checks_count || 0}}</span>
+          </div>
+        </div>
+        <div class="customization-body">
+          <div class="customization-block">
+            <h3>Что доработано</h3>
+            <p>${{esc(feature.summary)}}</p>
+            <h3>Состав доработки</h3>
+            <div class="badges">${{customizationTypeBadges(maps)}}</div>
+          </div>
+          <div class="customization-block">
+            <h3>Ключевые объекты</h3>
+            <div class="object-links">${{keyObjectLinks(maps)}}</div>
+            <h3>Для ревью перехода</h3>
+            <ul>${{risks}}</ul>
+            <div class="stats"><a href="#${{esc(feature.feature_id)}}">Детализация BF</a></div>
+          </div>
+        </div>
+      </article>`;
+    }}
+
+    function renderCustomizationGroups() {{
+      byId("customization-list").innerHTML = data.features.length
+        ? data.features.map(renderCustomizationGroup).join("")
+        : '<div class="panel empty">Бизнес-доработки не выделены текущими артефактами.</div>';
     }}
 
     function linkedDetailMapsBox(feature) {{
@@ -1163,6 +1250,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
       renderHeader();
       renderMetrics();
       fillFilters();
+      renderCustomizationGroups();
       renderDetailMaps();
       renderFeatures();
       renderQuestions();
