@@ -58,8 +58,8 @@ After `autopilot.enabled=true`, `doctor` fails until:
 - final-gate rows have no reverse-map blockers for claims published as complete;
 - `outputs/customization-map.md` and `outputs/customization-map.xlsx` exist;
 - `outputs/open-questions.csv` and `outputs/open-questions.xlsx` exist;
-- `analysis/detail-maps/README.md` and `_templates/detail-map.json` define the reusable detail-map contract;
-- `outputs/review/index.html` and `outputs/review/data.json` can be regenerated for analyst review, including `analysis/detail-maps/*/detail-map.json` when present;
+- `analysis/detail-maps/README.md`, `index.csv`, and `_templates/detail-map.json` define the reusable detail-map contract;
+- `outputs/review/index.html` and `outputs/review/data.json` can be regenerated for analyst review after `detail-map build`, including `analysis/detail-maps/**/*.json` when present;
 - `outputs/open-questions.csv` covers every item in `analysis/reverse-map/unresolved.csv`;
 - every open question has reason, closure method, and impact;
 - `analysis/final-audit.md` contains `Coverage status: complete` and `Unclassified diff entries: 0`;
@@ -70,6 +70,7 @@ Build and verify the publishable layer before final output generation:
 ```bash
 python -m one_c_autoresearch final-gate build
 python -m one_c_autoresearch final-gate verify
+python -m one_c_autoresearch detail-map build
 python -m one_c_autoresearch review-dashboard build
 ```
 

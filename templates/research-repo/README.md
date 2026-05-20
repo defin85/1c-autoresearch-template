@@ -39,6 +39,7 @@ If the reverse-map queue is empty, the command seeds workitems from uncovered ro
 Build the static analyst review dashboard:
 
 ```bash
+python -m one_c_autoresearch detail-map build
 python -m one_c_autoresearch review-dashboard build
 ```
 
@@ -69,4 +70,4 @@ python -m one_c_autoresearch autopilot scaffold --enable-gate
 
 Then follow `docs/method/autopilot-customization-map.md`. With `autopilot.enabled=true`, `python -m one_c_autoresearch doctor --deep --strict` fails until every diff entry is classified, reverse-map decisions are normalized through `python -m one_c_autoresearch final-gate build`, every feature pack has evidence, final outputs exist, and `analysis/final-audit.md` declares complete coverage without reverse-map blockers.
 
-After final outputs are current, add any concrete subject maps under `analysis/detail-maps/`, then run `python -m one_c_autoresearch review-dashboard build` to create `outputs/review/index.html` and `outputs/review/data.json` for analyst review.
+After final outputs are current, run `python -m one_c_autoresearch detail-map build` to create the generated subject inventory. Add or enrich analyst-owned maps under `analysis/detail-maps/` when a block needs deeper review, then run `python -m one_c_autoresearch review-dashboard build` to create `outputs/review/index.html` and `outputs/review/data.json`.

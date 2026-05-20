@@ -79,6 +79,22 @@ DETAIL_MAP_TYPE_LABELS = {
     "other": "Прочее",
 }
 
+GENERATION_MODE_LABELS = {
+    "generated": "Сгенерировано",
+    "manual": "Ручная карта",
+    "enriched": "Дообогащено",
+    "": "Не указано",
+}
+
+COMPLETENESS_LABELS = {
+    "generated_seed": "Автоинвентаризация",
+    "partial": "Частично",
+    "medium": "Средняя",
+    "high": "Высокая",
+    "complete": "Полная",
+    "": "Не указана",
+}
+
 RISK_STATUSES = {
     "blocked_by_infobase_data",
     "requires_1c_review",
@@ -193,6 +209,14 @@ def detail_type_label(value: str) -> str:
     return DETAIL_MAP_TYPE_LABELS.get((value or "").strip(), value or "Не указано")
 
 
+def generation_mode_label(value: str) -> str:
+    return GENERATION_MODE_LABELS.get((value or "").strip(), value or "Не указано")
+
+
+def completeness_label(value: str) -> str:
+    return COMPLETENESS_LABELS.get((value or "").strip(), value or "Не указана")
+
+
 def normalize_detail_rows(rows: Any) -> list[dict[str, str]]:
     normalized: list[dict[str, str]] = []
     for row in as_list(rows):
@@ -206,7 +230,7 @@ def load_detail_maps(root: Path, output_dir: Path) -> list[dict[str, Any]]:
     if not detail_root.exists():
         return []
     maps: list[dict[str, Any]] = []
-    for path in sorted(detail_root.glob("*/detail-map.json")):
+    for path in sorted(detail_root.rglob("detail-map.json")):
         if "_templates" in path.relative_to(detail_root).parts:
             continue
         try:
@@ -215,6 +239,8 @@ def load_detail_maps(root: Path, output_dir: Path) -> list[dict[str, Any]]:
             raise RuntimeError(f"Could not parse {path.relative_to(root).as_posix()}: {exc}") from exc
         slug = str(raw.get("slug") or path.parent.name).strip()
         map_type = str(raw.get("type", "") or "other").strip()
+        generation_mode = str(raw.get("generation_mode", "") or "manual").strip()
+        completeness = str(raw.get("completeness", "") or "").strip()
         status = str(raw.get("status", "") or "draft").strip()
         confidence = str(raw.get("confidence", "") or "").strip()
         sections = {name: normalize_detail_rows(raw.get(name, [])) for name in DETAIL_MAP_SECTIONS}
@@ -226,6 +252,10 @@ def load_detail_maps(root: Path, output_dir: Path) -> list[dict[str, Any]]:
                 "title": str(raw.get("title", "") or slug),
                 "type": map_type,
                 "type_label": detail_type_label(map_type),
+                "generation_mode": generation_mode,
+                "generation_mode_label": generation_mode_label(generation_mode),
+                "completeness": completeness,
+                "completeness_label": completeness_label(completeness),
                 "status": status,
                 "status_label": status_label(status),
                 "confidence": confidence,
@@ -256,6 +286,8 @@ def detail_map_summaries(detail_maps: list[dict[str, Any]], feature_id: str) -> 
                     "title": detail_map["title"],
                     "type": detail_map["type"],
                     "type_label": detail_map["type_label"],
+                    "generation_mode": detail_map["generation_mode"],
+                    "generation_mode_label": detail_map["generation_mode_label"],
                     "status": detail_map["status"],
                     "status_label": detail_map["status_label"],
                     "href": f"#detail-{detail_map['slug']}",
@@ -427,6 +459,7 @@ def build_dashboard_data(root: Path, output_dir: Path) -> dict[str, Any]:
         "risk_feature_count": len(risk_features),
         "detail_map_count": len(detail_maps),
         "detail_map_by_type": dict(sorted(Counter(detail_map["type"] for detail_map in detail_maps).items())),
+        "detail_map_by_generation_mode": dict(sorted(Counter(detail_map["generation_mode"] for detail_map in detail_maps).items())),
         "detail_map_open_question_count": sum(detail_map["open_questions_count"] for detail_map in detail_maps),
     }
 
@@ -556,7 +589,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
     .panel {{ padding: 16px; }}
     .toolbar {{
       display: grid;
-      grid-template-columns: minmax(260px, 1fr) minmax(160px, 220px) minmax(160px, 220px) minmax(160px, 200px);
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
       gap: 10px;
       margin: 18px 0 12px;
     }}
@@ -658,6 +691,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
         <div class="toolbar">
           <input id="detail-search" type="search" placeholder="Поиск по карте, объекту, правилу, источнику">
           <select id="detail-type-filter"><option value="">Все типы</option></select>
+          <select id="detail-generation-filter"><option value="">Все режимы</option></select>
           <select id="detail-status-filter"><option value="">Все статусы</option></select>
           <select id="detail-feature-filter"><option value="">Все BF</option></select>
           <select id="detail-question-filter">
@@ -771,9 +805,11 @@ def dashboard_html(data: dict[str, Any]) -> str:
       byId("status-filter").innerHTML += statuses.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
       byId("confidence-filter").innerHTML += confidences.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
       const detailTypes = [...new Map((data.detail_maps || []).map((item) => [item.type, item.type_label])).entries()].filter(([key]) => key);
+      const detailGenerationModes = [...new Map((data.detail_maps || []).map((item) => [item.generation_mode, item.generation_mode_label])).entries()].filter(([key]) => key);
       const detailStatuses = [...new Map((data.detail_maps || []).map((item) => [item.status, item.status_label])).entries()].filter(([key]) => key);
       const detailFeatures = [...new Set((data.detail_maps || []).flatMap((item) => item.linked_features || []))].filter(Boolean).sort();
       byId("detail-type-filter").innerHTML += detailTypes.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
+      byId("detail-generation-filter").innerHTML += detailGenerationModes.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
       byId("detail-status-filter").innerHTML += detailStatuses.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
       byId("detail-feature-filter").innerHTML += detailFeatures.map((value) => `<option value="${{esc(value)}}">${{esc(value)}}</option>`).join("");
     }}
@@ -782,7 +818,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
       if (!feature.detail_maps || !feature.detail_maps.length) {{
         return '<span class="empty">Для блока пока нет отдельных предметных карт.</span>';
       }}
-      return feature.detail_maps.map((item) => `<a class="badge ${{badgeClass(item.status)}}" href="${{esc(item.href)}}">${{esc(item.type_label)}} · ${{esc(item.title)}}</a>`).join(" ");
+      return feature.detail_maps.map((item) => `<a class="badge ${{badgeClass(item.status)}}" href="${{esc(item.href)}}">${{esc(item.type_label)}} · ${{esc(item.generation_mode_label)}} · ${{esc(item.title)}}</a>`).join(" ");
     }}
 
     function renderFeature(feature) {{
@@ -900,6 +936,8 @@ def dashboard_html(data: dict[str, Any]) -> str:
             <div class="title-row">
               <span class="feature-title">${{esc(map.title)}}</span>
               <span class="badge info">${{esc(map.type_label)}}</span>
+              <span class="badge info">${{esc(map.generation_mode_label)}}</span>
+              <span class="badge">${{esc(map.completeness_label)}}</span>
               <span class="badge ${{badgeClass(map.status)}}">${{esc(map.status_label)}}</span>
               <span class="badge">${{esc(map.confidence_label)}}</span>
             </div>
@@ -930,6 +968,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
     function filteredDetailMaps() {{
       const query = byId("detail-search").value.trim().toLowerCase();
       const type = byId("detail-type-filter").value;
+      const generationMode = byId("detail-generation-filter").value;
       const status = byId("detail-status-filter").value;
       const feature = byId("detail-feature-filter").value;
       const questionMode = byId("detail-question-filter").value;
@@ -937,6 +976,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
         const text = JSON.stringify(map).toLowerCase();
         if (query && !text.includes(query)) return false;
         if (type && map.type !== type) return false;
+        if (generationMode && map.generation_mode !== generationMode) return false;
         if (status && map.status !== status) return false;
         if (feature && !(map.linked_features || []).includes(feature)) return false;
         if (questionMode === "open" && !map.open_questions_count) return false;
@@ -1024,7 +1064,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
       renderMigration();
       renderAudit();
       ["search","status-filter","confidence-filter","question-filter"].forEach((id) => byId(id).addEventListener("input", renderFeatures));
-      ["detail-search","detail-type-filter","detail-status-filter","detail-feature-filter","detail-question-filter"].forEach((id) => byId(id).addEventListener("input", renderDetailMaps));
+      ["detail-search","detail-type-filter","detail-generation-filter","detail-status-filter","detail-feature-filter","detail-question-filter"].forEach((id) => byId(id).addEventListener("input", renderDetailMaps));
     }}
     boot();
   </script>

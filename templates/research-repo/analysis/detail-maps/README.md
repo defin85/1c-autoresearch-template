@@ -8,7 +8,23 @@ Each map lives in its own folder:
 
 ```text
 analysis/detail-maps/<slug>/detail-map.json
+analysis/detail-maps/generated/<slug>/detail-map.json
 ```
+
+Build the generated inventory from current final-gate and reverse-map artifacts:
+
+```bash
+python -m one_c_autoresearch detail-map build
+```
+
+The builder writes:
+
+- `analysis/detail-maps/index.csv`
+- `analysis/detail-maps/generated/<slug>/detail-map.json`
+
+Generated maps use `generation_mode=generated` and `completeness=generated_seed`.
+They are start points for analyst drill-down, not final human conclusions. Manual
+or enriched maps outside `generated/` are not overwritten by the builder.
 
 The `review-dashboard` command reads every `detail-map.json` under this folder
 and renders them as the `Карты доработок` section. `BF-*` blocks remain the

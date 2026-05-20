@@ -29,7 +29,7 @@ Declare inputs in `project.toml`:
 9. **Infobase evidence**: use live infobase data when allowed. If runtime evidence is unavailable, write formal open questions instead of TODO items.
 10. **Final map generation**: produce the Markdown and XLSX deliverables under `outputs/` from the final-gate layer.
 11. **Final audit**: write `analysis/final-audit.md` with coverage counts and completion evidence.
-12. **Analyst review dashboard**: run `python -m one_c_autoresearch review-dashboard build` to generate the static analyst surface under `outputs/review/`.
+12. **Analyst review dashboard**: run `python -m one_c_autoresearch detail-map build` and then `python -m one_c_autoresearch review-dashboard build` to generate the static analyst surface under `outputs/review/`.
 13. **Doctor gate**: run `python -m one_c_autoresearch doctor --deep --strict`. With `autopilot.enabled=true`, the gate must prove that every diff entry is classified and every final claim is consistent with reverse-map decisions.
 
 ## Required Artifacts
@@ -158,6 +158,7 @@ The scaffold creates the required index and output paths. Enabling the gate inte
 Generate the static analyst review dashboard after final-gate normalization and final outputs are current:
 
 ```bash
+python -m one_c_autoresearch detail-map build
 python -m one_c_autoresearch review-dashboard build
 ```
 
@@ -166,10 +167,16 @@ The command writes:
 - `outputs/review/index.html`: a self-contained Russian-language review surface with summary metrics, BF block details, evidence samples, open questions, infobase/runtime checks, and migration-impact notes for the move to a newer release such as ДО 3.0.
 - `outputs/review/data.json`: the reproducible data snapshot used by the HTML page.
 
-The dashboard also reads optional concrete subject maps from
-`analysis/detail-maps/*/detail-map.json`. These maps are the drill-down layer
-below `BF-*`: documents, catalogs, routes, scheduled jobs, rights, integrations,
-reports, and UI surfaces with attributes, form rules, validations, lifecycle,
-roles, source traces, open questions, and migration notes.
+Before the dashboard build, `detail-map build` creates a reproducible inventory
+in `analysis/detail-maps/index.csv` and generated maps in
+`analysis/detail-maps/generated/<slug>/detail-map.json` from
+`analysis/indexes/final-diff-inventory.csv` and `analysis/reverse-map/coverage.csv`.
+Manual or enriched maps outside `generated/` remain analyst-owned artifacts.
+
+The dashboard reads concrete subject maps from `analysis/detail-maps/**/*.json`.
+These maps are the drill-down layer below `BF-*`: documents, catalogs, routes,
+scheduled jobs, rights, integrations, reports, and UI surfaces with attributes,
+form rules, validations, lifecycle, roles, source traces, open questions, and
+migration notes.
 
 The dashboard is not a separate source of truth. It must be regenerated from `analysis/indexes/`, `analysis/reverse-map/`, `analysis/detail-maps/`, scenario summaries/evidence, `outputs/open-questions.*`, `outputs/customization-map.*`, and `analysis/final-audit.md`.

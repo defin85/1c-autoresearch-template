@@ -22,6 +22,7 @@ from .common import (
     toml_value,
     utc_now_iso,
 )
+from .detail_maps import DETAIL_MAP_GENERATION_MODES, DETAIL_MAP_INDEX_HEADER
 from .reverse_map import (
     REVERSE_MAP_COVERAGE_HEADER,
     REVERSE_MAP_DECISIONS_HEADER,
@@ -79,6 +80,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "src/one_c_autoresearch/__main__.py",
     "src/one_c_autoresearch/cli.py",
     "src/one_c_autoresearch/autopilot.py",
+    "src/one_c_autoresearch/detail_maps.py",
     "src/one_c_autoresearch/final_gate.py",
     "src/one_c_autoresearch/review_dashboard.py",
     "src/one_c_autoresearch/reverse_map.py",
@@ -112,6 +114,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/analysis/indexes/final-diff-inventory.csv",
     "templates/research-repo/analysis/indexes/final-feature-map.csv",
     "templates/research-repo/analysis/detail-maps/README.md",
+    "templates/research-repo/analysis/detail-maps/index.csv",
     "templates/research-repo/analysis/detail-maps/_templates/detail-map.json",
     "templates/research-repo/analysis/reverse-map/README.md",
     "templates/research-repo/analysis/reverse-map/state.md",
@@ -162,6 +165,7 @@ RESEARCH_REQUIRED_PATHS = [
     "src/one_c_autoresearch/__init__.py",
     "src/one_c_autoresearch/__main__.py",
     "src/one_c_autoresearch/autopilot.py",
+    "src/one_c_autoresearch/detail_maps.py",
     "src/one_c_autoresearch/final_gate.py",
     "src/one_c_autoresearch/review_dashboard.py",
     "src/one_c_autoresearch/reverse_map.py",
@@ -179,6 +183,7 @@ RESEARCH_REQUIRED_PATHS = [
     "analysis/indexes/final-diff-inventory.csv",
     "analysis/indexes/final-feature-map.csv",
     "analysis/detail-maps/README.md",
+    "analysis/detail-maps/index.csv",
     "analysis/detail-maps/_templates/detail-map.json",
     "analysis/reverse-map/README.md",
     "analysis/reverse-map/state.md",
@@ -779,13 +784,20 @@ class Doctor:
 
     def test_detail_maps_contract(self) -> None:
         self.require_path("analysis/detail-maps/README.md", "detail_maps")
+        index_path = repo_path(self.root, "analysis/detail-maps/index.csv")
+        if index_path.exists():
+            header = index_path.read_text(encoding="utf-8-sig").splitlines()[:1]
+            if header == [DETAIL_MAP_INDEX_HEADER]:
+                self.checks.add("detail_maps.index.header", "ok", "Detail-map index header matches the contract")
+            else:
+                self.checks.add("detail_maps.index.header", "fail", "Detail-map index header does not match the contract")
         self.require_path("analysis/detail-maps/_templates/detail-map.json", "detail_maps")
         root = repo_path(self.root, "analysis/detail-maps")
         if not root.exists():
             return
         maps = [
             path
-            for path in sorted(root.glob("*/detail-map.json"))
+            for path in sorted(root.rglob("detail-map.json"))
             if "_templates" not in path.relative_to(root).parts
         ]
         if not maps:
@@ -799,7 +811,7 @@ class Doctor:
             except Exception as exc:
                 self.checks.add("detail_maps.parse", "fail", f"Could not parse {relative}: {exc}")
                 continue
-            for field in ("id", "slug", "title", "type", "status", "confidence", "owner_feature", "linked_features", "summary"):
+            for field in ("id", "slug", "title", "type", "generation_mode", "completeness", "status", "confidence", "owner_feature", "linked_features", "summary"):
                 value = data.get(field)
                 if value in (None, "", []):
                     self.checks.add("detail_maps.required_field", "fail", f"{relative} is missing required field: {field}")
@@ -814,6 +826,9 @@ class Doctor:
             status = str(data.get("status", "")).strip()
             if status and status not in DETAIL_MAP_STATUSES:
                 self.checks.add("detail_maps.status", "fail", f"{relative} has invalid status: {status}")
+            generation_mode = str(data.get("generation_mode", "")).strip()
+            if generation_mode and generation_mode not in DETAIL_MAP_GENERATION_MODES:
+                self.checks.add("detail_maps.generation_mode", "fail", f"{relative} has invalid generation_mode: {generation_mode}")
             if data.get("linked_features") is not None and not isinstance(data.get("linked_features"), list):
                 self.checks.add("detail_maps.linked_features", "fail", f"{relative} linked_features must be a list")
             for section in DETAIL_MAP_SECTIONS:

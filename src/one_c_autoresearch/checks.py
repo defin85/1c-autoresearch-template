@@ -76,6 +76,7 @@ def test_template(args: argparse.Namespace) -> int:
         "project.example.toml",
         "src/one_c_autoresearch/cli.py",
         "src/one_c_autoresearch/autopilot.py",
+        "src/one_c_autoresearch/detail_maps.py",
         "src/one_c_autoresearch/final_gate.py",
         "src/one_c_autoresearch/review_dashboard.py",
         "src/one_c_autoresearch/reverse_map.py",
@@ -101,6 +102,7 @@ def test_template(args: argparse.Namespace) -> int:
         "templates/research-repo/analysis/indexes/final-diff-inventory.csv",
         "templates/research-repo/analysis/indexes/final-feature-map.csv",
         "templates/research-repo/analysis/detail-maps/README.md",
+        "templates/research-repo/analysis/detail-maps/index.csv",
         "templates/research-repo/analysis/detail-maps/_templates/detail-map.json",
         "templates/research-repo/analysis/reverse-map/README.md",
         "templates/research-repo/analysis/reverse-map/state.md",
@@ -162,7 +164,10 @@ def test_template(args: argparse.Namespace) -> int:
     require_text(root, "templates/research-repo/analysis/indexes/final-feature-map.csv", r"^feature_id,title,domain,source_bucket,classification,confidence,status,owner,summary,evidence_pack_path,open_questions_path,outputs,notes$", "Final feature map template should expose the canonical final-gate header.", errors)
     require_text(root, "templates/research-repo/outputs/open-questions.csv", r"^question_id,feature_id,status,reason,closure_method,impact,source_ref,owner,notes$", "Open questions template should expose the canonical autopilot header.", errors)
     require_text(root, "templates/research-repo/analysis/detail-maps/README.md", r"detail-map\.json", "Detail-map README should document the detail-map.json contract.", errors)
+    require_text(root, "templates/research-repo/analysis/detail-maps/README.md", r"detail-map build", "Detail-map README should document the reproducible builder command.", errors)
+    require_text(root, "templates/research-repo/analysis/detail-maps/index.csv", r"^slug,title,type,status,confidence,owner_feature,linked_features,source_rows,detail_map_path,generation_mode,completeness,notes$", "Detail-map index template should expose the canonical header.", errors)
     require_text(root, "templates/research-repo/analysis/detail-maps/_templates/detail-map.json", r'"linked_features"', "Detail-map template should expose linked_features.", errors)
+    require_text(root, "templates/research-repo/analysis/detail-maps/_templates/detail-map.json", r'"generation_mode"', "Detail-map template should expose generation_mode.", errors)
     require_text(root, "templates/research-repo/analysis/reverse-map/coverage.csv", rf"^{re.escape(REVERSE_MAP_COVERAGE_HEADER)}$", "Reverse-map coverage template should expose the canonical header.", errors)
     require_text(root, "templates/research-repo/project.toml", r"(?m)^\[autopilot\]$", "Generated manifest should include the autopilot final-gate section.", errors)
     require_text(root, "templates/research-repo/docs/agent/index.md", r"reverse-map claim", "Agent router should document the reverse-map continuation command.", errors)
@@ -171,6 +176,7 @@ def test_template(args: argparse.Namespace) -> int:
     require_text(root, "src/one_c_autoresearch/cli.py", r"reverse-map", "CLI should expose a reverse-map command group.", errors)
     require_text(root, "src/one_c_autoresearch/cli.py", r"final-gate", "CLI should expose a final-gate command group.", errors)
     require_text(root, "src/one_c_autoresearch/cli.py", r"review-dashboard", "CLI should expose a review-dashboard command group.", errors)
+    require_text(root, "src/one_c_autoresearch/cli.py", r"detail-map", "CLI should expose a detail-map command group.", errors)
     require_text(root, "templates/research-repo/outputs/review/README.md", r"review-dashboard build", "Generated outputs/review README should document the dashboard build command.", errors)
     require_text(root, "docs/method/autopilot-customization-map.md", r"Coverage status: complete", "Autopilot runbook should document the final audit coverage marker.", errors)
     require_text(root, "src/one_c_autoresearch/cli.py", r"autopilot", "CLI should expose an autopilot command group.", errors)
@@ -274,7 +280,8 @@ def test_doctor(args: argparse.Namespace) -> int:
         copy_smoke_repo(scaffold_repo, complete_repo)
         repo_path(complete_repo, "analysis/indexes/diff-inventory.csv").write_text(
             DIFF_INVENTORY_HEADER
-            + "\nD-0001,target_cf,M,cf/CommonModules/Example/Ext/Module.bsl,CommonModule,Example,bsl,feature-a,covered_by_existing_customization,high,mapped_to_feature,Example behavior changed,analysis/features/feature-a/evidence.csv#E-001,\n",
+            + "\nD-0001,target_cf,M,cf/Catalogs/Example.xml,Catalogs,Catalogs.Example,Documents,feature-a,covered_by_existing_customization,high,mapped_to_feature,Example catalog metadata changed,analysis/features/feature-a/evidence.csv#E-001,\n"
+            + "D-0002,target_cf,M,cf/ScheduledJobs/ExampleJob.xml,ScheduledJobs,ScheduledJobs.ExampleJob,Регламентные задания,feature-a,platform automation,medium,mapped_to_feature,Example scheduled job changed,analysis/features/feature-a/evidence.csv#E-002,\n",
             encoding="utf-8",
         )
         repo_path(complete_repo, "analysis/indexes/feature-map.csv").write_text(
@@ -288,7 +295,8 @@ def test_doctor(args: argparse.Namespace) -> int:
         (feature / "findings.md").write_text("# Findings\n\n- F-001: Example behavior changed.\n", encoding="utf-8")
         (feature / "evidence.csv").write_text(
             "feature_id,claim_id,source_kind,source_path,line_start,line_end,evidence_type,confidence,summary,notes\n"
-            "feature-a,F-001,target_cf,cf/CommonModules/Example/Ext/Module.bsl,1,3,bsl,high,Example behavior changed,\n",
+            "feature-a,F-001,target_cf,cf/Catalogs/Example.xml,1,3,metadata,high,Example catalog metadata changed,\n"
+            "feature-a,F-002,target_cf,cf/ScheduledJobs/ExampleJob.xml,1,3,metadata,medium,Example scheduled job changed,\n",
             encoding="utf-8",
         )
         (feature / "open-questions.md").write_text("# Open Questions\n\nNo open questions.\n", encoding="utf-8")
@@ -311,6 +319,8 @@ def test_doctor(args: argparse.Namespace) -> int:
                     "slug": "example-document",
                     "title": "Пример документа",
                     "type": "document",
+                    "generation_mode": "enriched",
+                    "completeness": "high",
                     "status": "complete",
                     "confidence": "high",
                     "owner_feature": "feature-a",
@@ -368,6 +378,8 @@ def test_doctor(args: argparse.Namespace) -> int:
                     "slug": "example-route",
                     "title": "Пример маршрута",
                     "type": "route",
+                    "generation_mode": "manual",
+                    "completeness": "medium",
                     "status": "requires_1c_review",
                     "confidence": "medium",
                     "owner_feature": "feature-a",
@@ -401,10 +413,34 @@ def test_doctor(args: argparse.Namespace) -> int:
         seed_reverse_map_workitems(complete_repo)
         repo_path(complete_repo, "analysis/reverse-map/coverage.csv").write_text(
             REVERSE_MAP_COVERAGE_HEADER
-            + "\nD-0001,target_cf,M,cf/CommonModules/Example/Ext/Module.bsl,CommonModule,Example,bsl,feature-a,feature-a,RM-0001,confirmed_in_scenario,high,analysis/features/feature-a/evidence.csv,analysis/reverse-map/decisions.csv#RM-0001,Confirmed by smoke test\n",
+            + "\nD-0001,target_cf,M,cf/Catalogs/Example.xml,Catalogs,Catalogs.Example,Documents,feature-a,feature-a,RM-0001,confirmed_in_scenario,high,analysis/features/feature-a/evidence.csv,analysis/reverse-map/decisions.csv#RM-0001,Confirmed by smoke test\n"
+            + "D-0002,target_cf,M,cf/ScheduledJobs/ExampleJob.xml,ScheduledJobs,ScheduledJobs.ExampleJob,Регламентные задания,feature-a,feature-a,RM-0001,confirmed_in_scenario,medium,analysis/features/feature-a/evidence.csv,analysis/reverse-map/decisions.csv#RM-0001,Confirmed by smoke test\n",
             encoding="utf-8",
         )
         build_final_gate(complete_repo)
+        detail_builder = subprocess.run(
+            current_module_command("detail-map", "build", "--repo-path", str(complete_repo)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        require(detail_builder.returncode == 0, f"Detail-map builder should pass: stdout={detail_builder.stdout} stderr={detail_builder.stderr}", errors)
+        detail_index = repo_path(complete_repo, "analysis/detail-maps/index.csv")
+        generated_maps = sorted(repo_path(complete_repo, "analysis/detail-maps/generated").glob("*/detail-map.json"))
+        require(detail_index.exists(), "Detail-map builder should write analysis/detail-maps/index.csv", errors)
+        require(len(generated_maps) == 2, "Detail-map builder should create generated maps for each concrete object group", errors)
+        if detail_index.exists():
+            detail_index_text = detail_index.read_text(encoding="utf-8-sig")
+            require("example-document/detail-map.json" in detail_index_text, "Detail-map index should include enriched manual maps", errors)
+            require("generated/catalog-example/detail-map.json" in detail_index_text, "Detail-map index should include the generated catalog map", errors)
+            require("generated/scheduled-job-examplejob/detail-map.json" in detail_index_text, "Detail-map index should include the generated scheduled job map", errors)
+        if generated_maps:
+            generated_payloads = [json.loads(path.read_text(encoding="utf-8")) for path in generated_maps]
+            require({payload.get("generation_mode") for payload in generated_payloads} == {"generated"}, "Generated detail maps should declare generation_mode=generated", errors)
+            require({payload.get("type") for payload in generated_payloads} == {"catalog", "scheduled_job"}, "Generated detail maps should infer concrete map types", errors)
+        manual_payload = json.loads(document_map.read_text(encoding="utf-8"))
+        require(manual_payload.get("generation_mode") == "enriched", "Detail-map builder should not overwrite enriched manual maps", errors)
         dashboard = subprocess.run(
             current_module_command("review-dashboard", "build", "--repo-path", str(complete_repo)),
             stdout=subprocess.PIPE,
@@ -428,12 +464,13 @@ def test_doctor(args: argparse.Namespace) -> int:
         if dashboard_data.exists():
             data = json.loads(dashboard_data.read_text(encoding="utf-8"))
             require(data.get("summary", {}).get("feature_count") == 1, "Review dashboard data should include the feature count", errors)
-            require(data.get("summary", {}).get("detail_map_count") == 2, "Review dashboard data should include detail-map count", errors)
+            require(data.get("summary", {}).get("detail_map_count") == 4, "Review dashboard data should include manual and generated detail-map count", errors)
             require(data.get("summary", {}).get("detail_map_by_type", {}).get("document") == 1, "Review dashboard data should count document detail maps", errors)
             require(data.get("summary", {}).get("detail_map_by_type", {}).get("route") == 1, "Review dashboard data should count route detail maps", errors)
-            require({item.get("slug") for item in data.get("detail_maps", [])} == {"example-document", "example-route"}, "Review dashboard data should include synthetic detail maps", errors)
-            require(data.get("features", [{}])[0].get("evidence_count") == 1, "Review dashboard data should include evidence counts", errors)
-            require(data.get("features", [{}])[0].get("detail_maps_count") == 2, "Feature data should include linked detail-map counts", errors)
+            require(data.get("summary", {}).get("detail_map_by_generation_mode", {}).get("generated") == 2, "Review dashboard data should count generated detail maps", errors)
+            require({item.get("slug") for item in data.get("detail_maps", [])} == {"example-document", "example-route", "catalog-example", "scheduled-job-examplejob"}, "Review dashboard data should include manual and generated detail maps", errors)
+            require(data.get("features", [{}])[0].get("evidence_count") == 2, "Review dashboard data should include evidence counts", errors)
+            require(data.get("features", [{}])[0].get("detail_maps_count") == 4, "Feature data should include linked detail-map counts", errors)
         complete = run_doctor(complete_repo)
         require(complete["status"] == "ok", "Autopilot gate should pass on a complete customization map", errors)
 

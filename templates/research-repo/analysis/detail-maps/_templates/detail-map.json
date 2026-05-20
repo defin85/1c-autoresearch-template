@@ -4,6 +4,8 @@
   "slug": "example-subject",
   "title": "Example customization subject",
   "type": "document",
+  "generation_mode": "manual",
+  "completeness": "partial",
   "status": "draft",
   "confidence": "medium",
   "owner_feature": "BF-000",

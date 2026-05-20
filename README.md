@@ -105,7 +105,7 @@ scripts/
 5. Build the clean diff, classify every diff entry, group entries into features, and complete reverse-map review.
 6. Run `python -m one_c_autoresearch final-gate build` before generating final outputs.
 7. Generate final outputs only from `analysis/indexes/final-diff-inventory.csv` and `analysis/indexes/final-feature-map.csv`, then write `analysis/final-audit.md`.
-8. Add detail maps under `analysis/detail-maps/` for concrete customization subjects that need analyst-level drill-down below `BF-*`.
+8. Run `python -m one_c_autoresearch detail-map build` to create generated subject maps, then enrich selected maps under `analysis/detail-maps/` when analyst-level drill-down below `BF-*` is needed.
 9. Build the static analyst dashboard with `python -m one_c_autoresearch review-dashboard build`.
 10. Run the generated repo doctor. With `autopilot.enabled=true`, it must prove every diff entry is classified and every final claim is consistent with reverse-map decisions before final delivery.
 11. Update queue or reverse-map workitem status only after verification passes.

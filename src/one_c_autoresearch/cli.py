@@ -7,6 +7,7 @@ from pathlib import Path
 from .autopilot import scaffold_autopilot
 from .bootstrap import create_research_repo
 from .checks import run_check, test_doctor, test_research_repo, test_template
+from .detail_maps import build_command as detail_map_build_command
 from .doctor import print_doctor, run_doctor
 from .final_gate import build_command as final_gate_build_command
 from .final_gate import status_command as final_gate_status_command
@@ -98,6 +99,13 @@ def build_parser() -> argparse.ArgumentParser:
     review_dashboard_build.add_argument("--repo-path", default=".")
     review_dashboard_build.add_argument("--output-dir", default="")
     review_dashboard_build.set_defaults(func=review_dashboard_build_command)
+
+    detail_map = sub.add_parser("detail-map")
+    detail_map_sub = detail_map.add_subparsers(dest="detail_map_command", required=True)
+    detail_map_build = detail_map_sub.add_parser("build")
+    detail_map_build.add_argument("--repo-path", default=".")
+    detail_map_build.add_argument("--force", action="store_true")
+    detail_map_build.set_defaults(func=detail_map_build_command)
 
     reverse_map = sub.add_parser("reverse-map")
     reverse_map_sub = reverse_map.add_subparsers(dest="reverse_map_command", required=True)
