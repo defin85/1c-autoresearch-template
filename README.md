@@ -85,6 +85,7 @@ analysis/
   cache/
     indexes/
     noise/
+  detail-maps/
   queue/
   reverse-map/
   features/
@@ -104,9 +105,10 @@ scripts/
 5. Build the clean diff, classify every diff entry, group entries into features, and complete reverse-map review.
 6. Run `python -m one_c_autoresearch final-gate build` before generating final outputs.
 7. Generate final outputs only from `analysis/indexes/final-diff-inventory.csv` and `analysis/indexes/final-feature-map.csv`, then write `analysis/final-audit.md`.
-8. Build the static analyst dashboard with `python -m one_c_autoresearch review-dashboard build`.
-9. Run the generated repo doctor. With `autopilot.enabled=true`, it must prove every diff entry is classified and every final claim is consistent with reverse-map decisions before final delivery.
-10. Update queue or reverse-map workitem status only after verification passes.
+8. Add detail maps under `analysis/detail-maps/` for concrete customization subjects that need analyst-level drill-down below `BF-*`.
+9. Build the static analyst dashboard with `python -m one_c_autoresearch review-dashboard build`.
+10. Run the generated repo doctor. With `autopilot.enabled=true`, it must prove every diff entry is classified and every final claim is consistent with reverse-map decisions before final delivery.
+11. Update queue or reverse-map workitem status only after verification passes.
 
 The queue is deliberately file-backed. It is slower than a broker but transparent, diffable, and easy for Codex automation to resume.
 

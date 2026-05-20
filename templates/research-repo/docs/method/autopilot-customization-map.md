@@ -166,4 +166,10 @@ The command writes:
 - `outputs/review/index.html`: a self-contained Russian-language review surface with summary metrics, BF block details, evidence samples, open questions, infobase/runtime checks, and migration-impact notes for the move to a newer release such as ДО 3.0.
 - `outputs/review/data.json`: the reproducible data snapshot used by the HTML page.
 
-The dashboard is not a separate source of truth. It must be regenerated from `analysis/indexes/`, `analysis/reverse-map/`, scenario summaries/evidence, `outputs/open-questions.*`, `outputs/customization-map.*`, and `analysis/final-audit.md`.
+The dashboard also reads optional concrete subject maps from
+`analysis/detail-maps/*/detail-map.json`. These maps are the drill-down layer
+below `BF-*`: documents, catalogs, routes, scheduled jobs, rights, integrations,
+reports, and UI surfaces with attributes, form rules, validations, lifecycle,
+roles, source traces, open questions, and migration notes.
+
+The dashboard is not a separate source of truth. It must be regenerated from `analysis/indexes/`, `analysis/reverse-map/`, `analysis/detail-maps/`, scenario summaries/evidence, `outputs/open-questions.*`, `outputs/customization-map.*`, and `analysis/final-audit.md`.

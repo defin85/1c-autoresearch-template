@@ -14,6 +14,18 @@ from .common import read_toml, repo_path, utc_now_iso
 DEFAULT_OUTPUT_DIR = "outputs/review"
 MAX_SUMMARY_CHARS = 12000
 MAX_SAMPLE_ROWS = 8
+DETAIL_MAP_SECTIONS = {
+    "attributes": "Реквизиты",
+    "form_rules": "Правила формы",
+    "validations": "Проверки заполнения",
+    "lifecycle": "Жизненный цикл",
+    "rights": "Права и роли",
+    "scheduled_jobs": "Регламентные задания",
+    "ui": "UI-поверхности",
+    "integrations": "Интеграции",
+    "sources": "Источники",
+    "open_questions": "Открытые вопросы",
+}
 
 
 STATUS_LABELS = {
@@ -33,6 +45,8 @@ STATUS_LABELS = {
     "technical_platform": "Техническая платформа",
     "technical_noise": "Технический шум",
     "out_of_scope": "Вне рамок",
+    "draft": "Черновик",
+    "needs_review": "Требует ревью",
 }
 
 CONFIDENCE_LABELS = {
@@ -51,6 +65,18 @@ CLASSIFICATION_LABELS = {
     "ui customization": "Пользовательский интерфейс",
     "reference data model": "Нормативно-справочная модель",
     "platform compatibility customization": "Платформенная совместимость",
+}
+
+DETAIL_MAP_TYPE_LABELS = {
+    "document": "Документ",
+    "catalog": "Справочник",
+    "route": "Маршрут",
+    "scheduled_job": "Регламентное задание",
+    "rights": "Права и роли",
+    "integration": "Интеграция",
+    "report": "Отчет",
+    "ui": "Пользовательский интерфейс",
+    "other": "Прочее",
 }
 
 RISK_STATUSES = {
@@ -151,6 +177,93 @@ def sample_rows(rows: list[dict[str, str]], fields: list[str], limit: int = MAX_
     return sampled
 
 
+def as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def text_list(value: Any) -> list[str]:
+    return [str(item) for item in as_list(value) if str(item).strip()]
+
+
+def detail_type_label(value: str) -> str:
+    return DETAIL_MAP_TYPE_LABELS.get((value or "").strip(), value or "Не указано")
+
+
+def normalize_detail_rows(rows: Any) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for row in as_list(rows):
+        if isinstance(row, dict):
+            normalized.append({str(key): "" if value is None else str(value) for key, value in row.items()})
+    return normalized
+
+
+def load_detail_maps(root: Path, output_dir: Path) -> list[dict[str, Any]]:
+    detail_root = repo_path(root, "analysis/detail-maps")
+    if not detail_root.exists():
+        return []
+    maps: list[dict[str, Any]] = []
+    for path in sorted(detail_root.glob("*/detail-map.json")):
+        if "_templates" in path.relative_to(detail_root).parts:
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Could not parse {path.relative_to(root).as_posix()}: {exc}") from exc
+        slug = str(raw.get("slug") or path.parent.name).strip()
+        map_type = str(raw.get("type", "") or "other").strip()
+        status = str(raw.get("status", "") or "draft").strip()
+        confidence = str(raw.get("confidence", "") or "").strip()
+        sections = {name: normalize_detail_rows(raw.get(name, [])) for name in DETAIL_MAP_SECTIONS}
+        source_workbook = str(raw.get("source_workbook", "") or "").strip()
+        maps.append(
+            {
+                "id": str(raw.get("id") or slug),
+                "slug": slug,
+                "title": str(raw.get("title", "") or slug),
+                "type": map_type,
+                "type_label": detail_type_label(map_type),
+                "status": status,
+                "status_label": status_label(status),
+                "confidence": confidence,
+                "confidence_label": confidence_label(confidence),
+                "owner_feature": str(raw.get("owner_feature", "") or ""),
+                "linked_features": text_list(raw.get("linked_features", [])),
+                "summary": str(raw.get("summary", "") or ""),
+                "migration_notes": text_list(raw.get("migration_notes", [])),
+                "source_path": path.relative_to(root).as_posix(),
+                "source_href": repo_href(root, output_dir, path.relative_to(root).as_posix()),
+                "source_workbook": source_workbook,
+                "source_workbook_href": repo_href(root, output_dir, source_workbook) if source_workbook else "",
+                "sections": sections,
+                "counts": {name: len(rows) for name, rows in sections.items()},
+                "open_questions_count": len(sections["open_questions"]),
+            }
+        )
+    return maps
+
+
+def detail_map_summaries(detail_maps: list[dict[str, Any]], feature_id: str) -> list[dict[str, Any]]:
+    linked: list[dict[str, Any]] = []
+    for detail_map in detail_maps:
+        if feature_id in set(detail_map.get("linked_features", [])):
+            linked.append(
+                {
+                    "slug": detail_map["slug"],
+                    "title": detail_map["title"],
+                    "type": detail_map["type"],
+                    "type_label": detail_map["type_label"],
+                    "status": detail_map["status"],
+                    "status_label": detail_map["status_label"],
+                    "href": f"#detail-{detail_map['slug']}",
+                }
+            )
+    return linked
+
+
 def parse_feature_sources(value: str) -> dict[str, int]:
     result: dict[str, int] = {}
     for part in split_refs(value):
@@ -172,6 +285,7 @@ def build_feature(
     decisions_by_scenario: dict[str, list[dict[str, str]]],
     unresolved_by_scenario: dict[str, list[dict[str, str]]],
     infobase_by_scenario: dict[str, list[dict[str, str]]],
+    detail_maps: list[dict[str, Any]],
 ) -> dict[str, Any]:
     feature_id = (row.get("feature_id") or "").strip()
     scenario_dir = repo_path(root, f"analysis/reverse-map/scenarios/{feature_id}")
@@ -189,6 +303,7 @@ def build_feature(
     evidence_confidence = count_values(evidence_rows, "confidence")
     source_counts = parse_feature_sources(row.get("source_bucket", ""))
     status = (row.get("status") or "").strip()
+    linked_detail_maps = detail_map_summaries(detail_maps, feature_id)
     migration_risks: list[str] = []
     if unresolved:
         migration_risks.append(f"Есть открытые вопросы: {len(unresolved)}. Их нужно закрыть до уверенной карты функциональных разрывов.")
@@ -242,6 +357,8 @@ def build_feature(
         "open_questions": unresolved,
         "infobase_checks_count": len(infobase),
         "infobase_checks": infobase,
+        "detail_maps_count": len(linked_detail_maps),
+        "detail_maps": linked_detail_maps,
         "migration_risks": migration_risks,
     }
 
@@ -257,6 +374,7 @@ def build_dashboard_data(root: Path, output_dir: Path) -> dict[str, Any]:
     unresolved_rows = non_empty_rows(read_csv_rows(repo_path(root, "analysis/reverse-map/unresolved.csv")))
     infobase_rows = non_empty_rows(read_csv_rows(repo_path(root, "analysis/reverse-map/infobase-checks.csv")))
     output_open_questions = non_empty_rows(read_csv_rows(repo_path(root, "outputs/open-questions.csv")))
+    detail_maps = load_detail_maps(root, output_dir)
 
     if not feature_rows:
         raise RuntimeError("No feature rows found in analysis/indexes/feature-map.csv")
@@ -274,6 +392,7 @@ def build_dashboard_data(root: Path, output_dir: Path) -> dict[str, Any]:
             decisions_by_scenario,
             unresolved_by_scenario,
             infobase_by_scenario,
+            detail_maps,
         )
         for row in feature_rows
     ]
@@ -306,6 +425,9 @@ def build_dashboard_data(root: Path, output_dir: Path) -> dict[str, Any]:
         "infobase_check_count": len(infobase_rows),
         "closed_infobase_check_count": sum(1 for row in infobase_rows if (row.get("status_after_pass") or "").strip() == "closed"),
         "risk_feature_count": len(risk_features),
+        "detail_map_count": len(detail_maps),
+        "detail_map_by_type": dict(sorted(Counter(detail_map["type"] for detail_map in detail_maps).items())),
+        "detail_map_open_question_count": sum(detail_map["open_questions_count"] for detail_map in detail_maps),
     }
 
     final_audit_path = repo_path(root, "analysis/final-audit.md")
@@ -333,6 +455,7 @@ def build_dashboard_data(root: Path, output_dir: Path) -> dict[str, Any]:
         "project": project,
         "summary": summary,
         "features": features,
+        "detail_maps": detail_maps,
         "open_questions": unresolved_rows,
         "output_open_questions": output_open_questions,
         "infobase_checks": infobase_rows,
@@ -506,6 +629,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
       <div class="subtle" id="project-caption"></div>
       <nav class="nav">
         <a href="#summary">Свод <span id="nav-feature-count"></span></a>
+        <a href="#detail-maps">Карты доработок <span id="nav-detail-count"></span></a>
         <a href="#features">Блоки BF <span id="nav-open-count"></span></a>
         <a href="#questions">Открытые вопросы</a>
         <a href="#migration">Переход на ДО 3.0</a>
@@ -527,6 +651,21 @@ def dashboard_html(data: dict[str, Any]) -> str:
 
       <section id="summary">
         <div class="grid metrics" id="metrics"></div>
+      </section>
+
+      <section id="detail-maps">
+        <h2>Карты доработок</h2>
+        <div class="toolbar">
+          <input id="detail-search" type="search" placeholder="Поиск по карте, объекту, правилу, источнику">
+          <select id="detail-type-filter"><option value="">Все типы</option></select>
+          <select id="detail-status-filter"><option value="">Все статусы</option></select>
+          <select id="detail-feature-filter"><option value="">Все BF</option></select>
+          <select id="detail-question-filter">
+            <option value="">Все карты</option>
+            <option value="open">С открытыми вопросами</option>
+          </select>
+        </div>
+        <div class="feature-list" id="detail-map-list"></div>
       </section>
 
       <section id="features">
@@ -609,6 +748,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
       byId("project-caption").textContent = [project.id, project.product].filter(Boolean).join(" · ");
       byId("generated-at").textContent = `Сформировано: ${{data.generated_at || ""}}`;
       byId("nav-feature-count").textContent = data.summary.feature_count || 0;
+      byId("nav-detail-count").textContent = data.summary.detail_map_count || 0;
       byId("nav-open-count").textContent = data.summary.open_question_count || 0;
     }}
 
@@ -617,6 +757,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
         ["Блоки BF", data.summary.feature_count],
         ["Строки сравнения", data.summary.diff_count],
         ["Строки покрытия", data.summary.coverage_count],
+        ["Карты доработок", data.summary.detail_map_count || 0],
         ["Открытые вопросы", data.summary.open_question_count],
         ["Проверки ИБ/UI", data.summary.infobase_check_count],
         ["Рисковые блоки", data.summary.risk_feature_count],
@@ -629,6 +770,19 @@ def dashboard_html(data: dict[str, Any]) -> str:
       const confidences = [...new Map(data.features.map((f) => [f.confidence, f.confidence_label])).entries()].filter(([key]) => key);
       byId("status-filter").innerHTML += statuses.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
       byId("confidence-filter").innerHTML += confidences.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
+      const detailTypes = [...new Map((data.detail_maps || []).map((item) => [item.type, item.type_label])).entries()].filter(([key]) => key);
+      const detailStatuses = [...new Map((data.detail_maps || []).map((item) => [item.status, item.status_label])).entries()].filter(([key]) => key);
+      const detailFeatures = [...new Set((data.detail_maps || []).flatMap((item) => item.linked_features || []))].filter(Boolean).sort();
+      byId("detail-type-filter").innerHTML += detailTypes.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
+      byId("detail-status-filter").innerHTML += detailStatuses.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
+      byId("detail-feature-filter").innerHTML += detailFeatures.map((value) => `<option value="${{esc(value)}}">${{esc(value)}}</option>`).join("");
+    }}
+
+    function linkedDetailMapsBox(feature) {{
+      if (!feature.detail_maps || !feature.detail_maps.length) {{
+        return '<span class="empty">Для блока пока нет отдельных предметных карт.</span>';
+      }}
+      return feature.detail_maps.map((item) => `<a class="badge ${{badgeClass(item.status)}}" href="${{esc(item.href)}}">${{esc(item.type_label)}} · ${{esc(item.title)}}</a>`).join(" ");
     }}
 
     function renderFeature(feature) {{
@@ -654,6 +808,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
             <span class="badge">доказательства: ${{feature.evidence_count}}</span>
             <span class="badge">покрытие: ${{feature.coverage_count}}</span>
             <span class="badge">вопросы: ${{feature.open_questions_count}}</span>
+            <span class="badge">карты: ${{feature.detail_maps_count}}</span>
           </div>
         </div>
         <p>${{esc(feature.summary)}}</p>
@@ -671,6 +826,10 @@ def dashboard_html(data: dict[str, Any]) -> str:
             ${{feature.evidence_pack_href ? `<div><a href="${{esc(feature.evidence_pack_href)}}">${{esc(feature.evidence_pack_path)}}</a></div>` : ""}}
           </div>
         </div>
+        <details>
+          <summary>Связанные карты доработок</summary>
+          <div class="box">${{linkedDetailMapsBox(feature)}}</div>
+        </details>
         <details>
           <summary>Сводка блока</summary>
           <div class="box">
@@ -697,13 +856,107 @@ def dashboard_html(data: dict[str, Any]) -> str:
       </article>`;
     }}
 
+    const detailColumns = {{
+      attributes: [["object","Объект"],["kind","Тип"],["name","Имя"],["synonym","Синоним"],["data_type","Тип данных"],["vendor_status","Статус к вендору"],["relation","Связь с доработкой"],["confidence","Достоверность"],["source","Источник"],["line","Строка"],["comment","Комментарий"]],
+      form_rules: [["id","ID"],["rule","Правило"],["description","Описание"],["mechanism","Условие/механизм"],["confidence","Достоверность"],["source","Источник"],["line","Строка"]],
+      validations: [["id","ID"],["field","Поле"],["validation","Проверка/обязательность"],["mechanism","Механизм"],["confidence","Достоверность"],["source","Источник"],["line","Строка"]],
+      lifecycle: [["id","ID"],["action","Переход/действие"],["description","Описание"],["mechanism","Условие/механизм"],["confidence","Достоверность"],["source","Источник"],["line","Строка"]],
+      rights: [["id","ID"],["role","Роль/ФИО-роль"],["description","Описание"],["mechanism","Механизм"],["confidence","Достоверность"],["source","Источник"],["line","Строка"]],
+      scheduled_jobs: [["id","ID"],["name","Регламентное задание"],["description","Описание"],["mechanism","Механизм"],["status","Статус"],["confidence","Достоверность"],["source","Источник"],["line","Строка"]],
+      ui: [["id","ID"],["surface","UI-поверхность"],["command","Команда"],["description","Описание"],["confidence","Достоверность"],["source","Источник"],["line","Строка"]],
+      integrations: [["id","ID"],["system","Система"],["flow","Поток"],["description","Описание"],["confidence","Достоверность"],["source","Источник"],["line","Строка"]],
+      sources: [["id","ID"],["claim","Что подтверждает"],["source","Источник"],["line","Строка"],["evidence","Доказательство"]],
+      open_questions: [["id","ID"],["question","Вопрос"],["why_open","Почему открыт"],["needed","Что нужно"]],
+    }};
+    const detailSectionLabels = {{
+      attributes: "Реквизиты",
+      form_rules: "Правила формы",
+      validations: "Проверки заполнения",
+      lifecycle: "Жизненный цикл",
+      rights: "Права и роли",
+      scheduled_jobs: "Регламентные задания",
+      ui: "UI-поверхности",
+      integrations: "Интеграции",
+      sources: "Источники",
+      open_questions: "Открытые вопросы",
+    }};
+
+    function detailSection(map, sectionKey) {{
+      const rows = (map.sections || {{}})[sectionKey] || [];
+      const count = (map.counts || {{}})[sectionKey] || rows.length;
+      return `<details>
+        <summary>${{esc(detailSectionLabels[sectionKey])}} · ${{count}}</summary>
+        ${{rowsTable(rows, detailColumns[sectionKey])}}
+      </details>`;
+    }}
+
+    function renderDetailMap(map) {{
+      const notes = (map.migration_notes || []).map((note) => `<li>${{esc(note)}}</li>`).join("") || "<li>Отдельные замечания по переходу пока не указаны.</li>";
+      const features = (map.linked_features || []).map((featureId) => `<a class="badge" href="#${{esc(featureId)}}">${{esc(featureId)}}</a>`).join(" ") || '<span class="badge">BF не указан</span>';
+      const sourceLinks = `<div><a href="${{esc(map.source_href)}}">${{esc(map.source_path)}}</a></div>` + (map.source_workbook_href ? `<div><a href="${{esc(map.source_workbook_href)}}">${{esc(map.source_workbook)}}</a></div>` : "");
+      return `<article class="feature" id="detail-${{esc(map.slug)}}">
+        <div class="feature-head">
+          <div>
+            <div class="title-row">
+              <span class="feature-title">${{esc(map.title)}}</span>
+              <span class="badge info">${{esc(map.type_label)}}</span>
+              <span class="badge ${{badgeClass(map.status)}}">${{esc(map.status_label)}}</span>
+              <span class="badge">${{esc(map.confidence_label)}}</span>
+            </div>
+            <div class="subtle">Владелец: ${{esc(map.owner_feature || "не указан")}} · Связанные BF: ${{(map.linked_features || []).join(", ") || "не указаны"}}</div>
+          </div>
+          <div class="badges">
+            <span class="badge">реквизиты: ${{(map.counts || {{}}).attributes || 0}}</span>
+            <span class="badge">проверки: ${{(map.counts || {{}}).validations || 0}}</span>
+            <span class="badge">вопросы: ${{map.open_questions_count || 0}}</span>
+          </div>
+        </div>
+        <p>${{esc(map.summary)}}</p>
+        <div class="section-grid">
+          <div class="box">
+            <h3>Что важно для ДО 3.0</h3>
+            <ul>${{notes}}</ul>
+          </div>
+          <div class="box">
+            <h3>Связи и источники</h3>
+            <div class="badges">${{features}}</div>
+            ${{sourceLinks}}
+          </div>
+        </div>
+        ${{Object.keys(detailSectionLabels).map((sectionKey) => detailSection(map, sectionKey)).join("")}}
+      </article>`;
+    }}
+
+    function filteredDetailMaps() {{
+      const query = byId("detail-search").value.trim().toLowerCase();
+      const type = byId("detail-type-filter").value;
+      const status = byId("detail-status-filter").value;
+      const feature = byId("detail-feature-filter").value;
+      const questionMode = byId("detail-question-filter").value;
+      return (data.detail_maps || []).filter((map) => {{
+        const text = JSON.stringify(map).toLowerCase();
+        if (query && !text.includes(query)) return false;
+        if (type && map.type !== type) return false;
+        if (status && map.status !== status) return false;
+        if (feature && !(map.linked_features || []).includes(feature)) return false;
+        if (questionMode === "open" && !map.open_questions_count) return false;
+        return true;
+      }});
+    }}
+
+    function renderDetailMaps() {{
+      const maps = filteredDetailMaps();
+      byId("detail-map-list").innerHTML = maps.length ? maps.map(renderDetailMap).join("") : '<div class="panel empty">Предметные карты по текущим фильтрам не найдены.</div>';
+    }}
+
     function filteredFeatures() {{
       const query = byId("search").value.trim().toLowerCase();
       const status = byId("status-filter").value;
       const confidence = byId("confidence-filter").value;
       const questionMode = byId("question-filter").value;
       return data.features.filter((feature) => {{
-        const text = [feature.feature_id, feature.title, feature.domain, feature.summary, feature.notes].join(" ").toLowerCase();
+        const linkedMaps = (feature.detail_maps || []).map((item) => `${{item.title}} ${{item.type_label}}`).join(" ");
+        const text = [feature.feature_id, feature.title, feature.domain, feature.summary, feature.notes, linkedMaps, feature.summary_md].join(" ").toLowerCase();
         if (query && !text.includes(query)) return false;
         if (status && feature.status !== status) return false;
         if (confidence && feature.confidence !== confidence) return false;
@@ -765,11 +1018,13 @@ def dashboard_html(data: dict[str, Any]) -> str:
       renderHeader();
       renderMetrics();
       fillFilters();
+      renderDetailMaps();
       renderFeatures();
       renderQuestions();
       renderMigration();
       renderAudit();
       ["search","status-filter","confidence-filter","question-filter"].forEach((id) => byId(id).addEventListener("input", renderFeatures));
+      ["detail-search","detail-type-filter","detail-status-filter","detail-feature-filter","detail-question-filter"].forEach((id) => byId(id).addEventListener("input", renderDetailMaps));
     }}
     boot();
   </script>
@@ -794,6 +1049,7 @@ def build_review_dashboard(root: Path, output_dir: Path | None = None) -> dict[s
         "html": str(html_path),
         "data": str(data_path),
         "feature_count": data["summary"]["feature_count"],
+        "detail_map_count": data["summary"]["detail_map_count"],
         "open_question_count": data["summary"]["open_question_count"],
         "risk_feature_count": data["summary"]["risk_feature_count"],
     }
@@ -806,6 +1062,7 @@ def build_command(args: argparse.Namespace) -> int:
     print(f"review_dashboard_html: {result['html']}")
     print(f"review_dashboard_data: {result['data']}")
     print(f"features: {result['feature_count']}")
+    print(f"detail_maps: {result['detail_map_count']}")
     print(f"open_questions: {result['open_question_count']}")
     print(f"risk_features: {result['risk_feature_count']}")
     return 0

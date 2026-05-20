@@ -46,6 +46,7 @@ python -m one_c_autoresearch review-dashboard build
 
 ```text
 analysis/cache/      generated indexes and noisy machine data
+analysis/detail-maps/ analyst-level maps for concrete customization subjects
 analysis/queue/      file-backed work queue
 analysis/reverse-map/ durable state for fact-to-intent reverse mapping
 analysis/features/   feature evidence packs
@@ -68,4 +69,4 @@ python -m one_c_autoresearch autopilot scaffold --enable-gate
 
 Then follow `docs/method/autopilot-customization-map.md`. With `autopilot.enabled=true`, `python -m one_c_autoresearch doctor --deep --strict` fails until every diff entry is classified, reverse-map decisions are normalized through `python -m one_c_autoresearch final-gate build`, every feature pack has evidence, final outputs exist, and `analysis/final-audit.md` declares complete coverage without reverse-map blockers.
 
-After final outputs are current, run `python -m one_c_autoresearch review-dashboard build` to create `outputs/review/index.html` and `outputs/review/data.json` for analyst review.
+After final outputs are current, add any concrete subject maps under `analysis/detail-maps/`, then run `python -m one_c_autoresearch review-dashboard build` to create `outputs/review/index.html` and `outputs/review/data.json` for analyst review.

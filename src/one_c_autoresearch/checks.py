@@ -100,6 +100,8 @@ def test_template(args: argparse.Namespace) -> int:
         "templates/research-repo/analysis/indexes/feature-map.csv",
         "templates/research-repo/analysis/indexes/final-diff-inventory.csv",
         "templates/research-repo/analysis/indexes/final-feature-map.csv",
+        "templates/research-repo/analysis/detail-maps/README.md",
+        "templates/research-repo/analysis/detail-maps/_templates/detail-map.json",
         "templates/research-repo/analysis/reverse-map/README.md",
         "templates/research-repo/analysis/reverse-map/state.md",
         "templates/research-repo/analysis/reverse-map/coverage.csv",
@@ -159,6 +161,8 @@ def test_template(args: argparse.Namespace) -> int:
     require_text(root, "templates/research-repo/analysis/indexes/final-diff-inventory.csv", rf"^{re.escape(FINAL_DIFF_INVENTORY_HEADER)}$", "Final diff inventory template should expose the canonical final-gate header.", errors)
     require_text(root, "templates/research-repo/analysis/indexes/final-feature-map.csv", r"^feature_id,title,domain,source_bucket,classification,confidence,status,owner,summary,evidence_pack_path,open_questions_path,outputs,notes$", "Final feature map template should expose the canonical final-gate header.", errors)
     require_text(root, "templates/research-repo/outputs/open-questions.csv", r"^question_id,feature_id,status,reason,closure_method,impact,source_ref,owner,notes$", "Open questions template should expose the canonical autopilot header.", errors)
+    require_text(root, "templates/research-repo/analysis/detail-maps/README.md", r"detail-map\.json", "Detail-map README should document the detail-map.json contract.", errors)
+    require_text(root, "templates/research-repo/analysis/detail-maps/_templates/detail-map.json", r'"linked_features"', "Detail-map template should expose linked_features.", errors)
     require_text(root, "templates/research-repo/analysis/reverse-map/coverage.csv", rf"^{re.escape(REVERSE_MAP_COVERAGE_HEADER)}$", "Reverse-map coverage template should expose the canonical header.", errors)
     require_text(root, "templates/research-repo/project.toml", r"(?m)^\[autopilot\]$", "Generated manifest should include the autopilot final-gate section.", errors)
     require_text(root, "templates/research-repo/docs/agent/index.md", r"reverse-map claim", "Agent router should document the reverse-map continuation command.", errors)
@@ -297,6 +301,103 @@ def test_doctor(args: argparse.Namespace) -> int:
             "# Final Audit\n\nCoverage status: complete\n\nUnclassified diff entries: 0\n\nStarting diff entries: 1\nFinal diff entries: 1\nOpen questions: 0\n",
             encoding="utf-8",
         )
+        document_map = repo_path(complete_repo, "analysis/detail-maps/example-document/detail-map.json")
+        document_map.parent.mkdir(parents=True, exist_ok=True)
+        document_map.write_text(
+            json.dumps(
+                {
+                    "schema_version": "detail-map/v1",
+                    "id": "example-document",
+                    "slug": "example-document",
+                    "title": "Пример документа",
+                    "type": "document",
+                    "status": "complete",
+                    "confidence": "high",
+                    "owner_feature": "feature-a",
+                    "linked_features": ["feature-a"],
+                    "summary": "Детальная карта документа для smoke-проверки.",
+                    "migration_notes": ["Проверить перенос реквизитов и правил формы на целевой релиз."],
+                    "attributes": [
+                        {
+                            "object": "Catalog.Example",
+                            "kind": "Attribute",
+                            "name": "ExampleAttribute",
+                            "synonym": "Пример реквизита",
+                            "data_type": "xs:string",
+                            "vendor_status": "добавлен",
+                            "relation": "Ключевой реквизит документа",
+                            "confidence": "high",
+                            "source": "cf/Catalogs/Example.xml",
+                            "line": "10",
+                            "comment": "",
+                        }
+                    ],
+                    "form_rules": [
+                        {
+                            "id": "FR01",
+                            "rule": "Настройка формы",
+                            "description": "Форма меняет доступность реквизита.",
+                            "mechanism": "ПриОткрытии",
+                            "confidence": "high",
+                            "source": "cf/Catalogs/Example/Forms/ФормаЭлемента/Ext/Form/Module.bsl",
+                            "line": "20",
+                        }
+                    ],
+                    "validations": [],
+                    "lifecycle": [],
+                    "rights": [],
+                    "scheduled_jobs": [],
+                    "ui": [],
+                    "integrations": [],
+                    "sources": [],
+                    "open_questions": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        route_map = repo_path(complete_repo, "analysis/detail-maps/example-route/detail-map.json")
+        route_map.parent.mkdir(parents=True, exist_ok=True)
+        route_map.write_text(
+            json.dumps(
+                {
+                    "schema_version": "detail-map/v1",
+                    "id": "example-route",
+                    "slug": "example-route",
+                    "title": "Пример маршрута",
+                    "type": "route",
+                    "status": "requires_1c_review",
+                    "confidence": "medium",
+                    "owner_feature": "feature-a",
+                    "linked_features": ["feature-a"],
+                    "summary": "Детальная карта маршрута для проверки нескольких типов.",
+                    "migration_notes": [],
+                    "attributes": [],
+                    "form_rules": [],
+                    "validations": [],
+                    "lifecycle": [],
+                    "rights": [],
+                    "scheduled_jobs": [],
+                    "ui": [],
+                    "integrations": [],
+                    "sources": [],
+                    "open_questions": [
+                        {
+                            "id": "OQ01",
+                            "question": "Какие условия маршрута включены в ИБ?",
+                            "why_open": "Нужны данные ИБ.",
+                            "needed": "Выгрузить настройки маршрута.",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         seed_reverse_map_workitems(complete_repo)
         repo_path(complete_repo, "analysis/reverse-map/coverage.csv").write_text(
             REVERSE_MAP_COVERAGE_HEADER
@@ -320,11 +421,19 @@ def test_doctor(args: argparse.Namespace) -> int:
             html = dashboard_html.read_text(encoding="utf-8")
             require("Карта доработок" in html, "Review dashboard should contain a Russian customization-map heading", errors)
             require("Example feature" in html, "Review dashboard should contain feature titles", errors)
+            require("Карты доработок" in html, "Review dashboard should expose the detail-map section", errors)
+            require("Пример документа" in html, "Review dashboard should render detail-map titles", errors)
+            require("Реквизиты" in html, "Review dashboard should render detail-map attribute tables", errors)
             require("Что важно для перехода на ДО 3.0" in html, "Review dashboard should expose the migration-impact section", errors)
         if dashboard_data.exists():
             data = json.loads(dashboard_data.read_text(encoding="utf-8"))
             require(data.get("summary", {}).get("feature_count") == 1, "Review dashboard data should include the feature count", errors)
+            require(data.get("summary", {}).get("detail_map_count") == 2, "Review dashboard data should include detail-map count", errors)
+            require(data.get("summary", {}).get("detail_map_by_type", {}).get("document") == 1, "Review dashboard data should count document detail maps", errors)
+            require(data.get("summary", {}).get("detail_map_by_type", {}).get("route") == 1, "Review dashboard data should count route detail maps", errors)
+            require({item.get("slug") for item in data.get("detail_maps", [])} == {"example-document", "example-route"}, "Review dashboard data should include synthetic detail maps", errors)
             require(data.get("features", [{}])[0].get("evidence_count") == 1, "Review dashboard data should include evidence counts", errors)
+            require(data.get("features", [{}])[0].get("detail_maps_count") == 2, "Feature data should include linked detail-map counts", errors)
         complete = run_doctor(complete_repo)
         require(complete["status"] == "ok", "Autopilot gate should pass on a complete customization map", errors)
 

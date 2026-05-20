@@ -21,7 +21,8 @@ The autopilot final-map workflow produces:
 
 When `autopilot.enabled=true`, these files are checked by `python -m one_c_autoresearch doctor`.
 
-Build the analyst review dashboard after final-gate outputs are current:
+Build the analyst review dashboard after final-gate outputs and any
+`analysis/detail-maps/*/detail-map.json` subject maps are current:
 
 ```bash
 python -m one_c_autoresearch review-dashboard build

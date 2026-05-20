@@ -44,6 +44,28 @@ AUTOPILOT_FEATURE_STATUSES = {
     "needs_reclassification",
     "out_of_scope",
 }
+DETAIL_MAP_TYPES = {"document", "catalog", "route", "scheduled_job", "rights", "integration", "report", "ui", "other"}
+DETAIL_MAP_STATUSES = {
+    "draft",
+    "complete",
+    "needs_review",
+    "requires_1c_review",
+    "needs_infobase_data",
+    "requires_runtime_verification",
+    "blocked_by_infobase_data",
+}
+DETAIL_MAP_SECTIONS = {
+    "attributes",
+    "form_rules",
+    "validations",
+    "lifecycle",
+    "rights",
+    "scheduled_jobs",
+    "ui",
+    "integrations",
+    "sources",
+    "open_questions",
+}
 
 TEMPLATE_REQUIRED_PATHS = [
     ".github/workflows/verify.yml",
@@ -89,6 +111,8 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/analysis/indexes/feature-map.csv",
     "templates/research-repo/analysis/indexes/final-diff-inventory.csv",
     "templates/research-repo/analysis/indexes/final-feature-map.csv",
+    "templates/research-repo/analysis/detail-maps/README.md",
+    "templates/research-repo/analysis/detail-maps/_templates/detail-map.json",
     "templates/research-repo/analysis/reverse-map/README.md",
     "templates/research-repo/analysis/reverse-map/state.md",
     "templates/research-repo/analysis/reverse-map/coverage.csv",
@@ -154,6 +178,8 @@ RESEARCH_REQUIRED_PATHS = [
     "analysis/indexes/feature-map.csv",
     "analysis/indexes/final-diff-inventory.csv",
     "analysis/indexes/final-feature-map.csv",
+    "analysis/detail-maps/README.md",
+    "analysis/detail-maps/_templates/detail-map.json",
     "analysis/reverse-map/README.md",
     "analysis/reverse-map/state.md",
     "analysis/reverse-map/coverage.csv",
@@ -751,6 +777,51 @@ class Doctor:
             else:
                 self.checks.add("reverse_map.coverage.diff_complete", "ok", "Reverse-map coverage contains every diff inventory row")
 
+    def test_detail_maps_contract(self) -> None:
+        self.require_path("analysis/detail-maps/README.md", "detail_maps")
+        self.require_path("analysis/detail-maps/_templates/detail-map.json", "detail_maps")
+        root = repo_path(self.root, "analysis/detail-maps")
+        if not root.exists():
+            return
+        maps = [
+            path
+            for path in sorted(root.glob("*/detail-map.json"))
+            if "_templates" not in path.relative_to(root).parts
+        ]
+        if not maps:
+            self.checks.add("detail_maps.empty", "ok", "No detail maps defined yet")
+            return
+        slugs: set[str] = set()
+        for path in maps:
+            relative = path.relative_to(self.root).as_posix()
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                self.checks.add("detail_maps.parse", "fail", f"Could not parse {relative}: {exc}")
+                continue
+            for field in ("id", "slug", "title", "type", "status", "confidence", "owner_feature", "linked_features", "summary"):
+                value = data.get(field)
+                if value in (None, "", []):
+                    self.checks.add("detail_maps.required_field", "fail", f"{relative} is missing required field: {field}")
+            slug = str(data.get("slug") or path.parent.name).strip()
+            if slug in slugs:
+                self.checks.add("detail_maps.duplicate_slug", "fail", f"Duplicate detail-map slug: {slug}")
+            elif slug:
+                slugs.add(slug)
+            map_type = str(data.get("type", "")).strip()
+            if map_type and map_type not in DETAIL_MAP_TYPES:
+                self.checks.add("detail_maps.type", "fail", f"{relative} has invalid type: {map_type}")
+            status = str(data.get("status", "")).strip()
+            if status and status not in DETAIL_MAP_STATUSES:
+                self.checks.add("detail_maps.status", "fail", f"{relative} has invalid status: {status}")
+            if data.get("linked_features") is not None and not isinstance(data.get("linked_features"), list):
+                self.checks.add("detail_maps.linked_features", "fail", f"{relative} linked_features must be a list")
+            for section in DETAIL_MAP_SECTIONS:
+                if section in data and not isinstance(data[section], list):
+                    self.checks.add("detail_maps.section_type", "fail", f"{relative} section {section} must be a list")
+        if slugs:
+            self.checks.add("detail_maps.rows", "ok", f"Detail-map contract has {len(slugs)} map(s)")
+
     def test_unresolved_placeholders(self) -> None:
         found = False
         for path in self.root.rglob("*"):
@@ -782,6 +853,7 @@ class Doctor:
         manifest = self.test_project_toml("project.toml")
         self.test_queue("analysis/queue/tasks.jsonl")
         self.test_evidence_packs()
+        self.test_detail_maps_contract()
         self.test_reverse_map_contract()
         self.test_autopilot_contract(manifest)
         self.test_unresolved_placeholders()
