@@ -13,6 +13,11 @@
     "BF-000"
   ],
   "summary": "Short analyst-facing summary of the concrete customization subject.",
+  "identification": "How the customization subject is identified or activated in metadata/runtime data.",
+  "key_conclusion": "Main analyst-facing conclusion: what was actually customized and why it matters.",
+  "upgrade_risk": "Main risk or compatibility concern for migration to the target vendor release.",
+  "runtime_data_needed": "Which infobase/runtime data is needed to close remaining uncertainty.",
+  "review_status": "Human review status for this subject map.",
   "migration_notes": [
     "Record what matters for migration to the target vendor release."
   ],

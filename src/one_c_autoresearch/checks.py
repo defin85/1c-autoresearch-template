@@ -326,6 +326,11 @@ def test_doctor(args: argparse.Namespace) -> int:
                     "owner_feature": "feature-a",
                     "linked_features": ["feature-a"],
                     "summary": "Детальная карта документа для smoke-проверки.",
+                    "identification": "Через признак тестовой предметной карты.",
+                    "key_conclusion": "Предметная карта документа показывает реквизит, правило формы и источник доказательства.",
+                    "upgrade_risk": "При переходе нужно сверить реквизит и правило формы с целевым релизом.",
+                    "runtime_data_needed": "Нужны значения тестового справочника в ИБ.",
+                    "review_status": "Готово к ревью аналитиком.",
                     "migration_notes": ["Проверить перенос реквизитов и правил формы на целевой релиз."],
                     "attributes": [
                         {
@@ -385,6 +390,11 @@ def test_doctor(args: argparse.Namespace) -> int:
                     "owner_feature": "feature-a",
                     "linked_features": ["feature-a"],
                     "summary": "Детальная карта маршрута для проверки нескольких типов.",
+                    "identification": "Через тестовый маршрут согласования.",
+                    "key_conclusion": "Предметная карта маршрута фиксирует условия согласования.",
+                    "upgrade_risk": "При переходе нужно сверить условия маршрута в ИБ.",
+                    "runtime_data_needed": "Нужны настройки маршрута из ИБ.",
+                    "review_status": "Требует проверки ИБ.",
                     "migration_notes": [],
                     "attributes": [],
                     "form_rules": [],
@@ -457,10 +467,15 @@ def test_doctor(args: argparse.Namespace) -> int:
             html = dashboard_html.read_text(encoding="utf-8")
             require("Карта доработок" in html, "Review dashboard should contain a Russian customization-map heading", errors)
             require("Example feature" in html, "Review dashboard should contain feature titles", errors)
-            require("Собственно доработки" in html, "Review dashboard should put the business customization catalog before technical details", errors)
-            require("renderCustomizationGroups" in html, "Review dashboard should render grouped business customizations", errors)
-            require("Ключевые объекты" in html, "Review dashboard should expose key changed objects for each customization", errors)
-            require("Карты доработок" in html, "Review dashboard should expose the detail-map section", errors)
+            require("Предметные карты доработок" in html, "Review dashboard should put analyst-facing subject maps first", errors)
+            require("renderSubjectMaps" in html, "Review dashboard should render subject maps as the primary unit", errors)
+            require("Ключевой вывод" in html, "Review dashboard should expose the subject-map key conclusion", errors)
+            require("Upgrade-риск" in html, "Review dashboard should expose the subject-map upgrade risk", errors)
+            require("Идентификация" in html, "Review dashboard should expose subject-map identification", errors)
+            require("Группировка по BF" in html, "Review dashboard should keep BF as secondary grouping", errors)
+            require("Техническая подложка" in html, "Review dashboard should move generated maps into a technical foundation section", errors)
+            require(html.find("Предметные карты доработок") < html.find("Группировка по BF") < html.find("Техническая подложка"), "Review dashboard should order subject maps before BF grouping and technical foundation", errors)
+            require("Пример документа" in html, "Review dashboard should render subject-map titles", errors)
             require("Пример документа" in html, "Review dashboard should render detail-map titles", errors)
             require("Реквизиты" in html, "Review dashboard should render detail-map attribute tables", errors)
             require("DETAIL_MAP_PAGE_SIZE" in html, "Review dashboard should page large detail-map lists instead of rendering every map at boot", errors)
@@ -476,6 +491,15 @@ def test_doctor(args: argparse.Namespace) -> int:
             require(data.get("summary", {}).get("detail_map_by_type", {}).get("route") == 1, "Review dashboard data should count route detail maps", errors)
             require(data.get("summary", {}).get("detail_map_by_generation_mode", {}).get("generated") == 2, "Review dashboard data should count generated detail maps", errors)
             require({item.get("slug") for item in data.get("detail_maps", [])} == {"example-document", "example-route", "catalog-example", "scheduled-job-examplejob"}, "Review dashboard data should include manual and generated detail maps", errors)
+            require(data.get("summary", {}).get("subject_map_count") == 2, "Review dashboard data should count manual/enriched subject maps", errors)
+            require(data.get("summary", {}).get("technical_map_count") == 2, "Review dashboard data should count generated technical maps", errors)
+            subject_slugs = {item.get("slug") for item in data.get("subject_maps", [])}
+            technical_slugs = {item.get("slug") for item in data.get("detail_maps", []) if item.get("generation_mode") == "generated"}
+            require(subject_slugs == {"example-document", "example-route"}, "Review dashboard should expose manual/enriched maps as subject maps", errors)
+            require(technical_slugs == {"catalog-example", "scheduled-job-examplejob"}, "Review dashboard should expose generated maps only as technical maps", errors)
+            document_subject = next((item for item in data.get("subject_maps", []) if item.get("slug") == "example-document"), {})
+            require(bool(document_subject.get("key_conclusion")), "Subject maps should include key_conclusion", errors)
+            require(bool(document_subject.get("upgrade_risk")), "Subject maps should include upgrade_risk", errors)
             require(data.get("features", [{}])[0].get("evidence_count") == 2, "Review dashboard data should include evidence counts", errors)
             require(data.get("features", [{}])[0].get("detail_maps_count") == 4, "Feature data should include linked detail-map counts", errors)
         complete = run_doctor(complete_repo)

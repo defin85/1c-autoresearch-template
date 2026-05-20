@@ -263,6 +263,11 @@ def load_detail_maps(root: Path, output_dir: Path) -> list[dict[str, Any]]:
                 "owner_feature": str(raw.get("owner_feature", "") or ""),
                 "linked_features": text_list(raw.get("linked_features", [])),
                 "summary": str(raw.get("summary", "") or ""),
+                "identification": str(raw.get("identification", "") or ""),
+                "key_conclusion": str(raw.get("key_conclusion", "") or ""),
+                "upgrade_risk": str(raw.get("upgrade_risk", "") or ""),
+                "runtime_data_needed": str(raw.get("runtime_data_needed", "") or ""),
+                "review_status": str(raw.get("review_status", "") or ""),
                 "migration_notes": text_list(raw.get("migration_notes", [])),
                 "source_path": path.relative_to(root).as_posix(),
                 "source_href": repo_href(root, output_dir, path.relative_to(root).as_posix()),
@@ -290,7 +295,7 @@ def detail_map_summaries(detail_maps: list[dict[str, Any]], feature_id: str) -> 
                     "generation_mode_label": detail_map["generation_mode_label"],
                     "status": detail_map["status"],
                     "status_label": detail_map["status_label"],
-                    "href": f"#detail-{detail_map['slug']}",
+                    "href": f"#subject-{detail_map['slug']}" if detail_map["generation_mode"] in {"manual", "enriched"} else f"#detail-{detail_map['slug']}",
                 }
             )
     return linked
@@ -407,6 +412,8 @@ def build_dashboard_data(root: Path, output_dir: Path) -> dict[str, Any]:
     infobase_rows = non_empty_rows(read_csv_rows(repo_path(root, "analysis/reverse-map/infobase-checks.csv")))
     output_open_questions = non_empty_rows(read_csv_rows(repo_path(root, "outputs/open-questions.csv")))
     detail_maps = load_detail_maps(root, output_dir)
+    subject_maps = [detail_map for detail_map in detail_maps if detail_map["generation_mode"] in {"manual", "enriched"}]
+    technical_maps = [detail_map for detail_map in detail_maps if detail_map["generation_mode"] == "generated"]
 
     if not feature_rows:
         raise RuntimeError("No feature rows found in analysis/indexes/feature-map.csv")
@@ -458,6 +465,9 @@ def build_dashboard_data(root: Path, output_dir: Path) -> dict[str, Any]:
         "closed_infobase_check_count": sum(1 for row in infobase_rows if (row.get("status_after_pass") or "").strip() == "closed"),
         "risk_feature_count": len(risk_features),
         "detail_map_count": len(detail_maps),
+        "subject_map_count": len(subject_maps),
+        "technical_map_count": len(technical_maps),
+        "complete_subject_map_count": sum(1 for detail_map in subject_maps if detail_map["key_conclusion"] and detail_map["upgrade_risk"]),
         "detail_map_by_type": dict(sorted(Counter(detail_map["type"] for detail_map in detail_maps).items())),
         "detail_map_by_generation_mode": dict(sorted(Counter(detail_map["generation_mode"] for detail_map in detail_maps).items())),
         "detail_map_open_question_count": sum(detail_map["open_questions_count"] for detail_map in detail_maps),
@@ -488,6 +498,7 @@ def build_dashboard_data(root: Path, output_dir: Path) -> dict[str, Any]:
         "project": project,
         "summary": summary,
         "features": features,
+        "subject_maps": subject_maps,
         "detail_maps": detail_maps,
         "open_questions": unresolved_rows,
         "output_open_questions": output_open_questions,
@@ -631,6 +642,14 @@ def dashboard_html(data: dict[str, Any]) -> str:
       margin-top: 12px;
     }}
     .customization-block h3 {{ margin-top: 0; }}
+    .subject-overview {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 12px;
+      margin-top: 12px;
+    }}
+    .subject-overview .box h3 {{ margin-top: 0; }}
+    .subject-section {{ margin-top: 14px; }}
     .object-links {{ display: flex; flex-wrap: wrap; gap: 6px; }}
     .feature-head {{
       display: grid;
@@ -676,6 +695,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
       .toolbar {{ grid-template-columns: 1fr; }}
       .section-grid {{ grid-template-columns: 1fr; }}
       .customization-body {{ grid-template-columns: 1fr; }}
+      .subject-overview {{ grid-template-columns: 1fr; }}
     }}
     @media (max-width: 1400px) and (min-width: 1101px) {{
       .toolbar {{ grid-template-columns: 1fr 1fr; }}
@@ -691,8 +711,9 @@ def dashboard_html(data: dict[str, Any]) -> str:
       <div class="subtle" id="project-caption"></div>
       <nav class="nav">
         <a href="#summary">Свод <span id="nav-feature-count"></span></a>
-        <a href="#customizations">Доработки <span id="nav-customization-count"></span></a>
-        <a href="#detail-maps">Техкарты <span id="nav-detail-count"></span></a>
+        <a href="#subject-maps">Предметные карты доработок <span id="nav-subject-count"></span></a>
+        <a href="#bf-groups">Группировка по BF <span id="nav-bf-count"></span></a>
+        <a href="#technical-maps">Техподложка <span id="nav-technical-count"></span></a>
         <a href="#features">Детализация BF <span id="nav-open-count"></span></a>
         <a href="#questions">Открытые вопросы</a>
         <a href="#migration">Переход на ДО 3.0</a>
@@ -712,29 +733,34 @@ def dashboard_html(data: dict[str, Any]) -> str:
         </div>
       </section>
 
+      <section id="subject-maps">
+        <h2>Предметные карты доработок</h2>
+        <div class="feature-list" id="subject-map-list"></div>
+      </section>
+
       <section id="summary">
+        <h2>Свод по анализу</h2>
         <div class="grid metrics" id="metrics"></div>
       </section>
 
-      <section id="customizations">
-        <h2>Собственно доработки</h2>
-        <div class="feature-list" id="customization-list"></div>
+      <section id="bf-groups">
+        <h2>Группировка по BF</h2>
+        <div class="feature-list" id="bf-group-list"></div>
       </section>
 
-      <section id="detail-maps">
-        <h2>Карты доработок: техническая детализация объектов</h2>
+      <section id="technical-maps">
+        <h2>Техническая подложка</h2>
         <div class="toolbar">
-          <input id="detail-search" type="search" placeholder="Поиск по карте, объекту, правилу, источнику">
-          <select id="detail-type-filter"><option value="">Все типы</option></select>
-          <select id="detail-generation-filter"><option value="">Все режимы</option></select>
-          <select id="detail-status-filter"><option value="">Все статусы</option></select>
-          <select id="detail-feature-filter"><option value="">Все BF</option></select>
-          <select id="detail-question-filter">
-            <option value="">Все карты</option>
+          <input id="technical-search" type="search" placeholder="Поиск по технической карте, объекту, правилу, источнику">
+          <select id="technical-type-filter"><option value="">Все типы</option></select>
+          <select id="technical-status-filter"><option value="">Все статусы</option></select>
+          <select id="technical-feature-filter"><option value="">Все BF</option></select>
+          <select id="technical-question-filter">
+            <option value="">Все технические карты</option>
             <option value="open">С открытыми вопросами</option>
           </select>
         </div>
-        <div class="feature-list" id="detail-map-list"></div>
+        <div class="feature-list" id="technical-map-list"></div>
       </section>
 
       <section id="features">
@@ -782,6 +808,8 @@ def dashboard_html(data: dict[str, Any]) -> str:
     const DETAIL_MAP_PAGE_SIZE = 60;
     let detailMapVisibleLimit = DETAIL_MAP_PAGE_SIZE;
     const detailMapBySlug = new Map((data.detail_maps || []).map((map) => [map.slug, map]));
+    const subjectMaps = data.subject_maps || [];
+    const technicalMaps = (data.detail_maps || []).filter((map) => map.generation_mode === "generated");
     const byId = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}}[char]));
     const badgeClass = (status) => {{
@@ -820,20 +848,20 @@ def dashboard_html(data: dict[str, Any]) -> str:
       byId("project-caption").textContent = [project.id, project.product].filter(Boolean).join(" · ");
       byId("generated-at").textContent = `Сформировано: ${{data.generated_at || ""}}`;
       byId("nav-feature-count").textContent = data.summary.feature_count || 0;
-      byId("nav-customization-count").textContent = data.summary.feature_count || 0;
-      byId("nav-detail-count").textContent = data.summary.detail_map_count || 0;
+      byId("nav-subject-count").textContent = data.summary.subject_map_count || 0;
+      byId("nav-bf-count").textContent = data.summary.feature_count || 0;
+      byId("nav-technical-count").textContent = data.summary.technical_map_count || 0;
       byId("nav-open-count").textContent = data.summary.open_question_count || 0;
     }}
 
     function renderMetrics() {{
       const metrics = [
+        ["Предметные карты", data.summary.subject_map_count || 0],
         ["Блоки BF", data.summary.feature_count],
-        ["Строки сравнения", data.summary.diff_count],
-        ["Строки покрытия", data.summary.coverage_count],
-        ["Карты доработок", data.summary.detail_map_count || 0],
+        ["Технические карты", data.summary.technical_map_count || 0],
         ["Открытые вопросы", data.summary.open_question_count],
         ["Проверки ИБ/UI", data.summary.infobase_check_count],
-        ["Рисковые блоки", data.summary.risk_feature_count],
+        ["Строки покрытия", data.summary.coverage_count],
       ];
       byId("metrics").innerHTML = metrics.map(([label, value]) => `<div class="metric"><strong>${{value}}</strong><span>${{esc(label)}}</span></div>`).join("");
     }}
@@ -843,14 +871,12 @@ def dashboard_html(data: dict[str, Any]) -> str:
       const confidences = [...new Map(data.features.map((f) => [f.confidence, f.confidence_label])).entries()].filter(([key]) => key);
       byId("status-filter").innerHTML += statuses.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
       byId("confidence-filter").innerHTML += confidences.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
-      const detailTypes = [...new Map((data.detail_maps || []).map((item) => [item.type, item.type_label])).entries()].filter(([key]) => key);
-      const detailGenerationModes = [...new Map((data.detail_maps || []).map((item) => [item.generation_mode, item.generation_mode_label])).entries()].filter(([key]) => key);
-      const detailStatuses = [...new Map((data.detail_maps || []).map((item) => [item.status, item.status_label])).entries()].filter(([key]) => key);
-      const detailFeatures = [...new Set((data.detail_maps || []).flatMap((item) => item.linked_features || []))].filter(Boolean).sort();
-      byId("detail-type-filter").innerHTML += detailTypes.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
-      byId("detail-generation-filter").innerHTML += detailGenerationModes.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
-      byId("detail-status-filter").innerHTML += detailStatuses.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
-      byId("detail-feature-filter").innerHTML += detailFeatures.map((value) => `<option value="${{esc(value)}}">${{esc(value)}}</option>`).join("");
+      const technicalTypes = [...new Map(technicalMaps.map((item) => [item.type, item.type_label])).entries()].filter(([key]) => key);
+      const technicalStatuses = [...new Map(technicalMaps.map((item) => [item.status, item.status_label])).entries()].filter(([key]) => key);
+      const technicalFeatures = [...new Set(technicalMaps.flatMap((item) => item.linked_features || []))].filter(Boolean).sort();
+      byId("technical-type-filter").innerHTML += technicalTypes.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
+      byId("technical-status-filter").innerHTML += technicalStatuses.map(([value, label]) => `<option value="${{esc(value)}}">${{esc(label)}}</option>`).join("");
+      byId("technical-feature-filter").innerHTML += technicalFeatures.map((value) => `<option value="${{esc(value)}}">${{esc(value)}}</option>`).join("");
     }}
 
     function detailMapWeight(map) {{
@@ -858,6 +884,11 @@ def dashboard_html(data: dict[str, Any]) -> str:
       const modeBonus = map.generation_mode === "enriched" ? 10000 : 0;
       const typePenalty = map.type === "other" ? -100 : 0;
       return modeBonus + typePenalty + count;
+    }}
+
+    const subjectMapSlugs = new Set(subjectMaps.map((map) => map.slug));
+    function mapHref(map) {{
+      return subjectMapSlugs.has(map.slug) ? `#subject-${{map.slug}}` : `#detail-${{map.slug}}`;
     }}
 
     function detailMapsForFeature(feature) {{
@@ -876,15 +907,16 @@ def dashboard_html(data: dict[str, Any]) -> str:
 
     function keyObjectLinks(maps) {{
       const visible = maps.slice(0, 8);
-      const links = visible.map((map) => `<a class="badge ${{badgeClass(map.status)}}" href="#detail-${{esc(map.slug)}}">${{esc(map.title)}}</a>`);
+      const links = visible.map((map) => `<a class="badge ${{badgeClass(map.status)}}" href="${{esc(mapHref(map))}}">${{esc(map.title)}}</a>`);
       if (maps.length > visible.length) links.push(`<span class="badge">еще ${{maps.length - visible.length}}</span>`);
       return links.join(" ") || '<span class="empty">Ключевые объекты не выделены.</span>';
     }}
 
-    function renderCustomizationGroup(feature) {{
+    function renderBfGroup(feature) {{
       const maps = detailMapsForFeature(feature);
       const risks = (feature.migration_risks || []).slice(0, 2).map((risk) => `<li>${{esc(risk)}}</li>`).join("") || "<li>Отдельные риски перехода не выделены текущими артефактами.</li>";
-      return `<article class="feature" id="customization-${{esc(feature.feature_id)}}">
+      const subjectMaps = maps.filter((map) => subjectMapSlugs.has(map.slug));
+      return `<article class="feature" id="bf-group-${{esc(feature.feature_id)}}">
         <div class="feature-head">
           <div>
             <div class="title-row">
@@ -895,20 +927,21 @@ def dashboard_html(data: dict[str, Any]) -> str:
             <div class="subtle">${{esc(feature.domain)}} · ${{esc(feature.classification_label)}}</div>
           </div>
           <div class="badges">
-            <span class="badge">техкарт: ${{maps.length}}</span>
+            <span class="badge">предметных карт: ${{subjectMaps.length}}</span>
+            <span class="badge">техкарт: ${{maps.length - subjectMaps.length}}</span>
             <span class="badge">вопросы: ${{feature.open_questions_count || 0}}</span>
             <span class="badge">ИБ/UI: ${{feature.infobase_checks_count || 0}}</span>
           </div>
         </div>
         <div class="customization-body">
           <div class="customization-block">
-            <h3>Что доработано</h3>
+            <h3>BF-группа</h3>
             <p>${{esc(feature.summary)}}</p>
-            <h3>Состав доработки</h3>
+            <h3>Состав по техническим объектам</h3>
             <div class="badges">${{customizationTypeBadges(maps)}}</div>
           </div>
           <div class="customization-block">
-            <h3>Ключевые объекты</h3>
+            <h3>Связанные предметные и технические карты</h3>
             <div class="object-links">${{keyObjectLinks(maps)}}</div>
             <h3>Для ревью перехода</h3>
             <ul>${{risks}}</ul>
@@ -918,10 +951,10 @@ def dashboard_html(data: dict[str, Any]) -> str:
       </article>`;
     }}
 
-    function renderCustomizationGroups() {{
-      byId("customization-list").innerHTML = data.features.length
-        ? data.features.map(renderCustomizationGroup).join("")
-        : '<div class="panel empty">Бизнес-доработки не выделены текущими артефактами.</div>';
+    function renderBfGroups() {{
+      byId("bf-group-list").innerHTML = data.features.length
+        ? data.features.map(renderBfGroup).join("")
+        : '<div class="panel empty">BF-группы не выделены текущими артефактами.</div>';
     }}
 
     function linkedDetailMapsBox(feature) {{
@@ -1027,6 +1060,88 @@ def dashboard_html(data: dict[str, Any]) -> str:
       open_questions: "Открытые вопросы",
     }};
 
+    function linkedFeatureBadges(map) {{
+      return (map.linked_features || []).map((featureId) => `<a class="badge" href="#bf-group-${{esc(featureId)}}">${{esc(featureId)}}</a>`).join(" ") || '<span class="badge">BF не указан</span>';
+    }}
+
+    function sourceLinks(map) {{
+      const jsonLink = map.source_href ? `<div><a href="${{esc(map.source_href)}}">${{esc(map.source_path)}}</a></div>` : "";
+      const workbookLink = map.source_workbook_href ? `<div><a href="${{esc(map.source_workbook_href)}}">${{esc(map.source_workbook)}}</a></div>` : "";
+      return jsonLink + workbookLink || '<span class="empty">Источник не указан.</span>';
+    }}
+
+    function subjectSection(map, sectionKey) {{
+      const rows = (map.sections || {{}})[sectionKey] || [];
+      const count = (map.counts || {{}})[sectionKey] || rows.length;
+      return `<section class="subject-section">
+        <h3>${{esc(detailSectionLabels[sectionKey])}} · ${{count}}</h3>
+        ${{rowsTable(rows, detailColumns[sectionKey])}}
+      </section>`;
+    }}
+
+    function renderSubjectMap(map) {{
+      const notes = (map.migration_notes || []).map((note) => `<li>${{esc(note)}}</li>`).join("") || "<li>Отдельные замечания по переходу пока не указаны.</li>";
+      return `<article class="feature subject-card" id="subject-${{esc(map.slug)}}">
+        <div class="feature-head">
+          <div>
+            <div class="title-row">
+              <span class="feature-title">${{esc(map.title)}}</span>
+              <span class="badge info">${{esc(map.type_label)}}</span>
+              <span class="badge info">${{esc(map.generation_mode_label)}}</span>
+              <span class="badge">${{esc(map.completeness_label)}}</span>
+              <span class="badge ${{badgeClass(map.status)}}">${{esc(map.status_label)}}</span>
+              <span class="badge">${{esc(map.confidence_label)}}</span>
+            </div>
+            <div class="subtle">Предметная карта доработки · Владелец: ${{esc(map.owner_feature || "не указан")}}</div>
+          </div>
+          <div class="badges">
+            <span class="badge">реквизиты: ${{(map.counts || {{}}).attributes || 0}}</span>
+            <span class="badge">проверки: ${{(map.counts || {{}}).validations || 0}}</span>
+            <span class="badge">вопросы: ${{map.open_questions_count || 0}}</span>
+          </div>
+        </div>
+        <div class="subject-overview">
+          <div class="box">
+            <h3>Сводка</h3>
+            <p>${{esc(map.summary || "Сводка не заполнена.")}}</p>
+          </div>
+          <div class="box">
+            <h3>Идентификация</h3>
+            <p>${{esc(map.identification || "Идентификация не заполнена.")}}</p>
+          </div>
+          <div class="box">
+            <h3>Ключевой вывод</h3>
+            <p>${{esc(map.key_conclusion || "Ключевой вывод не заполнен.")}}</p>
+          </div>
+          <div class="box">
+            <h3>Upgrade-риск</h3>
+            <p>${{esc(map.upgrade_risk || "Upgrade-риск не заполнен.")}}</p>
+          </div>
+          <div class="box">
+            <h3>Статус проверки</h3>
+            <p>${{esc(map.review_status || map.status_label || "Статус не указан.")}}</p>
+            <p class="subtle">${{esc(map.runtime_data_needed || "Дополнительные данные ИБ не указаны.")}}</p>
+          </div>
+          <div class="box">
+            <h3>Связи и источники</h3>
+            <div class="badges">${{linkedFeatureBadges(map)}}</div>
+            ${{sourceLinks(map)}}
+          </div>
+          <div class="box">
+            <h3>Что важно для ДО 3.0</h3>
+            <ul>${{notes}}</ul>
+          </div>
+        </div>
+        ${{Object.keys(detailSectionLabels).map((sectionKey) => subjectSection(map, sectionKey)).join("")}}
+      </article>`;
+    }}
+
+    function renderSubjectMaps() {{
+      byId("subject-map-list").innerHTML = subjectMaps.length
+        ? subjectMaps.map(renderSubjectMap).join("")
+        : '<div class="panel empty">Полноценные предметные карты пока не выделены. Создайте manual/enriched detail-map с ключевым выводом и upgrade-риском.</div>';
+    }}
+
     function pushDetailSearchRows(parts, rows) {{
       (rows || []).slice(0, 20).forEach((row) => {{
         Object.values(row || {{}}).forEach((value) => parts.push(value));
@@ -1035,25 +1150,26 @@ def dashboard_html(data: dict[str, Any]) -> str:
 
     function buildDetailSearchText(map) {{
       if (map.__searchText) return map.__searchText;
+      const searchableMap = detailMapBySlug.get(map.slug) || map;
       const parts = [
-        map.slug,
-        map.title,
-        map.type,
-        map.type_label,
-        map.generation_mode,
-        map.generation_mode_label,
-        map.status,
-        map.status_label,
-        map.completeness_label,
-        map.confidence_label,
-        map.owner_feature,
-        (map.linked_features || []).join(" "),
-        map.summary,
-        (map.migration_notes || []).join(" "),
-        map.source_path,
-        map.source_workbook,
+        searchableMap.slug,
+        searchableMap.title,
+        searchableMap.type,
+        searchableMap.type_label,
+        searchableMap.generation_mode,
+        searchableMap.generation_mode_label,
+        searchableMap.status,
+        searchableMap.status_label,
+        searchableMap.completeness_label,
+        searchableMap.confidence_label,
+        searchableMap.owner_feature,
+        (searchableMap.linked_features || []).join(" "),
+        searchableMap.summary,
+        (searchableMap.migration_notes || []).join(" "),
+        searchableMap.source_path,
+        searchableMap.source_workbook,
       ];
-      Object.values(map.sections || {{}}).forEach((rows) => pushDetailSearchRows(parts, rows));
+      Object.values(searchableMap.sections || {{}}).forEach((rows) => pushDetailSearchRows(parts, rows));
       map.__searchText = parts.filter((value) => value !== undefined && value !== null).join(" ").toLowerCase();
       return map.__searchText;
     }}
@@ -1129,16 +1245,14 @@ def dashboard_html(data: dict[str, Any]) -> str:
     }}
 
     function filteredDetailMaps() {{
-      const query = byId("detail-search").value.trim().toLowerCase();
-      const type = byId("detail-type-filter").value;
-      const generationMode = byId("detail-generation-filter").value;
-      const status = byId("detail-status-filter").value;
-      const feature = byId("detail-feature-filter").value;
-      const questionMode = byId("detail-question-filter").value;
-      return (data.detail_maps || []).filter((map) => {{
+      const query = byId("technical-search").value.trim().toLowerCase();
+      const type = byId("technical-type-filter").value;
+      const status = byId("technical-status-filter").value;
+      const feature = byId("technical-feature-filter").value;
+      const questionMode = byId("technical-question-filter").value;
+      return technicalMaps.filter((map) => {{
         if (query && !buildDetailSearchText(map).includes(query)) return false;
         if (type && map.type !== type) return false;
-        if (generationMode && map.generation_mode !== generationMode) return false;
         if (status && map.status !== status) return false;
         if (feature && !(map.linked_features || []).includes(feature)) return false;
         if (questionMode === "open" && !map.open_questions_count) return false;
@@ -1150,13 +1264,13 @@ def dashboard_html(data: dict[str, Any]) -> str:
       const maps = filteredDetailMaps();
       const visibleMaps = maps.slice(0, detailMapVisibleLimit);
       if (!maps.length) {{
-        byId("detail-map-list").innerHTML = '<div class="panel empty">Предметные карты по текущим фильтрам не найдены.</div>';
+        byId("technical-map-list").innerHTML = '<div class="panel empty">Технические карты по текущим фильтрам не найдены.</div>';
         return;
       }}
       const footer = maps.length > visibleMaps.length
         ? `<div class="list-footer"><span>Показано ${{visibleMaps.length}} из ${{maps.length}}</span><button type="button" data-detail-more="1">Показать еще</button></div>`
         : `<div class="list-footer"><span>Показано ${{visibleMaps.length}} из ${{maps.length}}</span></div>`;
-      byId("detail-map-list").innerHTML = visibleMaps.map(renderDetailMap).join("") + footer;
+      byId("technical-map-list").innerHTML = visibleMaps.map(renderDetailMap).join("") + footer;
     }}
 
     function resetDetailMapFilters() {{
@@ -1250,21 +1364,22 @@ def dashboard_html(data: dict[str, Any]) -> str:
       renderHeader();
       renderMetrics();
       fillFilters();
-      renderCustomizationGroups();
+      renderSubjectMaps();
+      renderBfGroups();
       renderDetailMaps();
       renderFeatures();
       renderQuestions();
       renderMigration();
       renderAudit();
       ["search","status-filter","confidence-filter","question-filter"].forEach((id) => byId(id).addEventListener("input", renderFeatures));
-      ["detail-search","detail-type-filter","detail-generation-filter","detail-status-filter","detail-feature-filter","detail-question-filter"].forEach((id) => byId(id).addEventListener("input", resetDetailMapFilters));
-      byId("detail-map-list").addEventListener("click", (event) => {{
+      ["technical-search","technical-type-filter","technical-status-filter","technical-feature-filter","technical-question-filter"].forEach((id) => byId(id).addEventListener("input", resetDetailMapFilters));
+      byId("technical-map-list").addEventListener("click", (event) => {{
         const more = event.target.closest ? event.target.closest("[data-detail-more]") : null;
         if (!more) return;
         detailMapVisibleLimit += DETAIL_MAP_PAGE_SIZE;
         renderDetailMaps();
       }});
-      byId("detail-map-list").addEventListener("toggle", (event) => {{
+      byId("technical-map-list").addEventListener("toggle", (event) => {{
         const details = event.target;
         if (details && details.classList && details.classList.contains("detail-map-details") && details.open) {{
           renderOpenedDetailMap(details);
