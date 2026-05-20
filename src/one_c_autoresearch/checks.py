@@ -460,6 +460,10 @@ def test_doctor(args: argparse.Namespace) -> int:
             require("Карты доработок" in html, "Review dashboard should expose the detail-map section", errors)
             require("Пример документа" in html, "Review dashboard should render detail-map titles", errors)
             require("Реквизиты" in html, "Review dashboard should render detail-map attribute tables", errors)
+            require("DETAIL_MAP_PAGE_SIZE" in html, "Review dashboard should page large detail-map lists instead of rendering every map at boot", errors)
+            require("renderDetailMapDetails" in html, "Review dashboard should lazy-render detail-map tables on demand", errors)
+            require("buildDetailSearchText" in html, "Review dashboard should precompute detail-map search text instead of JSON.stringify on every filter pass", errors)
+            require("JSON.stringify(map)" not in html, "Review dashboard should not stringify every detail map during filtering", errors)
             require("Что важно для перехода на ДО 3.0" in html, "Review dashboard should expose the migration-impact section", errors)
         if dashboard_data.exists():
             data = json.loads(dashboard_data.read_text(encoding="utf-8"))

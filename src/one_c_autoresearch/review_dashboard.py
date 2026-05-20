@@ -602,8 +602,28 @@ def dashboard_html(data: dict[str, Any]) -> str:
       color: var(--text);
       font: inherit;
     }}
+    button {{
+      width: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #ffffff;
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+    }}
+    button:hover {{ background: var(--panel-soft); }}
     .feature-list {{ display: grid; gap: 12px; }}
     .feature {{ padding: 16px; scroll-margin-top: 16px; }}
+    .list-footer {{
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 0 0;
+      color: var(--muted);
+    }}
     .feature-head {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -744,6 +764,9 @@ def dashboard_html(data: dict[str, Any]) -> str:
   </div>
   <script>
     const data = JSON.parse(document.getElementById("dashboard-data").textContent);
+    const DETAIL_MAP_PAGE_SIZE = 60;
+    let detailMapVisibleLimit = DETAIL_MAP_PAGE_SIZE;
+    const detailMapBySlug = new Map((data.detail_maps || []).map((map) => [map.slug, map]));
     const byId = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}}[char]));
     const badgeClass = (status) => {{
@@ -917,6 +940,37 @@ def dashboard_html(data: dict[str, Any]) -> str:
       open_questions: "Открытые вопросы",
     }};
 
+    function pushDetailSearchRows(parts, rows) {{
+      (rows || []).slice(0, 20).forEach((row) => {{
+        Object.values(row || {{}}).forEach((value) => parts.push(value));
+      }});
+    }}
+
+    function buildDetailSearchText(map) {{
+      if (map.__searchText) return map.__searchText;
+      const parts = [
+        map.slug,
+        map.title,
+        map.type,
+        map.type_label,
+        map.generation_mode,
+        map.generation_mode_label,
+        map.status,
+        map.status_label,
+        map.completeness_label,
+        map.confidence_label,
+        map.owner_feature,
+        (map.linked_features || []).join(" "),
+        map.summary,
+        (map.migration_notes || []).join(" "),
+        map.source_path,
+        map.source_workbook,
+      ];
+      Object.values(map.sections || {{}}).forEach((rows) => pushDetailSearchRows(parts, rows));
+      map.__searchText = parts.filter((value) => value !== undefined && value !== null).join(" ").toLowerCase();
+      return map.__searchText;
+    }}
+
     function detailSection(map, sectionKey) {{
       const rows = (map.sections || {{}})[sectionKey] || [];
       const count = (map.counts || {{}})[sectionKey] || rows.length;
@@ -926,10 +980,25 @@ def dashboard_html(data: dict[str, Any]) -> str:
       </details>`;
     }}
 
-    function renderDetailMap(map) {{
+    function renderDetailMapDetails(map) {{
       const notes = (map.migration_notes || []).map((note) => `<li>${{esc(note)}}</li>`).join("") || "<li>Отдельные замечания по переходу пока не указаны.</li>";
       const features = (map.linked_features || []).map((featureId) => `<a class="badge" href="#${{esc(featureId)}}">${{esc(featureId)}}</a>`).join(" ") || '<span class="badge">BF не указан</span>';
       const sourceLinks = `<div><a href="${{esc(map.source_href)}}">${{esc(map.source_path)}}</a></div>` + (map.source_workbook_href ? `<div><a href="${{esc(map.source_workbook_href)}}">${{esc(map.source_workbook)}}</a></div>` : "");
+      return `<div class="section-grid">
+        <div class="box">
+          <h3>Что важно для ДО 3.0</h3>
+          <ul>${{notes}}</ul>
+        </div>
+        <div class="box">
+          <h3>Связи и источники</h3>
+          <div class="badges">${{features}}</div>
+          ${{sourceLinks}}
+        </div>
+      </div>
+      ${{Object.keys(detailSectionLabels).map((sectionKey) => detailSection(map, sectionKey)).join("")}}`;
+    }}
+
+    function renderDetailMap(map) {{
       return `<article class="feature" id="detail-${{esc(map.slug)}}">
         <div class="feature-head">
           <div>
@@ -950,19 +1019,26 @@ def dashboard_html(data: dict[str, Any]) -> str:
           </div>
         </div>
         <p>${{esc(map.summary)}}</p>
-        <div class="section-grid">
-          <div class="box">
-            <h3>Что важно для ДО 3.0</h3>
-            <ul>${{notes}}</ul>
-          </div>
-          <div class="box">
-            <h3>Связи и источники</h3>
-            <div class="badges">${{features}}</div>
-            ${{sourceLinks}}
-          </div>
-        </div>
-        ${{Object.keys(detailSectionLabels).map((sectionKey) => detailSection(map, sectionKey)).join("")}}
+        <details class="detail-map-details" data-slug="${{esc(map.slug)}}">
+          <summary>Детализация карты</summary>
+          <div class="detail-map-details-body empty">Откройте карту, чтобы построить таблицы детализации.</div>
+        </details>
       </article>`;
+    }}
+
+    function renderOpenedDetailMap(details) {{
+      if (details.dataset.rendered === "1") return;
+      const body = details.querySelector(".detail-map-details-body");
+      if (!body) return;
+      const map = detailMapBySlug.get(details.dataset.slug || "");
+      if (!map) {{
+        body.innerHTML = '<div class="empty">Карта не найдена в данных дашборда.</div>';
+        details.dataset.rendered = "1";
+        return;
+      }}
+      body.classList.remove("empty");
+      body.innerHTML = renderDetailMapDetails(map);
+      details.dataset.rendered = "1";
     }}
 
     function filteredDetailMaps() {{
@@ -973,8 +1049,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
       const feature = byId("detail-feature-filter").value;
       const questionMode = byId("detail-question-filter").value;
       return (data.detail_maps || []).filter((map) => {{
-        const text = JSON.stringify(map).toLowerCase();
-        if (query && !text.includes(query)) return false;
+        if (query && !buildDetailSearchText(map).includes(query)) return false;
         if (type && map.type !== type) return false;
         if (generationMode && map.generation_mode !== generationMode) return false;
         if (status && map.status !== status) return false;
@@ -986,7 +1061,37 @@ def dashboard_html(data: dict[str, Any]) -> str:
 
     function renderDetailMaps() {{
       const maps = filteredDetailMaps();
-      byId("detail-map-list").innerHTML = maps.length ? maps.map(renderDetailMap).join("") : '<div class="panel empty">Предметные карты по текущим фильтрам не найдены.</div>';
+      const visibleMaps = maps.slice(0, detailMapVisibleLimit);
+      if (!maps.length) {{
+        byId("detail-map-list").innerHTML = '<div class="panel empty">Предметные карты по текущим фильтрам не найдены.</div>';
+        return;
+      }}
+      const footer = maps.length > visibleMaps.length
+        ? `<div class="list-footer"><span>Показано ${{visibleMaps.length}} из ${{maps.length}}</span><button type="button" data-detail-more="1">Показать еще</button></div>`
+        : `<div class="list-footer"><span>Показано ${{visibleMaps.length}} из ${{maps.length}}</span></div>`;
+      byId("detail-map-list").innerHTML = visibleMaps.map(renderDetailMap).join("") + footer;
+    }}
+
+    function resetDetailMapFilters() {{
+      detailMapVisibleLimit = DETAIL_MAP_PAGE_SIZE;
+      renderDetailMaps();
+    }}
+
+    function ensureDetailMapVisible(slug) {{
+      const maps = filteredDetailMaps();
+      const index = maps.findIndex((map) => map.slug === slug);
+      if (index >= detailMapVisibleLimit) {{
+        detailMapVisibleLimit = Math.ceil((index + 1) / DETAIL_MAP_PAGE_SIZE) * DETAIL_MAP_PAGE_SIZE;
+        renderDetailMaps();
+      }}
+      const target = byId(`detail-${{slug}}`);
+      if (target) target.scrollIntoView({{block: "start"}});
+    }}
+
+    function revealDetailMapFromHash() {{
+      const hash = window.location.hash || "";
+      if (!hash.startsWith("#detail-")) return;
+      ensureDetailMapVisible(decodeURIComponent(hash.slice("#detail-".length)));
     }}
 
     function filteredFeatures() {{
@@ -1064,7 +1169,29 @@ def dashboard_html(data: dict[str, Any]) -> str:
       renderMigration();
       renderAudit();
       ["search","status-filter","confidence-filter","question-filter"].forEach((id) => byId(id).addEventListener("input", renderFeatures));
-      ["detail-search","detail-type-filter","detail-generation-filter","detail-status-filter","detail-feature-filter","detail-question-filter"].forEach((id) => byId(id).addEventListener("input", renderDetailMaps));
+      ["detail-search","detail-type-filter","detail-generation-filter","detail-status-filter","detail-feature-filter","detail-question-filter"].forEach((id) => byId(id).addEventListener("input", resetDetailMapFilters));
+      byId("detail-map-list").addEventListener("click", (event) => {{
+        const more = event.target.closest ? event.target.closest("[data-detail-more]") : null;
+        if (!more) return;
+        detailMapVisibleLimit += DETAIL_MAP_PAGE_SIZE;
+        renderDetailMaps();
+      }});
+      byId("detail-map-list").addEventListener("toggle", (event) => {{
+        const details = event.target;
+        if (details && details.classList && details.classList.contains("detail-map-details") && details.open) {{
+          renderOpenedDetailMap(details);
+        }}
+      }}, true);
+      document.addEventListener("click", (event) => {{
+        const link = event.target.closest ? event.target.closest('a[href^="#detail-"]') : null;
+        if (!link) return;
+        const slug = decodeURIComponent(link.getAttribute("href").slice("#detail-".length));
+        if (byId(`detail-${{slug}}`)) return;
+        event.preventDefault();
+        ensureDetailMapVisible(slug);
+        window.location.hash = `detail-${{slug}}`;
+      }});
+      revealDetailMapFromHash();
     }}
     boot();
   </script>
