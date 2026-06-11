@@ -10,6 +10,8 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 - `analysis/indexes/diff-inventory.csv` and `analysis/indexes/feature-map.csv` are the primary autopilot inventory.
 - `analysis/indexes/final-diff-inventory.csv` and `analysis/indexes/final-feature-map.csv` are the publishable autopilot layer after reverse-map normalization.
 - `analysis/reverse-map/` is the durable state for long-running fact-to-intent reverse mapping. Agent context is disposable; continuation must read this folder.
+- `analysis/subject-cards/` is the durable registry and bundle layer for analyst-owned subject cards.
+- `analysis/functional-gaps/` is the durable one-card-per-pass layer for migration gap hypotheses and target-release checks.
 - `analysis/features/` contains feature-level evidence packs.
 - `outputs/` contains human-facing deliverables.
 - `docs/agent/repo-map.md` maps agent entry points and change routing.
@@ -21,6 +23,7 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 - Use `$1c-autoresearch-queue-worker` when selecting, claiming, executing, or updating queue tasks.
 - For reverse engineering continuation triggers such as `/goal Исследование`, follow `docs/method/reverse-functional-map.md`: run `python -m one_c_autoresearch reverse-map claim`, process one workitem, update reverse-map state, run `python -m one_c_autoresearch final-gate status`, verify, and stop.
 - For an end-to-end customization map, follow `docs/method/autopilot-customization-map.md` instead of stopping after a single queue task.
+- For subject-card or functional-gap work, process one card at a time and validate the selected card before moving on.
 - Prefer static source evidence and generated indexes before live 1C access.
 - Do not use unrelated 1C MCP servers as evidence.
 - Before using live 1C MCP or web access, confirm the configured target in `project.toml` and `.codex/1c-mcp.toml` if that file exists.

@@ -98,6 +98,32 @@ python -m one_c_autoresearch doctor
 
 The doctor checks that `analysis/reverse-map/coverage.csv` covers every diff row from `analysis/indexes/diff-inventory.csv`, workitems parse, statuses are valid, reverse-map CSV headers match the contract, and final-gate outputs are fresh when autopilot publication is enabled. Open work is represented in state files rather than hidden in agent context.
 
+## Subject Cards
+
+Build and validate subject cards iteratively:
+
+```bash
+python -m one_c_autoresearch subject-card discover
+python -m one_c_autoresearch subject-card classify
+python -m one_c_autoresearch subject-card registry-build
+python -m one_c_autoresearch subject-card seed --from-registry
+python -m one_c_autoresearch subject-card refine --card <slug>
+python -m one_c_autoresearch subject-card validate --card <slug>
+```
+
+An empty scaffolded `analysis/subject-cards/` layer is valid for a newly generated research repo. Once card bundles exist, `doctor` validates their JSON/CSV contract and expects ready cards to have no blocking gaps.
+
+## Functional Gap Map
+
+Build and validate one migration gap card at a time:
+
+```bash
+python -m one_c_autoresearch functional-gap build --card <slug>
+python -m one_c_autoresearch functional-gap validate --card <slug>
+```
+
+An empty scaffolded `analysis/functional-gaps/` layer is valid for a newly generated research repo. Once functional-gap cards exist, `doctor` validates the JSON/CSV contract for the whole layer. The builder intentionally has no `--all` mode: each pass must stay scoped to one subject card.
+
 ## Expected Result
 
 - `status = ok`: repository contract is healthy.

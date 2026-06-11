@@ -15,6 +15,8 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 | `analysis/queue/` | File-backed queue state and worker contract. | Tasks, statuses, schema, or review rules change. |
 | `analysis/reverse-map/` | Durable fact-to-intent reverse mapping state: coverage, workitems, decisions, unresolved items, and scenario outputs. | Continuing or auditing long-running reverse engineering work. |
 | `analysis/indexes/` | Reviewable autopilot indexes: primary diff/feature maps and final-gate normalized maps. | Diff entries are classified, reverse-map decisions are normalized, or functional features are grouped. |
+| `analysis/subject-cards/` | Iterative subject-card registry and analyst-owned cards below coarse `BF-*` containers. | Building or reviewing concrete subject cards. |
+| `analysis/functional-gaps/` | One-card-per-pass map of migration hypotheses, target-release checks, and analyst decisions. | A subject card is being prepared for transition to a newer release. |
 | `analysis/features/` | Feature evidence packs and file templates. | A queue task produces or updates feature-level evidence. |
 | `analysis/cache/` | Generated indexes and noisy intermediate artifacts. | Static analysis or comparison tools produce machine data. |
 | `analysis/runs/` | Run logs for task execution. | A worker run needs an auditable trace. |
@@ -62,12 +64,37 @@ Use this route when a continuation trigger such as `/goal Исследовани
 7. Run `python -m one_c_autoresearch doctor` and `python -m one_c_autoresearch checks research`.
 8. Advance the workitem status with `python -m one_c_autoresearch reverse-map set-status` and stop.
 
+## Subject-Card Route
+
+Use this route when coarse `BF-*` containers need analyst-owned subject cards:
+
+1. Run `python -m one_c_autoresearch detail-map build` when detail maps are stale.
+2. Run `python -m one_c_autoresearch subject-card discover`.
+3. Review `analysis/subject-cards/candidates.csv`.
+4. Run `python -m one_c_autoresearch subject-card classify` and `registry-build`.
+5. Run `python -m one_c_autoresearch subject-card seed --from-registry`.
+6. Refine one card with `python -m one_c_autoresearch subject-card refine --card <slug>`.
+7. Validate with `python -m one_c_autoresearch subject-card validate --card <slug>`.
+
+## Functional-Gap Route
+
+Use this route when the goal is to build a migration gap map for one already prepared subject card:
+
+1. Read `analysis/subject-cards/cards/<slug>/subject-card.json`, `evidence.csv`, and `gaps.csv`.
+2. Run `python -m one_c_autoresearch functional-gap build --card <slug>`.
+3. Review `analysis/functional-gaps/cards/<slug>/review.md`.
+4. Fill or close checks in `checks.csv` as target-release evidence appears.
+5. Run `python -m one_c_autoresearch functional-gap validate --card <slug>`.
+6. Stop after one subject card; start a new pass for the next card.
+
 ## System Of Record
 
 - `project.toml`: active source paths, RLM projects, MCP/web target, and evidence policy.
 - `.codex/1c-mcp.toml`: active MCP/web target when present; it must match `project.toml` before live evidence is used.
 - `analysis/queue/tasks.jsonl`: current queue state.
 - `analysis/reverse-map/`: durable continuation state for reverse functional mapping.
+- `analysis/subject-cards/`: durable subject-card registry and generated card bundles.
+- `analysis/functional-gaps/`: durable one-card-per-pass state for migration gap mapping.
 - `analysis/indexes/diff-inventory.csv`: every clean diff entry and its classification status.
 - `analysis/indexes/feature-map.csv`: functional grouping for the final customization map.
 - `analysis/indexes/final-diff-inventory.csv`: publishable row-level map after reverse-map normalization.

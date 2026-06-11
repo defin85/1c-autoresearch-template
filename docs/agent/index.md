@@ -25,4 +25,8 @@ For end-to-end customization-map work, read `docs/method/autopilot-customization
 
 For reverse functional mapping continuation, read `docs/method/reverse-functional-map.md` and the concrete repo's `analysis/reverse-map/state.md`, then run `python -m one_c_autoresearch reverse-map claim`. Process one returned workitem, update reverse-map state, run `python -m one_c_autoresearch final-gate status`, verify, and stop.
 
+For subject-card work, run one refinement pass at a time: `subject-card discover`, `classify`, `registry-build`, `seed --from-registry`, then `subject-card refine --card <slug>` and `subject-card validate --card <slug>`.
+
+For migration gap mapping, work one subject card per pass: run `python -m one_c_autoresearch functional-gap build --card <slug>`, review `analysis/functional-gaps/cards/<slug>/review.md`, then run `python -m one_c_autoresearch functional-gap validate --card <slug>`.
+
 Do not treat this template as an evidence source for any customer project.

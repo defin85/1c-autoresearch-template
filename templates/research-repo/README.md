@@ -43,11 +43,20 @@ python -m one_c_autoresearch detail-map build
 python -m one_c_autoresearch review-dashboard build
 ```
 
+Build one functional-gap card from one subject card:
+
+```bash
+python -m one_c_autoresearch functional-gap build --card <slug>
+python -m one_c_autoresearch functional-gap validate --card <slug>
+```
+
 ## Layout
 
 ```text
 analysis/cache/      generated indexes and noisy machine data
 analysis/detail-maps/ analyst-level maps for concrete customization subjects
+analysis/subject-cards/ analyst-owned subject cards
+analysis/functional-gaps/ one-card-per-pass migration gap map
 analysis/queue/      file-backed work queue
 analysis/reverse-map/ durable state for fact-to-intent reverse mapping
 analysis/features/   feature evidence packs
@@ -70,4 +79,4 @@ python -m one_c_autoresearch autopilot scaffold --enable-gate
 
 Then follow `docs/method/autopilot-customization-map.md`. With `autopilot.enabled=true`, `python -m one_c_autoresearch doctor --deep --strict` fails until every diff entry is classified, reverse-map decisions are normalized through `python -m one_c_autoresearch final-gate build`, every feature pack has evidence, final outputs exist, and `analysis/final-audit.md` declares complete coverage without reverse-map blockers.
 
-After final outputs are current, run `python -m one_c_autoresearch detail-map build` to create the generated subject inventory. Add or enrich analyst-owned maps under `analysis/detail-maps/` when a block needs deeper review, then run `python -m one_c_autoresearch review-dashboard build` to create `outputs/review/index.html` and `outputs/review/data.json`.
+After final outputs are current, run `python -m one_c_autoresearch detail-map build` to create the generated subject inventory. Add or enrich analyst-owned maps under `analysis/detail-maps/` when a block needs deeper review, build subject cards under `analysis/subject-cards/`, then run `python -m one_c_autoresearch review-dashboard build` to create `outputs/review/index.html` and `outputs/review/data.json`.

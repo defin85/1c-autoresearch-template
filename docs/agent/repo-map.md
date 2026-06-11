@@ -17,6 +17,8 @@ This repository is a reusable template for concrete 1C autoresearch repositories
 | `src/one_c_autoresearch/autopilot.py` | Autopilot customization-map scaffold helpers and artifact headers. | Final-map artifact contract or scaffold behavior changes. |
 | `src/one_c_autoresearch/final_gate.py` | Reverse-map normalization layer for publishable final diff and feature maps. | Final claims need new downgrade/blocking rules. |
 | `src/one_c_autoresearch/reverse_map.py` | Reverse functional mapping scaffold, coverage seeding, and workitem continuation helpers. | Fact-to-intent reverse engineering workflow changes. |
+| `src/one_c_autoresearch/subject_cards.py` | Iterative subject-card discovery, registry, seeding, refinement, and validation. | The analyst-owned card pipeline changes. |
+| `src/one_c_autoresearch/functional_gaps.py` | One-card-per-pass migration gap cards with hypotheses, checks, and review artifacts. | Migration gap workflow changes. |
 | `templates/research-repo/` | Files copied into a concrete research repository. | Concrete project layout, queue workflow, or generated repo instructions change. |
 | `examples/` | Small examples of intended command shapes. | User-facing examples need to reflect current bootstrap arguments. |
 
@@ -30,6 +32,8 @@ This repository is a reusable template for concrete 1C autoresearch repositories
 | Queue workflow | `docs/method/queue-design.md`, `templates/research-repo/analysis/queue/*` | Queue docs, queue scripts, queue skill | `python -m one_c_autoresearch checks doctor`, generated repo doctor |
 | Autopilot customization map | `docs/method/autopilot-customization-map.md` | `src/one_c_autoresearch/autopilot.py`, `src/one_c_autoresearch/final_gate.py`, `src/one_c_autoresearch/doctor.py`, `templates/research-repo/analysis/indexes/*`, `templates/research-repo/outputs/*` | `python -m one_c_autoresearch checks doctor`, generated repo doctor with `autopilot.enabled=true` |
 | Reverse functional map | `docs/method/reverse-functional-map.md` | `src/one_c_autoresearch/reverse_map.py`, `src/one_c_autoresearch/doctor.py`, `templates/research-repo/analysis/reverse-map/*` | `python -m one_c_autoresearch checks doctor`, generated repo doctor |
+| Subject cards | `templates/research-repo/analysis/subject-cards/README.md` | `src/one_c_autoresearch/subject_cards.py`, `src/one_c_autoresearch/review_dashboard.py`, `src/one_c_autoresearch/doctor.py`, `templates/research-repo/analysis/subject-cards/*` | `python -m one_c_autoresearch checks doctor`, generated repo subject-card commands |
+| Functional gaps | `templates/research-repo/analysis/functional-gaps/README.md` | `src/one_c_autoresearch/functional_gaps.py`, `src/one_c_autoresearch/doctor.py`, `templates/research-repo/analysis/functional-gaps/*` | `python -m one_c_autoresearch checks doctor`, `python -m one_c_autoresearch functional-gap validate --card <slug>` |
 | Manifest/MCP/web policy | `project.example.toml`, `templates/research-repo/project.toml` | Manifests, `src/one_c_autoresearch/doctor.py`, research `AGENTS.md`, optional `.codex/1c-mcp.toml` checks | `python -m one_c_autoresearch doctor --json --deep`, targeted doctor smoke tests |
 | Agent instructions | `AGENTS.md`, `docs/agent/index.md` | Root and template `AGENTS.md`, `docs/agent/*`, `.agents/skills/*` | `python -m one_c_autoresearch checks template`, generated repo validation |
 
@@ -43,6 +47,8 @@ This repository is a reusable template for concrete 1C autoresearch repositories
 - `docs/method/autopilot-customization-map.md`: end-to-end final customization-map contract and doctor-gated completion rules.
 - `docs/method/reverse-functional-map.md`: long-running fact-to-intent reverse mapping continuation contract.
 - `docs/method/queue-design.md`: queue semantics and worker rules.
+- `templates/research-repo/analysis/subject-cards/`: generated subject-card contract.
+- `templates/research-repo/analysis/functional-gaps/`: generated one-card-per-pass functional-gap contract.
 - `templates/research-repo/`: generated research repository contract.
 
 For generated research repositories, `.codex/1c-mcp.toml` is an optional local manifest. When it exists, it must match the MCP server, URL, and service root declared in `project.toml`.

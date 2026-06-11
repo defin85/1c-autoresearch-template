@@ -13,3 +13,6 @@ one-c-autoresearch = "one_c_autoresearch.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "scripts/checks"]

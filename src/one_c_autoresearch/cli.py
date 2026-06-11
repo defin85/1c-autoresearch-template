@@ -12,6 +12,13 @@ from .doctor import print_doctor, run_doctor
 from .final_gate import build_command as final_gate_build_command
 from .final_gate import status_command as final_gate_status_command
 from .final_gate import verify_command as final_gate_verify_command
+from .functional_gaps import build_command as functional_gap_build_command
+from .functional_gaps import inspect_target_command as functional_gap_inspect_target_command
+from .functional_gaps import map_build_command as functional_gap_map_build_command
+from .functional_gaps import refresh_command as functional_gap_refresh_command
+from .functional_gaps import status_command as functional_gap_status_command
+from .functional_gaps import validate_command as functional_gap_validate_command
+from .functional_gap_dashboard import build_command as functional_gap_dashboard_build_command
 from .queue import claim_command, get_command, set_status_command
 from .review_dashboard import build_command as review_dashboard_build_command
 from .reverse_map import (
@@ -21,6 +28,15 @@ from .reverse_map import (
     seed_command as reverse_map_seed_command,
     set_status_command as reverse_map_set_status_command,
     status_command as reverse_map_status_command,
+)
+from .subject_cards import (
+    classify_command as subject_card_classify_command,
+    compare_reference_command as subject_card_compare_reference_command,
+    discover_command as subject_card_discover_command,
+    refine_command as subject_card_refine_command,
+    registry_build_command as subject_card_registry_build_command,
+    seed_command as subject_card_seed_command,
+    validate_command as subject_card_validate_command,
 )
 
 
@@ -98,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     review_dashboard_build = review_dashboard_sub.add_parser("build")
     review_dashboard_build.add_argument("--repo-path", default=".")
     review_dashboard_build.add_argument("--output-dir", default="")
+    review_dashboard_build.add_argument("--subject-card", default="")
     review_dashboard_build.set_defaults(func=review_dashboard_build_command)
 
     detail_map = sub.add_parser("detail-map")
@@ -106,6 +123,70 @@ def build_parser() -> argparse.ArgumentParser:
     detail_map_build.add_argument("--repo-path", default=".")
     detail_map_build.add_argument("--force", action="store_true")
     detail_map_build.set_defaults(func=detail_map_build_command)
+
+    subject_card = sub.add_parser("subject-card")
+    subject_card_sub = subject_card.add_subparsers(dest="subject_card_command", required=True)
+    subject_discover = subject_card_sub.add_parser("discover")
+    subject_discover.add_argument("--repo-path", default=".")
+    subject_discover.set_defaults(func=subject_card_discover_command)
+    subject_classify = subject_card_sub.add_parser("classify")
+    subject_classify.add_argument("--repo-path", default=".")
+    subject_classify.set_defaults(func=subject_card_classify_command)
+    subject_registry_build = subject_card_sub.add_parser("registry-build")
+    subject_registry_build.add_argument("--repo-path", default=".")
+    subject_registry_build.set_defaults(func=subject_card_registry_build_command)
+    subject_seed = subject_card_sub.add_parser("seed")
+    subject_seed.add_argument("--repo-path", default=".")
+    subject_seed.add_argument("--card", default="")
+    subject_seed.add_argument("--all", action="store_true")
+    subject_seed.add_argument("--from-registry", action="store_true")
+    subject_seed.set_defaults(func=subject_card_seed_command)
+    subject_refine = subject_card_sub.add_parser("refine")
+    subject_refine.add_argument("--repo-path", default=".")
+    subject_refine.add_argument("--card", required=True)
+    subject_refine.set_defaults(func=subject_card_refine_command)
+    subject_validate = subject_card_sub.add_parser("validate")
+    subject_validate.add_argument("--repo-path", default=".")
+    subject_validate.add_argument("--card", default="")
+    subject_validate.set_defaults(func=subject_card_validate_command)
+    subject_compare = subject_card_sub.add_parser("compare-reference")
+    subject_compare.add_argument("--repo-path", default=".")
+    subject_compare.add_argument("--card", required=True)
+    subject_compare.add_argument("--workbook", required=True)
+    subject_compare.set_defaults(func=subject_card_compare_reference_command)
+
+    functional_gap = sub.add_parser("functional-gap")
+    functional_gap_sub = functional_gap.add_subparsers(dest="functional_gap_command", required=True)
+    functional_gap_build = functional_gap_sub.add_parser("build")
+    functional_gap_build.add_argument("--repo-path", default=".")
+    functional_gap_build.add_argument("--card", required=True)
+    functional_gap_build.add_argument("--force", action="store_true")
+    functional_gap_build.set_defaults(func=functional_gap_build_command)
+    functional_gap_refresh = functional_gap_sub.add_parser("refresh")
+    functional_gap_refresh.add_argument("--repo-path", default=".")
+    functional_gap_refresh.add_argument("--card", required=True)
+    functional_gap_refresh.add_argument("--force", action="store_true")
+    functional_gap_refresh.set_defaults(func=functional_gap_refresh_command)
+    functional_gap_inspect_target = functional_gap_sub.add_parser("inspect-target")
+    functional_gap_inspect_target.add_argument("--repo-path", default=".")
+    functional_gap_inspect_target.add_argument("--card", required=True)
+    functional_gap_inspect_target.add_argument("--force", action="store_true")
+    functional_gap_inspect_target.add_argument("--target-profile", default="")
+    functional_gap_inspect_target.set_defaults(func=functional_gap_inspect_target_command)
+    functional_gap_map_build = functional_gap_sub.add_parser("map-build")
+    functional_gap_map_build.add_argument("--repo-path", default=".")
+    functional_gap_map_build.set_defaults(func=functional_gap_map_build_command)
+    functional_gap_dashboard_build = functional_gap_sub.add_parser("dashboard-build")
+    functional_gap_dashboard_build.add_argument("--repo-path", default=".")
+    functional_gap_dashboard_build.add_argument("--output-dir", default="")
+    functional_gap_dashboard_build.set_defaults(func=functional_gap_dashboard_build_command)
+    functional_gap_validate = functional_gap_sub.add_parser("validate")
+    functional_gap_validate.add_argument("--repo-path", default=".")
+    functional_gap_validate.add_argument("--card", default="")
+    functional_gap_validate.set_defaults(func=functional_gap_validate_command)
+    functional_gap_status = functional_gap_sub.add_parser("status")
+    functional_gap_status.add_argument("--repo-path", default=".")
+    functional_gap_status.set_defaults(func=functional_gap_status_command)
 
     reverse_map = sub.add_parser("reverse-map")
     reverse_map_sub = reverse_map.add_subparsers(dest="reverse_map_command", required=True)

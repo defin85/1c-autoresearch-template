@@ -31,9 +31,26 @@ from .reverse_map import (
     REVERSE_MAP_WORKITEM_STATUSES,
 )
 from .final_gate import FINAL_FEATURE_MAP_HEADER
+from .functional_gaps import validate_functional_gaps
 
 CANONICAL_EVIDENCE_HEADER = "feature_id,claim_id,source_kind,source_path,line_start,line_end,evidence_type,confidence,summary,notes"
 CANONICAL_FEATURE_CANDIDATES_HEADER = "feature_id,title,source_bucket,classification,confidence,summary,next_step"
+SUBJECT_CARD_CANDIDATES_HEADER = "candidate_id,title,proposed_slug,source,discovery_basis,linked_features,linked_detail_maps,primary_objects,subject_type,confidence,proposed_action,status,notes"
+SUBJECT_CARD_CLASSIFICATION_HEADER = "candidate_id,proposed_slug,decision,subject_type,registry_slug,merge_into,split_from,why_separate_card,status,confidence,notes"
+SUBJECT_CARD_REGISTRY_HEADER = "slug,title,subject_type,status,confidence,origin_layer,owner_feature,linked_features,linked_detail_maps,primary_objects,coverage_scope,why_separate_card,merge_into,split_from,card_path,evidence_count,gap_count,review_notes"
+SUBJECT_CARD_COVERAGE_HEADER = "source_kind,source_id,feature_id,detail_map_slug,subject_card_slug,relation,confidence,notes"
+SUBJECT_CARD_EVIDENCE_HEADER = "evidence_id,section,claim,source_type,source_path,line,linked_diff_id,linked_feature_id,confidence,notes"
+SUBJECT_CARD_GAPS_HEADER = "gap_id,section,question,needed_source,status,blocking,notes"
+SUBJECT_CARD_TYPES = {
+    "business_process",
+    "business_document",
+    "reference_model",
+    "integration",
+    "access_model",
+    "ui_surface",
+    "background_automation",
+    "technical_support",
+}
 VALID_STATUSES = {"pending", "claimed", "evidence_pack", "drafted", "needs_review", "needs_followup", "blocked", "done", "skipped"}
 VALID_TYPES = {"discovery", "deep_dive", "review", "migration_map", "packaging", "needs_infobase_data"}
 AUTOPILOT_DIFF_STATUSES = {"mapped_to_feature", "technical_noise_removed", "requires_1c_review", "blocked_by_infobase_data"}
@@ -67,6 +84,27 @@ DETAIL_MAP_SECTIONS = {
     "sources",
     "open_questions",
 }
+SUBJECT_CARD_STATUSES = {
+    "candidate",
+    "accepted",
+    "draft",
+    "needs_static_analysis",
+    "needs_runtime_data",
+    "needs_ui_check",
+    "needs_review",
+    "ready_for_review",
+    "reviewed",
+    "rejected",
+    "merged_into_other",
+    "supporting",
+    "unclassified",
+}
+SUBJECT_CARD_SECTIONS = DETAIL_MAP_SECTIONS
+
+
+def spreadsheet_reference(value: str) -> bool:
+    lowered = value.lower()
+    return any(suffix in lowered for suffix in (".xlsx", ".xlsm", ".xlsb", ".xls#"))
 
 TEMPLATE_REQUIRED_PATHS = [
     ".github/workflows/verify.yml",
@@ -81,6 +119,10 @@ TEMPLATE_REQUIRED_PATHS = [
     "src/one_c_autoresearch/cli.py",
     "src/one_c_autoresearch/autopilot.py",
     "src/one_c_autoresearch/detail_maps.py",
+    "src/one_c_autoresearch/subject_cards.py",
+    "src/one_c_autoresearch/functional_gaps.py",
+    "src/one_c_autoresearch/functional_gap_dashboard.py",
+    "src/one_c_autoresearch/functional_gap_probes.py",
     "src/one_c_autoresearch/final_gate.py",
     "src/one_c_autoresearch/review_dashboard.py",
     "src/one_c_autoresearch/reverse_map.py",
@@ -116,6 +158,19 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/analysis/detail-maps/README.md",
     "templates/research-repo/analysis/detail-maps/index.csv",
     "templates/research-repo/analysis/detail-maps/_templates/detail-map.json",
+    "templates/research-repo/analysis/subject-cards/README.md",
+    "templates/research-repo/analysis/subject-cards/registry.csv",
+    "templates/research-repo/analysis/subject-cards/candidates.csv",
+    "templates/research-repo/analysis/subject-cards/classification.csv",
+    "templates/research-repo/analysis/subject-cards/coverage.csv",
+    "templates/research-repo/analysis/subject-cards/_templates/subject-card.json",
+    "templates/research-repo/analysis/functional-gaps/README.md",
+    "templates/research-repo/analysis/functional-gaps/index.csv",
+    "templates/research-repo/analysis/functional-gaps/coverage.csv",
+    "templates/research-repo/analysis/functional-gaps/open-questions.csv",
+    "templates/research-repo/analysis/functional-gaps/_templates/gap-card.json",
+    "templates/research-repo/analysis/functional-gaps/_templates/target-profile.toml",
+    "templates/research-repo/analysis/functional-gaps/profiles/.gitkeep",
     "templates/research-repo/analysis/reverse-map/README.md",
     "templates/research-repo/analysis/reverse-map/state.md",
     "templates/research-repo/analysis/reverse-map/coverage.csv",
@@ -166,6 +221,10 @@ RESEARCH_REQUIRED_PATHS = [
     "src/one_c_autoresearch/__main__.py",
     "src/one_c_autoresearch/autopilot.py",
     "src/one_c_autoresearch/detail_maps.py",
+    "src/one_c_autoresearch/subject_cards.py",
+    "src/one_c_autoresearch/functional_gaps.py",
+    "src/one_c_autoresearch/functional_gap_dashboard.py",
+    "src/one_c_autoresearch/functional_gap_probes.py",
     "src/one_c_autoresearch/final_gate.py",
     "src/one_c_autoresearch/review_dashboard.py",
     "src/one_c_autoresearch/reverse_map.py",
@@ -185,6 +244,19 @@ RESEARCH_REQUIRED_PATHS = [
     "analysis/detail-maps/README.md",
     "analysis/detail-maps/index.csv",
     "analysis/detail-maps/_templates/detail-map.json",
+    "analysis/subject-cards/README.md",
+    "analysis/subject-cards/registry.csv",
+    "analysis/subject-cards/candidates.csv",
+    "analysis/subject-cards/classification.csv",
+    "analysis/subject-cards/coverage.csv",
+    "analysis/subject-cards/_templates/subject-card.json",
+    "analysis/functional-gaps/README.md",
+    "analysis/functional-gaps/index.csv",
+    "analysis/functional-gaps/coverage.csv",
+    "analysis/functional-gaps/open-questions.csv",
+    "analysis/functional-gaps/_templates/gap-card.json",
+    "analysis/functional-gaps/_templates/target-profile.toml",
+    "analysis/functional-gaps/profiles/.gitkeep",
     "analysis/reverse-map/README.md",
     "analysis/reverse-map/state.md",
     "analysis/reverse-map/coverage.csv",
@@ -837,6 +909,170 @@ class Doctor:
         if slugs:
             self.checks.add("detail_maps.rows", "ok", f"Detail-map contract has {len(slugs)} map(s)")
 
+    def test_subject_cards_contract(self) -> None:
+        self.require_path("analysis/subject-cards/README.md", "subject_cards")
+        self.require_path("analysis/subject-cards/_templates/subject-card.json", "subject_cards")
+        candidates_path = repo_path(self.root, "analysis/subject-cards/candidates.csv")
+        if candidates_path.exists():
+            header = candidates_path.read_text(encoding="utf-8-sig").splitlines()[:1]
+            if header == [SUBJECT_CARD_CANDIDATES_HEADER]:
+                self.checks.add("subject_cards.candidates.header", "ok", "Subject-card candidates header matches the contract")
+            else:
+                self.checks.add("subject_cards.candidates.header", "fail", "Subject-card candidates header does not match the contract")
+        classification_path = repo_path(self.root, "analysis/subject-cards/classification.csv")
+        if classification_path.exists():
+            header = classification_path.read_text(encoding="utf-8-sig").splitlines()[:1]
+            if header == [SUBJECT_CARD_CLASSIFICATION_HEADER]:
+                self.checks.add("subject_cards.classification.header", "ok", "Subject-card classification header matches the contract")
+            else:
+                self.checks.add("subject_cards.classification.header", "fail", "Subject-card classification header does not match the contract")
+        registry_path = repo_path(self.root, "analysis/subject-cards/registry.csv")
+        registry_rows: list[dict[str, str]] = []
+        if registry_path.exists():
+            header = registry_path.read_text(encoding="utf-8-sig").splitlines()[:1]
+            if header == [SUBJECT_CARD_REGISTRY_HEADER]:
+                self.checks.add("subject_cards.registry.header", "ok", "Subject-card registry header matches the contract")
+                with registry_path.open("r", encoding="utf-8-sig", newline="") as fh:
+                    registry_rows = [row for row in csv.DictReader(fh) if any((value or "").strip() for value in row.values())]
+                invalid_types = [row for row in registry_rows if row.get("subject_type") not in SUBJECT_CARD_TYPES]
+                if invalid_types:
+                    self.checks.add("subject_cards.registry.subject_type", "fail", f"Registry contains invalid subject_type in {len(invalid_types)} row(s)")
+                else:
+                    self.checks.add("subject_cards.registry.subject_type", "ok", "Registry subject_type values are controlled")
+            else:
+                self.checks.add("subject_cards.registry.header", "fail", "Subject-card registry header does not match the contract")
+        coverage_path = repo_path(self.root, "analysis/subject-cards/coverage.csv")
+        coverage_rows: list[dict[str, str]] = []
+        if coverage_path.exists():
+            header = coverage_path.read_text(encoding="utf-8-sig").splitlines()[:1]
+            if header == [SUBJECT_CARD_COVERAGE_HEADER]:
+                self.checks.add("subject_cards.coverage.header", "ok", "Subject-card coverage header matches the contract")
+                with coverage_path.open("r", encoding="utf-8-sig", newline="") as fh:
+                    coverage_rows = [row for row in csv.DictReader(fh) if any((value or "").strip() for value in row.values())]
+            else:
+                self.checks.add("subject_cards.coverage.header", "fail", "Subject-card coverage header does not match the contract")
+        root = repo_path(self.root, "analysis/subject-cards/cards")
+        if not root.exists():
+            self.checks.add("subject_cards.cards_dir", "ok", "No subject-card cards directory yet; run `python -m one_c_autoresearch subject-card seed` after discovery")
+            return
+        cards = sorted(root.glob("*/subject-card.json"))
+        if not cards:
+            self.checks.add("subject_cards.empty", "ok", "No subject cards defined yet")
+            return
+        slugs: set[str] = set()
+        ready_count = 0
+        for path in cards:
+            relative = path.relative_to(self.root).as_posix()
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                self.checks.add("subject_cards.parse", "fail", f"Could not parse {relative}: {exc}")
+                continue
+            if data.get("schema_version") != "subject-card/v1":
+                self.checks.add("subject_cards.schema_version", "fail", f"{relative} must declare schema_version=subject-card/v1")
+            for field in ("slug", "title", "status", "confidence", "subject_type", "origin_layer", "coverage_scope", "why_separate_card", "summary", "identification", "key_conclusion", "upgrade_risk", "linked_features", "sections"):
+                value = data.get(field)
+                if value in (None, "", []):
+                    self.checks.add("subject_cards.required_field", "fail", f"{relative} is missing required field: {field}")
+            slug = str(data.get("slug") or path.parent.name).strip()
+            if slug in slugs:
+                self.checks.add("subject_cards.duplicate_slug", "fail", f"Duplicate subject-card slug: {slug}")
+            elif slug:
+                slugs.add(slug)
+            status = str(data.get("status", "")).strip()
+            if status and status not in SUBJECT_CARD_STATUSES:
+                self.checks.add("subject_cards.status", "fail", f"{relative} has invalid status: {status}")
+            if status == "ready_for_review":
+                ready_count += 1
+            subject_type = str(data.get("subject_type", "")).strip()
+            if subject_type and subject_type not in SUBJECT_CARD_TYPES:
+                self.checks.add("subject_cards.subject_type", "fail", f"{relative} has invalid subject_type: {subject_type}")
+            if data.get("linked_features") is not None and not isinstance(data.get("linked_features"), list):
+                self.checks.add("subject_cards.linked_features", "fail", f"{relative} linked_features must be a list")
+            for source in as_list(data.get("source_artifacts")):
+                source_text = str(source or "").strip()
+                if spreadsheet_reference(source_text):
+                    self.checks.add("subject_cards.source_artifact", "fail", f"{relative} uses Excel as source artifact: {source_text}")
+            sections = data.get("sections")
+            if not isinstance(sections, dict):
+                self.checks.add("subject_cards.sections", "fail", f"{relative} sections must be an object")
+                sections = {}
+            for section in SUBJECT_CARD_SECTIONS:
+                if section in sections and not isinstance(sections[section], list):
+                    self.checks.add("subject_cards.section_type", "fail", f"{relative} section {section} must be a list")
+                    continue
+                for index, row in enumerate(as_list(sections.get(section)), start=1):
+                    if not isinstance(row, dict):
+                        continue
+                    if section == "open_questions":
+                        if not str(row.get("question") or "").strip():
+                            self.checks.add("subject_cards.section_question", "fail", f"{relative} section {section} row {index} must contain question")
+                    elif not str(row.get("claim") or "").strip():
+                        self.checks.add("subject_cards.section_claim", "fail", f"{relative} section {section} row {index} must contain claim; technical rows belong in linked detail-map")
+                    for key in ("source", "source_path"):
+                        source_text = str(row.get(key) or "").strip()
+                        if spreadsheet_reference(source_text):
+                            self.checks.add("subject_cards.section_source", "fail", f"{relative} section {section} row {index} uses Excel as source: {source_text}")
+            evidence_path = path.parent / "evidence.csv"
+            gaps_path = path.parent / "gaps.csv"
+            review_path = path.parent / "review.md"
+            for child_path in (evidence_path, gaps_path, review_path):
+                if not child_path.exists():
+                    self.checks.add("subject_cards.required_artifact", "fail", f"Missing subject-card artifact: {child_path.relative_to(self.root).as_posix()}")
+            if evidence_path.exists():
+                header = evidence_path.read_text(encoding="utf-8-sig").splitlines()[:1]
+                if header != [SUBJECT_CARD_EVIDENCE_HEADER]:
+                    self.checks.add("subject_cards.evidence.header", "fail", f"{evidence_path.relative_to(self.root).as_posix()} header does not match the contract")
+                with evidence_path.open("r", encoding="utf-8-sig", newline="") as fh:
+                    for row in csv.DictReader(fh):
+                        source_text = str(row.get("source_path") or "").strip()
+                        if spreadsheet_reference(source_text):
+                            self.checks.add("subject_cards.evidence.source", "fail", f"{evidence_path.relative_to(self.root).as_posix()} uses Excel as source in {row.get('evidence_id')}: {source_text}")
+            if gaps_path.exists():
+                header = gaps_path.read_text(encoding="utf-8-sig").splitlines()[:1]
+                if header != [SUBJECT_CARD_GAPS_HEADER]:
+                    self.checks.add("subject_cards.gaps.header", "fail", f"{gaps_path.relative_to(self.root).as_posix()} header does not match the contract")
+        if slugs:
+            self.checks.add("subject_cards.rows", "ok", f"Subject-card contract has {len(slugs)} card(s)")
+        if ready_count:
+            self.checks.add("subject_cards.ready_for_review", "ok", f"Subject-card workflow has {ready_count} ready-for-review card(s)")
+        else:
+            self.checks.add("subject_cards.ready_for_review", "ok", "No ready_for_review subject cards yet")
+        registry_by_slug = {row.get("slug", ""): row for row in registry_rows}
+        missing_registry = [slug for slug in slugs if slug not in registry_by_slug or not registry_by_slug[slug].get("card_path")]
+        if missing_registry:
+            self.checks.add("subject_cards.registry.coverage", "fail", f"Subject-card registry does not point to card_path for: {', '.join(sorted(missing_registry))}")
+        elif registry_rows:
+            self.checks.add("subject_cards.registry.coverage", "ok", "Subject-card registry covers every card and can also contain candidates")
+        final_feature_path = repo_path(self.root, "analysis/indexes/final-feature-map.csv")
+        final_feature_rows: list[dict[str, str]] = []
+        if final_feature_path.exists():
+            with final_feature_path.open("r", encoding="utf-8-sig", newline="") as fh:
+                final_feature_rows = [row for row in csv.DictReader(fh) if any((value or "").strip() for value in row.values())]
+        feature_ids = {row.get("feature_id", "") for row in final_feature_rows if row.get("feature_id")}
+        covered_feature_ids = {row.get("feature_id", "") for row in coverage_rows if row.get("source_kind") == "BF" and row.get("feature_id")}
+        missing_features = sorted(feature_ids - covered_feature_ids)
+        if missing_features:
+            self.checks.add("subject_cards.coverage.bf", "fail", f"Subject-card coverage misses BF containers: {', '.join(missing_features)}")
+        elif feature_ids:
+            self.checks.add("subject_cards.coverage.bf", "ok", f"Subject-card coverage classifies {len(feature_ids)} BF container(s)")
+
+    def test_functional_gaps_contract(self) -> None:
+        root = repo_path(self.root, "analysis/functional-gaps")
+        if not root.exists():
+            self.checks.add("functional_gaps.not_enabled", "ok", "Functional-gap layer is not enabled yet")
+            return
+        cards_root = root / "cards"
+        if not cards_root.exists() or not list(cards_root.glob("*/gap-card.json")):
+            self.checks.add("functional_gaps.not_seeded", "ok", "No functional-gap cards built yet")
+            return
+        result = validate_functional_gaps(self.root)
+        if result["status"] == "ok":
+            self.checks.add("functional_gaps.contract", "ok", f"Functional-gap contract has {result.get('cards', 0)} card(s)")
+            return
+        for error in result.get("errors", []):
+            self.checks.add("functional_gaps.contract", "fail", error)
+
     def test_unresolved_placeholders(self) -> None:
         found = False
         for path in self.root.rglob("*"):
@@ -869,6 +1105,8 @@ class Doctor:
         self.test_queue("analysis/queue/tasks.jsonl")
         self.test_evidence_packs()
         self.test_detail_maps_contract()
+        self.test_subject_cards_contract()
+        self.test_functional_gaps_contract()
         self.test_reverse_map_contract()
         self.test_autopilot_contract(manifest)
         self.test_unresolved_placeholders()
