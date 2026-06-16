@@ -24,6 +24,12 @@ REVERSE_MAP_DECISIONS_HEADER = (
 REVERSE_MAP_UNRESOLVED_HEADER = (
     "item_id,workitem_id,diff_id,scenario_id,status,reason,needed_input,impact,owner,notes"
 )
+REVERSE_MAP_INFOBASE_CHECKS_HEADER = (
+    "check_id,item_id,workitem_id,diff_id,scenario_id,feature_id,subject_card_slug,"
+    "question_ref,check_method,custom_target,vendor_target,query_or_probe,custom_result,"
+    "vendor_result,result,status_before_pass,status_after_pass,evidence_ref,checked_by,"
+    "checked_at,notes"
+)
 
 REVERSE_MAP_STATUSES = {
     "unreviewed",
@@ -137,6 +143,7 @@ def reverse_map_paths(root: Path) -> dict[str, Path]:
         "workitems": base / "workitems.jsonl",
         "decisions": base / "decisions.csv",
         "unresolved": base / "unresolved.csv",
+        "infobase_checks": base / "infobase-checks.csv",
         "scenarios_readme": base / "scenarios" / "README.md",
         "outputs_readme": base / "outputs" / "README.md",
     }
@@ -179,6 +186,7 @@ def scaffold_reverse_map_files(root: Path, force: bool = False) -> tuple[list[st
         "analysis/reverse-map/coverage.csv": REVERSE_MAP_COVERAGE_HEADER,
         "analysis/reverse-map/decisions.csv": REVERSE_MAP_DECISIONS_HEADER,
         "analysis/reverse-map/unresolved.csv": REVERSE_MAP_UNRESOLVED_HEADER,
+        "analysis/reverse-map/infobase-checks.csv": REVERSE_MAP_INFOBASE_CHECKS_HEADER,
     }
     for relative, header in csv_files.items():
         path = repo_path(root, relative)

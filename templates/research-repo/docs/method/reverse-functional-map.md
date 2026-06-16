@@ -13,9 +13,10 @@ When the user writes a short continuation trigger such as `/goal Исследо�
 3. If a workitem is returned, process exactly that workitem.
 4. If no workitem is returned, run `python -m one_c_autoresearch reverse-map status` and report whether coverage is complete or blocked.
 5. Update `analysis/reverse-map/coverage.csv`, `decisions.csv`, `unresolved.csv`, and the scenario folder.
-6. Run `python -m one_c_autoresearch final-gate status` to report how the reverse-map state affects final claims.
-7. Run `python -m one_c_autoresearch doctor` and `python -m one_c_autoresearch checks research`.
-8. Stop with the claimed workitem either advanced or explicitly blocked.
+6. If the workitem contains `needs_infobase_data`, run or record the live infobase evidence pass in `analysis/reverse-map/infobase-checks.csv`.
+7. Run `python -m one_c_autoresearch final-gate status` to report how the reverse-map state affects final claims.
+8. Run `python -m one_c_autoresearch doctor` and `python -m one_c_autoresearch checks research`.
+9. Stop with the claimed workitem either advanced or explicitly blocked.
 
 ## State Files
 
@@ -23,6 +24,7 @@ When the user writes a short continuation trigger such as `/goal Исследо�
 - `workitems.jsonl`: durable queue for scenario or cluster research.
 - `decisions.csv`: manual or agent-recorded assignment decisions.
 - `unresolved.csv`: facts that need infobase data, business review, or follow-up evidence.
+- `infobase-checks.csv`: live checks that close or preserve `needs_infobase_data` blockers.
 - `scenarios/`: one folder per reconstructed scenario.
 - `outputs/`: intermediate human-facing reverse-map outputs before promotion to final deliverables.
 
@@ -45,6 +47,24 @@ When the user writes a short continuation trigger such as `/goal Исследо�
 ## Quality Rule
 
 The agent may generate hypotheses, but final map rows must be evidence-backed. If a claim cannot be tied to source files, lines, metadata, or explicit runtime-data requirements, it belongs in `unresolved.csv`, not in the final map.
+
+## Infobase Evidence Rule
+
+Use live infobase evidence only for a concrete static-analysis blocker. Before a
+live check, identify the `item_id`, `diff_id`, `scenario_id`, expected fact, and
+read-only query or scenario probe. When custom and vendor infobases are both
+available, run equivalent checks against both and classify the result as
+`custom_only`, `same_as_vendor`, `vendor_differs`, `runtime_only`,
+`manual_scenario_required`, or `inconclusive`.
+
+Write every pass to `analysis/reverse-map/infobase-checks.csv`. A row with
+`status_after_pass=closed` must have an `evidence_ref`. If the fact still cannot
+be closed, keep the unresolved row or `outputs/infobase-questions.csv` row and
+ensure the final open questions explain the required data, closure method, and
+impact. `final-gate build` promotes open infobase questions into
+`outputs/open-questions.csv`; `doctor --strict` fails when an open infobase
+question is neither closed by `infobase-checks.csv` nor carried into final open
+questions.
 
 ## Final-Gate Rule
 

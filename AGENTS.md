@@ -24,7 +24,7 @@ This repository is a clean template for reproducible 1C autoresearch projects.
 
 - Use `docs/agent/repo-map.md` as the map of entry points, ownership, and change routing.
 - Use `docs/agent/verification.md` as the canonical verification matrix.
-- Use `docs/method/1c-autoresearch-process.md`, `docs/method/queue-design.md`, and `docs/method/reverse-functional-map.md` as the reusable analysis methodology.
+- Use `docs/method/1c-autoresearch-process.md`, `docs/method/queue-design.md`, `docs/method/physical-clean-comparison.md`, and `docs/method/reverse-functional-map.md` as the reusable analysis methodology.
 - Keep short command snippets in this file aligned with `docs/agent/verification.md`.
 
 ## Verification

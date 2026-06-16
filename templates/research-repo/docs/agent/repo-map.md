@@ -13,8 +13,9 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 | `docs/agent/` | Agent router, repo map, and verification runbook. | Agent workflow or navigation changes. |
 | `docs/method/` | Project-local copy of the reusable analysis method. | Method needs project-specific clarification. |
 | `analysis/queue/` | File-backed queue state and worker contract. | Tasks, statuses, schema, or review rules change. |
-| `analysis/reverse-map/` | Durable fact-to-intent reverse mapping state: coverage, workitems, decisions, unresolved items, and scenario outputs. | Continuing or auditing long-running reverse engineering work. |
+| `analysis/reverse-map/` | Durable fact-to-intent reverse mapping state: coverage, workitems, decisions, unresolved items, infobase checks, and scenario outputs. | Continuing or auditing long-running reverse engineering work. |
 | `analysis/indexes/` | Reviewable autopilot indexes: primary diff/feature maps and final-gate normalized maps. | Diff entries are classified, reverse-map decisions are normalized, or functional features are grouped. |
+| `analysis/clean-comparison/` | Durable queue, decisions, summaries, and reports for physical cleanup of raw comparison noise. | Building or auditing the clean diff before classification. |
 | `analysis/subject-cards/` | Iterative subject-card registry and analyst-owned cards below coarse `BF-*` containers. | Building or reviewing concrete subject cards. |
 | `analysis/functional-gaps/` | One-card-per-pass map of migration hypotheses, target-release checks, and analyst decisions. | A subject card is being prepared for transition to a newer release. |
 | `analysis/features/` | Feature evidence packs and file templates. | A queue task produces or updates feature-level evidence. |
@@ -39,17 +40,19 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 
 Use this route when the goal is the final end-to-end customization map rather than a single queue task:
 
-1. Read `project.toml` and `docs/method/autopilot-customization-map.md`.
+1. Read `project.toml`, `docs/method/autopilot-customization-map.md`, and `docs/method/physical-clean-comparison.md`.
 2. Run `python -m one_c_autoresearch autopilot scaffold --enable-gate` if the final-map artifacts are not initialized.
-3. Build or reuse the physical clean-rebase comparison.
+3. Build or reuse the physical clean comparison, including its queue, decision ledger, summary, and intermediate dashboard when analyst review is needed.
 4. Classify every clean diff entry in `analysis/indexes/diff-inventory.csv`.
 5. Group real customizations in `analysis/indexes/feature-map.csv`.
 6. Complete reverse-map coverage and decisions under `analysis/reverse-map/`.
 7. Run `python -m one_c_autoresearch final-gate build`.
 8. Create complete evidence packs under `analysis/features/<feature-id>/`.
 9. Generate `outputs/customization-map.md`, `outputs/customization-map.xlsx`, `outputs/open-questions.csv`, and `outputs/open-questions.xlsx` from the final-gate layer.
-10. Write `analysis/final-audit.md`.
-11. Run `python -m one_c_autoresearch doctor --deep --strict`; do not claim completion until it passes.
+10. Build the subject-card layer: run `detail-map build`, `subject-card discover`, review/classify candidates, `registry-build`, `seed --from-registry`, `refine --card <slug>`, and `subject-card validate`.
+11. Run `python -m one_c_autoresearch review-dashboard build` and verify that the first screen contains concrete subject cards, not only BF containers.
+12. Write `analysis/final-audit.md`.
+13. Run `python -m one_c_autoresearch doctor --deep --strict`; do not claim completion until it passes.
 
 ## Reverse-Map Route
 
@@ -93,6 +96,8 @@ Use this route when the goal is to build a migration gap map for one already pre
 - `.codex/1c-mcp.toml`: active MCP/web target when present; it must match `project.toml` before live evidence is used.
 - `analysis/queue/tasks.jsonl`: current queue state.
 - `analysis/reverse-map/`: durable continuation state for reverse functional mapping.
+- `analysis/reverse-map/infobase-checks.csv`: durable live-check ledger for infobase-dependent findings.
+- `analysis/clean-comparison/`: durable state for physical cleanup of raw comparison noise.
 - `analysis/subject-cards/`: durable subject-card registry and generated card bundles.
 - `analysis/functional-gaps/`: durable one-card-per-pass state for migration gap mapping.
 - `analysis/indexes/diff-inventory.csv`: every clean diff entry and its classification status.
@@ -102,6 +107,7 @@ Use this route when the goal is to build a migration gap map for one already pre
 - `analysis/features/`: durable feature evidence.
 - `docs/method/evidence-pack-schema.md`: canonical CSV headers and feature pack file contract.
 - `docs/method/autopilot-customization-map.md`: final-map pipeline and completion gate.
+- `docs/method/physical-clean-comparison.md`: clean diff, refinement ledger, and intermediate dashboard contract.
 - `outputs/`: final human-facing deliverables.
 - `docs/agent/verification.md`: validation commands and health gate meaning.
 

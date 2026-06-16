@@ -15,6 +15,7 @@ from .autopilot import (
     DIFF_INVENTORY_HEADER,
     FEATURE_MAP_HEADER,
     FINAL_DIFF_INVENTORY_HEADER,
+    INFOBASE_QUESTIONS_HEADER,
     OPEN_QUESTIONS_HEADER,
     scaffold_autopilot,
     write_minimal_xlsx,
@@ -28,6 +29,7 @@ from .functional_gaps import build_functional_gap_card, build_functional_gap_map
 from .queue import claim_next_task, set_task_status
 from .reverse_map import (
     REVERSE_MAP_COVERAGE_HEADER,
+    REVERSE_MAP_INFOBASE_CHECKS_HEADER,
     get_next_reverse_map_workitem,
     scaffold_reverse_map,
     seed_reverse_map_workitems,
@@ -111,12 +113,14 @@ def test_template(args: argparse.Namespace) -> int:
         "templates/research-repo/docs/method/1c-autoresearch-process.md",
         "templates/research-repo/docs/method/evidence-pack-schema.md",
         "templates/research-repo/docs/method/autopilot-customization-map.md",
+        "templates/research-repo/docs/method/physical-clean-comparison.md",
         "templates/research-repo/docs/method/reverse-functional-map.md",
         "templates/research-repo/analysis/indexes/README.md",
         "templates/research-repo/analysis/indexes/diff-inventory.csv",
         "templates/research-repo/analysis/indexes/feature-map.csv",
         "templates/research-repo/analysis/indexes/final-diff-inventory.csv",
         "templates/research-repo/analysis/indexes/final-feature-map.csv",
+        "templates/research-repo/analysis/clean-comparison/README.md",
         "templates/research-repo/analysis/detail-maps/README.md",
         "templates/research-repo/analysis/detail-maps/index.csv",
         "templates/research-repo/analysis/detail-maps/_templates/detail-map.json",
@@ -139,6 +143,7 @@ def test_template(args: argparse.Namespace) -> int:
         "templates/research-repo/analysis/reverse-map/workitems.jsonl",
         "templates/research-repo/analysis/reverse-map/decisions.csv",
         "templates/research-repo/analysis/reverse-map/unresolved.csv",
+        "templates/research-repo/analysis/reverse-map/infobase-checks.csv",
         "templates/research-repo/analysis/reverse-map/scenarios/README.md",
         "templates/research-repo/analysis/reverse-map/outputs/README.md",
         "templates/research-repo/analysis/runs/README.md",
@@ -162,6 +167,7 @@ def test_template(args: argparse.Namespace) -> int:
         "templates/research-repo/outputs/README.md",
         "templates/research-repo/outputs/review/README.md",
         "templates/research-repo/outputs/open-questions.csv",
+        "templates/research-repo/outputs/infobase-questions.csv",
         "templates/research-repo/scripts/queue/claim_next_analysis_task.py",
         "templates/research-repo/scripts/queue/get_next_analysis_task.py",
         "templates/research-repo/scripts/queue/set_analysis_task_status.py",
@@ -191,7 +197,15 @@ def test_template(args: argparse.Namespace) -> int:
     require_text(root, "templates/research-repo/analysis/indexes/feature-map.csv", r"^feature_id,title,domain,source_bucket,classification,confidence,status,owner,summary,evidence_pack_path,open_questions_path,outputs,notes$", "Feature map template should expose the canonical autopilot header.", errors)
     require_text(root, "templates/research-repo/analysis/indexes/final-diff-inventory.csv", rf"^{re.escape(FINAL_DIFF_INVENTORY_HEADER)}$", "Final diff inventory template should expose the canonical final-gate header.", errors)
     require_text(root, "templates/research-repo/analysis/indexes/final-feature-map.csv", r"^feature_id,title,domain,source_bucket,classification,confidence,status,owner,summary,evidence_pack_path,open_questions_path,outputs,notes$", "Final feature map template should expose the canonical final-gate header.", errors)
+    require_text(root, "docs/method/autopilot-customization-map.md", r"physical-clean-comparison\.md", "Autopilot runbook should route physical cleanup through the clean-comparison contract.", errors)
+    require_text(root, "docs/method/autopilot-customization-map.md", r"subject-card validate", "Autopilot runbook should require subject-card validation before the analyst dashboard.", errors)
+    require_text(root, "docs/agent/verification.md", r"subject_cards", "Verification runbook should include subject-card dashboard readiness checks.", errors)
+    require_text(root, "docs/method/physical-clean-comparison.md", r"outputs/clean-comparison-dashboard", "Physical clean-comparison runbook should require an intermediate analyst dashboard.", errors)
+    require_text(root, "docs/method/physical-clean-comparison.md", r"self-contained HTML", "Physical clean-comparison dashboard should be self-contained.", errors)
+    require_text(root, "templates/research-repo/analysis/clean-comparison/README.md", r"physical-clean-comparison\.md", "Generated clean-comparison README should point to the method contract.", errors)
     require_text(root, "templates/research-repo/outputs/open-questions.csv", r"^question_id,feature_id,status,reason,closure_method,impact,source_ref,owner,notes$", "Open questions template should expose the canonical autopilot header.", errors)
+    require_text(root, "templates/research-repo/outputs/infobase-questions.csv", rf"^{re.escape(INFOBASE_QUESTIONS_HEADER)}$", "Infobase questions template should expose the canonical autopilot header.", errors)
+    require_text(root, "templates/research-repo/analysis/reverse-map/infobase-checks.csv", r"^check_id,item_id,workitem_id,diff_id,scenario_id,feature_id,subject_card_slug,question_ref,check_method,custom_target,vendor_target,query_or_probe,custom_result,vendor_result,result,status_before_pass,status_after_pass,evidence_ref,checked_by,checked_at,notes$", "Reverse-map infobase checks template should expose the canonical header.", errors)
     require_text(root, "templates/research-repo/analysis/detail-maps/README.md", r"detail-map\.json", "Detail-map README should document the detail-map.json contract.", errors)
     require_text(root, "templates/research-repo/analysis/detail-maps/README.md", r"detail-map build", "Detail-map README should document the reproducible builder command.", errors)
     require_text(root, "templates/research-repo/analysis/detail-maps/index.csv", r"^slug,title,type,status,confidence,owner_feature,linked_features,source_rows,detail_map_path,generation_mode,completeness,notes$", "Detail-map index template should expose the canonical header.", errors)
@@ -226,6 +240,7 @@ def test_template(args: argparse.Namespace) -> int:
     require_same_content(root, "docs/method/1c-autoresearch-process.md", "templates/research-repo/docs/method/1c-autoresearch-process.md", "Generated research methodology must match the template system-of-record document.", errors)
     require_same_content(root, "docs/method/evidence-pack-schema.md", "templates/research-repo/docs/method/evidence-pack-schema.md", "Generated evidence pack schema must match the template system-of-record document.", errors)
     require_same_content(root, "docs/method/autopilot-customization-map.md", "templates/research-repo/docs/method/autopilot-customization-map.md", "Generated autopilot runbook must match the template system-of-record document.", errors)
+    require_same_content(root, "docs/method/physical-clean-comparison.md", "templates/research-repo/docs/method/physical-clean-comparison.md", "Generated physical clean-comparison runbook must match the template system-of-record document.", errors)
     require_same_content(root, "docs/method/reverse-functional-map.md", "templates/research-repo/docs/method/reverse-functional-map.md", "Generated reverse-map runbook must match the template system-of-record document.", errors)
     try:
         read_jsonl(repo_path(root, "templates/research-repo/analysis/queue/tasks.jsonl"))
@@ -591,6 +606,7 @@ def test_doctor(args: argparse.Namespace) -> int:
             "analysis/reverse-map/workitems.jsonl",
             "analysis/reverse-map/decisions.csv",
             "analysis/reverse-map/unresolved.csv",
+            "analysis/reverse-map/infobase-checks.csv",
             "analysis/reverse-map/scenarios/README.md",
             "analysis/reverse-map/outputs/README.md",
             "analysis/cache/AGENTS.md",
@@ -598,6 +614,7 @@ def test_doctor(args: argparse.Namespace) -> int:
             "analysis/features/_templates/evidence.csv",
             "analysis/queue/runs/README.md",
             "outputs/open-questions.csv",
+            "outputs/infobase-questions.csv",
             "outputs/AGENTS.md",
             "scripts/queue/claim_next_analysis_task.py",
         ):
@@ -967,6 +984,19 @@ def test_doctor(args: argparse.Namespace) -> int:
         complete = run_doctor(complete_repo)
         require(complete["status"] == "ok", "Autopilot gate should pass on a complete customization map", errors)
 
+        no_subject_card_repo = base / "no-subject-card-autopilot"
+        copy_smoke_repo(complete_repo, no_subject_card_repo)
+        shutil.rmtree(repo_path(no_subject_card_repo, "analysis/subject-cards/cards"), ignore_errors=True)
+        repo_path(no_subject_card_repo, "analysis/subject-cards/registry.csv").write_text(SUBJECT_CARD_REGISTRY_HEADER + "\n", encoding="utf-8")
+        repo_path(no_subject_card_repo, "analysis/subject-cards/coverage.csv").write_text("source_kind,source_id,feature_id,detail_map_slug,subject_card_slug,relation,confidence,notes\n", encoding="utf-8")
+        no_subject_card = run_doctor(no_subject_card_repo)
+        require(no_subject_card["status"] == "fail", "Autopilot gate should fail when the analyst subject-card layer is empty", errors)
+        require(
+            any(str(check["id"]).startswith("autopilot.subject_cards.") and check["status"] == "fail" for check in no_subject_card["checks"]),
+            "Doctor should report autopilot.subject_cards failures when subject cards are missing",
+            errors,
+        )
+
         reverse_blocked_final_repo = base / "reverse-blocked-final"
         copy_smoke_repo(complete_repo, reverse_blocked_final_repo)
         repo_path(reverse_blocked_final_repo, "analysis/reverse-map/coverage.csv").write_text(
@@ -991,6 +1021,31 @@ def test_doctor(args: argparse.Namespace) -> int:
         bad_question = run_doctor(bad_question_repo)
         require(bad_question["status"] == "fail", "Autopilot gate should fail when open questions lack reason, closure method, or impact", errors)
         require(any(check["id"] == "autopilot.open_questions.required_fields" for check in bad_question["checks"]), "Autopilot gate should report incomplete open questions", errors)
+
+        infobase_question_repo = base / "open-infobase-question"
+        copy_smoke_repo(complete_repo, infobase_question_repo)
+        repo_path(infobase_question_repo, "outputs/infobase-questions.csv").write_text(
+            "question_id,subject_card_slug,feature_id,object_or_setting,check_target,reason,closing_result,risk_if_open,source_ref,status\n"
+            "IBQ-1,example-document,feature-a,Catalog.Example,Проверить данные ИБ,Статический анализ не видит данные,Закрыть проверкой,Риск миграции,analysis/subject-cards/cards/example-document/gaps.csv#IB-001,open\n",
+            encoding="utf-8",
+        )
+        open_infobase_question = run_doctor(infobase_question_repo)
+        require(open_infobase_question["status"] == "fail", "Autopilot gate should fail when infobase questions are open and neither checked nor promoted to final open questions", errors)
+        require(
+            any(check["id"] == "autopilot.infobase_questions.unresolved" for check in open_infobase_question["checks"]),
+            "Doctor should report unresolved infobase questions as an autopilot blocker",
+            errors,
+        )
+
+        checked_infobase_question_repo = base / "checked-infobase-question"
+        copy_smoke_repo(infobase_question_repo, checked_infobase_question_repo)
+        repo_path(checked_infobase_question_repo, "analysis/reverse-map/infobase-checks.csv").write_text(
+            REVERSE_MAP_INFOBASE_CHECKS_HEADER
+            + "\nIBC-1,IBQ-1,RM-0001,D-0001,feature-a,feature-a,example-document,outputs/infobase-questions.csv#IBQ-1,direct_postgresql_query,tn_bp20_custom,tn_bp20_demo,select 1,1,1,same_as_vendor,needs_infobase_data,closed,analysis/reverse-map/evidence/IBC-1.md,codex,2026-06-16T00:00:00Z,\n",
+            encoding="utf-8",
+        )
+        checked_infobase_question = run_doctor(checked_infobase_question_repo)
+        require(checked_infobase_question["status"] == "ok", "Autopilot gate should pass when every infobase question has a closed live-check row", errors)
 
         reverse_repo = base / "reverse-map"
         copy_smoke_repo(temp_repo, reverse_repo)

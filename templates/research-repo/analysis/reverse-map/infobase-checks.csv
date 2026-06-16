@@ -1,0 +1,1 @@
+check_id,item_id,workitem_id,diff_id,scenario_id,feature_id,subject_card_slug,question_ref,check_method,custom_target,vendor_target,query_or_probe,custom_result,vendor_result,result,status_before_pass,status_after_pass,evidence_ref,checked_by,checked_at,notes

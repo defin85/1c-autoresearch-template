@@ -9,11 +9,15 @@ Human-facing deliverables go here:
 - development backlog seeds.
 
 Intermediate indexes and noisy diagnostics belong under `analysis/cache/`.
+Physical cleanup review dashboards are intermediate analyst artifacts and may
+live under `outputs/clean-comparison-dashboard/` or a documented layer-specific
+directory such as `outputs/v8unpack-refinement-dashboard/`.
 
 The autopilot final-map workflow produces:
 
 - `customization-map.md`
 - `customization-map.xlsx`
+- `infobase-questions.csv`
 - `open-questions.csv`
 - `open-questions.xlsx`
 - `review/index.html`

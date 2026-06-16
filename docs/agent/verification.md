@@ -80,8 +80,13 @@ After `autopilot.enabled=true`, `doctor` fails until:
 - `outputs/customization-map.md` and `outputs/customization-map.xlsx` exist;
 - `outputs/open-questions.csv` and `outputs/open-questions.xlsx` exist;
 - `analysis/detail-maps/README.md`, `index.csv`, and `_templates/detail-map.json` define the reusable detail-map contract;
-- `outputs/review/index.html` and `outputs/review/data.json` can be regenerated for analyst review after `detail-map build`, including `analysis/detail-maps/**/*.json` when present;
+- `analysis/subject-cards/registry.csv` and `coverage.csv` classify every publishable BF container into a concrete subject card or an explicit non-card decision;
+- `analysis/subject-cards/cards/<slug>/subject-card.json`, `evidence.csv`, `gaps.csv`, and `review.md` exist for ready analyst cards;
+- at least one subject card is in `ready_for_review` or `reviewed` status;
+- `outputs/review/index.html` and `outputs/review/data.json` can be regenerated for analyst review after `detail-map build` and subject-card validation, including `analysis/detail-maps/**/*.json` when present;
+- `outputs/review/data.json` contains non-empty `subject_cards` and `subject_registry` arrays, so the first dashboard screen is not empty;
 - `outputs/open-questions.csv` covers every item in `analysis/reverse-map/unresolved.csv`;
+- `analysis/reverse-map/infobase-checks.csv` exists and records every attempted live check for `needs_infobase_data` blockers;
 - every open question has reason, closure method, and impact;
 - `analysis/final-audit.md` contains `Coverage status: complete` and `Unclassified diff entries: 0`;
 - final text artifacts contain no `TODO` or `FIXME` markers.
@@ -92,8 +97,32 @@ Build and verify the publishable layer before final output generation:
 python -m one_c_autoresearch final-gate build
 python -m one_c_autoresearch final-gate verify
 python -m one_c_autoresearch detail-map build
+python -m one_c_autoresearch subject-card discover
+python -m one_c_autoresearch subject-card classify
+python -m one_c_autoresearch subject-card registry-build
+python -m one_c_autoresearch subject-card seed --from-registry
+python -m one_c_autoresearch subject-card refine --card <slug>
+python -m one_c_autoresearch subject-card validate
 python -m one_c_autoresearch review-dashboard build
 ```
+
+## Physical Clean Comparison
+
+When the research project needs physical cleanup of a raw vendor-vs-customer
+diff, follow `docs/method/physical-clean-comparison.md` before building
+`analysis/indexes/diff-inventory.csv`.
+
+Verify the cleanup layer by checking that:
+
+- raw vendor and customer tags or commits are recorded and unchanged;
+- the nested comparison repo has no uncommitted cleanup work;
+- every `analysis/clean-comparison/refinement-queue.csv` row, or the documented layer-specific queue, has a terminal status or an explicit manual-review/blocker status;
+- `decisions.jsonl` records a decision and rationale for every reviewed item;
+- `summary.json` records raw diff count, clean diff count, removed noise classes, preserved customization classes, clean commit, and clean diff command;
+- `outputs/clean-comparison-dashboard/index.html` and `outputs/clean-comparison-dashboard/data.json`, or documented layer-specific dashboard paths, exist when analyst review is required.
+
+The final `outputs/review/` dashboard is still built after `final-gate`; it does
+not replace the intermediate clean-comparison dashboard.
 
 ## Reverse Functional Map
 
@@ -118,6 +147,12 @@ python -m one_c_autoresearch doctor
 ```
 
 The doctor checks that `analysis/reverse-map/coverage.csv` covers every diff row from `analysis/indexes/diff-inventory.csv`, workitems parse, statuses are valid, reverse-map CSV headers match the contract, and final-gate outputs are fresh when autopilot publication is enabled. Open work is represented in state files rather than hidden in agent context.
+`analysis/reverse-map/infobase-checks.csv` is the durable ledger for live
+infobase passes. `outputs/infobase-questions.csv` is the autopilot input
+registry for subject-card questions that need infobase data. `doctor --strict`
+fails when a `needs_infobase_data` unresolved item or an open infobase question
+is neither closed by `infobase-checks.csv` nor carried into final open questions
+with a closure method and impact.
 
 ## Subject Cards
 
@@ -132,7 +167,7 @@ python -m one_c_autoresearch subject-card refine --card <slug>
 python -m one_c_autoresearch subject-card validate --card <slug>
 ```
 
-An empty scaffolded `analysis/subject-cards/` layer is valid for a newly generated research repo. Once card bundles exist, `doctor` validates their JSON/CSV contract and expects ready cards to have no blocking gaps.
+An empty scaffolded `analysis/subject-cards/` layer is valid for a newly generated research repo only while `autopilot.enabled=false` or before the final map is claimed complete. With `autopilot.enabled=true`, `doctor --deep --strict` fails until the subject-card registry, coverage rows, concrete card bundles, and the dashboard data all expose ready analyst cards.
 
 ## Functional Gap Map
 

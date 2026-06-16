@@ -11,6 +11,7 @@ from .common import repo_path
 DIFF_INVENTORY_HEADER = "diff_id,source,change_type,path,object_kind,object_name,area,feature_id,classification,confidence,status,summary,evidence_ref,notes"
 FEATURE_MAP_HEADER = "feature_id,title,domain,source_bucket,classification,confidence,status,owner,summary,evidence_pack_path,open_questions_path,outputs,notes"
 OPEN_QUESTIONS_HEADER = "question_id,feature_id,status,reason,closure_method,impact,source_ref,owner,notes"
+INFOBASE_QUESTIONS_HEADER = "question_id,subject_card_slug,feature_id,object_or_setting,check_target,reason,closing_result,risk_if_open,source_ref,status"
 FINAL_DIFF_INVENTORY_HEADER = (
     DIFF_INVENTORY_HEADER
     + ",reverse_status,reverse_confidence,reverse_scenario_id,final_feature_id,"
@@ -127,6 +128,7 @@ def scaffold_autopilot(args: argparse.Namespace) -> int:
         "analysis/indexes/final-diff-inventory.csv": FINAL_DIFF_INVENTORY_HEADER + "\n",
         "analysis/indexes/final-feature-map.csv": FEATURE_MAP_HEADER + "\n",
         "outputs/open-questions.csv": OPEN_QUESTIONS_HEADER + "\n",
+        "outputs/infobase-questions.csv": INFOBASE_QUESTIONS_HEADER + "\n",
         "outputs/customization-map.md": (
             "# Customization Map\n\n"
             "Status: scaffolded\n\n"

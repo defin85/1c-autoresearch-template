@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .autopilot import DIFF_INVENTORY_HEADER, FEATURE_MAP_HEADER, FINAL_DIFF_INVENTORY_HEADER, OPEN_QUESTIONS_HEADER
+from .autopilot import DIFF_INVENTORY_HEADER, FEATURE_MAP_HEADER, FINAL_DIFF_INVENTORY_HEADER, INFOBASE_QUESTIONS_HEADER, OPEN_QUESTIONS_HEADER
 from .common import (
     CheckSet,
     as_list,
@@ -26,6 +26,7 @@ from .detail_maps import DETAIL_MAP_GENERATION_MODES, DETAIL_MAP_INDEX_HEADER
 from .reverse_map import (
     REVERSE_MAP_COVERAGE_HEADER,
     REVERSE_MAP_DECISIONS_HEADER,
+    REVERSE_MAP_INFOBASE_CHECKS_HEADER,
     REVERSE_MAP_STATUSES,
     REVERSE_MAP_UNRESOLVED_HEADER,
     REVERSE_MAP_WORKITEM_STATUSES,
@@ -62,6 +63,29 @@ AUTOPILOT_FEATURE_STATUSES = {
     "needs_reclassification",
     "out_of_scope",
 }
+INFOBASE_CHECK_METHODS = {
+    "1c_mcp_run_select_query",
+    "1c_mcp_debug_execute_bsl",
+    "playwright_1c_web_ui",
+    "direct_postgresql_query",
+    "manual_1c_scenario",
+}
+INFOBASE_CHECK_RESULTS = {
+    "custom_only",
+    "same_as_vendor",
+    "vendor_differs",
+    "runtime_only",
+    "manual_scenario_required",
+    "inconclusive",
+}
+INFOBASE_CHECK_FINAL_STATUSES = {
+    "closed",
+    "needs_infobase_data",
+    "needs_runtime_verification",
+    "needs_manual_review",
+    "blocked_by_infobase_data",
+}
+INFOBASE_QUESTION_STATUSES = {"open", "closed", "blocked_by_infobase_data"}
 DETAIL_MAP_TYPES = {"document", "catalog", "route", "scheduled_job", "rights", "integration", "report", "ui", "other"}
 DETAIL_MAP_STATUSES = {
     "draft",
@@ -136,6 +160,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "docs/method/1c-autoresearch-process.md",
     "docs/method/evidence-pack-schema.md",
     "docs/method/autopilot-customization-map.md",
+    "docs/method/physical-clean-comparison.md",
     "docs/method/reverse-functional-map.md",
     "docs/method/queue-design.md",
     "templates/research-repo/.gitignore",
@@ -149,12 +174,14 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/docs/method/1c-autoresearch-process.md",
     "templates/research-repo/docs/method/evidence-pack-schema.md",
     "templates/research-repo/docs/method/autopilot-customization-map.md",
+    "templates/research-repo/docs/method/physical-clean-comparison.md",
     "templates/research-repo/docs/method/reverse-functional-map.md",
     "templates/research-repo/analysis/indexes/README.md",
     "templates/research-repo/analysis/indexes/diff-inventory.csv",
     "templates/research-repo/analysis/indexes/feature-map.csv",
     "templates/research-repo/analysis/indexes/final-diff-inventory.csv",
     "templates/research-repo/analysis/indexes/final-feature-map.csv",
+    "templates/research-repo/analysis/clean-comparison/README.md",
     "templates/research-repo/analysis/detail-maps/README.md",
     "templates/research-repo/analysis/detail-maps/index.csv",
     "templates/research-repo/analysis/detail-maps/_templates/detail-map.json",
@@ -177,6 +204,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/analysis/reverse-map/workitems.jsonl",
     "templates/research-repo/analysis/reverse-map/decisions.csv",
     "templates/research-repo/analysis/reverse-map/unresolved.csv",
+    "templates/research-repo/analysis/reverse-map/infobase-checks.csv",
     "templates/research-repo/analysis/reverse-map/scenarios/README.md",
     "templates/research-repo/analysis/reverse-map/outputs/README.md",
     "templates/research-repo/analysis/runs/README.md",
@@ -200,6 +228,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/outputs/README.md",
     "templates/research-repo/outputs/review/README.md",
     "templates/research-repo/outputs/open-questions.csv",
+    "templates/research-repo/outputs/infobase-questions.csv",
     "templates/research-repo/.agents/skills/1c-autoresearch-queue-worker/SKILL.md",
     "scripts/doctor.py",
     "scripts/bootstrap/new_research_repo.py",
@@ -235,12 +264,14 @@ RESEARCH_REQUIRED_PATHS = [
     "docs/method/1c-autoresearch-process.md",
     "docs/method/evidence-pack-schema.md",
     "docs/method/autopilot-customization-map.md",
+    "docs/method/physical-clean-comparison.md",
     "docs/method/reverse-functional-map.md",
     "analysis/indexes/README.md",
     "analysis/indexes/diff-inventory.csv",
     "analysis/indexes/feature-map.csv",
     "analysis/indexes/final-diff-inventory.csv",
     "analysis/indexes/final-feature-map.csv",
+    "analysis/clean-comparison/README.md",
     "analysis/detail-maps/README.md",
     "analysis/detail-maps/index.csv",
     "analysis/detail-maps/_templates/detail-map.json",
@@ -263,6 +294,7 @@ RESEARCH_REQUIRED_PATHS = [
     "analysis/reverse-map/workitems.jsonl",
     "analysis/reverse-map/decisions.csv",
     "analysis/reverse-map/unresolved.csv",
+    "analysis/reverse-map/infobase-checks.csv",
     "analysis/reverse-map/scenarios/README.md",
     "analysis/reverse-map/outputs/README.md",
     "analysis/runs/README.md",
@@ -286,6 +318,7 @@ RESEARCH_REQUIRED_PATHS = [
     "outputs/README.md",
     "outputs/review/README.md",
     "outputs/open-questions.csv",
+    "outputs/infobase-questions.csv",
     ".agents/skills/1c-autoresearch-queue-worker/SKILL.md",
     "scripts/doctor.py",
     "scripts/queue/claim_next_analysis_task.py",
@@ -368,7 +401,7 @@ class Doctor:
         rlm = manifest.get("rlm", {})
         for key in ("vendor_baseline", "target_cf", "target_cfe", "next_vendor"):
             value = str(rlm.get(key, "")).strip()
-            self.checks.add(f"manifest.rlm.{key}", "ok" if value else "warn", f"RLM project is {'set' if value else 'empty'}: {key}")
+            self.checks.add(f"manifest.rlm.{key}", "ok", f"RLM project is {'set' if value else 'not configured'}: {key}" + ("" if value else " (optional)"))
 
         self.test_manifest_access_policy(manifest)
         self.test_local_mcp_manifest(manifest)
@@ -619,6 +652,106 @@ class Doctor:
         else:
             self.checks.add("autopilot.feature_pack.evidence_rows", "fail", f"Feature {feature_id} has no evidence rows")
 
+    def test_autopilot_subject_card_gate(self, final_feature_rows: list[dict[str, str]]) -> None:
+        registry_rows = [
+            row
+            for row in self.read_csv_rows("analysis/subject-cards/registry.csv", SUBJECT_CARD_REGISTRY_HEADER, "autopilot.subject_cards.registry")
+            if any((value or "").strip() for value in row.values())
+        ]
+        coverage_rows = [
+            row
+            for row in self.read_csv_rows("analysis/subject-cards/coverage.csv", SUBJECT_CARD_COVERAGE_HEADER, "autopilot.subject_cards.coverage")
+            if any((value or "").strip() for value in row.values())
+        ]
+        if not registry_rows:
+            self.checks.add("autopilot.subject_cards.registry_rows", "fail", "Autopilot map has no subject-card registry rows; BF containers are not analyst-ready cards")
+        else:
+            self.checks.add("autopilot.subject_cards.registry_rows", "ok", f"Subject-card registry has {len(registry_rows)} row(s)")
+
+        registry_by_slug = {row.get("slug", "").strip(): row for row in registry_rows if row.get("slug", "").strip()}
+        card_paths = [row.get("card_path", "").strip() for row in registry_rows if row.get("card_path", "").strip()]
+        if not card_paths:
+            self.checks.add("autopilot.subject_cards.card_paths", "fail", "Subject-card registry has no concrete card_path rows; dashboard would show only BF containers")
+        else:
+            self.checks.add("autopilot.subject_cards.card_paths", "ok", f"Subject-card registry points to {len(card_paths)} card bundle(s)")
+
+        card_root = repo_path(self.root, "analysis/subject-cards/cards")
+        card_files = sorted(card_root.glob("*/subject-card.json")) if card_root.exists() else []
+        if not card_files:
+            self.checks.add("autopilot.subject_cards.cards", "fail", "No subject-card bundles found under analysis/subject-cards/cards")
+        else:
+            self.checks.add("autopilot.subject_cards.cards", "ok", f"Found {len(card_files)} subject-card bundle(s)")
+
+        ready_cards: list[str] = []
+        for path in card_files:
+            relative = path.relative_to(self.root).as_posix()
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                self.checks.add("autopilot.subject_cards.parse", "fail", f"Could not parse {relative}: {exc}")
+                continue
+            status = str(payload.get("status") or "").strip()
+            slug = str(payload.get("slug") or path.parent.name).strip()
+            if status in {"ready_for_review", "reviewed"}:
+                ready_cards.append(slug)
+            if slug and slug not in registry_by_slug:
+                self.checks.add("autopilot.subject_cards.registry_link", "fail", f"Subject-card {slug} is not present in analysis/subject-cards/registry.csv")
+        if ready_cards:
+            self.checks.add("autopilot.subject_cards.ready", "ok", f"Subject-card layer has {len(ready_cards)} ready card(s)")
+        else:
+            self.checks.add("autopilot.subject_cards.ready", "fail", "Autopilot map has no subject cards in ready_for_review or reviewed status")
+
+        publishable_feature_ids = {
+            row.get("feature_id", "").strip()
+            for row in final_feature_rows
+            if row.get("feature_id", "").strip() and row.get("status", "").strip() not in {"out_of_scope", "needs_reclassification"}
+        }
+        coverage_by_feature: dict[str, list[dict[str, str]]] = {}
+        for row in coverage_rows:
+            if row.get("source_kind", "").strip() != "BF":
+                continue
+            feature_id = row.get("feature_id", "").strip()
+            if feature_id:
+                coverage_by_feature.setdefault(feature_id, []).append(row)
+        for feature_id in sorted(publishable_feature_ids):
+            rows = coverage_by_feature.get(feature_id, [])
+            if not rows:
+                self.checks.add("autopilot.subject_cards.bf_coverage", "fail", f"Publishable BF {feature_id} is absent from subject-card coverage")
+                continue
+            useful_rows = [row for row in rows if row.get("relation", "").strip() in {"covered_by_subject_card", "supporting", "shared", "rejected", "technical_support"}]
+            if not useful_rows:
+                self.checks.add("autopilot.subject_cards.bf_unclassified", "fail", f"Publishable BF {feature_id} is still unclassified in subject-card coverage")
+                continue
+            for row in useful_rows:
+                relation = row.get("relation", "").strip()
+                subject_slug = row.get("subject_card_slug", "").strip()
+                if relation == "covered_by_subject_card" and (not subject_slug or not registry_by_slug.get(subject_slug, {}).get("card_path", "").strip()):
+                    self.checks.add("autopilot.subject_cards.bf_card_link", "fail", f"Publishable BF {feature_id} claims card coverage but has no concrete subject-card path")
+                if relation != "covered_by_subject_card" and not row.get("notes", "").strip():
+                    self.checks.add("autopilot.subject_cards.bf_decision_notes", "fail", f"Publishable BF {feature_id} has non-card relation {relation} without rationale notes")
+        if publishable_feature_ids and not any(check["id"] in {"autopilot.subject_cards.bf_coverage", "autopilot.subject_cards.bf_unclassified", "autopilot.subject_cards.bf_card_link", "autopilot.subject_cards.bf_decision_notes"} for check in self.checks.checks):
+            self.checks.add("autopilot.subject_cards.bf_coverage_complete", "ok", f"Subject-card coverage classifies {len(publishable_feature_ids)} publishable BF container(s)")
+
+        dashboard_data_path = repo_path(self.root, "outputs/review/data.json")
+        if not dashboard_data_path.exists():
+            self.checks.add("autopilot.subject_cards.dashboard_data", "fail", "Missing analyst dashboard data: outputs/review/data.json")
+            return
+        try:
+            dashboard_data = json.loads(dashboard_data_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.checks.add("autopilot.subject_cards.dashboard_data", "fail", f"Could not parse outputs/review/data.json: {exc}")
+            return
+        dashboard_cards = dashboard_data.get("subject_cards") if isinstance(dashboard_data, dict) else []
+        dashboard_registry = dashboard_data.get("subject_registry") if isinstance(dashboard_data, dict) else []
+        if not isinstance(dashboard_cards, list) or not dashboard_cards:
+            self.checks.add("autopilot.subject_cards.dashboard_cards", "fail", "Review dashboard data has no subject_cards; first analyst screen would be empty")
+        else:
+            self.checks.add("autopilot.subject_cards.dashboard_cards", "ok", f"Review dashboard exposes {len(dashboard_cards)} subject card(s)")
+        if not isinstance(dashboard_registry, list) or not dashboard_registry:
+            self.checks.add("autopilot.subject_cards.dashboard_registry", "fail", "Review dashboard data has no subject_registry rows")
+        else:
+            self.checks.add("autopilot.subject_cards.dashboard_registry", "ok", f"Review dashboard exposes {len(dashboard_registry)} subject registry row(s)")
+
     def test_autopilot_contract(self, manifest: dict[str, Any] | None) -> None:
         if not manifest or not toml_enabled(manifest, "autopilot"):
             self.checks.add("autopilot.enabled", "ok", "Autopilot final gate is disabled")
@@ -632,7 +765,10 @@ class Doctor:
             "outputs/customization-map.md",
             "outputs/customization-map.xlsx",
             "outputs/open-questions.csv",
+            "outputs/infobase-questions.csv",
             "outputs/open-questions.xlsx",
+            "outputs/review/index.html",
+            "outputs/review/data.json",
             "analysis/final-audit.md",
         ):
             self.require_path(relative, "autopilot")
@@ -642,6 +778,8 @@ class Doctor:
         final_diff_rows = self.read_csv_rows("analysis/indexes/final-diff-inventory.csv", FINAL_DIFF_INVENTORY_HEADER, "final_gate.diff_inventory")
         final_feature_rows = self.read_csv_rows("analysis/indexes/final-feature-map.csv", FINAL_FEATURE_MAP_HEADER, "final_gate.feature_map")
         open_question_rows = self.read_csv_rows("outputs/open-questions.csv", OPEN_QUESTIONS_HEADER, "autopilot.open_questions")
+        infobase_question_rows = self.read_csv_rows("outputs/infobase-questions.csv", INFOBASE_QUESTIONS_HEADER, "autopilot.infobase_questions")
+        infobase_check_rows = self.read_csv_rows("analysis/reverse-map/infobase-checks.csv", REVERSE_MAP_INFOBASE_CHECKS_HEADER, "autopilot.infobase_checks")
         coverage_rows = self.read_csv_rows("analysis/reverse-map/coverage.csv", REVERSE_MAP_COVERAGE_HEADER, "final_gate.coverage")
         unresolved_rows = self.read_csv_rows("analysis/reverse-map/unresolved.csv", REVERSE_MAP_UNRESOLVED_HEADER, "final_gate.unresolved")
         self.test_xlsx_file("outputs/customization-map.xlsx", "autopilot.outputs.customization_map_xlsx")
@@ -736,6 +874,8 @@ class Doctor:
         if final_diff_rows and not any(check["id"] == "final_gate.feature_blocked" for check in self.checks.checks):
             self.checks.add("final_gate.feature_blocking", "ok", "Final feature statuses account for reverse-map blockers")
 
+        self.test_autopilot_subject_card_gate(final_feature_rows)
+
         for row in open_question_rows:
             if not any((value or "").strip() for value in row.values()):
                 continue
@@ -746,6 +886,8 @@ class Doctor:
             status = row.get("status", "").strip()
             if status not in {"open_question", "blocked_by_infobase_data", "closed"}:
                 self.checks.add("autopilot.open_questions.status", "fail", f"Open question {question_id} has invalid status: {status or '<empty>'}")
+
+        self.test_infobase_question_gate(infobase_question_rows, infobase_check_rows, open_question_rows)
 
         unresolved_ids = {row.get("item_id", "").strip() for row in unresolved_rows if row.get("item_id", "").strip()}
         if unresolved_ids:
@@ -782,6 +924,64 @@ class Doctor:
             else:
                 self.checks.add("autopilot.final_audit.unclassified_zero", "ok", "Final audit declares zero unclassified diff entries")
 
+    def test_infobase_question_gate(
+        self,
+        infobase_question_rows: list[dict[str, str]],
+        infobase_check_rows: list[dict[str, str]],
+        open_question_rows: list[dict[str, str]],
+    ) -> None:
+        closed_question_ids: set[str] = set()
+        for row in infobase_check_rows:
+            if row.get("status_after_pass", "").strip() != "closed":
+                continue
+            item_id = row.get("item_id", "").strip()
+            if item_id:
+                closed_question_ids.add(item_id)
+            question_ref = row.get("question_ref", "").strip()
+            if "#" in question_ref:
+                closed_question_ids.add(question_ref.rsplit("#", 1)[-1])
+
+        final_open_refs: set[str] = set()
+        for row in open_question_rows:
+            question_id = row.get("question_id", "").strip()
+            if question_id:
+                final_open_refs.add(question_id)
+            source_ref = row.get("source_ref", "").strip()
+            if "#" in source_ref:
+                final_open_refs.add(source_ref.rsplit("#", 1)[-1])
+
+        question_ids: set[str] = set()
+        unresolved: list[str] = []
+        closed_count = 0
+        for index, row in enumerate(infobase_question_rows, 1):
+            if not any((value or "").strip() for value in row.values()):
+                continue
+            question_id = row.get("question_id", "").strip() or f"<row {index}>"
+            if question_id in question_ids:
+                self.checks.add("autopilot.infobase_questions.duplicate_id", "fail", f"Duplicate infobase question id: {question_id}")
+            question_ids.add(question_id)
+            status = row.get("status", "").strip()
+            if status not in INFOBASE_QUESTION_STATUSES:
+                self.checks.add("autopilot.infobase_questions.status", "fail", f"Infobase question {question_id} has invalid status: {status or '<empty>'}")
+            for field in ("feature_id", "reason", "closing_result", "risk_if_open", "source_ref"):
+                if not row.get(field, "").strip():
+                    self.checks.add("autopilot.infobase_questions.required_fields", "fail", f"Infobase question {question_id} is missing {field}")
+            if question_id in closed_question_ids:
+                closed_count += 1
+            elif status == "closed":
+                self.checks.add("autopilot.infobase_questions.closed_without_check", "fail", f"Infobase question {question_id} is closed without a closed infobase-check row")
+            elif question_id not in final_open_refs:
+                unresolved.append(question_id)
+
+        if question_ids:
+            self.checks.add("autopilot.infobase_questions.rows", "ok", f"Infobase question registry has {len(question_ids)} row(s), closed_by_checks={closed_count}")
+        else:
+            self.checks.add("autopilot.infobase_questions.empty", "ok", "No infobase questions recorded")
+        if unresolved:
+            self.checks.add("autopilot.infobase_questions.unresolved", "fail", f"{len(unresolved)} open infobase question(s) are neither closed by infobase-checks.csv nor carried into outputs/open-questions.csv")
+        elif question_ids:
+            self.checks.add("autopilot.infobase_questions.coverage", "ok", "Every infobase question is closed by a live check or carried into final open questions")
+
     def test_reverse_map_contract(self) -> None:
         for relative in (
             "analysis/reverse-map/README.md",
@@ -790,6 +990,7 @@ class Doctor:
             "analysis/reverse-map/workitems.jsonl",
             "analysis/reverse-map/decisions.csv",
             "analysis/reverse-map/unresolved.csv",
+            "analysis/reverse-map/infobase-checks.csv",
             "analysis/reverse-map/scenarios/README.md",
             "analysis/reverse-map/outputs/README.md",
         ):
@@ -797,7 +998,8 @@ class Doctor:
 
         coverage_rows = self.read_csv_rows("analysis/reverse-map/coverage.csv", REVERSE_MAP_COVERAGE_HEADER, "reverse_map.coverage")
         self.read_csv_rows("analysis/reverse-map/decisions.csv", REVERSE_MAP_DECISIONS_HEADER, "reverse_map.decisions")
-        self.read_csv_rows("analysis/reverse-map/unresolved.csv", REVERSE_MAP_UNRESOLVED_HEADER, "reverse_map.unresolved")
+        unresolved_rows = self.read_csv_rows("analysis/reverse-map/unresolved.csv", REVERSE_MAP_UNRESOLVED_HEADER, "reverse_map.unresolved")
+        infobase_check_rows = self.read_csv_rows("analysis/reverse-map/infobase-checks.csv", REVERSE_MAP_INFOBASE_CHECKS_HEADER, "reverse_map.infobase_checks")
 
         workitems_path = repo_path(self.root, "analysis/reverse-map/workitems.jsonl")
         workitems: list[dict[str, Any]] = []
@@ -844,6 +1046,8 @@ class Doctor:
         if coverage_by_status:
             self.checks.add("reverse_map.coverage.status_counts", "ok", "Reverse-map coverage status counts", coverage_by_status)
 
+        self.test_infobase_checks_contract(unresolved_rows, infobase_check_rows)
+
         diff_path = repo_path(self.root, "analysis/indexes/diff-inventory.csv")
         if diff_path.exists() and diff_path.read_text(encoding="utf-8-sig").splitlines()[:1] == [DIFF_INVENTORY_HEADER]:
             with diff_path.open("r", encoding="utf-8-sig", newline="") as fh:
@@ -853,6 +1057,68 @@ class Doctor:
                 self.checks.add("reverse_map.coverage.missing_diff", "fail", f"Reverse-map coverage is missing {len(missing)} diff row(s); run `python -m one_c_autoresearch reverse-map seed`")
             else:
                 self.checks.add("reverse_map.coverage.diff_complete", "ok", "Reverse-map coverage contains every diff inventory row")
+
+    def test_infobase_checks_contract(self, unresolved_rows: list[dict[str, str]], infobase_check_rows: list[dict[str, str]]) -> None:
+        check_ids: set[str] = set()
+        covered_item_ids: set[str] = set()
+        closed_count = 0
+        for row in infobase_check_rows:
+            if not any((value or "").strip() for value in row.values()):
+                continue
+            check_id = row.get("check_id", "").strip()
+            item_id = row.get("item_id", "").strip()
+            if not check_id:
+                self.checks.add("reverse_map.infobase_checks.check_id", "fail", "Infobase check row has empty check_id")
+            elif check_id in check_ids:
+                self.checks.add("reverse_map.infobase_checks.duplicate_id", "fail", f"Duplicate infobase check id: {check_id}")
+            else:
+                check_ids.add(check_id)
+            if item_id:
+                covered_item_ids.add(item_id)
+            else:
+                self.checks.add("reverse_map.infobase_checks.item_id", "fail", f"Infobase check {check_id or '<empty>'} has empty item_id")
+
+            method = row.get("check_method", "").strip()
+            if method and method not in INFOBASE_CHECK_METHODS:
+                self.checks.add("reverse_map.infobase_checks.method", "fail", f"Infobase check {check_id or '<empty>'} has invalid method: {method}")
+            elif not method:
+                self.checks.add("reverse_map.infobase_checks.method", "fail", f"Infobase check {check_id or '<empty>'} has empty method")
+
+            result = row.get("result", "").strip()
+            if result and result not in INFOBASE_CHECK_RESULTS:
+                self.checks.add("reverse_map.infobase_checks.result", "fail", f"Infobase check {check_id or '<empty>'} has invalid result: {result}")
+
+            status_after = row.get("status_after_pass", "").strip()
+            if status_after and status_after not in INFOBASE_CHECK_FINAL_STATUSES:
+                self.checks.add("reverse_map.infobase_checks.status_after_pass", "fail", f"Infobase check {check_id or '<empty>'} has invalid status_after_pass: {status_after}")
+            elif not status_after:
+                self.checks.add("reverse_map.infobase_checks.status_after_pass", "fail", f"Infobase check {check_id or '<empty>'} has empty status_after_pass")
+            elif status_after == "closed":
+                closed_count += 1
+                for field in ("result", "evidence_ref"):
+                    if not row.get(field, "").strip():
+                        self.checks.add("reverse_map.infobase_checks.closed_required_fields", "fail", f"Closed infobase check {check_id or '<empty>'} is missing {field}")
+
+            if method.startswith("1c_mcp") and not row.get("custom_target", "").strip():
+                self.checks.add("reverse_map.infobase_checks.custom_target", "fail", f"1C MCP infobase check {check_id or '<empty>'} lacks custom_target")
+            if result in {"same_as_vendor", "vendor_differs"} and not row.get("vendor_target", "").strip():
+                self.checks.add("reverse_map.infobase_checks.vendor_target", "fail", f"Vendor-comparison infobase check {check_id or '<empty>'} lacks vendor_target")
+
+        if check_ids:
+            self.checks.add("reverse_map.infobase_checks.rows", "ok", f"Reverse-map infobase checks contain {len(check_ids)} row(s), closed={closed_count}")
+        else:
+            self.checks.add("reverse_map.infobase_checks.empty", "ok", "No reverse-map infobase checks recorded yet")
+
+        unresolved_infobase_ids = {
+            row.get("item_id", "").strip()
+            for row in unresolved_rows
+            if row.get("item_id", "").strip() and row.get("status", "").strip() == "needs_infobase_data"
+        }
+        missing_checks = sorted(unresolved_infobase_ids - covered_item_ids)
+        if missing_checks:
+            self.checks.add("reverse_map.infobase_checks.missing_for_unresolved", "warn", f"{len(missing_checks)} needs_infobase_data unresolved item(s) have no infobase-check row")
+        elif unresolved_infobase_ids:
+            self.checks.add("reverse_map.infobase_checks.unresolved_coverage", "ok", "Every needs_infobase_data unresolved item has an infobase-check row")
 
     def test_detail_maps_contract(self) -> None:
         self.require_path("analysis/detail-maps/README.md", "detail_maps")

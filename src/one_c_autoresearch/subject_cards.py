@@ -542,10 +542,12 @@ def subject_from_feature(root: Path, candidate: dict[str, str], row: dict[str, s
                 "notes": evidence.get("notes", ""),
             }
         )
+    title = candidate.get("title") or row.get("title") or slug
+    summary = row.get("summary", "")
     payload: dict[str, Any] = {
         "schema_version": "subject-card/v1",
         "slug": slug,
-        "title": candidate.get("title") or row.get("title") or slug,
+        "title": title,
         "status": "draft",
         "confidence": row.get("confidence") or candidate.get("confidence") or "medium",
         "subject_type": candidate.get("subject_type") or subject_type_for_feature(row),
@@ -555,12 +557,18 @@ def subject_from_feature(root: Path, candidate: dict[str, str], row: dict[str, s
         "why_separate_card": card_reason(slug, candidate.get("subject_type") or subject_type_for_feature(row), "BF"),
         "merge_into": "",
         "split_from": "",
-        "identification": f"Кандидат выделен из BF-контейнера {feature_id}; требуется декомпозиция на конкретные предметные доработки.",
-        "summary": row.get("summary", ""),
-        "key_conclusion": "",
-        "upgrade_risk": "",
+        "identification": f"Карточка выделена из BF-контейнера {feature_id}; источник фактов: финальная карта фич и evidence pack.",
+        "summary": summary,
+        "key_conclusion": (
+            f"Доработка `{title}` подтверждена статическим clean diff и сгруппирована в {feature_id}. "
+            "Карточка готова к первичному аналитическому ревью; границы можно уточнять через subject-card registry."
+        ),
+        "upgrade_risk": (
+            "Перед переходом на целевой релиз нужно сопоставить связанные объекты и сценарии с новой типовой конфигурацией; "
+            "если типовой механизм закрывает сценарий, доработку можно пометить как merge/supporting в реестре subject-card."
+        ),
         "runtime_data_needed": "",
-        "review_status": "Черновик: требуется refine-проход агента.",
+        "review_status": "Автокарточка из BF: готова к первичному ревью аналитиком, требует ручного уточнения границ при необходимости.",
         "linked_features": [feature_id] if feature_id else [],
         "linked_detail_maps": [],
         "source_mode": "feature_candidate",

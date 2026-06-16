@@ -36,6 +36,7 @@ STATUS_LABELS = {
     "requires_runtime_verification": "Требует проверки в ИБ",
     "needs_reclassification": "Требует переклассификации",
     "open_question": "Открытый вопрос",
+    "open": "Открыто",
     "closed": "Закрыто",
     "disabled": "Отключено",
     "enabled": "Включено",
@@ -166,6 +167,18 @@ CHECK_METHOD_LABELS = {
     "1c_mcp_run_select_query": "Запрос 1С-MCP без записи",
     "1c_mcp_debug_execute_bsl": "Выполнение BSL через 1С-MCP на демо-ИБ",
     "playwright_1c_web_ui": "Проверка веб-интерфейса 1С",
+    "direct_postgresql_query": "Прямой read-only запрос к PostgreSQL",
+    "manual_1c_scenario": "Ручная проверка сценария в 1С",
+}
+
+INFOBASE_RESULT_LABELS = {
+    "custom_only": "только custom",
+    "same_as_vendor": "как у вендора",
+    "vendor_differs": "отличается от вендора",
+    "runtime_only": "только данные ИБ",
+    "manual_scenario_required": "нужен ручной сценарий",
+    "inconclusive": "не закрыто",
+    "": "не указан",
 }
 
 SOURCE_KIND_LABELS = {
@@ -335,14 +348,37 @@ def normalize_infobase_checks(rows: list[dict[str, str]]) -> list[dict[str, str]
         artifacts = artifact_refs(row.get("notes", "")) or artifact_refs(row.get("result", ""))
         normalized.append(
             {
+                "check_id": row.get("check_id", ""),
                 "scenario_id": row.get("scenario_id", ""),
                 "item_id": row.get("item_id", ""),
+                "feature_id": row.get("feature_id", ""),
+                "subject_card_slug": row.get("subject_card_slug", ""),
                 "status_after_pass": status,
                 "status_after_pass_label": status_label(status),
                 "check_method": method,
                 "check_method_label": CHECK_METHOD_LABELS.get(method, method or "не указан"),
+                "custom_target": row.get("custom_target", ""),
+                "vendor_target": row.get("vendor_target", ""),
+                "result": row.get("result", ""),
+                "result_comparison_label": INFOBASE_RESULT_LABELS.get(row.get("result", ""), row.get("result", "") or "не указан"),
                 "result_label": infobase_result_label(row),
-                "artifact_refs": artifacts or "Подробности см. в исходном CSV: analysis/reverse-map/infobase-checks.csv",
+                "evidence_ref": row.get("evidence_ref", ""),
+                "artifact_refs": artifacts or row.get("evidence_ref", "") or "Подробности см. в исходном CSV: analysis/reverse-map/infobase-checks.csv",
+            }
+        )
+    return normalized
+
+
+def normalize_infobase_questions(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for row in rows:
+        status = (row.get("status") or "").strip()
+        normalized.append(
+            {
+                **humanize_row_fields(row),
+                "status": status,
+                "status_label": status_label(status),
+                "artifact_refs": row.get("source_ref", "") or "Подробности см. в исходном CSV: outputs/infobase-questions.csv",
             }
         )
     return normalized
@@ -884,6 +920,7 @@ def output_files(root: Path, output_dir: Path) -> list[dict[str, Any]]:
         "outputs/customization-map.md",
         "outputs/customization-map.xlsx",
         "outputs/open-questions.csv",
+        "outputs/infobase-questions.csv",
         "outputs/open-questions.xlsx",
         "outputs/functional-gap-map.md",
         "outputs/functional-gap-map.json",
@@ -996,6 +1033,7 @@ def build_dashboard_data(root: Path, output_dir: Path, subject_card: str = "") -
     decisions_rows = non_empty_rows(read_csv_rows(repo_path(root, "analysis/reverse-map/decisions.csv")))
     unresolved_rows = add_status_labels([humanize_row_fields(row) for row in non_empty_rows(read_csv_rows(repo_path(root, "analysis/reverse-map/unresolved.csv")))])
     infobase_rows = normalize_infobase_checks(non_empty_rows(read_csv_rows(repo_path(root, "analysis/reverse-map/infobase-checks.csv"))))
+    infobase_questions = normalize_infobase_questions(non_empty_rows(read_csv_rows(repo_path(root, "outputs/infobase-questions.csv"))))
     output_open_questions = [humanize_row_fields(row) for row in non_empty_rows(read_csv_rows(repo_path(root, "outputs/open-questions.csv")))]
     detail_maps = load_detail_maps(root, output_dir)
     subject_cards = load_subject_cards(root, output_dir)
@@ -1064,6 +1102,8 @@ def build_dashboard_data(root: Path, output_dir: Path, subject_card: str = "") -
         "output_open_question_count": len(output_open_questions),
         "infobase_check_count": len(infobase_rows),
         "closed_infobase_check_count": sum(1 for row in infobase_rows if (row.get("status_after_pass") or "").strip() == "closed"),
+        "infobase_question_count": len(infobase_questions),
+        "open_infobase_question_count": sum(1 for row in infobase_questions if (row.get("status") or "").strip() == "open"),
         "risk_feature_count": len(risk_features),
         "detail_map_count": len(detail_maps),
         "subject_map_count": len(subject_maps),
@@ -1096,7 +1136,8 @@ def build_dashboard_data(root: Path, output_dir: Path, subject_card: str = "") -
         f"В дашборд вынесена краткая сводка: BF-контейнеров {summary['feature_count']}, "
         f"карточек доработок {summary['subject_registry_ready_count']}, "
         f"открытых вопросов {summary['open_question_count']}, "
-        f"закрытых проверок в ИБ {summary['closed_infobase_check_count']} из {summary['infobase_check_count']}."
+        f"закрытых проверок в ИБ {summary['closed_infobase_check_count']} из {summary['infobase_check_count']}, "
+        f"открытых вопросов к ИБ {summary['open_infobase_question_count']}."
     )
     return {
         "schema_version": "review-dashboard/v1",
@@ -1114,6 +1155,7 @@ def build_dashboard_data(root: Path, output_dir: Path, subject_card: str = "") -
         "detail_maps": detail_maps,
         "open_questions": unresolved_rows,
         "output_open_questions": output_open_questions,
+        "infobase_questions": infobase_questions,
         "infobase_checks": infobase_rows,
         "risk_features": risk_features,
         "final_audit": {
@@ -1549,6 +1591,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
     const subjectCardBySlug = new Map(subjectCards.map((map) => [map.slug, map]));
     const subjectMapBySlug = new Map(subjectMaps.map((map) => [map.slug, map]));
     const technicalMaps = (data.detail_maps || []).filter((map) => map.generation_mode === "generated");
+    const infobaseQuestions = data.infobase_questions || [];
     const runtimeChecks = data.infobase_checks || [];
     const byId = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}}[char]));
@@ -1631,7 +1674,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
       byId("nav-bf-count").textContent = data.summary.feature_count || 0;
       byId("nav-technical-count").textContent = data.summary.technical_map_count || 0;
       byId("nav-open-count").textContent = data.summary.open_question_count || 0;
-      byId("nav-runtime-count").textContent = runtimeChecks.length || 0;
+      byId("nav-runtime-count").textContent = (runtimeChecks.length || 0) + (infobaseQuestions.length || 0);
       byId("card-list-badges").innerHTML = [
         `<span class="badge">строк реестра: ${{subjectRegistry.length || subjectCards.length || 0}}</span>`,
         `<span class="badge ok">готовых карточек: ${{data.summary.subject_registry_ready_count || subjectCards.length || 0}}</span>`,
@@ -1639,7 +1682,9 @@ def dashboard_html(data: dict[str, Any]) -> str:
         `<span class="badge">BF: ${{data.summary.feature_count || 0}}</span>`,
       ].join("");
       byId("runtime-check-badges").innerHTML = [
-        `<span class="badge">всего: ${{runtimeChecks.length || 0}}</span>`,
+        `<span class="badge">вопросов: ${{infobaseQuestions.length || 0}}</span>`,
+        `<span class="badge warn">открыто: ${{data.summary.open_infobase_question_count || 0}}</span>`,
+        `<span class="badge">проверок: ${{runtimeChecks.length || 0}}</span>`,
         `<span class="badge ok">закрыто: ${{data.summary.closed_infobase_check_count || 0}}</span>`,
       ].join("");
       byId("functional-gap-badges").innerHTML = [
@@ -2514,7 +2559,16 @@ def dashboard_html(data: dict[str, Any]) -> str:
 
     function renderRuntimeChecks() {{
       const rows = filteredRuntimeChecks();
-      byId("runtime-check-list").innerHTML = rowsTable(rows, [
+      const questionTable = rowsTable(infobaseQuestions, [
+        ["question_id", "Вопрос"],
+        ["feature_id", "BF"],
+        ["subject_card_slug", "Карточка"],
+        ["object_or_setting", "Объект или настройка"],
+        ["status_label", "Статус"],
+        ["check_target", "Что проверить"],
+        ["risk_if_open", "Риск"],
+      ]);
+      const checkTable = rowsTable(rows, [
         ["scenario_id", "BF"],
         ["item_id", "Вопрос"],
         ["status_after_pass_label", "Статус"],
@@ -2522,6 +2576,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
         ["result_label", "Результат"],
         ["artifact_refs", "Артефакты"],
       ]);
+      byId("runtime-check-list").innerHTML = `<h3>Вопросы к ИБ</h3>${{questionTable}}<h3>Выполненные проверки</h3>${{checkTable}}`;
     }}
 
     function renderMigration() {{
@@ -2546,6 +2601,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
           <li>Строк сравнения: ${{data.summary.diff_count}}</li>
           <li>Строк финальной проверки: ${{data.summary.final_diff_count}}</li>
           <li>Открытых вопросов: ${{data.summary.open_question_count}}</li>
+          <li>Вопросов к ИБ: ${{data.summary.infobase_question_count || 0}}, открыто: ${{data.summary.open_infobase_question_count || 0}}</li>
           <li>Закрытых проверок в ИБ: ${{data.summary.closed_infobase_check_count}} из ${{data.summary.infobase_check_count}}</li>
         </ul>
         <p><a href="${{esc(data.final_audit.href)}}">${{esc(data.final_audit.path)}}</a></p>

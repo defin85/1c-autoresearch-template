@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from one_c_autoresearch.review_dashboard import dashboard_html  # noqa: E402
+from one_c_autoresearch.review_dashboard import build_dashboard_data, dashboard_html  # noqa: E402
 
 
 def test_subject_card_claim_rows_have_dedicated_dashboard_columns() -> None:
@@ -161,3 +161,36 @@ def test_subject_card_renders_linked_detail_map_attributes_summary() -> None:
     assert "linkedDetailAttributeRows" in html
     assert "Реквизиты из технических карт" in html
     assert '["detail_map_title","Техническая карта"]' in html
+
+
+def test_dashboard_data_counts_infobase_question_registry(tmp_path: Path) -> None:
+    (tmp_path / "analysis/indexes").mkdir(parents=True)
+    (tmp_path / "analysis/reverse-map").mkdir(parents=True)
+    (tmp_path / "outputs").mkdir(parents=True)
+    (tmp_path / "analysis/indexes/feature-map.csv").write_text(
+        "feature_id,title,domain,source_bucket,classification,confidence,status,owner,summary,evidence_pack_path,open_questions_path,outputs,notes\n"
+        "BF-001,Тестовая доработка,НСИ,target_cf,confirmed business feature,high,complete,codex,Описание,analysis/features/BF-001,analysis/features/BF-001/open-questions.md,outputs/customization-map.md,\n",
+        encoding="utf-8",
+    )
+    for relative in (
+        "analysis/indexes/diff-inventory.csv",
+        "analysis/indexes/final-diff-inventory.csv",
+        "analysis/indexes/final-feature-map.csv",
+        "analysis/reverse-map/coverage.csv",
+        "analysis/reverse-map/decisions.csv",
+        "analysis/reverse-map/unresolved.csv",
+        "analysis/reverse-map/infobase-checks.csv",
+        "outputs/open-questions.csv",
+    ):
+        (tmp_path / relative).write_text("\n", encoding="utf-8")
+    (tmp_path / "outputs/infobase-questions.csv").write_text(
+        "question_id,subject_card_slug,feature_id,object_or_setting,check_target,reason,closing_result,risk_if_open,source_ref,status\n"
+        "IBQ-1,card-a,BF-001,Catalog.Тест,Проверить данные ИБ,Статический анализ не видит данные,Закрыть проверкой,Риск миграции,analysis/subject-cards/cards/card-a/gaps.csv#IB-001,open\n",
+        encoding="utf-8",
+    )
+
+    data = build_dashboard_data(tmp_path, tmp_path / "outputs/review")
+
+    assert data["summary"]["infobase_question_count"] == 1
+    assert data["summary"]["open_infobase_question_count"] == 1
+    assert data["infobase_questions"][0]["question_id"] == "IBQ-1"

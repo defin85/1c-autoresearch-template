@@ -6,9 +6,15 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from .autopilot import DIFF_INVENTORY_HEADER, FEATURE_MAP_HEADER, FINAL_DIFF_INVENTORY_HEADER, OPEN_QUESTIONS_HEADER
+from .autopilot import (
+    DIFF_INVENTORY_HEADER,
+    FEATURE_MAP_HEADER,
+    FINAL_DIFF_INVENTORY_HEADER,
+    INFOBASE_QUESTIONS_HEADER,
+    OPEN_QUESTIONS_HEADER,
+)
 from .common import repo_path
-from .reverse_map import REVERSE_MAP_COVERAGE_HEADER, REVERSE_MAP_UNRESOLVED_HEADER
+from .reverse_map import REVERSE_MAP_COVERAGE_HEADER, REVERSE_MAP_INFOBASE_CHECKS_HEADER, REVERSE_MAP_UNRESOLVED_HEADER
 
 
 FINAL_FEATURE_MAP_HEADER = FEATURE_MAP_HEADER
@@ -40,7 +46,7 @@ class FinalGateResult:
 
     @property
     def is_clean(self) -> bool:
-        return not self.blocking_rows
+        return not self.blocking_rows and not self.open_questions
 
     def summary(self) -> dict[str, int]:
         return {
@@ -83,6 +89,8 @@ def final_gate_paths(root: Path) -> dict[str, Path]:
         "final_diff_inventory": repo_path(root, "analysis/indexes/final-diff-inventory.csv"),
         "final_feature_map": repo_path(root, "analysis/indexes/final-feature-map.csv"),
         "open_questions": repo_path(root, "outputs/open-questions.csv"),
+        "infobase_questions": repo_path(root, "outputs/infobase-questions.csv"),
+        "infobase_checks": repo_path(root, "analysis/reverse-map/infobase-checks.csv"),
     }
 
 
@@ -121,12 +129,40 @@ def open_question_status(unresolved_status: str) -> str:
     return "open_question"
 
 
+def covered_infobase_question_ids(infobase_check_rows: list[dict[str, str]]) -> set[str]:
+    covered: set[str] = set()
+    for row in infobase_check_rows:
+        if row.get("status_after_pass", "").strip() != "closed":
+            continue
+        item_id = row.get("item_id", "").strip()
+        if item_id:
+            covered.add(item_id)
+        question_ref = row.get("question_ref", "").strip()
+        if "#" in question_ref:
+            covered.add(question_ref.rsplit("#", 1)[-1])
+    return covered
+
+
+def open_question_refs(open_questions: list[dict[str, str]]) -> set[str]:
+    refs: set[str] = set()
+    for row in open_questions:
+        question_id = row.get("question_id", "").strip()
+        if question_id:
+            refs.add(question_id)
+        source_ref = row.get("source_ref", "").strip()
+        if "#" in source_ref:
+            refs.add(source_ref.rsplit("#", 1)[-1])
+    return refs
+
+
 def build_final_gate_rows(root: Path) -> FinalGateResult:
     paths = final_gate_paths(root)
     diff_rows = read_csv_rows(paths["diff_inventory"], DIFF_INVENTORY_HEADER)
     feature_rows = read_csv_rows(paths["feature_map"], FEATURE_MAP_HEADER)
     coverage_rows = read_csv_rows(paths["coverage"], REVERSE_MAP_COVERAGE_HEADER)
     unresolved_rows = read_csv_rows(paths["unresolved"], REVERSE_MAP_UNRESOLVED_HEADER)
+    infobase_question_rows = read_csv_rows(paths["infobase_questions"], INFOBASE_QUESTIONS_HEADER)
+    infobase_check_rows = read_csv_rows(paths["infobase_checks"], REVERSE_MAP_INFOBASE_CHECKS_HEADER)
 
     coverage_by_diff = {row.get("diff_id", "").strip(): row for row in coverage_rows if row.get("diff_id", "").strip()}
     final_diff_rows: list[dict[str, str]] = []
@@ -202,6 +238,27 @@ def build_final_gate_rows(root: Path) -> FinalGateResult:
                 "source_ref": f"analysis/reverse-map/unresolved.csv#{item_id}",
                 "owner": row.get("owner", "").strip() or "business/1C review",
                 "notes": row.get("notes", "").strip(),
+            }
+        )
+
+    covered_infobase_questions = covered_infobase_question_ids(infobase_check_rows)
+    for index, row in enumerate(infobase_question_rows, 1):
+        if not any((value or "").strip() for value in row.values()):
+            continue
+        question_id = row.get("question_id", "").strip() or f"IBQ-{index:04d}"
+        if row.get("status", "").strip() == "closed" or question_id in covered_infobase_questions:
+            continue
+        open_questions.append(
+            {
+                "question_id": question_id,
+                "feature_id": row.get("feature_id", "").strip(),
+                "status": "blocked_by_infobase_data",
+                "reason": row.get("reason", "").strip() or "Нужна проверка данных ИБ.",
+                "closure_method": row.get("closing_result", "").strip() or row.get("check_target", "").strip() or "Закрыть проверкой ИБ и записать результат в analysis/reverse-map/infobase-checks.csv.",
+                "impact": row.get("risk_if_open", "").strip() or "Нельзя подтвердить финальный вывод без данных ИБ.",
+                "source_ref": f"outputs/infobase-questions.csv#{question_id}",
+                "owner": "business/1C review",
+                "notes": row.get("object_or_setting", "").strip(),
             }
         )
 

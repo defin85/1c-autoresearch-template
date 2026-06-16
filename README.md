@@ -10,11 +10,13 @@ Use it when you need to compare a vendor baseline, a customer-modified 1C config
 - A file-backed analysis queue for loopback/autonomous Codex runs.
 - Feature evidence packs for deep dives.
 - An autopilot customization-map contract with strict completion gates.
+- A physical clean-comparison contract for deterministic vendor-vs-customer diffs before business analysis.
 - A reverse functional mapping state machine for long-running fact-to-intent research.
 - A final-gate normalization layer that applies reverse-map decisions before final outputs are published.
 - An iterative subject-card layer for analyst-owned customization cards below coarse `BF-*` containers.
 - A one-card-per-pass functional-gap layer for migration hypotheses and target-release checks.
 - A static analyst review dashboard generated from final research artifacts.
+- An intermediate clean-comparison dashboard contract for analyst review of noise removal decisions.
 - Quality gates for static 1C source analysis.
 - Bootstrap and validation scripts for new research repositories.
 - A small method layer for standard-vs-custom-vs-next-release gap analysis.
@@ -88,6 +90,7 @@ analysis/
     indexes/
     noise/
   detail-maps/
+  clean-comparison/
   subject-cards/
   functional-gaps/
   queue/
@@ -106,15 +109,16 @@ scripts/
 2. For queue work, read `analysis/queue/README.md`, `task-schema.md`, `review-checklist.md`, and `tasks.jsonl`.
 3. For reverse functional mapping continuation, read `analysis/reverse-map/state.md` and use `python -m one_c_autoresearch reverse-map claim` in the concrete research repo.
 4. For end-to-end customization maps, read `docs/method/autopilot-customization-map.md` and use `python -m one_c_autoresearch autopilot scaffold --enable-gate` in the concrete research repo.
-5. Build the clean diff, classify every diff entry, group entries into features, and complete reverse-map review.
-6. Run `python -m one_c_autoresearch final-gate build` before generating final outputs.
-7. Generate final outputs only from `analysis/indexes/final-diff-inventory.csv` and `analysis/indexes/final-feature-map.csv`, then write `analysis/final-audit.md`.
-8. Run `python -m one_c_autoresearch detail-map build` to create generated subject maps, then enrich selected maps under `analysis/detail-maps/` when analyst-level drill-down below `BF-*` is needed.
-9. Run `python -m one_c_autoresearch subject-card discover`, `classify`, `registry-build`, `seed --from-registry`, and `refine --card <slug>` to build analyst-owned subject cards.
-10. Run `python -m one_c_autoresearch functional-gap build --card <slug>` to start a migration gap pass for one subject card.
-11. Build the static analyst dashboard with `python -m one_c_autoresearch review-dashboard build`.
-12. Run the generated repo doctor. With `autopilot.enabled=true`, it must prove every diff entry is classified and every final claim is consistent with reverse-map decisions before final delivery.
-13. Update queue or reverse-map workitem status only after verification passes.
+5. Follow `docs/method/physical-clean-comparison.md` to build the clean diff, including the cleanup queue, decision ledger, summary, and intermediate dashboard when analyst review is needed.
+6. Classify every clean diff entry, group entries into features, and complete reverse-map review.
+7. Run `python -m one_c_autoresearch final-gate build` before generating final outputs.
+8. Generate final outputs only from `analysis/indexes/final-diff-inventory.csv` and `analysis/indexes/final-feature-map.csv`, then write `analysis/final-audit.md`.
+9. Run `python -m one_c_autoresearch detail-map build` to create generated subject maps, then enrich selected maps under `analysis/detail-maps/` when analyst-level drill-down below `BF-*` is needed.
+10. Run `python -m one_c_autoresearch subject-card discover`, `classify`, `registry-build`, `seed --from-registry`, and `refine --card <slug>` to build analyst-owned subject cards.
+11. Run `python -m one_c_autoresearch functional-gap build --card <slug>` to start a migration gap pass for one subject card.
+12. Build the static analyst dashboard with `python -m one_c_autoresearch review-dashboard build`.
+13. Run the generated repo doctor. With `autopilot.enabled=true`, it must prove every diff entry is classified and every final claim is consistent with reverse-map decisions before final delivery.
+14. Update queue or reverse-map workitem status only after verification passes.
 
 The queue is deliberately file-backed. It is slower than a broker but transparent, diffable, and easy for Codex automation to resume.
 

@@ -13,7 +13,7 @@ For this concrete research repo:
 7. Validate with `python -m one_c_autoresearch doctor` and `python -m one_c_autoresearch checks research`.
 8. Update the selected task status and stop.
 
-For end-to-end customization-map work, read `docs/method/autopilot-customization-map.md` after `project.toml`, initialize with `python -m one_c_autoresearch autopilot scaffold --enable-gate` when needed, run `python -m one_c_autoresearch final-gate build` before final output generation, and stop only after `python -m one_c_autoresearch doctor --deep --strict` proves complete reverse-map-consistent coverage.
+For end-to-end customization-map work, read `docs/method/autopilot-customization-map.md` and `docs/method/physical-clean-comparison.md` after `project.toml`, initialize with `python -m one_c_autoresearch autopilot scaffold --enable-gate` when needed, build or audit the clean diff before `analysis/indexes/diff-inventory.csv`, run `python -m one_c_autoresearch final-gate build` before final output generation, build and validate subject cards before `review-dashboard build`, and stop only after `python -m one_c_autoresearch doctor --deep --strict` proves complete reverse-map and subject-card coverage.
 
 For reverse functional mapping continuation, read `docs/method/reverse-functional-map.md` and the concrete repo's `analysis/reverse-map/state.md`, then run `python -m one_c_autoresearch reverse-map claim`. Process one returned workitem, update reverse-map state, run `python -m one_c_autoresearch final-gate status`, verify, and stop.
 
