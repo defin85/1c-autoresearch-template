@@ -32,6 +32,8 @@ from .reverse_map import (
 from .subject_cards import (
     classify_command as subject_card_classify_command,
     compare_reference_command as subject_card_compare_reference_command,
+    contour_draft_command as subject_card_contour_draft_command,
+    contour_validate_command as subject_card_contour_validate_command,
     discover_command as subject_card_discover_command,
     refine_command as subject_card_refine_command,
     registry_build_command as subject_card_registry_build_command,
@@ -129,6 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
     subject_discover = subject_card_sub.add_parser("discover")
     subject_discover.add_argument("--repo-path", default=".")
     subject_discover.set_defaults(func=subject_card_discover_command)
+    subject_contour_draft = subject_card_sub.add_parser("contour-draft")
+    subject_contour_draft.add_argument("--repo-path", default=".")
+    subject_contour_draft.set_defaults(func=subject_card_contour_draft_command)
+    subject_contour_validate = subject_card_sub.add_parser("contour-validate")
+    subject_contour_validate.add_argument("--repo-path", default=".")
+    subject_contour_validate.set_defaults(func=subject_card_contour_validate_command)
     subject_classify = subject_card_sub.add_parser("classify")
     subject_classify.add_argument("--repo-path", default=".")
     subject_classify.set_defaults(func=subject_card_classify_command)

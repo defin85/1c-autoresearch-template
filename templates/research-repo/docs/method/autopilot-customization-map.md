@@ -28,7 +28,7 @@ Declare inputs in `project.toml`:
 8. **Feature deep dives**: create evidence packs under `analysis/features/<feature-id>/` for every publishable non-noise feature.
 9. **Infobase evidence**: close `needs_infobase_data` blockers through the live evidence loop in `analysis/reverse-map/infobase-checks.csv` when live access is allowed. If runtime evidence is unavailable, write formal open questions instead of TODO items.
 10. **Final map generation**: produce the Markdown and XLSX deliverables under `outputs/` from the final-gate layer.
-11. **Subject-card layer**: build the analyst-owned subject-card registry below coarse `BF-*` containers. Run `subject-card discover`, review/classify the candidates, build the registry, seed accepted cards, refine cards, and validate the layer. A publishable autopilot map must not stop at BF containers.
+11. **Subject-card contour layer**: build the analyst-owned subject-card registry below coarse `BF-*` containers. Run `subject-card discover`, `subject-card contour-draft`, `subject-card contour-validate`, then classify the candidates, build the registry, seed accepted cards, refine cards, and validate the layer. A publishable autopilot map must not stop at BF containers and must not accept technical buckets as cards without a contour rationale.
 12. **Final audit**: write `analysis/final-audit.md` with coverage counts and completion evidence.
 13. **Analyst review dashboard**: run `python -m one_c_autoresearch detail-map build` and then `python -m one_c_autoresearch review-dashboard build` to generate the static analyst surface under `outputs/review/`. The first dashboard screen must contain concrete subject cards, not only BF groups or generated technical maps.
 14. **Doctor gate**: run `python -m one_c_autoresearch doctor --deep --strict`. With `autopilot.enabled=true`, the gate must prove that every diff entry is classified, every final claim is consistent with reverse-map decisions, and the subject-card layer exposes ready analyst cards.
@@ -54,6 +54,7 @@ outputs/open-questions.xlsx
 outputs/review/index.html
 outputs/review/data.json
 analysis/subject-cards/candidates.csv
+analysis/subject-cards/contours.csv
 analysis/subject-cards/classification.csv
 analysis/subject-cards/registry.csv
 analysis/subject-cards/coverage.csv
@@ -140,6 +141,37 @@ Allowed `status` values:
 - `out_of_scope`
 
 Every feature that is not `out_of_scope` must point to a complete evidence pack.
+
+## Subject-Card Contour Contract
+
+`analysis/subject-cards/contours.csv` is the bridge between autopilot feature
+containers and analyst-facing customization cards. It must use this header:
+
+```csv
+contour_id,slug,title,contour_type,linked_features,primary_objects,linked_detail_maps,scenario_summary,migration_boundary,why_this_is_one_contour,why_not_technical_bucket,evidence_refs,runtime_refs,technical_bucket_refs,status,confidence,notes
+```
+
+An accepted contour is required for every publishable final feature. Accepted
+contours must identify the reviewed migration boundary, cite static evidence,
+carry closed runtime/infobase references when such checks exist, and explain why
+the card is not merely a technical bucket such as documents, registers, forms,
+commands, or common modules.
+
+The subject-card workflow is:
+
+```bash
+python -m one_c_autoresearch subject-card discover
+python -m one_c_autoresearch subject-card contour-draft
+python -m one_c_autoresearch subject-card contour-validate
+python -m one_c_autoresearch subject-card classify
+python -m one_c_autoresearch subject-card registry-build
+python -m one_c_autoresearch subject-card seed --from-registry
+python -m one_c_autoresearch subject-card validate
+```
+
+`classification.csv` must distinguish accepted contours from supporting
+technical buckets. A run where every candidate is accepted as a standalone card
+is not a valid autopilot result.
 
 ## Infobase Evidence Contract
 

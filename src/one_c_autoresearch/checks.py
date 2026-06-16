@@ -35,9 +35,11 @@ from .reverse_map import (
     seed_reverse_map_workitems,
 )
 from .subject_cards import (
+    SUBJECT_CARD_CONTOURS_HEADER,
     SUBJECT_CARD_REGISTRY_HEADER,
     build_subject_card_registry,
     classify_subject_cards,
+    draft_subject_card_contours,
     discover_subject_cards,
     read_csv_rows as read_subject_csv_rows,
     seed_subject_cards,
@@ -126,6 +128,7 @@ def test_template(args: argparse.Namespace) -> int:
         "templates/research-repo/analysis/detail-maps/_templates/detail-map.json",
         "templates/research-repo/analysis/subject-cards/README.md",
         "templates/research-repo/analysis/subject-cards/candidates.csv",
+        "templates/research-repo/analysis/subject-cards/contours.csv",
         "templates/research-repo/analysis/subject-cards/classification.csv",
         "templates/research-repo/analysis/subject-cards/registry.csv",
         "templates/research-repo/analysis/subject-cards/coverage.csv",
@@ -199,6 +202,7 @@ def test_template(args: argparse.Namespace) -> int:
     require_text(root, "templates/research-repo/analysis/indexes/final-feature-map.csv", r"^feature_id,title,domain,source_bucket,classification,confidence,status,owner,summary,evidence_pack_path,open_questions_path,outputs,notes$", "Final feature map template should expose the canonical final-gate header.", errors)
     require_text(root, "docs/method/autopilot-customization-map.md", r"physical-clean-comparison\.md", "Autopilot runbook should route physical cleanup through the clean-comparison contract.", errors)
     require_text(root, "docs/method/autopilot-customization-map.md", r"subject-card validate", "Autopilot runbook should require subject-card validation before the analyst dashboard.", errors)
+    require_text(root, "docs/method/autopilot-customization-map.md", r"contour-draft", "Autopilot runbook should require subject-card contour drafting before classification.", errors)
     require_text(root, "docs/agent/verification.md", r"subject_cards", "Verification runbook should include subject-card dashboard readiness checks.", errors)
     require_text(root, "docs/method/physical-clean-comparison.md", r"outputs/clean-comparison-dashboard", "Physical clean-comparison runbook should require an intermediate analyst dashboard.", errors)
     require_text(root, "docs/method/physical-clean-comparison.md", r"self-contained HTML", "Physical clean-comparison dashboard should be self-contained.", errors)
@@ -212,6 +216,7 @@ def test_template(args: argparse.Namespace) -> int:
     require_text(root, "templates/research-repo/analysis/detail-maps/_templates/detail-map.json", r'"linked_features"', "Detail-map template should expose linked_features.", errors)
     require_text(root, "templates/research-repo/analysis/detail-maps/_templates/detail-map.json", r'"generation_mode"', "Detail-map template should expose generation_mode.", errors)
     require_text(root, "templates/research-repo/analysis/subject-cards/candidates.csv", r"^candidate_id,title,proposed_slug,source,discovery_basis,linked_features,linked_detail_maps,primary_objects,subject_type,confidence,proposed_action,status,notes$", "Subject-card candidates template should expose the canonical header.", errors)
+    require_text(root, "templates/research-repo/analysis/subject-cards/contours.csv", rf"^{re.escape(SUBJECT_CARD_CONTOURS_HEADER)}$", "Subject-card contours template should expose the canonical header.", errors)
     require_text(root, "templates/research-repo/analysis/subject-cards/classification.csv", r"^candidate_id,proposed_slug,decision,subject_type,registry_slug,merge_into,split_from,why_separate_card,status,confidence,notes$", "Subject-card classification template should expose the canonical header.", errors)
     require_text(root, "templates/research-repo/analysis/subject-cards/registry.csv", r"^slug,title,subject_type,status,confidence,origin_layer,owner_feature,linked_features,linked_detail_maps,primary_objects,coverage_scope,why_separate_card,merge_into,split_from,card_path,evidence_count,gap_count,review_notes$", "Subject-card registry template should expose the canonical header.", errors)
     require_text(root, "templates/research-repo/analysis/subject-cards/coverage.csv", r"^source_kind,source_id,feature_id,detail_map_slug,subject_card_slug,relation,confidence,notes$", "Subject-card coverage template should expose the canonical header.", errors)
@@ -285,6 +290,7 @@ def test_subject_card_registry_seed_contract(errors: list[str]) -> None:
             encoding="utf-8",
         )
         discover_subject_cards(root)
+        draft_subject_card_contours(root)
         classify_subject_cards(root)
         build_subject_card_registry(root)
         registry_path = repo_path(root, "analysis/subject-cards/registry.csv")
@@ -292,7 +298,7 @@ def test_subject_card_registry_seed_contract(errors: list[str]) -> None:
         if not registry_rows:
             errors.append("Subject-card registry seed smoke should create a registry candidate row")
             return
-        registry_rows[0]["status"] = "accepted"
+        registry_rows[0]["status"] = "ready_for_review"
         registry_rows[0]["coverage_scope"] = "covered"
         registry_rows[0]["why_separate_card"] = "Проверочная строка registry принята аналитиком."
         write_subject_csv_rows(registry_path, SUBJECT_CARD_REGISTRY_HEADER, registry_rows)
@@ -814,6 +820,22 @@ def test_doctor(args: argparse.Namespace) -> int:
             check=False,
         )
         require(subject_discover.returncode == 0, f"Subject-card discover should pass: stdout={subject_discover.stdout} stderr={subject_discover.stderr}", errors)
+        subject_contour_draft = subprocess.run(
+            current_module_command("subject-card", "contour-draft", "--repo-path", str(complete_repo)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        require(subject_contour_draft.returncode == 0, f"Subject-card contour-draft should pass: stdout={subject_contour_draft.stdout} stderr={subject_contour_draft.stderr}", errors)
+        subject_contour_validate = subprocess.run(
+            current_module_command("subject-card", "contour-validate", "--repo-path", str(complete_repo)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        require(subject_contour_validate.returncode == 0, f"Subject-card contour-validate should pass: stdout={subject_contour_validate.stdout} stderr={subject_contour_validate.stderr}", errors)
         subject_classify = subprocess.run(
             current_module_command("subject-card", "classify", "--repo-path", str(complete_repo)),
             stdout=subprocess.PIPE,
@@ -838,8 +860,9 @@ def test_doctor(args: argparse.Namespace) -> int:
             check=False,
         )
         require(subject_seed.returncode == 0, f"Subject-card seed should pass: stdout={subject_seed.stdout} stderr={subject_seed.stderr}", errors)
+        contour_slug = "feature-a-example-feature"
         subject_refine = subprocess.run(
-            current_module_command("subject-card", "refine", "--repo-path", str(complete_repo), "--card", "example-document"),
+            current_module_command("subject-card", "refine", "--repo-path", str(complete_repo), "--card", contour_slug),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -856,15 +879,17 @@ def test_doctor(args: argparse.Namespace) -> int:
         require(subject_validate.returncode == 0, f"Subject-card validate should pass: stdout={subject_validate.stdout} stderr={subject_validate.stderr}", errors)
         subject_registry = repo_path(complete_repo, "analysis/subject-cards/registry.csv")
         subject_candidates = repo_path(complete_repo, "analysis/subject-cards/candidates.csv")
+        subject_contours = repo_path(complete_repo, "analysis/subject-cards/contours.csv")
         subject_classification = repo_path(complete_repo, "analysis/subject-cards/classification.csv")
         subject_coverage = repo_path(complete_repo, "analysis/subject-cards/coverage.csv")
         subject_template = repo_path(complete_repo, "analysis/subject-cards/_templates/subject-card.json")
-        subject_document_card = repo_path(complete_repo, "analysis/subject-cards/cards/example-document/subject-card.json")
-        subject_document_evidence = repo_path(complete_repo, "analysis/subject-cards/cards/example-document/evidence.csv")
-        subject_document_gaps = repo_path(complete_repo, "analysis/subject-cards/cards/example-document/gaps.csv")
+        subject_document_card = repo_path(complete_repo, f"analysis/subject-cards/cards/{contour_slug}/subject-card.json")
+        subject_document_evidence = repo_path(complete_repo, f"analysis/subject-cards/cards/{contour_slug}/evidence.csv")
+        subject_document_gaps = repo_path(complete_repo, f"analysis/subject-cards/cards/{contour_slug}/gaps.csv")
         for subject_path in (
             subject_registry,
             subject_candidates,
+            subject_contours,
             subject_classification,
             subject_coverage,
             subject_template,
@@ -876,10 +901,11 @@ def test_doctor(args: argparse.Namespace) -> int:
         if subject_document_card.exists():
             subject_payload = json.loads(subject_document_card.read_text(encoding="utf-8"))
             require(subject_payload.get("schema_version") == "subject-card/v1", "Subject-card payload should declare schema_version=subject-card/v1", errors)
-            require(subject_payload.get("slug") == "example-document", "Subject-card seed should preserve the source card slug", errors)
+            require(subject_payload.get("slug") == contour_slug, "Subject-card seed should create the accepted contour card", errors)
             require(bool(subject_payload.get("key_conclusion")), "Subject-card seed should carry key_conclusion from source artifacts", errors)
             require(bool(subject_payload.get("upgrade_risk")), "Subject-card seed should carry upgrade_risk from source artifacts", errors)
-            require(subject_payload.get("subject_type") == "business_document", "Subject-card seed should classify document maps as business_document", errors)
+            require(subject_payload.get("origin_layer") == "contour", "Subject-card seed should mark contour cards as contour-origin cards", errors)
+            require(bool(subject_payload.get("migration_boundary")), "Subject-card seed should carry the contour migration boundary", errors)
             require(bool(subject_payload.get("why_separate_card")), "Subject-card seed should explain why the card exists as a separate subject", errors)
             require(subject_payload.get("source_mode") != "hardcoded", "Subject-card seed should not mark cards as hardcoded", errors)
         dashboard = subprocess.run(
@@ -918,7 +944,7 @@ def test_doctor(args: argparse.Namespace) -> int:
             require("Группировка по BF" in html, "Review dashboard should keep BF as secondary grouping", errors)
             require("Техническая подложка" in html, "Review dashboard should move generated maps into a technical foundation section", errors)
             require(html.find("Реестр предметных доработок") < html.find("Группировка по BF") < html.find("Техническая подложка"), "Review dashboard should order subject registry before BF grouping and technical foundation", errors)
-            require("Пример документа" in html, "Review dashboard should render subject-map titles", errors)
+            require("Example feature" in html, "Review dashboard should render contour subject-map titles", errors)
             require("Пример документа" in html, "Review dashboard should render detail-map titles", errors)
             require("Реквизиты" in html, "Review dashboard should render detail-map attribute tables", errors)
             require("DETAIL_MAP_PAGE_SIZE" in html, "Review dashboard should page large detail-map lists instead of rendering every map at boot", errors)
@@ -936,21 +962,21 @@ def test_doctor(args: argparse.Namespace) -> int:
             require(data.get("summary", {}).get("detail_map_by_type", {}).get("route") == 1, "Review dashboard data should count route detail maps", errors)
             require(data.get("summary", {}).get("detail_map_by_generation_mode", {}).get("generated") == 2, "Review dashboard data should count generated detail maps", errors)
             require({item.get("slug") for item in data.get("detail_maps", [])} == {"example-document", "example-route", "catalog-example", "scheduled-job-examplejob"}, "Review dashboard data should include manual and generated detail maps", errors)
-            require(data.get("summary", {}).get("subject_map_count") == 2, "Review dashboard data should count manual/enriched subject maps", errors)
+            require(data.get("summary", {}).get("subject_map_count") == 1, "Review dashboard data should count contour subject maps", errors)
             require(data.get("summary", {}).get("technical_map_count") == 2, "Review dashboard data should count generated technical maps", errors)
-            require(data.get("summary", {}).get("subject_registry_count") == 2, "Review dashboard data should count subject registry rows", errors)
-            require(data.get("summary", {}).get("subject_registry_ready_count") == 2, "Review dashboard data should count ready subject-card registry rows", errors)
+            require(data.get("summary", {}).get("subject_registry_count", 0) >= 1, "Review dashboard data should count subject registry rows", errors)
+            require(data.get("summary", {}).get("subject_registry_ready_count") == 1, "Review dashboard data should count ready contour subject-card registry rows", errors)
             require(data.get("summary", {}).get("subject_bf_covered_count") >= 1, "Review dashboard data should include BF coverage by subject cards", errors)
             subject_slugs = {item.get("slug") for item in data.get("subject_maps", [])}
             technical_slugs = {item.get("slug") for item in data.get("detail_maps", []) if item.get("generation_mode") == "generated"}
-            require(subject_slugs == {"example-document", "example-route"}, "Review dashboard should expose manual/enriched maps as subject maps", errors)
-            require({item.get("slug") for item in data.get("subject_cards", [])} == {"example-document", "example-route"}, "Review dashboard should expose subject-card artifacts as the analyst-facing subject cards", errors)
-            require({item.get("slug") for item in data.get("subject_registry", [])} == {"example-document", "example-route"}, "Review dashboard should expose the canonical subject registry", errors)
+            require(subject_slugs == {"feature-a-example-feature"}, "Review dashboard should expose contour cards as subject maps", errors)
+            require({item.get("slug") for item in data.get("subject_cards", [])} == {"feature-a-example-feature"}, "Review dashboard should expose contour artifacts as the analyst-facing subject cards", errors)
+            require("feature-a-example-feature" in {item.get("slug") for item in data.get("subject_registry", [])}, "Review dashboard should expose the canonical contour registry row", errors)
             require(bool(data.get("subject_card_coverage")), "Review dashboard should expose subject-card coverage rows", errors)
             require(technical_slugs == {"catalog-example", "scheduled-job-examplejob"}, "Review dashboard should expose generated maps only as technical maps", errors)
-            document_subject = next((item for item in data.get("subject_maps", []) if item.get("slug") == "example-document"), {})
-            require(bool(document_subject.get("key_conclusion")), "Subject maps should include key_conclusion", errors)
-            require(bool(document_subject.get("upgrade_risk")), "Subject maps should include upgrade_risk", errors)
+            contour_subject = next((item for item in data.get("subject_maps", []) if item.get("slug") == "feature-a-example-feature"), {})
+            require(bool(contour_subject.get("key_conclusion")), "Subject maps should include key_conclusion", errors)
+            require(bool(contour_subject.get("upgrade_risk")), "Subject maps should include upgrade_risk", errors)
             require(data.get("features", [{}])[0].get("evidence_count") == 2, "Review dashboard data should include evidence counts", errors)
             require(data.get("features", [{}])[0].get("detail_maps_count") == 4, "Feature data should include linked detail-map counts", errors)
         scoped_output_dir = base / "subject-card-dashboard"
@@ -963,7 +989,7 @@ def test_doctor(args: argparse.Namespace) -> int:
                 "--output-dir",
                 str(scoped_output_dir),
                 "--subject-card",
-                "example-document",
+                contour_slug,
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -975,9 +1001,9 @@ def test_doctor(args: argparse.Namespace) -> int:
         if scoped_data_path.exists():
             scoped_data = json.loads(scoped_data_path.read_text(encoding="utf-8"))
             require(scoped_data.get("dashboard_scope", {}).get("mode") == "subject_card", "Scoped dashboard should declare subject_card mode", errors)
-            require(scoped_data.get("dashboard_scope", {}).get("subject_card") == "example-document", "Scoped dashboard should declare selected subject card", errors)
-            require([item.get("slug") for item in scoped_data.get("subject_cards", [])] == ["example-document"], "Scoped dashboard should include only selected subject card", errors)
-            require([item.get("slug") for item in scoped_data.get("subject_maps", [])] == ["example-document"], "Scoped dashboard should include only selected subject map", errors)
+            require(scoped_data.get("dashboard_scope", {}).get("subject_card") == contour_slug, "Scoped dashboard should declare selected subject card", errors)
+            require([item.get("slug") for item in scoped_data.get("subject_cards", [])] == [contour_slug], "Scoped dashboard should include only selected subject card", errors)
+            require([item.get("slug") for item in scoped_data.get("subject_maps", [])] == [contour_slug], "Scoped dashboard should include only selected subject map", errors)
             require(scoped_data.get("detail_maps") == [], "Scoped dashboard should not include generated technical maps", errors)
             require(scoped_data.get("features") == [], "Scoped dashboard should not include global BF sections", errors)
             require(scoped_data.get("summary", {}).get("technical_map_count") == 0, "Scoped dashboard technical map count should be zero", errors)

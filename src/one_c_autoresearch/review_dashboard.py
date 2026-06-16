@@ -589,6 +589,8 @@ def load_subject_cards(root: Path, output_dir: Path) -> list[dict[str, Any]]:
     cards_root = repo_path(root, "analysis/subject-cards/cards")
     if not cards_root.exists():
         return []
+    contour_rows = non_empty_rows(read_csv_rows(repo_path(root, "analysis/subject-cards/contours.csv")))
+    contours_by_slug = {row.get("slug", ""): row for row in contour_rows if row.get("slug")}
     cards: list[dict[str, Any]] = []
     for path in sorted(cards_root.glob("*/subject-card.json")):
         try:
@@ -604,6 +606,7 @@ def load_subject_cards(root: Path, output_dir: Path) -> list[dict[str, Any]]:
         sections = {name: normalize_detail_rows(sections_raw.get(name, [])) for name in DETAIL_MAP_SECTIONS}
         linked_features = text_list(raw.get("linked_features", []))
         subject_type = str(raw.get("subject_type") or "").strip()
+        contour = contours_by_slug.get(slug, {})
         card_dir = path.parent
         evidence_rows = [humanize_row_fields(row) for row in non_empty_rows(read_csv_rows(card_dir / "evidence.csv"))]
         gaps = [humanize_row_fields(row) for row in non_empty_rows(read_csv_rows(card_dir / "gaps.csv"))]
@@ -624,6 +627,10 @@ def load_subject_cards(root: Path, output_dir: Path) -> list[dict[str, Any]]:
                 "coverage_scope": str(raw.get("coverage_scope") or ""),
                 "coverage_scope_label": subject_relation_label(str(raw.get("coverage_scope") or "")),
                 "why_separate_card": humanize_dashboard_text(raw.get("why_separate_card") or ""),
+                "why_not_technical_bucket": humanize_dashboard_text(raw.get("why_not_technical_bucket") or contour.get("why_not_technical_bucket") or ""),
+                "migration_boundary": humanize_dashboard_text(raw.get("migration_boundary") or contour.get("migration_boundary") or ""),
+                "contour_id": str(contour.get("contour_id") or ""),
+                "contour_status": str(contour.get("status") or ""),
                 "merge_into": str(raw.get("merge_into") or ""),
                 "split_from": str(raw.get("split_from") or ""),
                 "generation_mode": "subject_card",

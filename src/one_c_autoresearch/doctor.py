@@ -37,6 +37,7 @@ from .functional_gaps import validate_functional_gaps
 CANONICAL_EVIDENCE_HEADER = "feature_id,claim_id,source_kind,source_path,line_start,line_end,evidence_type,confidence,summary,notes"
 CANONICAL_FEATURE_CANDIDATES_HEADER = "feature_id,title,source_bucket,classification,confidence,summary,next_step"
 SUBJECT_CARD_CANDIDATES_HEADER = "candidate_id,title,proposed_slug,source,discovery_basis,linked_features,linked_detail_maps,primary_objects,subject_type,confidence,proposed_action,status,notes"
+SUBJECT_CARD_CONTOURS_HEADER = "contour_id,slug,title,contour_type,linked_features,primary_objects,linked_detail_maps,scenario_summary,migration_boundary,why_this_is_one_contour,why_not_technical_bucket,evidence_refs,runtime_refs,technical_bucket_refs,status,confidence,notes"
 SUBJECT_CARD_CLASSIFICATION_HEADER = "candidate_id,proposed_slug,decision,subject_type,registry_slug,merge_into,split_from,why_separate_card,status,confidence,notes"
 SUBJECT_CARD_REGISTRY_HEADER = "slug,title,subject_type,status,confidence,origin_layer,owner_feature,linked_features,linked_detail_maps,primary_objects,coverage_scope,why_separate_card,merge_into,split_from,card_path,evidence_count,gap_count,review_notes"
 SUBJECT_CARD_COVERAGE_HEADER = "source_kind,source_id,feature_id,detail_map_slug,subject_card_slug,relation,confidence,notes"
@@ -124,6 +125,29 @@ SUBJECT_CARD_STATUSES = {
     "unclassified",
 }
 SUBJECT_CARD_SECTIONS = DETAIL_MAP_SECTIONS
+GENERIC_BUCKET_SUFFIXES = (
+    "документы и журналы",
+    "регистры и движения",
+    "общие модули и платформенная логика",
+    "формы, команды и интерфейс",
+    "прочие связанные объекты",
+)
+GENERIC_TEMPLATE_FRAGMENTS = (
+    "имеет собственные объекты, формы или источники риска",
+    "подтверждена статическим clean diff",
+    "подтверждено, что `",
+    "карточка готова к первичному аналитическому ревью",
+)
+
+
+def generic_bucket_title(title: str) -> bool:
+    lowered = str(title or "").strip().lower()
+    return any(lowered.endswith(suffix) for suffix in GENERIC_BUCKET_SUFFIXES)
+
+
+def generic_template_text(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(fragment in lowered for fragment in GENERIC_TEMPLATE_FRAGMENTS)
 
 
 def spreadsheet_reference(value: str) -> bool:
@@ -188,6 +212,7 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/analysis/subject-cards/README.md",
     "templates/research-repo/analysis/subject-cards/registry.csv",
     "templates/research-repo/analysis/subject-cards/candidates.csv",
+    "templates/research-repo/analysis/subject-cards/contours.csv",
     "templates/research-repo/analysis/subject-cards/classification.csv",
     "templates/research-repo/analysis/subject-cards/coverage.csv",
     "templates/research-repo/analysis/subject-cards/_templates/subject-card.json",
@@ -278,6 +303,7 @@ RESEARCH_REQUIRED_PATHS = [
     "analysis/subject-cards/README.md",
     "analysis/subject-cards/registry.csv",
     "analysis/subject-cards/candidates.csv",
+    "analysis/subject-cards/contours.csv",
     "analysis/subject-cards/classification.csv",
     "analysis/subject-cards/coverage.csv",
     "analysis/subject-cards/_templates/subject-card.json",
@@ -1186,12 +1212,48 @@ class Doctor:
             else:
                 self.checks.add("subject_cards.candidates.header", "fail", "Subject-card candidates header does not match the contract")
         classification_path = repo_path(self.root, "analysis/subject-cards/classification.csv")
+        classification_rows: list[dict[str, str]] = []
         if classification_path.exists():
             header = classification_path.read_text(encoding="utf-8-sig").splitlines()[:1]
             if header == [SUBJECT_CARD_CLASSIFICATION_HEADER]:
                 self.checks.add("subject_cards.classification.header", "ok", "Subject-card classification header matches the contract")
+                with classification_path.open("r", encoding="utf-8-sig", newline="") as fh:
+                    classification_rows = [row for row in csv.DictReader(fh) if any((value or "").strip() for value in row.values())]
             else:
                 self.checks.add("subject_cards.classification.header", "fail", "Subject-card classification header does not match the contract")
+        contour_path = repo_path(self.root, "analysis/subject-cards/contours.csv")
+        contour_rows: list[dict[str, str]] = []
+        if contour_path.exists():
+            header = contour_path.read_text(encoding="utf-8-sig").splitlines()[:1]
+            if header == [SUBJECT_CARD_CONTOURS_HEADER]:
+                self.checks.add("subject_cards.contours.header", "ok", "Subject-card contours header matches the contract")
+                with contour_path.open("r", encoding="utf-8-sig", newline="") as fh:
+                    contour_rows = [row for row in csv.DictReader(fh) if any((value or "").strip() for value in row.values())]
+            else:
+                self.checks.add("subject_cards.contours.header", "fail", "Subject-card contours header does not match the contract")
+        accepted_contours = {row.get("slug", ""): row for row in contour_rows if row.get("status", "").strip() == "accepted" and row.get("slug", "").strip()}
+        for row in contour_rows:
+            if row.get("status", "").strip() != "accepted":
+                continue
+            label = row.get("contour_id") or row.get("slug", "")
+            for field in ("slug", "title", "contour_type", "linked_features", "scenario_summary", "migration_boundary", "why_this_is_one_contour", "why_not_technical_bucket", "evidence_refs", "confidence"):
+                if not row.get(field, "").strip():
+                    self.checks.add("subject_cards.contours.required", "fail", f"Accepted contour {label} is missing required field: {field}")
+            if row.get("contour_type") not in SUBJECT_CARD_TYPES:
+                self.checks.add("subject_cards.contours.subject_type", "fail", f"Accepted contour {label} has invalid contour_type: {row.get('contour_type', '')}")
+            if not row.get("technical_bucket_refs", "").strip():
+                self.checks.add("subject_cards.contours.technical_refs", "fail", f"Accepted contour {label} has no technical_bucket_refs")
+            if generic_bucket_title(row.get("title", "")) and "не техническая корзина" not in row.get("why_not_technical_bucket", "").lower():
+                self.checks.add("subject_cards.contours.generic_title", "fail", f"Accepted contour {label} has a generic title without explicit non-technical-bucket rationale")
+            for field in ("scenario_summary", "migration_boundary", "why_this_is_one_contour", "why_not_technical_bucket"):
+                if generic_template_text(row.get(field, "")):
+                    self.checks.add("subject_cards.contours.template_text", "fail", f"Accepted contour {label} keeps template-like text in {field}")
+        if (
+            classification_rows
+            and all(row.get("decision", "").strip() == "accept" for row in classification_rows)
+            and len(classification_rows) > len(accepted_contours)
+        ):
+            self.checks.add("subject_cards.classification.mass_accept", "fail", "All subject-card candidates are accepted; contour layer must split analyst contours from supporting technical buckets")
         registry_path = repo_path(self.root, "analysis/subject-cards/registry.csv")
         registry_rows: list[dict[str, str]] = []
         if registry_path.exists():
@@ -1250,6 +1312,16 @@ class Doctor:
                 self.checks.add("subject_cards.status", "fail", f"{relative} has invalid status: {status}")
             if status == "ready_for_review":
                 ready_count += 1
+                contour = accepted_contours.get(slug)
+                if not contour:
+                    self.checks.add("subject_cards.contour_link", "fail", f"{relative} is ready_for_review but has no accepted contour in analysis/subject-cards/contours.csv")
+                if generic_bucket_title(str(data.get("title") or "")) and "не техническая корзина" not in str(data.get("why_not_technical_bucket") or "").lower():
+                    self.checks.add("subject_cards.generic_title", "fail", f"{relative} has a generic title without why_not_technical_bucket")
+                for field in ("why_separate_card", "key_conclusion", "upgrade_risk"):
+                    if generic_template_text(str(data.get(field) or "")):
+                        self.checks.add("subject_cards.template_text", "fail", f"{relative} keeps template-like text in {field}")
+                if not str(data.get("migration_boundary") or "").strip():
+                    self.checks.add("subject_cards.migration_boundary", "fail", f"{relative} is missing migration_boundary")
             subject_type = str(data.get("subject_type", "")).strip()
             if subject_type and subject_type not in SUBJECT_CARD_TYPES:
                 self.checks.add("subject_cards.subject_type", "fail", f"{relative} has invalid subject_type: {subject_type}")
@@ -1316,6 +1388,17 @@ class Doctor:
             with final_feature_path.open("r", encoding="utf-8-sig", newline="") as fh:
                 final_feature_rows = [row for row in csv.DictReader(fh) if any((value or "").strip() for value in row.values())]
         feature_ids = {row.get("feature_id", "") for row in final_feature_rows if row.get("feature_id")}
+        contour_feature_ids = {
+            feature_id
+            for row in accepted_contours.values()
+            for feature_id in str(row.get("linked_features") or "").split(";")
+            if feature_id
+        }
+        missing_contours = sorted(feature_ids - contour_feature_ids)
+        if missing_contours:
+            self.checks.add("subject_cards.contours.bf", "fail", f"Subject-card contours miss BF containers: {', '.join(missing_contours)}")
+        elif feature_ids:
+            self.checks.add("subject_cards.contours.bf", "ok", f"Subject-card contours classify {len(feature_ids)} BF container(s)")
         covered_feature_ids = {row.get("feature_id", "") for row in coverage_rows if row.get("source_kind") == "BF" and row.get("feature_id")}
         missing_features = sorted(feature_ids - covered_feature_ids)
         if missing_features:
