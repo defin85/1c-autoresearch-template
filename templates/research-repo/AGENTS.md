@@ -13,6 +13,9 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 - `analysis/reverse-map/` is the durable state for long-running fact-to-intent reverse mapping. Agent context is disposable; continuation must read this folder.
 - `analysis/subject-cards/` is the durable registry and bundle layer for analyst-owned subject cards.
 - `analysis/functional-gaps/` is the durable one-card-per-pass layer for migration gap hypotheses and target-release checks.
+- `analysis/customization-registry/` is the canonical atomic `CUS-*` registry.
+- `analysis/migration-requirements/` is the canonical `MRQ-*` graph after activation.
+- `analysis/parallel-research/` stores coordinator manifests and the single-writer ledger.
 - `analysis/features/` contains feature-level evidence packs.
 - `outputs/` contains human-facing deliverables.
 - `docs/agent/repo-map.md` maps agent entry points and change routing.
@@ -20,8 +23,12 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 
 ## Operating Rules
 
-- Process one queue task at a time.
+- Process one queue task at a time. `/goal Параллельное исследование` is the
+  only multi-worker exception and uses one writer.
 - Use `$1c-autoresearch-queue-worker` when selecting, claiming, executing, or updating queue tasks.
+- Route `/goal Исследование`, `/goal Подготовь ревью`, `/goal Ручная разметка`,
+  `/goal Карта разрывов`, and `/goal Параллельное исследование` through their
+  matching files under `docs/method/` and `.agents/skills/`.
 - For reverse engineering continuation triggers such as `/goal Исследование`, follow `docs/method/reverse-functional-map.md`: run `python -m one_c_autoresearch reverse-map claim`, process one workitem, update reverse-map state, run `python -m one_c_autoresearch final-gate status`, verify, and stop.
 - For an end-to-end customization map, follow `docs/method/autopilot-customization-map.md` instead of stopping after a single queue task.
 - When raw source dumps include exporter noise, binary forms, ordering churn, or generated metadata drift, follow `docs/method/physical-clean-comparison.md` before building `analysis/indexes/diff-inventory.csv`.

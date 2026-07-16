@@ -18,6 +18,10 @@ analysis/queue/runs/**
 !analysis/queue/runs/README.md
 analysis/cache/indexes/**
 analysis/cache/noise/**
+analysis/cache/parallel-research-traces/**
+analysis/cache/parallel-research-workspaces/**
+analysis/cache/parallel-research-v8unpack-pairs/**
+analysis/parallel-research/runs/**
 
 # Keep generated Excel/CSV outputs only when intentionally reviewed.
 ~$*.xlsx

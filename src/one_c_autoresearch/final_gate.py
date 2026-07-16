@@ -15,6 +15,9 @@ from .autopilot import (
 )
 from .common import repo_path
 from .reverse_map import REVERSE_MAP_COVERAGE_HEADER, REVERSE_MAP_INFOBASE_CHECKS_HEADER, REVERSE_MAP_UNRESOLVED_HEADER
+from .stable_diff_ids import write_diff_id_map
+from .v8unpack_autopilot import assert_source_alignment
+from .v8unpack_refinement import NESTED_REPO, REFINEMENT_BRANCH, VENDOR_TAG
 
 
 FINAL_FEATURE_MAP_HEADER = FEATURE_MAP_HEADER
@@ -274,11 +277,22 @@ def build_final_gate_rows(root: Path) -> FinalGateResult:
 
 
 def build_final_gate(root: Path) -> FinalGateResult:
+    metadata = assert_source_alignment(root)
+    refinement_ref = metadata.get("branch_commits", {}).get("v8unpack_refinement", "")
     result = build_final_gate_rows(root)
     paths = final_gate_paths(root)
     write_csv_rows(paths["final_diff_inventory"], FINAL_DIFF_INVENTORY_HEADER, result.diff_rows)
     write_csv_rows(paths["final_feature_map"], FINAL_FEATURE_MAP_HEADER, result.feature_rows)
     write_csv_rows(paths["open_questions"], OPEN_QUESTIONS_HEADER, result.open_questions)
+    write_diff_id_map(
+        root,
+        result.diff_rows,
+        nested_repo=repo_path(root, NESTED_REPO),
+        vendor_ref=VENDOR_TAG,
+        target_ref=REFINEMENT_BRANCH,
+        first_seen_ref=refinement_ref,
+        last_seen_ref=refinement_ref,
+    )
     return result
 
 
@@ -293,6 +307,7 @@ def print_summary(result: FinalGateResult) -> None:
 
 def build_command(args: argparse.Namespace) -> int:
     root = Path(args.repo_path).resolve() if args.repo_path else Path.cwd()
+    assert_source_alignment(root)
     result = build_final_gate(root)
     print_summary(result)
     if args.strict and not result.is_clean:
@@ -302,12 +317,14 @@ def build_command(args: argparse.Namespace) -> int:
 
 def status_command(args: argparse.Namespace) -> int:
     root = Path(args.repo_path).resolve() if args.repo_path else Path.cwd()
+    assert_source_alignment(root)
     print_summary(build_final_gate_rows(root))
     return 0
 
 
 def verify_command(args: argparse.Namespace) -> int:
     root = Path(args.repo_path).resolve() if args.repo_path else Path.cwd()
+    assert_source_alignment(root)
     result = build_final_gate_rows(root)
     print_summary(result)
     return 0 if result.is_clean else 1

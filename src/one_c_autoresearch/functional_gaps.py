@@ -8,16 +8,38 @@ from pathlib import Path
 from typing import Any
 
 from .common import read_toml, repo_path, utc_now_iso
+from .customization_registry import customization_trace_payload, customizations_for_subject, load_registry_index
+from .migration_requirements import canonical_active, load_index as load_migration_requirement_index
 from .functional_gap_probes import derive_behavior_probe_requests, evaluate_behavior_probe_requests, load_target_profile
+from .stable_diff_ids import DIFF_ID_MAP_PATH, current_to_stable_diff_ids, read_csv_rows as read_stable_csv_rows
 from .subject_cards import load_subject_card, read_csv_rows, split_refs, write_csv_rows
 
 
 FUNCTIONAL_GAP_SCHEMA_VERSION = "functional-gap-card/v2"
 FUNCTIONAL_GAP_HYPOTHESES_HEADER = "hypothesis_id,gap_type,status,confidence,summary,evidence_ref,next_check,decision"
 FUNCTIONAL_GAP_CHECKS_HEADER = "check_id,check_type,status,source,question,result,blocking"
-FUNCTIONAL_GAP_TARGET_FINDINGS_HEADER = "finding_id,finding_type,target_object,target_path,match_basis,confidence,evidence_ref,notes"
-FUNCTIONAL_GAP_OBJECT_MAPPING_HEADER = "mapping_id,source_object,source_path,target_object,target_path,mapping_type,confidence,decision,notes"
+FUNCTIONAL_GAP_TARGET_FINDINGS_HEADER = "finding_id,finding_type,target_object,target_path,match_basis,confidence,evidence_ref,object_role,functional_relevance,notes"
+FUNCTIONAL_GAP_OBJECT_MAPPING_HEADER = "mapping_id,source_object,source_path,target_object,target_path,mapping_type,object_role,scenario_id,coverage_status,is_gap_driver,confidence,decision,notes"
 FUNCTIONAL_GAP_BEHAVIOR_PROBES_HEADER = "probe_id,capability_id,source_signal,source_ref,target_profile,profile_status,result,confidence,evidence_ref,finding_id,notes"
+FUNCTIONAL_GAP_SCENARIO_HEADER = "scenario_id,scenario,status,standard_mechanism,target_object,evidence_ref,gap_or_limit,next_action,confidence,notes"
+FUNCTIONAL_GAP_IMPLEMENTATION_SCOPE_HEADER = "scope_id,scenario_id,source_object,stable_source_key,linked_diff_ids,linked_stable_diff_ids,source_paths,target_objects,transfer_decision,verification,notes"
+FUNCTIONAL_GAP_METADATA_REBASE_HEADER = "metadata_object,metadata_kind,top_level_change_type,structural_part_kinds,change_types,linked_final_diff_ids,scenario_votes,selected_scenario_id,confidence_bucket,current_subject_card_slugs,needs_bsl_review,notes"
+FUNCTIONAL_GAP_METADATA_REBASE_EXCLUDED_HEADER = "metadata_object,metadata_kind,part_kind,part_name,change_type,final_diff_ids,subject_card_slugs,reason"
+FUNCTIONAL_GAP_METADATA_REBASE_CARD_SUPPORT_HEADER = "subject_card_slug,source_objects_count,structural_matches_count,excluded_only_count,rebuild_action,structural_objects,excluded_only_objects,notes"
+FUNCTIONAL_GAP_METADATA_REBASE_OBJECT_COVERAGE_HEADER = "metadata_object,metadata_kind,selected_scenario_id,confidence_bucket,current_subject_card_slugs,actual_subject_card_slugs,actual_refs,coverage_status,notes"
+FUNCTIONAL_GAP_METADATA_REBASE_UNRESOLVED_HEADER = "metadata_object,metadata_kind,selected_scenario_id,confidence_bucket,current_subject_card_slugs,linked_final_diff_ids,notes"
+FUNCTIONAL_GAP_SCENARIO_SOURCE_OBJECT_ISSUES_HEADER = "subject_card_slug,scenario_id,scenario,standard_mechanism,target_object,issue,notes"
+STRUCTURAL_METADATA_PART_KINDS = {
+    "object",
+    "attribute",
+    "dimension",
+    "resource",
+    "tabular_section",
+    "tabularsection",
+    "table_part",
+    "requisite",
+}
+NONSTRUCTURAL_METADATA_PART_KINDS = {"form", "template", "module", "help", "unknown"}
 FUNCTIONAL_GAP_BEHAVIOR_PROBE_RESULTS = {
     "standard_supported",
     "adaptation_candidate",
@@ -60,6 +82,8 @@ FUNCTIONAL_GAP_STATUSES = {
     "needs_target_analysis",
     "needs_runtime_check",
     "needs_analyst_decision",
+    "needs_reclassification",
+    "needs_manual_review",
     "ready_for_review",
     "reviewed",
     "blocked",
@@ -97,6 +121,19 @@ CHECK_STATUS_LABELS = {
     "blocked": "заблокирована",
     "not_applicable": "не требуется",
 }
+OBJECT_ROLE_LABELS = {
+    "core_source_object": "ядро разрыва",
+    "supporting_standard_object": "типовая опорная часть",
+    "standard_target_object": "типовой объект целевого релиза",
+    "target_candidate_object": "кандидат целевого механизма",
+    "noise_or_infrastructure": "технический след",
+}
+FUNCTIONAL_RELEVANCE_LABELS = {
+    "direct_standard_support": "прямое типовое покрытие",
+    "candidate_only": "только кандидат",
+    "gap_driver": "формирует разрыв",
+    "technical_noise": "технический шум",
+}
 TARGET_INSPECTION_CHECK_IDS = {"FGC-0001", "FGC-0007"}
 MANUAL_REVIEW_HEADING = "## Ручные заметки аналитика"
 DEFAULT_ANALYST_DECISION_TEXT = "Пока не зафиксировано. После проверок целевого релиза нужно выбрать: заменить типовым механизмом, адаптировать, сохранить или вывести из эксплуатации."
@@ -126,6 +163,374 @@ def first_csv_line(path: Path) -> str:
 
 def non_empty_csv_rows(path: Path) -> list[dict[str, str]]:
     return [row for row in read_csv_rows(path) if any((value or "").strip() for value in row.values())]
+
+
+def is_non_typical_metadata_row(row: dict[str, str]) -> bool:
+    return row.get("status") != "unchanged" or row.get("change_type") not in {"", "unchanged"}
+
+
+def is_structural_metadata_row(row: dict[str, str]) -> bool:
+    if is_role_rights_metadata_row(row):
+        return True
+    return row.get("part_kind", "").strip().lower() in STRUCTURAL_METADATA_PART_KINDS
+
+
+def is_role_rights_metadata_row(row: dict[str, str]) -> bool:
+    if row.get("metadata_kind") != "Role":
+        return False
+    part_name = row.get("part_name", "").strip().lower()
+    part_path = row.get("part_path", "").strip().lower()
+    return part_name == "rights" or part_path.endswith("/ext/rights.xml")
+
+
+def structural_metadata_part_kind(row: dict[str, str]) -> str:
+    if is_role_rights_metadata_row(row):
+        return "rights"
+    return row.get("part_kind", "")
+
+
+def is_metadata_rebase_driver_row(row: dict[str, str]) -> bool:
+    if not is_non_typical_metadata_row(row) or not is_structural_metadata_row(row):
+        return False
+    if row.get("part_kind", "").strip().lower() == "object":
+        return row.get("change_type") in {"added", "modified", "removed"}
+    return True
+
+
+def metadata_rebase_bucket(votes: dict[str, int]) -> tuple[str, str, bool]:
+    if not votes:
+        return "", "no_votes", True
+    ordered = sorted(votes.items(), key=lambda item: (-item[1], item[0]))
+    selected, count = ordered[0]
+    total = sum(votes.values())
+    ratio = count / total if total else 0
+    if len(votes) == 1 or ratio >= 0.7:
+        return selected, "clear", False
+    if ratio >= 0.5:
+        return selected, "weak", True
+    return selected, "conflict", True
+
+
+def scenario_votes_text(votes: dict[str, int]) -> str:
+    return ";".join(f"{scenario}:{count}" for scenario, count in sorted(votes.items(), key=lambda item: (-item[1], item[0])))
+
+
+def current_functional_gap_slugs(root: Path) -> set[str]:
+    slugs: set[str] = set()
+    for row in non_empty_csv_rows(functional_gap_root(root) / "index.csv"):
+        slug = row.get("subject_card_slug", "").strip()
+        if slug:
+            slugs.add(slug)
+    cards_dir = functional_gap_root(root) / "cards"
+    if cards_dir.exists():
+        slugs.update(path.name for path in cards_dir.iterdir() if path.is_dir())
+    return slugs
+
+
+def excluded_metadata_rebase_rows(root: Path) -> list[dict[str, str]]:
+    metadata_rows = non_empty_csv_rows(repo_path(root, "analysis/custom-metadata/index.csv"))
+    result: list[dict[str, str]] = []
+    for row in metadata_rows:
+        if not is_non_typical_metadata_row(row) or is_metadata_rebase_driver_row(row):
+            continue
+        metadata_object = row.get("metadata_full_name") or ".".join(part for part in (row.get("metadata_kind"), row.get("metadata_name")) if part)
+        if not metadata_object:
+            continue
+        part_kind = row.get("part_kind", "")
+        reason = "nonstructural_part" if part_kind.lower() in NONSTRUCTURAL_METADATA_PART_KINDS else "not_structural_driver"
+        result.append(
+            {
+                "metadata_object": metadata_object,
+                "metadata_kind": row.get("metadata_kind", ""),
+                "part_kind": part_kind,
+                "part_name": row.get("part_name", "") or row.get("part_path", ""),
+                "change_type": row.get("change_type", ""),
+                "final_diff_ids": row.get("final_diff_ids", ""),
+                "subject_card_slugs": row.get("subject_card_slugs", ""),
+                "reason": reason,
+            }
+        )
+    return result
+
+
+def build_metadata_rebase_candidates(root: Path) -> list[dict[str, str]]:
+    metadata_rows = non_empty_csv_rows(repo_path(root, "analysis/custom-metadata/index.csv"))
+    final_diff_ids = {row.get("diff_id", "") for row in non_empty_csv_rows(repo_path(root, "analysis/indexes/final-diff-inventory.csv")) if row.get("diff_id")}
+    decisions = [
+        row
+        for row in non_empty_csv_rows(repo_path(root, "analysis/reverse-map/decisions.csv"))
+        if row.get("decision") == "confirmed_in_scenario" and row.get("diff_id") and row.get("scenario_id")
+    ]
+    scenario_by_diff = {row["diff_id"]: row["scenario_id"] for row in decisions}
+    current_slugs = current_functional_gap_slugs(root)
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in metadata_rows:
+        if not is_metadata_rebase_driver_row(row):
+            continue
+        metadata_object = row.get("metadata_full_name") or ".".join(part for part in (row.get("metadata_kind"), row.get("metadata_name")) if part)
+        if not metadata_object:
+            continue
+        group = grouped.setdefault(
+            metadata_object,
+            {
+                "metadata_object": metadata_object,
+                "metadata_kind": row.get("metadata_kind", ""),
+                "top_level_change_type": "",
+                "structural_part_kinds": set(),
+                "change_types": set(),
+                "linked_final_diff_ids": set(),
+                "subject_card_slugs": set(),
+                "unresolved_diff_ids": set(),
+            },
+        )
+        if row.get("part_kind") == "object" and row.get("change_type") in {"added", "modified", "removed"}:
+            group["top_level_change_type"] = row.get("change_type", "")
+        structural_part_kind = structural_metadata_part_kind(row)
+        if structural_part_kind:
+            group["structural_part_kinds"].add(structural_part_kind)
+        if row.get("change_type"):
+            group["change_types"].add(row["change_type"])
+        group["linked_final_diff_ids"].update(split_refs(row.get("final_diff_ids", "")))
+        group["subject_card_slugs"].update(slug for slug in split_refs(row.get("subject_card_slugs", "")) if not current_slugs or slug in current_slugs)
+
+    result: list[dict[str, str]] = []
+    for metadata_object, group in sorted(grouped.items()):
+        diff_ids = sorted(group["linked_final_diff_ids"])
+        votes: dict[str, int] = {}
+        unresolved: list[str] = []
+        stale: list[str] = []
+        for diff_id in diff_ids:
+            if final_diff_ids and diff_id not in final_diff_ids:
+                stale.append(diff_id)
+            scenario = scenario_by_diff.get(diff_id)
+            if scenario:
+                votes[scenario] = votes.get(scenario, 0) + 1
+            else:
+                unresolved.append(diff_id)
+        selected, bucket, needs_bsl = metadata_rebase_bucket(votes)
+        notes: list[str] = []
+        if not diff_ids:
+            notes.append("parser_only_no_final_diff_ids")
+        if unresolved:
+            notes.append("unresolved_diff_ids=" + ";".join(unresolved))
+        if stale:
+            notes.append("stale_final_diff_ids=" + ";".join(stale))
+        result.append(
+            {
+                "metadata_object": metadata_object,
+                "metadata_kind": group["metadata_kind"],
+                "top_level_change_type": group["top_level_change_type"],
+                "structural_part_kinds": ";".join(sorted(group["structural_part_kinds"])),
+                "change_types": ";".join(sorted(group["change_types"])),
+                "linked_final_diff_ids": ";".join(diff_ids),
+                "scenario_votes": scenario_votes_text(votes),
+                "selected_scenario_id": selected,
+                "confidence_bucket": bucket,
+                "current_subject_card_slugs": ";".join(sorted(group["subject_card_slugs"])),
+                "needs_bsl_review": "true" if needs_bsl else "false",
+                "notes": "; ".join(notes),
+            }
+        )
+    return result
+
+
+def write_metadata_rebase_summary(root: Path, rows: list[dict[str, str]], output_dir: Path) -> None:
+    bucket_counts: dict[str, int] = {}
+    selected_counts: dict[str, int] = {}
+    for row in rows:
+        bucket_counts[row["confidence_bucket"]] = bucket_counts.get(row["confidence_bucket"], 0) + 1
+        if row.get("selected_scenario_id"):
+            selected_counts[row["selected_scenario_id"]] = selected_counts.get(row["selected_scenario_id"], 0) + 1
+    lines = [
+        "# Структурная metadata-first ревизия карты функциональных разрывов",
+        "",
+        f"- Сформировано: {utc_now_iso()}",
+        f"- Структурных объектов метаданных: {len(rows)}",
+        f"- Требуют BSL-проверки: {sum(1 for row in rows if row.get('needs_bsl_review') == 'true')}",
+        "",
+        "## Уверенность",
+        "",
+    ]
+    for bucket in ("clear", "weak", "conflict", "no_votes"):
+        lines.append(f"- `{bucket}`: {bucket_counts.get(bucket, 0)}")
+    lines.extend(["", "## Ведущие сценарии", ""])
+    if selected_counts:
+        for scenario, count in sorted(selected_counts.items(), key=lambda item: (-item[1], item[0])):
+            lines.append(f"- `{scenario}`: {count}")
+    else:
+        lines.append("Нет выбранных сценариев.")
+    lines.extend(["", "## Следующий шаг", "", "Использовать `candidates.csv` как вход для ручного переоформления карточек по новым/измененным объектам и реквизитам; формы и макеты из `excluded-parts.csv` не считать самостоятельными драйверами карточек. `weak`, `conflict` и `no_votes` проверять по BSL/исходникам перед изменением карточек."])
+    (output_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
+def functional_gap_card_source_objects(card_dir: Path) -> list[str]:
+    objects: list[str] = []
+    payload_path = card_dir / "gap-card.json"
+    if payload_path.exists():
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        source_contour = payload.get("source_contour") if isinstance(payload.get("source_contour"), dict) else {}
+        for key in ("core_source_objects", "primary_objects"):
+            objects.extend(split_refs(source_contour.get(key, [])))
+            objects.extend(split_refs(payload.get(key, [])))
+    mapping_path = card_dir / "object-mapping.csv"
+    if mapping_path.exists():
+        objects.extend(row.get("source_object", "") for row in non_empty_csv_rows(mapping_path))
+    return sorted({obj for obj in objects if obj})
+
+
+def build_metadata_rebase_card_support(root: Path, candidates: list[dict[str, str]], excluded: list[dict[str, str]]) -> list[dict[str, str]]:
+    structural_objects = {row.get("metadata_object", "") for row in candidates if row.get("metadata_object")}
+    excluded_objects = {row.get("metadata_object", "") for row in excluded if row.get("metadata_object")}
+    result: list[dict[str, str]] = []
+    cards_dir = functional_gap_root(root) / "cards"
+    if not cards_dir.exists():
+        return result
+    for card_dir in sorted(path for path in cards_dir.iterdir() if path.is_dir()):
+        source_objects = functional_gap_card_source_objects(card_dir)
+        matched = sorted(obj for obj in source_objects if obj in structural_objects)
+        excluded_only = sorted(obj for obj in source_objects if obj in excluded_objects and obj not in structural_objects)
+        if matched:
+            action = "keep_rebuild_from_structural_candidates"
+            notes = "Есть структурная опора; формы и макеты оставить только вторичным контекстом."
+        elif excluded_only:
+            action = "remove_or_merge_form_only"
+            notes = "Самостоятельный разрыв не подтвержден структурными метаданными."
+        else:
+            action = "needs_manual_source_review"
+            notes = "В карточке нет прямой связи с текущим структурным отчетом."
+        result.append(
+            {
+                "subject_card_slug": card_dir.name,
+                "source_objects_count": str(len(source_objects)),
+                "structural_matches_count": str(len(matched)),
+                "excluded_only_count": str(len(excluded_only)),
+                "rebuild_action": action,
+                "structural_objects": ";".join(matched),
+                "excluded_only_objects": ";".join(excluded_only),
+                "notes": notes,
+            }
+        )
+    return result
+
+
+def add_metadata_rebase_ref(refs: dict[str, set[str]], candidate_objects: set[str], metadata_object: str, ref: str) -> None:
+    metadata_object = metadata_object.strip()
+    if metadata_object and metadata_object in candidate_objects:
+        refs.setdefault(metadata_object, set()).add(ref)
+
+
+def metadata_rebase_card_object_refs(root: Path, candidate_objects: set[str]) -> dict[str, set[str]]:
+    refs: dict[str, set[str]] = {}
+    for relative, slug_field in (("analysis/subject-cards/contours.csv", "slug"), ("analysis/subject-cards/registry.csv", "slug")):
+        path = repo_path(root, relative)
+        if not path.exists():
+            continue
+        for row in non_empty_csv_rows(path):
+            slug = row.get(slug_field, "").strip()
+            for metadata_object in split_refs(row.get("primary_objects", "")):
+                add_metadata_rebase_ref(refs, candidate_objects, metadata_object, f"{relative}:{slug}")
+    cards_dir = functional_gap_root(root) / "cards"
+    if not cards_dir.exists():
+        return refs
+    for card_dir in sorted(path for path in cards_dir.iterdir() if path.is_dir()):
+        payload_path = card_dir / "gap-card.json"
+        if payload_path.exists():
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            source_contour = payload.get("source_contour") if isinstance(payload.get("source_contour"), dict) else {}
+            for key in ("primary_objects", "core_source_objects"):
+                for metadata_object in split_refs(source_contour.get(key, [])):
+                    add_metadata_rebase_ref(refs, candidate_objects, metadata_object, f"gap-card:{card_dir.name}:{key}")
+                for metadata_object in split_refs(payload.get(key, [])):
+                    add_metadata_rebase_ref(refs, candidate_objects, metadata_object, f"gap-card:{card_dir.name}:{key}")
+        for filename, column in (("object-mapping.csv", "source_object"), ("functional-equivalence.csv", "standard_mechanism")):
+            path = card_dir / filename
+            if not path.exists():
+                continue
+            for row in non_empty_csv_rows(path):
+                add_metadata_rebase_ref(refs, candidate_objects, row.get(column, ""), f"{filename}:{card_dir.name}")
+    return refs
+
+
+def metadata_rebase_ref_slug(ref: str) -> str:
+    if ref.startswith("gap-card:"):
+        parts = ref.split(":")
+        return parts[1] if len(parts) > 1 else ""
+    return ref.rsplit(":", 1)[-1] if ":" in ref else ""
+
+
+def build_metadata_rebase_object_coverage(root: Path, candidates: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    candidate_objects = {row.get("metadata_object", "") for row in candidates if row.get("metadata_object")}
+    refs_by_object = metadata_rebase_card_object_refs(root, candidate_objects)
+    coverage_rows: list[dict[str, str]] = []
+    unresolved_rows: list[dict[str, str]] = []
+    for row in candidates:
+        metadata_object = row.get("metadata_object", "")
+        refs = sorted(refs_by_object.get(metadata_object, set()))
+        actual_slugs = sorted({slug for slug in (metadata_rebase_ref_slug(ref) for ref in refs) if slug})
+        coverage_status = "covered" if refs else "uncovered"
+        notes = "" if refs else "Нет фактической ссылки в contours/registry/gap-card/object-mapping/functional-equivalence."
+        coverage_row = {
+            "metadata_object": metadata_object,
+            "metadata_kind": row.get("metadata_kind", ""),
+            "selected_scenario_id": row.get("selected_scenario_id", ""),
+            "confidence_bucket": row.get("confidence_bucket", ""),
+            "current_subject_card_slugs": row.get("current_subject_card_slugs", ""),
+            "actual_subject_card_slugs": ";".join(actual_slugs),
+            "actual_refs": ";".join(refs),
+            "coverage_status": coverage_status,
+            "notes": notes,
+        }
+        coverage_rows.append(coverage_row)
+        if coverage_status == "uncovered":
+            unresolved_rows.append(
+                {
+                    "metadata_object": metadata_object,
+                    "metadata_kind": row.get("metadata_kind", ""),
+                    "selected_scenario_id": row.get("selected_scenario_id", ""),
+                    "confidence_bucket": row.get("confidence_bucket", ""),
+                    "current_subject_card_slugs": row.get("current_subject_card_slugs", ""),
+                    "linked_final_diff_ids": row.get("linked_final_diff_ids", ""),
+                    "notes": notes or row.get("notes", ""),
+                }
+            )
+    return coverage_rows, unresolved_rows
+
+
+def build_metadata_rebase(root: Path) -> dict[str, Any]:
+    output_dir = functional_gap_root(root) / "metadata-rebase"
+    rows = build_metadata_rebase_candidates(root)
+    excluded_rows = excluded_metadata_rebase_rows(root)
+    card_support_rows = build_metadata_rebase_card_support(root, rows, excluded_rows)
+    coverage_rows, unresolved_rows = build_metadata_rebase_object_coverage(root, rows)
+    write_csv_rows(output_dir / "candidates.csv", FUNCTIONAL_GAP_METADATA_REBASE_HEADER, rows)
+    write_csv_rows(output_dir / "excluded-parts.csv", FUNCTIONAL_GAP_METADATA_REBASE_EXCLUDED_HEADER, excluded_rows)
+    write_csv_rows(output_dir / "card-support.csv", FUNCTIONAL_GAP_METADATA_REBASE_CARD_SUPPORT_HEADER, card_support_rows)
+    write_csv_rows(output_dir / "object-coverage.csv", FUNCTIONAL_GAP_METADATA_REBASE_OBJECT_COVERAGE_HEADER, coverage_rows)
+    write_csv_rows(output_dir / "unresolved-candidates.csv", FUNCTIONAL_GAP_METADATA_REBASE_UNRESOLVED_HEADER, unresolved_rows)
+    write_metadata_rebase_summary(root, rows, output_dir)
+    return {
+        "status": "ok",
+        "rows": len(rows),
+        "excluded_rows": len(excluded_rows),
+        "card_support_rows": len(card_support_rows),
+        "covered_rows": sum(1 for row in coverage_rows if row.get("coverage_status") == "covered"),
+        "unresolved_rows": len(unresolved_rows),
+        "needs_bsl_review": sum(1 for row in rows if row.get("needs_bsl_review") == "true"),
+        "path": "analysis/functional-gaps/metadata-rebase/candidates.csv",
+    }
+
+
+def metadata_supported_card_slugs(root: Path) -> set[str] | None:
+    path = functional_gap_root(root) / "metadata-rebase/card-support.csv"
+    if not path.exists():
+        return None
+    rows = read_csv_rows(path)
+    return {
+        row.get("subject_card_slug", "").strip()
+        for row in rows
+        if row.get("subject_card_slug", "").strip()
+        and row.get("rebuild_action") == "keep_rebuild_from_structural_candidates"
+    }
 
 
 def load_manifest(root: Path) -> dict[str, Any]:
@@ -218,6 +623,73 @@ def source_ref(root: Path, slug: str, field: str) -> str:
     return f"{subject_card_relative(slug)}#{field}"
 
 
+def row_by_slug(root: Path, relative: str, slug: str) -> dict[str, str]:
+    for row in read_csv_rows(repo_path(root, relative)):
+        if row.get("slug") == slug:
+            return row
+    return {}
+
+
+def source_contour_snapshot(
+    root: Path,
+    slug: str,
+    payload: dict[str, Any],
+    evidence_rows: list[dict[str, str]],
+) -> dict[str, Any]:
+    registry = row_by_slug(root, "analysis/subject-cards/registry.csv", slug)
+    contour = next(
+        (
+            row
+            for row in read_csv_rows(repo_path(root, "analysis/subject-cards/contours.csv"))
+            if row.get("slug") == slug and row.get("status") == "accepted"
+        ),
+        {},
+    )
+    subject_path = repo_path(root, subject_card_relative(slug))
+    primary_objects = (
+        split_refs(payload.get("primary_objects", []))
+        or split_refs(contour.get("primary_objects", ""))
+        or split_refs(registry.get("primary_objects", ""))
+    )
+    linked_detail_maps = (
+        split_refs(payload.get("linked_detail_maps", []))
+        or split_refs(contour.get("linked_detail_maps", ""))
+        or split_refs(registry.get("linked_detail_maps", ""))
+    )
+    evidence_refs = split_refs(contour.get("evidence_refs", "")) or split_refs(payload.get("source_artifacts", []))
+    evidence_refs.extend(row.get("source_path", "") for row in evidence_rows if row.get("source_path"))
+    return {
+        "slug": slug,
+        "title": str(payload.get("title") or registry.get("title") or contour.get("title") or slug),
+        "card_path": subject_card_relative(slug),
+        "subject_card_hash": file_sha256(subject_path),
+        "registry_title": registry.get("title", ""),
+        "registry_status": registry.get("status", ""),
+        "accepted_contour_id": contour.get("contour_id", ""),
+        "accepted_contour_title": contour.get("title", ""),
+        "scenario_summary": contour.get("scenario_summary", "") or str(payload.get("summary") or ""),
+        "migration_boundary": contour.get("migration_boundary", "") or str(payload.get("migration_boundary") or payload.get("upgrade_risk") or ""),
+        "primary_objects": primary_objects,
+        "core_source_objects": primary_objects,
+        "linked_detail_maps": linked_detail_maps,
+        "evidence_refs": split_refs(";".join(evidence_refs)),
+    }
+
+
+def source_contour_problem(snapshot: dict[str, Any]) -> str:
+    if not snapshot:
+        return "source_contour отсутствует"
+    if not str(snapshot.get("scenario_summary") or "").strip():
+        return "не заполнен scenario_summary"
+    if not str(snapshot.get("migration_boundary") or "").strip():
+        return "не заполнен migration_boundary"
+    if not split_refs(snapshot.get("core_source_objects", [])):
+        return "не определены core_source_objects"
+    if not str(snapshot.get("accepted_contour_id") or "").strip():
+        return "нет accepted contour"
+    return ""
+
+
 def has_open_blocking_subject_gaps(gaps: list[dict[str, str]]) -> bool:
     return any(
         row.get("blocking", "").strip().lower() == "true"
@@ -231,7 +703,14 @@ def subject_ready_for_gap_pass(payload: dict[str, Any], gaps: list[dict[str, str
     return status in {"ready_for_review", "reviewed"} and not has_open_blocking_subject_gaps(gaps)
 
 
-def gap_readiness(payload: dict[str, Any], gaps: list[dict[str, str]], sources: dict[str, str]) -> str:
+def gap_readiness(
+    payload: dict[str, Any],
+    gaps: list[dict[str, str]],
+    sources: dict[str, str],
+    contour_problem: str = "",
+) -> str:
+    if contour_problem:
+        return "needs_subject_card_readiness"
     if not subject_ready_for_gap_pass(payload, gaps):
         return "needs_subject_card_readiness"
     if not sources.get("next_vendor_path") and not sources.get("next_vendor_rlm"):
@@ -509,25 +988,31 @@ def build_gap_payload(
     root: Path,
     slug: str,
     payload: dict[str, Any],
+    evidence_rows: list[dict[str, str]],
     gaps: list[dict[str, str]],
     manifest: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, str]], list[dict[str, str]]]:
     sources = target_sources(manifest)
     target_label = target_release_label(manifest)
-    readiness = gap_readiness(payload, gaps, sources)
+    source_contour = source_contour_snapshot(root, slug, payload, evidence_rows)
+    contour_problem = source_contour_problem(source_contour)
+    readiness = gap_readiness(payload, gaps, sources, contour_problem)
     hypotheses = build_hypotheses(root, slug, payload, target_label)
     checks = build_required_checks(slug, payload, gaps, sources, readiness, target_label)
     subject_path = repo_path(root, subject_card_relative(slug))
     now = utc_now_iso()
+    status = "needs_reclassification" if contour_problem else status_from_readiness(readiness)
     card_payload = {
         "schema_version": FUNCTIONAL_GAP_SCHEMA_VERSION,
         "subject_card_slug": slug,
         "title": str(payload.get("title") or slug),
-        "status": status_from_readiness(readiness),
+        "status": status,
         "gap_readiness": readiness,
         "target_release": target_label,
         "source_subject_card": subject_card_relative(slug),
         "source_subject_card_hash": file_sha256(subject_path),
+        "source_contour": source_contour,
+        "source_contour_problem": contour_problem,
         "target_source_hash": target_source_hash(root, sources),
         "selected_decision": "",
         "selected_decision_summary": "",
@@ -687,6 +1172,71 @@ def merge_checks(generated: list[dict[str, str]], existing: list[dict[str, str]]
     return merged
 
 
+def functional_relevance_for_role(role: str, fallback: str = "") -> str:
+    if role == "standard_target_object":
+        return "direct_standard_support"
+    if role == "target_candidate_object":
+        return "candidate_only"
+    if role == "core_source_object":
+        return "gap_driver"
+    if role == "noise_or_infrastructure":
+        return "technical_noise"
+    return fallback
+
+
+def normalize_gap_driver(row: dict[str, str]) -> dict[str, str]:
+    result = dict(row)
+    if result.get("object_role") != "core_source_object" and result.get("is_gap_driver") == "true":
+        result["is_gap_driver"] = "false"
+    return result
+
+
+def merge_curated_object_mappings(
+    generated: list[dict[str, str]],
+    existing: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    existing_by_source = {row.get("source_object", ""): row for row in existing if row.get("source_object")}
+    merged: list[dict[str, str]] = []
+    preserved_fields = ("object_role", "scenario_id", "coverage_status", "is_gap_driver", "confidence", "decision", "notes")
+    for row in generated:
+        current = dict(row)
+        previous = existing_by_source.get(row.get("source_object", ""))
+        if previous:
+            for field in preserved_fields:
+                if previous.get(field):
+                    current[field] = previous[field]
+        merged.append(normalize_gap_driver(current))
+    generated_sources = {row.get("source_object", "") for row in generated}
+    for row in existing:
+        if row.get("source_object") and row["source_object"] not in generated_sources:
+            merged.append(normalize_gap_driver(row))
+    return merged
+
+
+def merge_curated_target_findings(
+    generated: list[dict[str, str]],
+    existing: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    existing_by_key = {
+        (row.get("target_object", ""), row.get("match_basis", "")): row
+        for row in existing
+        if row.get("target_object") or row.get("match_basis")
+    }
+    merged: list[dict[str, str]] = []
+    for row in generated:
+        current = dict(row)
+        previous = existing_by_key.get((row.get("target_object", ""), row.get("match_basis", "")))
+        if previous:
+            for field in ("object_role", "functional_relevance", "confidence", "notes"):
+                if previous.get(field):
+                    current[field] = previous[field]
+        relevance = functional_relevance_for_role(current.get("object_role", ""), current.get("functional_relevance", ""))
+        if relevance:
+            current["functional_relevance"] = relevance
+        merged.append(current)
+    return merged
+
+
 def preserve_manual_payload_fields(generated: dict[str, Any], existing: dict[str, Any] | None) -> dict[str, Any]:
     if not existing:
         return generated
@@ -709,15 +1259,134 @@ def update_counts(
     findings: list[dict[str, str]],
     mappings: list[dict[str, str]],
     behavior_probes: list[dict[str, str]] | None = None,
+    scenarios: list[dict[str, str]] | None = None,
 ) -> None:
     behavior_probes = behavior_probes or []
+    scenarios = scenarios or []
     payload["counts"] = {
         "hypotheses": len(hypotheses),
         "checks_open": sum(1 for row in checks if row.get("status") in {"open", "blocked"}),
         "target_findings": len(findings),
         "object_mappings": len(mappings),
         "behavior_probes": len(behavior_probes),
+        "scenarios": len(scenarios),
     }
+
+
+def _expand_diff_refs(value: str) -> list[str]:
+    result: list[str] = []
+    for part in split_refs(value):
+        if ".." not in part:
+            result.append(part)
+            continue
+        start, end = part.split("..", 1)
+        prefix = start.rstrip("0123456789")
+        if not prefix or not end.startswith(prefix):
+            result.append(part)
+            continue
+        try:
+            start_num = int(start[len(prefix) :])
+            end_num = int(end[len(prefix) :])
+        except ValueError:
+            result.append(part)
+            continue
+        width = len(start) - len(prefix)
+        step = 1 if end_num >= start_num else -1
+        result.extend(f"{prefix}{num:0{width}d}" for num in range(start_num, end_num + step, step))
+    return result
+
+
+def _stable_source_key(path: str) -> str:
+    return hashlib.sha1(path.encode("utf-8")).hexdigest()[:12] if path else ""
+
+
+def _diff_inventory_rows(root: Path) -> list[dict[str, str]]:
+    rows = read_csv_rows(repo_path(root, "analysis/indexes/final-diff-inventory.csv"))
+    if not rows:
+        rows = read_csv_rows(repo_path(root, "analysis/indexes/diff-inventory.csv"))
+    return rows
+
+
+def _diff_inventory_by_id(root: Path) -> dict[str, dict[str, str]]:
+    rows = _diff_inventory_rows(root)
+    return {row.get("diff_id", ""): row for row in rows if row.get("diff_id")}
+
+
+def _source_object_from_path(source_path: str) -> str:
+    parts = Path(source_path).parts
+    category_map = {
+        "Catalog": "Catalog",
+        "CommonModule": "CommonModule",
+        "CommonTemplate": "CommonTemplate",
+        "DataProcessor": "DataProcessor",
+        "Document": "Document",
+        "ExchangePlan": "ExchangePlan",
+        "InformationRegister": "InformationRegister",
+        "Report": "Report",
+    }
+    for index, part in enumerate(parts[:-1]):
+        if part in category_map:
+            return f"{category_map[part]}.{parts[index + 1]}"
+    return ""
+
+
+def _diff_rows_for_evidence(evidence: dict[str, str], diff_rows: list[dict[str, str]], diff_by_id: dict[str, dict[str, str]]) -> list[dict[str, str]]:
+    linked_rows = [diff_by_id[diff_id] for diff_id in _expand_diff_refs(evidence.get("linked_diff_id", "")) if diff_id in diff_by_id]
+    source_path = evidence.get("source_path", "")
+    source_object = _source_object_from_path(source_path)
+    if source_object and linked_rows and all(row.get("object_name") == source_object for row in linked_rows):
+        return linked_rows
+    normalized_source = source_path.replace("/repo/", "/repo#")
+    exact_rows = [row for row in diff_rows if row.get("evidence_ref") == normalized_source]
+    if exact_rows:
+        return exact_rows
+    if source_object:
+        return [row for row in diff_rows if row.get("object_name") == source_object]
+    return linked_rows
+
+
+def build_implementation_scope(root: Path, slug: str, mappings: list[dict[str, str]], scenarios: list[dict[str, str]]) -> list[dict[str, str]]:
+    evidence_rows = read_csv_rows(repo_path(root, f"analysis/subject-cards/cards/{slug}/evidence.csv"))
+    diff_rows = _diff_inventory_rows(root)
+    diff_by_id = _diff_inventory_by_id(root)
+    stable_by_current = current_to_stable_diff_ids(root)
+    scenario_by_id = {row.get("scenario_id", ""): row for row in scenarios if row.get("scenario_id")}
+    mapping_by_source = {row.get("source_object", ""): row for row in mappings if row.get("source_object")}
+    rows: list[dict[str, str]] = []
+    for evidence in evidence_rows:
+        diff_matches = _diff_rows_for_evidence(evidence, diff_rows, diff_by_id)
+        if not diff_matches:
+            continue
+        diff_ids = [row.get("diff_id", "") for row in diff_matches if row.get("diff_id")]
+        stable_diff_ids = [stable_by_current[diff_id] for diff_id in diff_ids if diff_id in stable_by_current]
+        source_objects = sorted({diff_by_id[diff_id].get("object_name", "") for diff_id in diff_ids if diff_by_id[diff_id].get("object_name")})
+        source_paths = sorted({diff_by_id[diff_id].get("evidence_ref", "") for diff_id in diff_ids if diff_by_id[diff_id].get("evidence_ref")})
+        scenario_id = ""
+        target_objects: list[str] = []
+        for source_object in source_objects:
+            mapping = mapping_by_source.get(source_object)
+            if mapping and not scenario_id:
+                scenario_id = mapping.get("scenario_id", "")
+            if mapping and mapping.get("target_object"):
+                target_objects.append(mapping["target_object"])
+        scenario = scenario_by_id.get(scenario_id, {})
+        transfer_decision = scenario.get("status") or "needs_gap_decision"
+        rows.append(
+            {
+                "scope_id": f"FGS-{len(rows) + 1:04d}",
+                "scenario_id": scenario_id,
+                "source_object": ";".join(source_objects),
+                "stable_source_key": _stable_source_key(";".join(source_paths) or ";".join(diff_ids)),
+                "linked_diff_ids": ";".join(diff_ids),
+                "linked_stable_diff_ids": ";".join(stable_diff_ids),
+                "source_paths": ";".join(source_paths),
+                "target_objects": ";".join(sorted(set(target_objects))),
+                "transfer_decision": transfer_decision,
+                "verification": scenario.get("next_action", ""),
+                "notes": f"subject_evidence={evidence.get('evidence_id', '')}; {evidence.get('claim', '')}",
+            }
+        )
+    return rows
 
 
 def write_functional_gap_bundle(
@@ -728,6 +1397,7 @@ def write_functional_gap_bundle(
     target_findings: list[dict[str, str]] | None = None,
     object_mappings: list[dict[str, str]] | None = None,
     behavior_probes: list[dict[str, str]] | None = None,
+    scenarios: list[dict[str, str]] | None = None,
     preserve_review: bool = False,
 ) -> None:
     slug = str(payload["subject_card_slug"])
@@ -736,9 +1406,16 @@ def write_functional_gap_bundle(
     target_findings = target_findings or []
     object_mappings = object_mappings or []
     behavior_probes = behavior_probes or []
+    scenarios = scenarios if scenarios is not None else build_functional_equivalence_rows(object_mappings)
     payload["hypotheses"] = hypotheses
     payload["required_checks"] = checks
-    update_counts(payload, hypotheses, checks, target_findings, object_mappings, behavior_probes)
+    registry = load_registry_index(root)
+    payload["semantic_customizations"] = customization_trace_payload(
+        root,
+        [str(item.get("customization_id") or "") for item in customizations_for_subject(root, slug, registry)],
+        registry,
+    )
+    update_counts(payload, hypotheses, checks, target_findings, object_mappings, behavior_probes, scenarios)
     (card_dir / "gap-card.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -749,6 +1426,8 @@ def write_functional_gap_bundle(
     write_csv_rows(card_dir / "target-findings.csv", FUNCTIONAL_GAP_TARGET_FINDINGS_HEADER, target_findings)
     write_csv_rows(card_dir / "object-mapping.csv", FUNCTIONAL_GAP_OBJECT_MAPPING_HEADER, object_mappings)
     write_csv_rows(card_dir / "behavior-probes.csv", FUNCTIONAL_GAP_BEHAVIOR_PROBES_HEADER, behavior_probes)
+    write_csv_rows(card_dir / "functional-equivalence.csv", FUNCTIONAL_GAP_SCENARIO_HEADER, scenarios)
+    write_csv_rows(card_dir / "implementation-scope.csv", FUNCTIONAL_GAP_IMPLEMENTATION_SCOPE_HEADER, build_implementation_scope(root, slug, object_mappings, scenarios))
     review_path = card_dir / "review.md"
     manual_notes = extract_manual_review_notes(review_path) if preserve_review else ""
     write_review(review_path, payload, hypotheses, checks, manual_notes=manual_notes)
@@ -756,6 +1435,7 @@ def write_functional_gap_bundle(
 
 def refresh_index(root: Path) -> dict[str, Any]:
     ensure_scaffold(root)
+    supported_slugs = metadata_supported_card_slugs(root)
     rows: list[dict[str, str]] = []
     coverage_rows: list[dict[str, str]] = []
     open_question_rows: list[dict[str, str]] = []
@@ -768,6 +1448,8 @@ def refresh_index(root: Path) -> dict[str, Any]:
         checks = non_empty_csv_rows(card_dir / "checks.csv")
         open_checks = [row for row in checks if row.get("status") in {"open", "blocked"}]
         slug = str(payload.get("subject_card_slug") or card_dir.name)
+        if supported_slugs is not None and slug not in supported_slugs:
+            continue
         gap_card_path = path.relative_to(root).as_posix()
         rows.append(
             {
@@ -845,9 +1527,9 @@ def build_or_refresh_functional_gap_card(root: Path, card: str, preserve_manual:
     existing_findings = non_empty_csv_rows(card_dir / "target-findings.csv")
     existing_mappings = non_empty_csv_rows(card_dir / "object-mapping.csv")
     existing_behavior_probes = non_empty_csv_rows(card_dir / "behavior-probes.csv")
-    payload, _evidence_rows, gaps = load_subject_card(root, card)
+    payload, evidence_rows, gaps = load_subject_card(root, card)
     manifest = load_manifest(root)
-    gap_payload, hypotheses, checks = build_gap_payload(root, card, payload, gaps, manifest)
+    gap_payload, hypotheses, checks = build_gap_payload(root, card, payload, evidence_rows, gaps, manifest)
     target_inspection_stale = target_inspection_is_stale(existing_payload, gap_payload)
     if target_inspection_stale:
         existing_findings = []
@@ -997,12 +1679,167 @@ def collect_subject_object_refs(root: Path, payload: dict[str, Any]) -> list[str
     return result
 
 
+def target_inspection_source_refs(
+    gap_payload: dict[str, Any],
+    subject_payload: dict[str, Any],
+    root: Path | None = None,
+) -> list[str]:
+    source_contour = gap_payload.get("source_contour") if isinstance(gap_payload.get("source_contour"), dict) else {}
+    refs = split_refs(source_contour.get("core_source_objects", [])) or split_refs(source_contour.get("primary_objects", []))
+    if refs:
+        return list(dict.fromkeys(refs))
+    return collect_subject_object_refs(root or Path("."), subject_payload)
+
+
 def object_tail(ref: str) -> str:
     return ref.rsplit(".", 1)[-1].strip()
 
 
 def object_type(ref: str) -> str:
     return ref.split(".", 1)[0].strip() if "." in ref else ""
+
+
+def object_role_for_mapping(source_object: str, mapping_type: str) -> str:
+    tail = object_tail(source_object).lower()
+    if tail in {"id", "json", "obj", "mgr", "html", "xml"}:
+        return "noise_or_infrastructure"
+    if mapping_type == "no_target_match":
+        return "core_source_object"
+    if mapping_type == "same_name":
+        return "supporting_standard_object"
+    return "target_candidate_object"
+
+
+def coverage_status_for_role(role: str) -> str:
+    if role == "supporting_standard_object":
+        return "covered"
+    if role == "core_source_object":
+        return "not_covered"
+    if role == "target_candidate_object":
+        return "partially_covered"
+    return "not_relevant"
+
+
+def finding_role_and_relevance(finding_type: str, match_basis: str) -> tuple[str, str]:
+    if match_basis.startswith("behavior_probe:"):
+        if finding_type == "standard_mechanism":
+            return "standard_target_object", "direct_standard_support"
+        return "target_candidate_object", "candidate_only"
+    if finding_type == "same_object":
+        return "standard_target_object", "direct_standard_support"
+    if finding_type == "no_match":
+        return "core_source_object", "gap_driver"
+    if finding_type in {"similar_object", "standard_mechanism", "removed_or_changed_mechanism", "needs_runtime_check"}:
+        return "target_candidate_object", "candidate_only"
+    return "noise_or_infrastructure", "technical_noise"
+
+
+def scenario_title_for_object(source_object: str) -> str:
+    tail = object_tail(source_object)
+    if not tail:
+        return "Неуказанный объект"
+    return f"Проверить функциональное покрытие: {tail}"
+
+
+def build_functional_equivalence_rows(mappings: list[dict[str, str]]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for index, mapping in enumerate(mappings, 1):
+        role = mapping.get("object_role", "")
+        if role == "noise_or_infrastructure":
+            continue
+        status = {
+            "supporting_standard_object": "standard_setting",
+            "core_source_object": "adaptation_required",
+            "target_candidate_object": "needs_runtime_check",
+        }.get(role, "needs_runtime_check")
+        rows.append(
+            {
+                "scenario_id": f"FGE-{index:04d}",
+                "scenario": scenario_title_for_object(mapping.get("source_object", "")),
+                "status": status,
+                "standard_mechanism": mapping.get("target_object", "") or "не найден",
+                "target_object": mapping.get("target_object", ""),
+                "evidence_ref": mapping.get("source_path", ""),
+                "gap_or_limit": mapping.get("notes", ""),
+                "next_action": "Зафиксировать решение аналитика" if status == "standard_setting" else "Проверить функциональный аналог в целевом релизе",
+                "confidence": mapping.get("confidence", ""),
+                "notes": OBJECT_ROLE_LABELS.get(role, role),
+            }
+        )
+    return rows
+
+
+def mappings_by_scenario_id(mappings: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+    result: dict[str, list[dict[str, str]]] = {}
+    for row in mappings:
+        scenario_id = row.get("scenario_id", "").strip()
+        if scenario_id:
+            result.setdefault(scenario_id, []).append(row)
+    return result
+
+
+def enrich_scenarios_with_mapping_sources(scenarios: list[dict[str, str]], mappings: list[dict[str, str]]) -> list[dict[str, str]]:
+    by_scenario = mappings_by_scenario_id(mappings)
+    result: list[dict[str, str]] = []
+    for row in scenarios:
+        enriched = dict(row)
+        scenario_mappings = by_scenario.get(row.get("scenario_id", "").strip(), [])
+        source_objects = sorted({mapping.get("source_object", "").strip() for mapping in scenario_mappings if mapping.get("source_object", "").strip()})
+        source_paths = sorted({mapping.get("source_path", "").strip() for mapping in scenario_mappings if mapping.get("source_path", "").strip()})
+        target_objects = sorted({target for mapping in scenario_mappings for target in split_refs(mapping.get("target_object", "")) if target})
+        enriched["source_object"] = ";".join(source_objects)
+        enriched["source_path"] = ";".join(source_paths)
+        enriched["mapping_ids"] = ";".join(mapping.get("mapping_id", "").strip() for mapping in scenario_mappings if mapping.get("mapping_id", "").strip())
+        if target_objects and not enriched.get("target_object", "").strip():
+            enriched["target_object"] = ";".join(target_objects)
+        result.append(enriched)
+    return result
+
+
+def build_scenario_source_object_issues(root: Path) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    cards_root = functional_gap_root(root) / "cards"
+    if not cards_root.exists():
+        return issues
+    for card_dir in sorted(path for path in cards_root.iterdir() if path.is_dir()):
+        scenarios = non_empty_csv_rows(card_dir / "functional-equivalence.csv")
+        mappings = non_empty_csv_rows(card_dir / "object-mapping.csv")
+        by_scenario = mappings_by_scenario_id(mappings)
+        for row in scenarios:
+            scenario_id = row.get("scenario_id", "").strip()
+            matched = by_scenario.get(scenario_id, []) if scenario_id else []
+            source_objects = [mapping.get("source_object", "").strip() for mapping in matched if mapping.get("source_object", "").strip()]
+            issue = ""
+            notes = ""
+            if not scenario_id:
+                issue = "missing_scenario_id"
+                notes = "Сценарий нельзя сопоставить с object-mapping без scenario_id."
+            elif not source_objects:
+                issue = "missing_source_object_mapping"
+                notes = "Для сценария нет source_object в object-mapping.csv."
+            if issue:
+                issues.append(
+                    {
+                        "subject_card_slug": card_dir.name,
+                        "scenario_id": scenario_id,
+                        "scenario": row.get("scenario", ""),
+                        "standard_mechanism": row.get("standard_mechanism", ""),
+                        "target_object": row.get("target_object", ""),
+                        "issue": issue,
+                        "notes": notes,
+                    }
+                )
+    return issues
+
+
+def write_scenario_source_object_issues(root: Path) -> list[dict[str, str]]:
+    issues = build_scenario_source_object_issues(root)
+    write_csv_rows(
+        functional_gap_root(root) / "metadata-rebase/scenario-source-object-issues.csv",
+        FUNCTIONAL_GAP_SCENARIO_SOURCE_OBJECT_ISSUES_HEADER,
+        issues,
+    )
+    return issues
 
 
 def text_file_candidates(root: Path) -> list[Path]:
@@ -1014,7 +1851,6 @@ def text_file_candidates(root: Path) -> list[Path]:
 def find_target_object(target_root: Path, ref: str, files: list[Path]) -> tuple[str, Path | None, str, str]:
     type_dir = TARGET_TYPE_DIRS.get(object_type(ref), "")
     tail = object_tail(ref)
-    ref_lower = ref.lower()
     tail_lower = tail.lower()
     if type_dir:
         expected_xml = f"{type_dir}/{tail}.xml".lower()
@@ -1027,17 +1863,7 @@ def find_target_object(target_root: Path, ref: str, files: list[Path]) -> tuple[
         relative_lower = path.relative_to(target_root).as_posix().lower()
         if tail_lower and tail_lower in relative_lower:
             return "similar_object", path, f"path:{tail}", "medium"
-    for path in files:
-        try:
-            if path.stat().st_size > 2_000_000:
-                continue
-            text = path.read_text(encoding="utf-8", errors="ignore").lower()
-        except (OSError, UnicodeDecodeError):
-            continue
-        if ref_lower in text:
-            return "same_object", path, f"content:{ref}", "high"
-        if tail_lower and tail_lower in text:
-            return "similar_object", path, f"content:{tail}", "medium"
+    # ponytail: content-wide fallback is too expensive on full target-release exports; add an indexed lookup if path matching is not enough.
     return "no_match", None, "not_found", "low"
 
 
@@ -1115,6 +1941,7 @@ def append_behavior_findings(findings: list[dict[str, str]], behavior_probes: li
             continue
         finding_id = next_finding_id(used_ids)
         probe["finding_id"] = finding_id
+        object_role, functional_relevance = finding_role_and_relevance(finding_type, f"behavior_probe:{probe.get('capability_id', '')}")
         result.append(
             {
                 "finding_id": finding_id,
@@ -1124,6 +1951,8 @@ def append_behavior_findings(findings: list[dict[str, str]], behavior_probes: li
                 "match_basis": f"behavior_probe:{probe.get('capability_id', '')}",
                 "confidence": probe.get("confidence", ""),
                 "evidence_ref": probe.get("source_ref", ""),
+                "object_role": object_role,
+                "functional_relevance": functional_relevance,
                 "notes": probe.get("notes", ""),
             }
         )
@@ -1170,6 +1999,7 @@ def inspect_target_for_functional_gap(root: Path, card: str, force: bool = False
             behavior_probes = evaluate_behavior_probe_requests(root, behavior_requests, profile, files)
             checks = update_check_after_behavior_probe_inspection(non_empty_csv_rows(card_dir / "checks.csv"), behavior_probes, card)
             findings = append_behavior_findings(existing_findings, behavior_probes)
+            mappings = merge_curated_object_mappings([], existing_mappings)
             hypotheses = non_empty_csv_rows(card_dir / "hypotheses.csv")
             payload["target_source_hash"] = target_source_hash(root, {"next_vendor_path": target_relative})
             payload["updated_at"] = utc_now_iso()
@@ -1179,7 +2009,7 @@ def inspect_target_for_functional_gap(root: Path, card: str, force: bool = False
                 hypotheses,
                 checks,
                 target_findings=findings,
-                object_mappings=existing_mappings,
+                object_mappings=mappings,
                 behavior_probes=behavior_probes,
                 preserve_review=True,
             )
@@ -1188,12 +2018,14 @@ def inspect_target_for_functional_gap(root: Path, card: str, force: bool = False
                 "status": "ok",
                 "card": card,
                 "target_findings": len(findings),
-                "object_mappings": len(existing_mappings),
+                "object_mappings": len(mappings),
                 "behavior_probes": len(behavior_probes),
             }
     refresh_functional_gap_card(root, card)
     manifest = load_manifest(root)
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    existing_findings = non_empty_csv_rows(card_dir / "target-findings.csv")
+    existing_mappings = non_empty_csv_rows(card_dir / "object-mapping.csv")
     target_relative = target_relative_from_gap_payload(payload)
     if not target_relative:
         raise ValueError("Не задан project.toml:[paths].next_vendor для inspect-target")
@@ -1202,7 +2034,7 @@ def inspect_target_for_functional_gap(root: Path, card: str, force: bool = False
         raise FileNotFoundError(f"Нет каталога целевого релиза: {target_relative}")
 
     subject_payload, _evidence_rows, _gaps = load_subject_card(root, card)
-    refs = collect_subject_object_refs(root, subject_payload)
+    refs = target_inspection_source_refs(payload, subject_payload, root)
     files = text_file_candidates(target_root)
     findings: list[dict[str, str]] = []
     mappings: list[dict[str, str]] = []
@@ -1210,6 +2042,10 @@ def inspect_target_for_functional_gap(root: Path, card: str, force: bool = False
         finding_type, target_path, match_basis, confidence = find_target_object(target_root, ref, files)
         relative_target_path = target_path.relative_to(root).as_posix() if target_path else ""
         target_object = ref if finding_type == "same_object" else ""
+        mapping_type = "same_name" if finding_type == "same_object" else ("shared_infrastructure" if target_path else "no_target_match")
+        object_role = object_role_for_mapping(ref, mapping_type)
+        coverage_status = coverage_status_for_role(object_role)
+        finding_role, functional_relevance = finding_role_and_relevance(finding_type, match_basis)
         findings.append(
             {
                 "finding_id": f"FGF-{index:04d}",
@@ -1219,6 +2055,8 @@ def inspect_target_for_functional_gap(root: Path, card: str, force: bool = False
                 "match_basis": match_basis,
                 "confidence": confidence,
                 "evidence_ref": source_ref(root, card, "primary_objects"),
+                "object_role": finding_role,
+                "functional_relevance": functional_relevance,
                 "notes": "Совпадение найдено в исходниках целевого релиза." if target_path else "Совпадение в исходниках целевого релиза не найдено.",
             }
         )
@@ -1229,7 +2067,11 @@ def inspect_target_for_functional_gap(root: Path, card: str, force: bool = False
                 "source_path": source_ref(root, card, "primary_objects"),
                 "target_object": target_object,
                 "target_path": relative_target_path,
-                "mapping_type": "same_name" if finding_type == "same_object" else ("shared_infrastructure" if target_path else "no_target_match"),
+                "mapping_type": mapping_type,
+                "object_role": object_role,
+                "scenario_id": f"FGE-{index:04d}" if object_role != "noise_or_infrastructure" else "",
+                "coverage_status": coverage_status,
+                "is_gap_driver": "true" if object_role == "core_source_object" else "false",
                 "confidence": confidence,
                 "decision": "",
                 "notes": "Найден тот же объект в целевом релизе." if finding_type == "same_object" else ("Найден похожий механизм или инфраструктурная ссылка; это не доказанное соответствие объекта." if target_path else "Нужно проверить, не заменяется ли типовым механизмом с другим именем."),
@@ -1242,6 +2084,8 @@ def inspect_target_for_functional_gap(root: Path, card: str, force: bool = False
     behavior_probes = evaluate_behavior_probe_requests(root, behavior_requests, profile, files)
     checks = update_check_after_behavior_probe_inspection(checks, behavior_probes, card)
     findings = append_behavior_findings(findings, behavior_probes)
+    findings = merge_curated_target_findings(findings, existing_findings)
+    mappings = merge_curated_object_mappings(mappings, existing_mappings)
     hypotheses = non_empty_csv_rows(card_dir / "hypotheses.csv")
     payload["target_source_hash"] = target_source_hash(root, {"next_vendor_path": target_relative})
     payload["updated_at"] = utc_now_iso()
@@ -1272,6 +2116,7 @@ def validate_functional_gaps(root: Path, card: str = "") -> dict[str, Any]:
     manifest = load_manifest(root)
     sources = target_sources(manifest)
     expected_next_vendor = sources.get("next_vendor_path", "")
+    expected_target_source_hash = target_source_hash(root, sources) if expected_next_vendor else ""
     if not base.exists():
         return {"status": "fail", "cards": 0, "errors": ["Нет analysis/functional-gaps; выполните functional-gap build --card <slug>."]}
     for relative, header in (
@@ -1298,8 +2143,10 @@ def validate_functional_gaps(root: Path, card: str = "") -> dict[str, Any]:
         findings_path = card_dir / "target-findings.csv"
         mapping_path = card_dir / "object-mapping.csv"
         behavior_probes_path = card_dir / "behavior-probes.csv"
+        scenario_path = card_dir / "functional-equivalence.csv"
+        implementation_scope_path = card_dir / "implementation-scope.csv"
         review_path = card_dir / "review.md"
-        for path in (payload_path, hypotheses_path, checks_path, findings_path, mapping_path, behavior_probes_path, review_path):
+        for path in (payload_path, hypotheses_path, checks_path, findings_path, mapping_path, behavior_probes_path, scenario_path, implementation_scope_path, review_path):
             if not path.exists():
                 errors.append(f"Нет артефакта functional-gap: {path.relative_to(root).as_posix()}")
         if first_csv_line(hypotheses_path) != FUNCTIONAL_GAP_HYPOTHESES_HEADER:
@@ -1312,6 +2159,10 @@ def validate_functional_gaps(root: Path, card: str = "") -> dict[str, Any]:
             errors.append(f"{mapping_path.relative_to(root).as_posix()}: неверный заголовок CSV")
         if first_csv_line(behavior_probes_path) != FUNCTIONAL_GAP_BEHAVIOR_PROBES_HEADER:
             errors.append(f"{behavior_probes_path.relative_to(root).as_posix()}: неверный заголовок CSV")
+        if first_csv_line(scenario_path) != FUNCTIONAL_GAP_SCENARIO_HEADER:
+            errors.append(f"{scenario_path.relative_to(root).as_posix()}: неверный заголовок CSV")
+        if first_csv_line(implementation_scope_path) != FUNCTIONAL_GAP_IMPLEMENTATION_SCOPE_HEADER:
+            errors.append(f"{implementation_scope_path.relative_to(root).as_posix()}: неверный заголовок CSV")
         if not payload_path.exists():
             continue
         try:
@@ -1346,16 +2197,105 @@ def validate_functional_gaps(root: Path, card: str = "") -> dict[str, Any]:
             expected_subject_hash = file_sha256(repo_path(root, subject_card_relative(slug)))
             if expected_subject_hash and payload.get("source_subject_card_hash") != expected_subject_hash:
                 errors.append(f"{slug}: gap-card устарела относительно subject-card; выполните functional-gap refresh --card {slug}")
+            source_contour = payload.get("source_contour") if isinstance(payload.get("source_contour"), dict) else {}
+            if not source_contour:
+                errors.append(f"{slug}: gap-card не содержит source_contour")
+            else:
+                expected_contour = source_contour_snapshot(root, slug, json.loads(repo_path(root, subject_card_relative(slug)).read_text(encoding="utf-8")), [],)
+                if source_contour.get("subject_card_hash") != expected_subject_hash:
+                    errors.append(f"{slug}: source_contour устарел относительно subject-card")
+                required_contour_fields = ["slug", "card_path", "scenario_summary", "migration_boundary"]
+                if expected_contour.get("accepted_contour_id"):
+                    required_contour_fields.append("accepted_contour_id")
+                for field in required_contour_fields:
+                    if not str(source_contour.get(field) or "").strip():
+                        errors.append(f"{slug}: source_contour не содержит {field}")
+                if not split_refs(source_contour.get("core_source_objects", [])):
+                    errors.append(f"{slug}: source_contour не содержит core_source_objects")
+                if source_contour.get("accepted_contour_id") != expected_contour.get("accepted_contour_id"):
+                    errors.append(f"{slug}: source_contour устарел относительно accepted contour")
+                if split_refs(source_contour.get("core_source_objects", [])) != split_refs(expected_contour.get("core_source_objects", [])):
+                    errors.append(f"{slug}: source_contour core_source_objects не совпадает с текущим контуром")
+            if payload.get("status") in {"needs_reclassification", "needs_manual_review"} and str(payload.get("selected_decision") or "").strip():
+                errors.append(f"{slug}: reclassification/manual-review карточка не должна содержать selected_decision")
         inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
         if expected_next_vendor and inputs.get("next_vendor_path") != expected_next_vendor:
             errors.append(f"{slug or card_dir.name}: next_vendor_path устарел; выполните functional-gap refresh --card {slug or card_dir.name}")
-        if expected_next_vendor and payload.get("target_source_hash") != target_source_hash(root, sources):
+        if expected_next_vendor and payload.get("target_source_hash") != expected_target_source_hash:
             errors.append(f"{slug or card_dir.name}: target_source_hash устарел; выполните functional-gap refresh --card {slug or card_dir.name}")
         hypotheses = non_empty_csv_rows(hypotheses_path)
         checks = non_empty_csv_rows(checks_path)
         findings = non_empty_csv_rows(findings_path)
         mappings = non_empty_csv_rows(mapping_path)
         behavior_probes = non_empty_csv_rows(behavior_probes_path)
+        scenarios = non_empty_csv_rows(scenario_path)
+        implementation_scope = non_empty_csv_rows(implementation_scope_path)
+        registry = load_registry_index(root)
+        semantic_rows = payload.get("semantic_customizations") if isinstance(payload.get("semantic_customizations"), list) else []
+        registry_ids = set(registry["by_id"])
+        evidence_by_item = registry["evidence_by_item"]
+        if registry["exists"]:
+            linked_ids = {item.get("customization_id") for item in customizations_for_subject(root, slug, registry)} if slug else set()
+            payload_ids = {str(row.get("customization_id") or "") for row in semantic_rows}
+            missing_payload_ids = sorted(linked_ids - payload_ids)
+            if missing_payload_ids:
+                errors.append(f"{slug or card_dir.name}: gap-card не содержит связанные CUS-* из реестра: {';'.join(missing_payload_ids[:10])}")
+        for row in semantic_rows:
+            customization_id = str(row.get("customization_id") or "")
+            if customization_id not in registry_ids:
+                errors.append(f"{slug or card_dir.name}: semantic_customizations ссылается на неизвестный customization_id: {customization_id}")
+            elif not evidence_by_item.get(customization_id):
+                errors.append(f"{slug or card_dir.name}: customization_id без evidence: {customization_id}")
+        diff_ids = {row.get("diff_id", "") for row in read_csv_rows(repo_path(root, "analysis/indexes/final-diff-inventory.csv")) if row.get("diff_id")}
+        if not diff_ids:
+            diff_ids = {row.get("diff_id", "") for row in read_csv_rows(repo_path(root, "analysis/indexes/diff-inventory.csv")) if row.get("diff_id")}
+        diff_ids |= {row.get("row_id", "") for row in read_csv_rows(repo_path(root, "analysis/detailed-register-reverse-review/markup.csv")) if row.get("row_id")}
+        stable_rows = read_stable_csv_rows(repo_path(root, DIFF_ID_MAP_PATH))
+        stable_by_id = {row.get("stable_diff_id", ""): row for row in stable_rows if row.get("stable_diff_id")}
+        active_stable_ids = {sid for sid, row in stable_by_id.items() if row.get("active") == "true"}
+        inactive_stable_ids = {sid for sid, row in stable_by_id.items() if row.get("active") == "false"}
+        subject_evidence = read_csv_rows(repo_path(root, f"analysis/subject-cards/cards/{slug}/evidence.csv")) if slug else []
+        subject_diff_refs = [
+            diff_id
+            for row in subject_evidence
+            for diff_id in _expand_diff_refs(row.get("linked_diff_id", ""))
+            if diff_id.startswith("V8D-") and diff_id in diff_ids
+        ]
+        if subject_diff_refs and not implementation_scope:
+            errors.append(f"{slug or card_dir.name}: implementation-scope.csv пустой, хотя subject-card evidence содержит linked_diff_id")
+        scope_ids = {row.get("scope_id", "") for row in implementation_scope if row.get("scope_id")}
+        if len(scope_ids) != len(implementation_scope):
+            errors.append(f"{slug or card_dir.name}: implementation-scope.csv содержит пустые или повторяющиеся scope_id")
+        for row in implementation_scope:
+            linked = split_refs(row.get("linked_diff_ids", ""))
+            linked_stable = split_refs(row.get("linked_stable_diff_ids", ""))
+            if not linked:
+                errors.append(f"{slug or card_dir.name}: implementation-scope row {row.get('scope_id')} не содержит linked_diff_ids")
+            if linked and any(diff_id.startswith("V8D-") for diff_id in linked) and not linked_stable:
+                errors.append(
+                    f"{slug or card_dir.name}: implementation-scope row {row.get('scope_id')} содержит только V8D-* без linked_stable_diff_ids; обновите карточку"
+                )
+            missing = [diff_id for diff_id in linked if diff_id not in diff_ids]
+            if missing:
+                errors.append(f"{slug or card_dir.name}: implementation-scope row {row.get('scope_id')} ссылается на неизвестные diff_id: {';'.join(missing[:10])}")
+            missing_stable = [diff_id for diff_id in linked_stable if diff_id not in stable_by_id]
+            if missing_stable:
+                errors.append(
+                    f"{slug or card_dir.name}: implementation-scope row {row.get('scope_id')} ссылается на неизвестные stable_diff_id: {';'.join(missing_stable[:10])}"
+                )
+            inactive = [diff_id for diff_id in linked_stable if diff_id in inactive_stable_ids]
+            if inactive:
+                errors.append(
+                    f"{slug or card_dir.name}: implementation-scope row {row.get('scope_id')} ссылается на удаленные или переклассифицированные stable_diff_id: {';'.join(inactive[:10])}"
+                )
+            unresolved_active = [diff_id for diff_id in linked_stable if diff_id not in active_stable_ids and diff_id not in inactive_stable_ids]
+            if unresolved_active:
+                errors.append(
+                    f"{slug or card_dir.name}: implementation-scope row {row.get('scope_id')} не может разрешить stable_diff_id: {';'.join(unresolved_active[:10])}"
+                )
+            for field in ("stable_source_key", "source_paths", "transfer_decision"):
+                if not row.get(field, "").strip():
+                    errors.append(f"{slug or card_dir.name}: implementation-scope row {row.get('scope_id')} не содержит {field}")
         hypothesis_ids = {row.get("hypothesis_id", "") for row in hypotheses if row.get("hypothesis_id")}
         check_ids = {row.get("check_id", "") for row in checks if row.get("check_id")}
         if len(hypothesis_ids) != len(hypotheses):
@@ -1368,6 +2308,21 @@ def validate_functional_gaps(root: Path, card: str = "") -> dict[str, Any]:
             errors.append(f"{slug or card_dir.name}: target-findings.csv содержит пустые или повторяющиеся finding_id")
         if len(mapping_ids) != len(mappings):
             errors.append(f"{slug or card_dir.name}: object-mapping.csv содержит пустые или повторяющиеся mapping_id")
+        scenario_ids = {row.get("scenario_id", "") for row in scenarios if row.get("scenario_id")}
+        if len(scenario_ids) != len(scenarios):
+            errors.append(f"{slug or card_dir.name}: functional-equivalence.csv содержит пустые или повторяющиеся scenario_id")
+        for row in mappings:
+            if row.get("object_role") not in OBJECT_ROLE_LABELS:
+                errors.append(f"{slug or card_dir.name}: object-mapping.csv содержит недопустимую object_role {row.get('object_role')}")
+            if row.get("object_role") == "core_source_object" and row.get("is_gap_driver") != "true":
+                errors.append(f"{slug or card_dir.name}: core_source_object должен быть is_gap_driver=true")
+            if row.get("object_role") != "core_source_object" and row.get("is_gap_driver") == "true":
+                errors.append(f"{slug or card_dir.name}: только core_source_object может быть is_gap_driver=true")
+        for row in findings:
+            if row.get("object_role") not in OBJECT_ROLE_LABELS:
+                errors.append(f"{slug or card_dir.name}: target-findings.csv содержит недопустимую object_role {row.get('object_role')}")
+            if row.get("functional_relevance") not in FUNCTIONAL_RELEVANCE_LABELS:
+                errors.append(f"{slug or card_dir.name}: target-findings.csv содержит недопустимую functional_relevance {row.get('functional_relevance')}")
         probe_ids = {row.get("probe_id", "") for row in behavior_probes if row.get("probe_id")}
         if len(probe_ids) != len(behavior_probes):
             errors.append(f"{slug or card_dir.name}: behavior-probes.csv содержит пустые или повторяющиеся probe_id")
@@ -1407,6 +2362,8 @@ def validate_functional_gaps(root: Path, card: str = "") -> dict[str, Any]:
                 errors.append(f"{slug or card_dir.name}: есть открытые блокирующие проверки")
             if review_path.exists() and "## Решение аналитика" not in review_path.read_text(encoding="utf-8"):
                 errors.append(f"{slug or card_dir.name}: review.md должен содержать раздел решения аналитика")
+            if not scenarios:
+                errors.append(f"{slug or card_dir.name}: для ready/reviewed нужна functional-equivalence.csv со сценарной матрицей")
     return {"status": "ok" if not errors else "fail", "cards": len(card_dirs), "errors": errors}
 
 
@@ -1423,6 +2380,7 @@ def load_gap_cards(root: Path) -> list[dict[str, Any]]:
     cards_root = functional_gap_root(root) / "cards"
     if not cards_root.exists():
         return cards
+    supported_slugs = metadata_supported_card_slugs(root)
     for payload_path in sorted(cards_root.glob("*/gap-card.json")):
         try:
             payload = json.loads(payload_path.read_text(encoding="utf-8"))
@@ -1433,7 +2391,10 @@ def load_gap_cards(root: Path) -> list[dict[str, Any]]:
         hypotheses = non_empty_csv_rows(card_dir / "hypotheses.csv")
         findings = non_empty_csv_rows(card_dir / "target-findings.csv")
         mappings = non_empty_csv_rows(card_dir / "object-mapping.csv")
+        scenarios = enrich_scenarios_with_mapping_sources(non_empty_csv_rows(card_dir / "functional-equivalence.csv"), mappings)
         slug = str(payload.get("subject_card_slug") or card_dir.name)
+        if supported_slugs is not None and slug not in supported_slugs:
+            continue
         open_blocking_checks = [
             row
             for row in checks
@@ -1458,8 +2419,10 @@ def load_gap_cards(root: Path) -> list[dict[str, Any]]:
                 "object_mappings_count": len(mappings),
                 "target_findings": findings,
                 "object_mappings": mappings,
+                "scenarios": scenarios,
                 "checks": checks,
                 "hypotheses": hypotheses,
+                "semantic_customizations": payload.get("semantic_customizations") or [],
             }
         )
     return cards
@@ -1472,6 +2435,26 @@ def build_functional_gap_map(root: Path) -> dict[str, Any]:
     manifest = load_manifest(root)
     target_label = target_release_label(manifest)
     cards = load_gap_cards(root)
+    if canonical_active(root):
+        mrq = load_migration_requirement_index(root)
+        by_slug = {str(row.get("source_provenance", {}).get("subject_card_slug") or ""): row for row in mrq["requirements"] if row.get("status") in {"ready_for_review", "approved"}}
+        derived = []
+        for card in cards:
+            requirement = by_slug.get(card["subject_card_slug"])
+            if not requirement:
+                continue
+            derived.append({
+                **card,
+                "title": requirement["title"],
+                "status": requirement["status"],
+                "selected_decision": requirement["target_solution"],
+                "selected_decision_summary": requirement["residual_gap"],
+                "migration_requirement_id": requirement["requirement_id"],
+                "migration_requirement_hash": hashlib.sha256(json.dumps(requirement, ensure_ascii=False, sort_keys=True).encode()).hexdigest(),
+                "semantic_customizations": [link["customization_id"] for link in mrq["links_by_req"][requirement["requirement_id"]]],
+            })
+        cards = derived
+    write_scenario_source_object_issues(root)
     output_dir = repo_path(root, "outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
     summary = {
@@ -1566,6 +2549,17 @@ def map_build_command(args: argparse.Namespace) -> int:
     result = build_functional_gap_map(root)
     print(f"functional_gap_map: {result['path']}")
     print(f"cards: {result['cards']}")
+    return 0
+
+
+def metadata_rebase_command(args: argparse.Namespace) -> int:
+    root = Path(args.repo_path).resolve() if args.repo_path else Path.cwd()
+    result = build_metadata_rebase(root)
+    print(f"metadata_rebase: {result['path']}")
+    print(f"rows: {result['rows']}")
+    print(f"excluded_rows: {result['excluded_rows']}")
+    print(f"card_support_rows: {result['card_support_rows']}")
+    print(f"needs_bsl_review: {result['needs_bsl_review']}")
     return 0
 
 

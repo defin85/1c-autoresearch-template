@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject>
+  <Catalog uuid="catalog-1">
+    <Properties>
+      <Name>Товары</Name>
+      <Synonym>
+        <item>
+          <lang>ru</lang>
+          <content>Товары</content>
+        </item>
+      </Synonym>
+    </Properties>
+    <Attributes>
+      <Attribute uuid="attr-1">
+        <Properties>
+          <Name>Артикул</Name>
+          <Type>
+            <Type>xs:string</Type>
+          </Type>
+        </Properties>
+      </Attribute>
+    </Attributes>
+    <TabularSections>
+      <TabularSection uuid="tab-1">
+        <Properties>
+          <Name>Штрихкоды</Name>
+        </Properties>
+      </TabularSection>
+    </TabularSections>
+    <Commands>
+      <Command uuid="cmd-1">
+        <Properties>
+          <Name>Печать</Name>
+        </Properties>
+      </Command>
+    </Commands>
+  </Catalog>
+</MetaDataObject>

@@ -2,6 +2,12 @@
 
 This repository is a reusable template for concrete 1C autoresearch repositories. Keep customer source dumps, generated indexes, and deliverables out of this template.
 
+Reusable contour implementations are in `src/one_c_autoresearch/`:
+`configuration_source_parser.py`, `custom_metadata_inventory.py`,
+`customization_registry.py`, `migration_requirements.py`,
+`parallel_research.py`, and `manual_cleanup_commands/`. Generated repository
+scaffolds and agent entry points are under `templates/research-repo/`.
+
 ## Top-Level Map
 
 | Path | Purpose | Edit When |

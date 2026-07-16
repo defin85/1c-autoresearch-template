@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Atomic customization","type":"object","required":["schema_version","customization_id","semantic_key","title"]}

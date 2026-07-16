@@ -22,3 +22,11 @@ For subject-card work, run one refinement pass at a time: `subject-card discover
 For migration gap mapping, work one subject card per pass: run `python -m one_c_autoresearch functional-gap build --card <slug>`, review `analysis/functional-gaps/cards/<slug>/review.md`, then run `python -m one_c_autoresearch functional-gap validate --card <slug>`.
 
 Do not treat agent memory or primary classifications as final evidence when current files disagree.
+
+## Goal Entry Points
+
+- `/goal Исследование`: `docs/method/research-goal-router.md`
+- `/goal Параллельное исследование`: `docs/method/parallel-research-goal.md`
+- `/goal Подготовь ревью`: `docs/method/research-review-preparation.md`
+- `/goal Ручная разметка`: `docs/method/manual-markup-goal.md`
+- `/goal Карта разрывов`: `docs/method/functional-gap-goal.md`

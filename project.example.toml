@@ -13,6 +13,30 @@ target_cfe = "E:/Projects/customer/cfe"
 next_vendor = "E:/Projects/vendor_next"
 compare_repo = "."
 
+[source_roles]
+vendor = "vendor_baseline"
+customer = "target_cf"
+target_release = "next_vendor"
+
+[parallel_research]
+model = ""
+workers = 3
+unit_size = 3
+timeout_seconds = 1800
+comparison_repo = "analysis/cache/noise/clean-rebase-v8unpack/repo"
+vendor_ref = "HEAD^"
+customer_ref = "HEAD"
+vendor_drift_markers = []
+
+[physical_cleanup]
+enabled = false
+comparison_repo = ""
+normalized_repo = "analysis/cache/clean-rebase/repo"
+vendor_ref = "HEAD^"
+customer_ref = "HEAD"
+batch_size = 30
+workers = 3
+
 [rlm]
 vendor_baseline = "vendor_baseline"
 target_cf = "customer_cf"

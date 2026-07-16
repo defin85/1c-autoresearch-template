@@ -2,6 +2,11 @@
 
 Concrete 1C autoresearch repository.
 
+Optional canonical layers live under `analysis/customization-registry/`,
+`analysis/migration-requirements/`, and `analysis/parallel-research/`. Use the
+matching CLI groups and `docs/method/` contracts; configure source roles and
+execution settings in `project.toml` before enabling them.
+
 ## Sources
 
 Source paths are declared in `project.toml`.

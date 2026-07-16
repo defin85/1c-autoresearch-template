@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject>
+  <CommonForm uuid="common-form-1">
+    <Properties>
+      <Name>ОбычнаяФорма</Name>
+      <FormType>Ordinary</FormType>
+    </Properties>
+  </CommonForm>
+</MetaDataObject>

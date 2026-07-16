@@ -4,12 +4,18 @@ import json
 import re
 import sys
 import csv
-import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .autopilot import DIFF_INVENTORY_HEADER, FEATURE_MAP_HEADER, FINAL_DIFF_INVENTORY_HEADER, INFOBASE_QUESTIONS_HEADER, OPEN_QUESTIONS_HEADER
+from .autopilot import (
+    DIFF_INVENTORY_HEADER,
+    FEATURE_MAP_HEADER,
+    FINAL_DIFF_INVENTORY_HEADER,
+    INFOBASE_QUESTIONS_HEADER,
+    OPEN_QUESTIONS_HEADER,
+    validate_minimal_xlsx,
+)
 from .common import (
     CheckSet,
     as_list,
@@ -22,6 +28,15 @@ from .common import (
     toml_value,
     utc_now_iso,
 )
+from .custom_metadata_inventory import DEFAULT_INVENTORY_DIR, validate_inventory
+from .queue_seed import SEED_GENERATION, validate_seed_configuration
+from .research_review import (
+    CHECKS_HEADER as RESEARCH_REVIEW_CHECKS_HEADER,
+    DECISIONS_HEADER as RESEARCH_REVIEW_DECISIONS_HEADER,
+    QUEUE_PLAN_PATH as RESEARCH_REVIEW_QUEUE_PLAN_PATH,
+    TARGETS_HEADER as RESEARCH_REVIEW_TARGETS_HEADER,
+    validate_research_review,
+)
 from .detail_maps import DETAIL_MAP_GENERATION_MODES, DETAIL_MAP_INDEX_HEADER
 from .reverse_map import (
     REVERSE_MAP_COVERAGE_HEADER,
@@ -33,6 +48,8 @@ from .reverse_map import (
 )
 from .final_gate import FINAL_FEATURE_MAP_HEADER
 from .functional_gaps import validate_functional_gaps
+from .migration_requirements import canonical_active as migration_requirements_active, validate as validate_migration_requirements
+from .v8unpack_autopilot import METADATA_PATH, validate_source_alignment
 
 CANONICAL_EVIDENCE_HEADER = "feature_id,claim_id,source_kind,source_path,line_start,line_end,evidence_type,confidence,summary,notes"
 CANONICAL_FEATURE_CANDIDATES_HEADER = "feature_id,title,source_bucket,classification,confidence,summary,next_step"
@@ -54,8 +71,8 @@ SUBJECT_CARD_TYPES = {
     "technical_support",
 }
 VALID_STATUSES = {"pending", "claimed", "evidence_pack", "drafted", "needs_review", "needs_followup", "blocked", "done", "skipped"}
-VALID_TYPES = {"discovery", "deep_dive", "review", "migration_map", "packaging", "needs_infobase_data"}
-AUTOPILOT_DIFF_STATUSES = {"mapped_to_feature", "technical_noise_removed", "requires_1c_review", "blocked_by_infobase_data"}
+VALID_TYPES = {"discovery", "deep_dive", "review", "manual_markup", "migration_map", "packaging", "needs_infobase_data"}
+AUTOPILOT_DIFF_STATUSES = {"mapped_to_feature", "retained_candidate", "technical_noise_removed", "requires_1c_review", "blocked_by_infobase_data"}
 AUTOPILOT_FEATURE_STATUSES = {
     "complete",
     "blocked_by_infobase_data",
@@ -178,6 +195,8 @@ TEMPLATE_REQUIRED_PATHS = [
     "src/one_c_autoresearch/bootstrap.py",
     "src/one_c_autoresearch/queue.py",
     "src/one_c_autoresearch/checks.py",
+    "src/one_c_autoresearch/configuration_source_parser.py",
+    "src/one_c_autoresearch/custom_metadata_inventory.py",
     "docs/agent/index.md",
     "docs/agent/repo-map.md",
     "docs/agent/verification.md",
@@ -282,6 +301,9 @@ RESEARCH_REQUIRED_PATHS = [
     "src/one_c_autoresearch/final_gate.py",
     "src/one_c_autoresearch/review_dashboard.py",
     "src/one_c_autoresearch/reverse_map.py",
+    "src/one_c_autoresearch/research_review.py",
+    "src/one_c_autoresearch/configuration_source_parser.py",
+    "src/one_c_autoresearch/custom_metadata_inventory.py",
     "src/one_c_autoresearch/cli.py",
     "docs/agent/index.md",
     "docs/agent/repo-map.md",
@@ -291,12 +313,17 @@ RESEARCH_REQUIRED_PATHS = [
     "docs/method/autopilot-customization-map.md",
     "docs/method/physical-clean-comparison.md",
     "docs/method/reverse-functional-map.md",
+    "docs/method/research-review-preparation.md",
     "analysis/indexes/README.md",
     "analysis/indexes/diff-inventory.csv",
     "analysis/indexes/feature-map.csv",
     "analysis/indexes/final-diff-inventory.csv",
     "analysis/indexes/final-feature-map.csv",
     "analysis/clean-comparison/README.md",
+    "analysis/research-review/README.md",
+    "analysis/research-review/targets.csv",
+    "analysis/research-review/checks.csv",
+    "analysis/research-review/decisions.csv",
     "analysis/detail-maps/README.md",
     "analysis/detail-maps/index.csv",
     "analysis/detail-maps/_templates/detail-map.json",
@@ -346,6 +373,7 @@ RESEARCH_REQUIRED_PATHS = [
     "outputs/open-questions.csv",
     "outputs/infobase-questions.csv",
     ".agents/skills/1c-autoresearch-queue-worker/SKILL.md",
+    ".agents/skills/1c-autoresearch-review-preparation-goal/SKILL.md",
     "scripts/doctor.py",
     "scripts/queue/claim_next_analysis_task.py",
     "scripts/queue/get_next_analysis_task.py",
@@ -431,6 +459,7 @@ class Doctor:
 
         self.test_manifest_access_policy(manifest)
         self.test_local_mcp_manifest(manifest)
+        self.test_codex_project_config()
         return manifest
 
     def test_manifest_access_policy(self, manifest: dict[str, Any]) -> None:
@@ -506,6 +535,59 @@ class Doctor:
             elif project_web and local_web != project_web:
                 self.checks.add("manifest.local_mcp.web_mismatch", "fail", f".codex/1c-mcp.toml web_url differs from project.toml web.url: project.toml={project_web} local={local_web}")
 
+    def test_codex_project_config(self) -> None:
+        path = repo_path(self.root, ".codex/config.toml")
+        if not path.exists():
+            self.checks.add("codex.project_config.exists", "warn", "No project-local .codex/config.toml found for Codex CLI MCP servers")
+            return
+        try:
+            config = read_toml(path)
+            self.checks.add("codex.project_config.parse", "ok", "Parsed .codex/config.toml")
+        except Exception as exc:
+            self.checks.add("codex.project_config.parse", "fail", f"Could not parse .codex/config.toml: {exc}")
+            return
+        servers = config.get("mcp_servers", {})
+        if not isinstance(servers, dict):
+            self.checks.add("codex.project_config.mcp_servers", "fail", ".codex/config.toml has no [mcp_servers] table")
+            return
+        manifest = load_manifest(self.root)
+        codex_settings = manifest.get("codex") or {}
+        configured_profiles = codex_settings.get("mcp_profiles") or [] if isinstance(codex_settings, dict) else []
+        expected = {str(profile): str(profile) for profile in configured_profiles if str(profile).strip()}
+        if not expected:
+            self.checks.add("codex.project_config.mcp_servers.expected", "ok", "No required Codex MCP profiles are configured")
+            return
+        missing = sorted(set(expected) - set(servers))
+        if missing:
+            self.checks.add("codex.project_config.mcp_servers.expected", "fail", f".codex/config.toml is missing MCP server(s): {', '.join(missing)}")
+        else:
+            self.checks.add("codex.project_config.mcp_servers.expected", "ok", "Codex project config declares the configured MCP profiles")
+        expected_command = str(codex_settings.get("mcp_wrapper") or ".codex/bin/run-1c-mcp.sh")
+        for name, expected_profile in expected.items():
+            server = servers.get(name, {})
+            if not isinstance(server, dict):
+                self.checks.add("codex.project_config.mcp_server.type", "fail", f"MCP server {name} must be a TOML table")
+                continue
+            actual_command = str(server.get("command", "")).strip()
+            if actual_command != expected_command:
+                self.checks.add("codex.project_config.mcp_server.command", "fail", f"MCP server {name} command differs from expected: expected={expected_command} actual={actual_command}")
+            else:
+                self.checks.add(f"codex.project_config.mcp_server.{name}.command", "ok", f"MCP server {name} uses the repo-local 1C MCP wrapper")
+            args = server.get("args", [])
+            if args != [expected_profile]:
+                self.checks.add("codex.project_config.mcp_server.args", "fail", f"MCP server {name} args differ from expected: expected={[expected_profile]} actual={args}")
+            else:
+                self.checks.add(f"codex.project_config.mcp_server.{name}.args", "ok", f"MCP server {name} targets profile {expected_profile}")
+            if server.get("enabled") is False:
+                self.checks.add(f"codex.project_config.mcp_server.{name}.enabled", "fail", f"MCP server {name} is disabled")
+            else:
+                self.checks.add(f"codex.project_config.mcp_server.{name}.enabled", "ok", f"MCP server {name} is enabled")
+        wrapper = repo_path(self.root, expected_command)
+        if wrapper.exists():
+            self.checks.add("codex.project_config.mcp_wrapper.exists", "ok", "Found repo-local 1C MCP wrapper")
+        else:
+            self.checks.add("codex.project_config.mcp_wrapper.exists", "fail", f"Missing repo-local 1C MCP wrapper: {expected_command}")
+
     def test_queue(self, relative: str = "analysis/queue/tasks.jsonl") -> None:
         path = repo_path(self.root, relative)
         if not path.exists():
@@ -560,6 +642,30 @@ class Doctor:
         if not any(check["id"] == "queue.duplicate_id" for check in self.checks.checks):
             self.checks.add("queue.unique_ids", "ok", "Task ids are unique")
         self.last_queue_tasks = tasks
+        self.test_queue_seed_contract(relative, path, tasks)
+
+    def test_queue_seed_contract(self, relative: str, queue_path: Path, tasks: list[dict[str, Any]]) -> None:
+        seed_root = self.root
+        if relative.startswith("templates/research-repo/"):
+            seed_root = repo_path(self.root, "templates/research-repo")
+        seed_errors = validate_seed_configuration(seed_root)
+        if seed_errors:
+            for error in seed_errors:
+                self.checks.add("queue.seed.configuration", "fail", error)
+        else:
+            self.checks.add("queue.seed.configuration", "ok", "Queue seed profiles and overrides are valid")
+        seed_managed = 0
+        for task in tasks:
+            has_seed_field = any(field in task for field in ("seed_profile", "seed_candidate_key", "seed_generation", "seed_input_fingerprint"))
+            if not has_seed_field:
+                continue
+            seed_managed += 1
+            for field_name in ("seed_profile", "seed_candidate_key", "seed_generation", "seed_input_fingerprint"):
+                if not str(task.get(field_name, "")).strip():
+                    self.checks.add("queue.seed.metadata", "fail", f"Seed-managed task {task.get('id')} is missing {field_name}")
+            if task.get("seed_generation") != SEED_GENERATION:
+                self.checks.add("queue.seed.generation", "fail", f"Seed-managed task {task.get('id')} has unsupported generation: {task.get('seed_generation')}")
+        self.checks.add("queue.seed.metadata.present", "ok", f"Queue contains {seed_managed} seed-managed task(s)")
 
     def test_queue_cycles(self, tasks_by_id: dict[str, dict[str, Any]]) -> None:
         visiting: set[str] = set()
@@ -592,6 +698,8 @@ class Doctor:
 
     def test_evidence_packs(self) -> None:
         for task in self.last_queue_tasks:
+            if task.get("external_processing_generation") or task.get("type") == "migration_map":
+                continue
             if task.get("status") not in {"evidence_pack", "drafted", "needs_review", "done"} or not task.get("feature_id"):
                 continue
             feature_id = str(task["feature_id"])
@@ -632,16 +740,11 @@ class Doctor:
         if not path.exists():
             self.checks.add(check_id, "fail", f"Missing required XLSX deliverable: {relative}")
             return
-        try:
-            with zipfile.ZipFile(path) as zf:
-                names = set(zf.namelist())
-            required = {"[Content_Types].xml", "xl/workbook.xml"}
-            if required.issubset(names):
-                self.checks.add(check_id, "ok", f"XLSX deliverable is a readable workbook: {relative}")
-            else:
-                self.checks.add(check_id, "fail", f"XLSX deliverable is missing workbook parts: {relative}")
-        except Exception as exc:
-            self.checks.add(check_id, "fail", f"XLSX deliverable is not readable: {relative}: {exc}")
+        errors = validate_minimal_xlsx(path)
+        if errors:
+            self.checks.add(check_id, "fail", f"XLSX deliverable is not Excel-compatible: {relative}", errors)
+        else:
+            self.checks.add(check_id, "ok", f"XLSX deliverable is Excel-compatible: {relative}")
 
     def test_final_text_has_no_todos(self, relative: str) -> None:
         path = repo_path(self.root, relative)
@@ -778,6 +881,28 @@ class Doctor:
         else:
             self.checks.add("autopilot.subject_cards.dashboard_registry", "ok", f"Review dashboard exposes {len(dashboard_registry)} subject registry row(s)")
 
+    def test_v8unpack_source_alignment(self) -> None:
+        if not repo_path(self.root, "analysis/v8unpack-refinement/summary.json").exists():
+            return
+        errors = validate_source_alignment(self.root)
+        if errors:
+            for error in errors:
+                self.checks.add("autopilot.source_alignment", "fail", error)
+            return
+        metadata = json.loads(repo_path(self.root, METADATA_PATH).read_text(encoding="utf-8"))
+        counts = metadata.get("counts", {})
+        self.checks.add(
+            "autopilot.source_alignment",
+            "ok",
+            "Autopilot inventory is realigned to v8unpack-refinement",
+            {
+                "canonical_v8unpack_rows": counts.get("canonical_v8unpack_rows", 0),
+                "xml_support_rows": counts.get("xml_support_rows", 0),
+                "form_template_mixed_rows": counts.get("form_template_mixed_rows", 0),
+                "manual_review_rows": counts.get("manual_review_rows", 0),
+            },
+        )
+
     def test_autopilot_contract(self, manifest: dict[str, Any] | None) -> None:
         if not manifest or not toml_enabled(manifest, "autopilot"):
             self.checks.add("autopilot.enabled", "ok", "Autopilot final gate is disabled")
@@ -808,6 +933,7 @@ class Doctor:
         infobase_check_rows = self.read_csv_rows("analysis/reverse-map/infobase-checks.csv", REVERSE_MAP_INFOBASE_CHECKS_HEADER, "autopilot.infobase_checks")
         coverage_rows = self.read_csv_rows("analysis/reverse-map/coverage.csv", REVERSE_MAP_COVERAGE_HEADER, "final_gate.coverage")
         unresolved_rows = self.read_csv_rows("analysis/reverse-map/unresolved.csv", REVERSE_MAP_UNRESOLVED_HEADER, "final_gate.unresolved")
+        self.test_v8unpack_source_alignment()
         self.test_xlsx_file("outputs/customization-map.xlsx", "autopilot.outputs.customization_map_xlsx")
         self.test_xlsx_file("outputs/open-questions.xlsx", "autopilot.outputs.open_questions_xlsx")
         self.test_final_text_has_no_todos("outputs/customization-map.md")
@@ -826,7 +952,7 @@ class Doctor:
                 self.checks.add("autopilot.diff_inventory.unclassified", "fail", f"Diff row {diff_id} has invalid or unclassified status: {status or '<empty>'}")
             if not row.get("classification", "").strip():
                 self.checks.add("autopilot.diff_inventory.missing_classification", "fail", f"Diff row {diff_id} has empty classification")
-            if status in {"mapped_to_feature", "blocked_by_infobase_data", "requires_1c_review"} and not row.get("feature_id", "").strip():
+            if status in {"mapped_to_feature", "retained_candidate", "blocked_by_infobase_data", "requires_1c_review"} and not row.get("feature_id", "").strip():
                 self.checks.add("autopilot.diff_inventory.missing_feature", "fail", f"Diff row {diff_id} requires a feature_id for status {status}")
             if not row.get("summary", "").strip():
                 self.checks.add("autopilot.diff_inventory.missing_summary", "fail", f"Diff row {diff_id} has empty summary")
@@ -1313,14 +1439,14 @@ class Doctor:
             if status == "ready_for_review":
                 ready_count += 1
                 contour = accepted_contours.get(slug)
-                if not contour:
+                if accepted_contours and not contour:
                     self.checks.add("subject_cards.contour_link", "fail", f"{relative} is ready_for_review but has no accepted contour in analysis/subject-cards/contours.csv")
                 if generic_bucket_title(str(data.get("title") or "")) and "не техническая корзина" not in str(data.get("why_not_technical_bucket") or "").lower():
                     self.checks.add("subject_cards.generic_title", "fail", f"{relative} has a generic title without why_not_technical_bucket")
                 for field in ("why_separate_card", "key_conclusion", "upgrade_risk"):
                     if generic_template_text(str(data.get(field) or "")):
                         self.checks.add("subject_cards.template_text", "fail", f"{relative} keeps template-like text in {field}")
-                if not str(data.get("migration_boundary") or "").strip():
+                if accepted_contours and not str(data.get("migration_boundary") or "").strip():
                     self.checks.add("subject_cards.migration_boundary", "fail", f"{relative} is missing migration_boundary")
             subject_type = str(data.get("subject_type", "")).strip()
             if subject_type and subject_type not in SUBJECT_CARD_TYPES:
@@ -1390,7 +1516,7 @@ class Doctor:
         feature_ids = {row.get("feature_id", "") for row in final_feature_rows if row.get("feature_id")}
         contour_feature_ids = {
             feature_id
-            for row in accepted_contours.values()
+            for row in contour_rows
             for feature_id in str(row.get("linked_features") or "").split(";")
             if feature_id
         }
@@ -1422,6 +1548,39 @@ class Doctor:
         for error in result.get("errors", []):
             self.checks.add("functional_gaps.contract", "fail", error)
 
+    def test_migration_requirements_contract(self) -> None:
+        if not migration_requirements_active(self.root):
+            self.checks.add("migration_requirements.not_active", "ok", "Migration-requirement contour is not canonical yet")
+            return
+        result = validate_migration_requirements(self.root)
+        if result["status"] == "ok":
+            self.checks.add("migration_requirements.contract", "ok", f"Migration-requirement contract has {result['counts']['requirements']} requirement(s)")
+        else:
+            for error in result["errors"]:
+                self.checks.add("migration_requirements.contract", "fail", error)
+
+    def test_research_review_contract(self) -> None:
+        root = repo_path(self.root, "analysis/research-review")
+        if not root.exists():
+            self.checks.add("research_review.not_enabled", "ok", "Research-review preparation layer is not enabled yet")
+            return
+        self.read_csv_rows("analysis/research-review/targets.csv", RESEARCH_REVIEW_TARGETS_HEADER, "research_review.targets")
+        self.read_csv_rows("analysis/research-review/checks.csv", RESEARCH_REVIEW_CHECKS_HEADER, "research_review.checks")
+        self.read_csv_rows("analysis/research-review/decisions.csv", RESEARCH_REVIEW_DECISIONS_HEADER, "research_review.decisions")
+        if not repo_path(self.root, RESEARCH_REVIEW_QUEUE_PLAN_PATH).exists():
+            self.checks.add("research_review.queue_plan.exists", "fail", f"Missing research-review queue plan: {RESEARCH_REVIEW_QUEUE_PLAN_PATH}")
+            return
+        result = validate_research_review(self.root)
+        if result["status"] == "ok":
+            self.checks.add(
+                "research_review.contract",
+                "ok",
+                f"Research-review preparation has {result.get('targets', 0)} target(s) and {result.get('checks', 0)} check(s)",
+            )
+            return
+        for error in result.get("errors", []):
+            self.checks.add("research_review.contract", "fail", error)
+
     def test_unresolved_placeholders(self) -> None:
         found = False
         for path in self.root.rglob("*"):
@@ -1430,6 +1589,8 @@ class Doctor:
             if path.suffix not in {".md", ".toml", ".jsonl", ".py", ".txt", ".csv"} and path.name != ".gitignore":
                 continue
             relative = path.relative_to(self.root).as_posix()
+            if relative.startswith("analysis/cache/"):
+                continue
             if relative.startswith("src/one_c_autoresearch/") or relative.startswith("scripts/"):
                 continue
             matches = list(re.finditer(r"__[A-Z][A-Z0-9_]*__", path.read_text(encoding="utf-8", errors="ignore")))
@@ -1454,11 +1615,25 @@ class Doctor:
         self.test_queue("analysis/queue/tasks.jsonl")
         self.test_evidence_packs()
         self.test_detail_maps_contract()
+        self.test_research_review_contract()
+        self.test_custom_metadata_inventory_contract()
         self.test_subject_cards_contract()
         self.test_functional_gaps_contract()
+        self.test_migration_requirements_contract()
         self.test_reverse_map_contract()
         self.test_autopilot_contract(manifest)
         self.test_unresolved_placeholders()
+
+    def test_custom_metadata_inventory_contract(self) -> None:
+        inventory_dir = repo_path(self.root, DEFAULT_INVENTORY_DIR)
+        if not inventory_dir.exists():
+            self.checks.add("custom_metadata_inventory.optional", "ok", f"{DEFAULT_INVENTORY_DIR} is not built yet")
+            return
+        errors = validate_inventory(self.root, inventory_dir, strict_reconciliation=True)
+        if errors:
+            self.checks.add("custom_metadata_inventory.contract", "fail", "Custom metadata inventory validation failed", errors)
+        else:
+            self.checks.add("custom_metadata_inventory.contract", "ok", "Custom metadata inventory artifacts are valid")
 
     def run(self) -> dict[str, Any]:
         kind = self.repo_kind()

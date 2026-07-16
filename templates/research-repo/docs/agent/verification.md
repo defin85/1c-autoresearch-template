@@ -46,6 +46,15 @@ Then validate from the generated repo:
 python -m one_c_autoresearch doctor --repo-path <target-repo>
 ```
 
+Optional contours have focused validators:
+
+```bash
+python -m one_c_autoresearch custom-metadata validate --strict-reconciliation
+python -m one_c_autoresearch customization-registry validate
+python -m one_c_autoresearch migration-requirement validate
+python -m one_c_autoresearch parallel-research inspect --run-id <run-id>
+```
+
 For deeper source-path and tool checks:
 
 ```bash

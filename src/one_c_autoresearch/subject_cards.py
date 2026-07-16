@@ -442,9 +442,9 @@ def draft_subject_card_contours(root: Path) -> dict[str, Any]:
                 "evidence_refs": join_refs(evidence_refs),
                 "runtime_refs": join_refs(runtime),
                 "technical_bucket_refs": join_refs(candidate_slugs),
-                "status": "accepted" if evidence_refs else "draft",
+                "status": "candidate",
                 "confidence": feature.get("confidence", "") or "medium",
-                "notes": "Черновик автопилота; агент обязан уточнить границы при наличии более точного предметного деления.",
+                "notes": "BF-контур является кандидатом на предметную классификацию; агент должен восстановить бизнес-сценарии до принятия готовой карточки.",
             }
         )
     write_csv_rows(subject_root(root) / "contours.csv", SUBJECT_CARD_CONTOURS_HEADER, rows)
@@ -496,8 +496,13 @@ def validate_subject_card_contours(root: Path) -> dict[str, Any]:
                 covered_features.add(feature_id)
             if not split_refs(row.get("technical_bucket_refs", "")):
                 errors.append(f"{label}: нет technical_bucket_refs для связи с исходными кандидатами")
+        else:
+            for feature_id in split_refs(row.get("linked_features", "")):
+                covered_features.add(feature_id)
+            if row.get("status") not in SUBJECT_CARD_STATUSES:
+                errors.append(f"{label}: недопустимый status {row.get('status')}")
     for feature_id in sorted(feature_ids - covered_features):
-        errors.append(f"BF {feature_id}: нет accepted contour")
+        errors.append(f"BF {feature_id}: нет contour-кандидата или accepted contour")
     return {"status": "ok" if not errors else "fail", "contours": len(rows), "accepted": len(accepted), "errors": errors}
 
 
@@ -1066,6 +1071,11 @@ def registry_row_from_card(
     else:
         origin_layer = str(payload.get("origin_layer") or ("detail_map" if linked_detail_maps else "BF"))
     primary_objects = split_refs(payload.get("primary_objects", []))
+    if primary_objects == ["clean_rebase_diff"] and linked_features:
+        feature = feature_by_id(root).get(linked_features[0], {})
+        source_bucket = str(feature.get("source_bucket") or "").strip()
+        if source_bucket:
+            primary_objects = [source_bucket]
     why = str(payload.get("why_separate_card") or classification.get("why_separate_card") or card_reason(slug, subject_type, origin_layer))
     return {
         "slug": slug,
@@ -1450,7 +1460,7 @@ def validate_subject_cards(root: Path, card: str = "") -> dict[str, Any]:
     for feature_id in sorted(feature_ids - covered_feature_ids):
         errors.append(f"coverage.csv: BF {feature_id} не покрыт и не классифицирован")
     dirs = [subject_root(root) / "cards" / card] if card else card_dirs(root)
-    if not dirs:
+    if not dirs and not registry_rows:
         errors.append("Нет предметных карточек; выполните subject-card seed.")
     ready_count = 0
     card_slugs: set[str] = set()
@@ -1512,6 +1522,7 @@ def validate_subject_cards(root: Path, card: str = "") -> dict[str, Any]:
         if payload.get("status") == "ready_for_review":
             ready_count += 1
             contour = accepted_contour_by_slug.get(slug, {})
+            registry = registry_by_slug.get(slug, {})
             if not contour:
                 errors.append(f"{slug}: ready_for_review без accepted contour в contours.csv")
             if generic_bucket_title(str(payload.get("title") or "")) and "не техническая корзина" not in str(payload.get("why_not_technical_bucket") or "").lower():
@@ -1521,13 +1532,19 @@ def validate_subject_cards(root: Path, card: str = "") -> dict[str, Any]:
                     errors.append(f"{slug}: поле {field} похоже на шаблонный текст")
             if not str(payload.get("migration_boundary") or "").strip():
                 errors.append(f"{slug}: ready-карточка не содержит migration_boundary")
+            core_objects = split_refs(payload.get("primary_objects", [])) or split_refs(contour.get("primary_objects", "")) or split_refs(registry.get("primary_objects", ""))
+            if not core_objects:
+                errors.append(f"{slug}: ready-карточка не содержит ядро сценария в primary_objects или accepted contour")
+            if contour and registry:
+                if split_refs(contour.get("primary_objects", "")) != split_refs(registry.get("primary_objects", "")):
+                    errors.append(f"{slug}: primary_objects в registry.csv и accepted contour не совпадают")
+                if contour.get("title", "").strip() and registry.get("title", "").strip() and contour.get("title") != registry.get("title"):
+                    errors.append(f"{slug}: title в registry.csv и accepted contour не совпадает")
             if blocking_gaps:
                 errors.append(f"{payload.get('slug')}: статус ready_for_review при открытых blocking gaps")
     missing_cards = [slug for slug in card_slugs if not registry_by_slug.get(slug, {}).get("card_path")]
     for slug in missing_cards:
         errors.append(f"{slug}: registry.csv не содержит card_path для существующей карточки")
-    if not ready_count:
-        errors.append("Нет ни одной карточки в статусе ready_for_review.")
     return {
         "status": "ok" if not errors else "fail",
         "ready_count": ready_count,

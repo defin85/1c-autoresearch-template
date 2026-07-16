@@ -47,6 +47,7 @@ SCENARIO_STATUS_LABELS = {
 }
 FINDING_TYPE_LABELS = {
     "same_object": "одноименный объект",
+    "similar_object": "похожий объект",
     "standard_mechanism": "типовой механизм",
     "removed_or_changed_mechanism": "измененный или отсутствующий механизм",
     "needs_runtime_check": "нужна проверка в ИБ",
@@ -54,10 +55,29 @@ FINDING_TYPE_LABELS = {
     "": "не указано",
 }
 MAPPING_TYPE_LABELS = {
+    "same_name": "одноименный объект",
+    "shared_infrastructure": "инфраструктурное совпадение",
+    "no_target_match": "прямого аналога нет",
     "same_object": "одноименный объект",
     "functional_candidate": "функциональный кандидат",
+    "semantic_candidate": "смысловой кандидат",
     "manual-functional-equivalence": "ручная функциональная эквивалентность",
     "no_direct_mapping": "прямого сопоставления нет",
+    "": "не указано",
+}
+OBJECT_ROLE_LABELS = {
+    "core_source_object": "ядро разрыва",
+    "supporting_standard_object": "типовая опорная часть",
+    "standard_target_object": "типовой объект целевого релиза",
+    "target_candidate_object": "кандидат целевого механизма",
+    "noise_or_infrastructure": "технический след",
+    "": "не указано",
+}
+FUNCTIONAL_RELEVANCE_LABELS = {
+    "direct_standard_support": "прямое типовое покрытие",
+    "candidate_only": "только кандидат",
+    "gap_driver": "формирует разрыв",
+    "technical_noise": "технический шум",
     "": "не указано",
 }
 BLOCKING_CHECK_STATUSES = {"open", "blocked"}
@@ -184,6 +204,39 @@ def _read_optional_csv(path: Path) -> list[dict[str, str]]:
     return _read_csv_rows(path)
 
 
+def _source_metadata_labels(root: Path) -> dict[str, str]:
+    path = repo_path(root, "analysis/custom-metadata/index.csv")
+    if not path.exists():
+        return {}
+    labels: dict[str, str] = {}
+    priority = {"added": 3, "modified": 2, "removed": 1}
+    current_priority: dict[str, int] = {}
+    for row in _read_csv_rows(path):
+        if row.get("status") != "non_typical":
+            continue
+        name = _trimmed(row.get("metadata_full_name"))
+        change = _trimmed(row.get("change_type"))
+        if not name or change not in priority:
+            continue
+        if priority[change] <= current_priority.get(name, 0):
+            continue
+        current_priority[name] = priority[change]
+        labels[name] = {
+            "added": "добавлен в доработанном источнике",
+            "modified": "изменен в доработанном источнике",
+            "removed": "удален из доработанного источника",
+        }[change]
+    return labels
+
+
+def _source_change_label(objects: str, labels: dict[str, str]) -> str:
+    values = [value for value in _split_multi(objects) if value and value != "не найден"]
+    if not values:
+        return "исходный объект не указан"
+    result = [labels.get(value, "не найден в нетиповых метаданных") for value in values]
+    return "; ".join(dict.fromkeys(result))
+
+
 def _normalize_row(row: dict[str, str], *, status_labels: dict[str, str] | None = None) -> dict[str, str]:
     normalized = {str(key): humanize_dashboard_text(value) for key, value in row.items()}
     status = _trimmed(row.get("status", ""))
@@ -209,6 +262,26 @@ def _normalize_scenarios(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         normalized["confidence_label"] = confidence_label(confidence)
         normalized["target_objects"] = _split_multi(row.get("target_object", ""))
         scenarios.append(normalized)
+    return scenarios
+
+
+def _attach_scenario_sources(scenarios: list[dict[str, str]], mappings: list[dict[str, str]]) -> list[dict[str, str]]:
+    by_scenario: dict[str, list[dict[str, str]]] = {}
+    for mapping in mappings:
+        scenario_id = _trimmed(mapping.get("scenario_id"))
+        if scenario_id:
+            by_scenario.setdefault(scenario_id, []).append(mapping)
+    for scenario in scenarios:
+        scenario_mappings = by_scenario.get(_trimmed(scenario.get("scenario_id")), [])
+        source_objects = sorted({mapping.get("source_object", "").strip() for mapping in scenario_mappings if mapping.get("source_object", "").strip()})
+        source_paths = sorted({mapping.get("source_path", "").strip() for mapping in scenario_mappings if mapping.get("source_path", "").strip()})
+        mapping_ids = [mapping.get("mapping_id", "").strip() for mapping in scenario_mappings if mapping.get("mapping_id", "").strip()]
+        if source_objects:
+            scenario["source_object"] = ";".join(source_objects)
+        if source_paths:
+            scenario["source_path"] = ";".join(source_paths)
+        if mapping_ids:
+            scenario["mapping_ids"] = ";".join(mapping_ids)
     return scenarios
 
 
@@ -242,8 +315,14 @@ def _normalize_findings(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     for row in rows:
         normalized = _normalize_row(row)
         finding_type = _trimmed(row.get("finding_type", ""))
+        object_role = _trimmed(row.get("object_role", ""))
+        functional_relevance = _trimmed(row.get("functional_relevance", ""))
         normalized["finding_type"] = finding_type
         normalized["finding_type_label"] = FINDING_TYPE_LABELS.get(finding_type, finding_type or "не указано")
+        normalized["object_role"] = object_role
+        normalized["object_role_label"] = OBJECT_ROLE_LABELS.get(object_role, object_role or "не указано")
+        normalized["functional_relevance"] = functional_relevance
+        normalized["functional_relevance_label"] = FUNCTIONAL_RELEVANCE_LABELS.get(functional_relevance, functional_relevance or "не указано")
         findings.append(normalized)
     return findings
 
@@ -253,13 +332,32 @@ def _normalize_mappings(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     for row in rows:
         normalized = _normalize_row(row)
         mapping_type = _trimmed(row.get("mapping_type", ""))
+        object_role = _trimmed(row.get("object_role", ""))
         decision = _trimmed(row.get("decision", ""))
         normalized["mapping_type"] = mapping_type
         normalized["mapping_type_label"] = MAPPING_TYPE_LABELS.get(mapping_type, mapping_type or "не указано")
+        normalized["object_role"] = object_role
+        normalized["object_role_label"] = OBJECT_ROLE_LABELS.get(object_role, object_role or "не указано")
         normalized["decision"] = decision
         normalized["decision_label"] = GAP_TYPE_LABELS.get(decision, decision or "не указано")
         mappings.append(normalized)
     return mappings
+
+
+def _attach_finding_sources(findings: list[dict[str, str]], mappings: list[dict[str, str]]) -> list[dict[str, str]]:
+    mapping_by_suffix = {
+        mapping.get("mapping_id", "").removeprefix("FGM-"): mapping
+        for mapping in mappings
+        if mapping.get("mapping_id", "").startswith("FGM-")
+    }
+    for finding in findings:
+        mapping = mapping_by_suffix.get(finding.get("finding_id", "").removeprefix("FGF-"))
+        if not mapping:
+            continue
+        finding["source_object"] = mapping.get("source_object", "")
+        finding["source_path"] = mapping.get("source_path", "")
+        finding["mapping_id"] = mapping.get("mapping_id", "")
+    return findings
 
 
 def _filter_open_questions(rows: list[dict[str, str]], slug: str) -> list[dict[str, str]]:
@@ -316,6 +414,7 @@ def _load_card(
     output_dir: Path,
     raw_card: dict[str, Any],
     open_questions: list[dict[str, str]],
+    source_metadata_labels: dict[str, str],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     slug = _trimmed(raw_card.get("subject_card_slug", ""))
     if not slug:
@@ -380,6 +479,12 @@ def _load_card(
     checks = _normalize_checks(_read_optional_csv(card_dir / "checks.csv"))
     target_findings = _normalize_findings(_read_optional_csv(card_dir / "target-findings.csv"))
     object_mappings = _normalize_mappings(_read_optional_csv(card_dir / "object-mapping.csv"))
+    for row in object_mappings:
+        row["source_change_label"] = _source_change_label(row.get("source_object", ""), source_metadata_labels)
+    scenarios = _attach_scenario_sources(scenarios, object_mappings)
+    for row in scenarios:
+        row["source_change_label"] = _source_change_label(row.get("source_object", ""), source_metadata_labels)
+    target_findings = _attach_finding_sources(target_findings, object_mappings)
     card_open_questions = _filter_open_questions(open_questions, slug)
     scenario_statuses = _count_values([row.get("status", "") for row in scenarios])
     decision = _trimmed(raw_card.get("selected_decision") or gap_payload.get("selected_decision") or "undecided")
@@ -437,55 +542,6 @@ def _load_card(
     return card, source_artifacts, warnings
 
 
-def _diagram_for_cards(cards: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    nodes: list[dict[str, Any]] = []
-    edges: list[dict[str, Any]] = []
-    for card in cards:
-        slug = card["subject_card_slug"]
-        current_id = f"{slug}:current"
-        decision_id = f"{slug}:decision"
-        target_id = f"{slug}:target"
-        target_label = "; ".join(card.get("target_objects", [])[:3]) or (
-            "Сценарная матрица не собрана" if card.get("scenario_matrix_missing") else "Механизмы целевого релиза не выделены"
-        )
-        nodes.extend(
-            [
-                {
-                    "id": current_id,
-                    "card": slug,
-                    "column": "current",
-                    "column_label": "Текущая доработка",
-                    "label": card["title"],
-                    "risk_level": card["risk_level"],
-                },
-                {
-                    "id": decision_id,
-                    "card": slug,
-                    "column": "decision",
-                    "column_label": "Решение перехода",
-                    "label": card["selected_decision_label"],
-                    "value": card["selected_decision"],
-                    "risk_level": card["risk_level"],
-                },
-                {
-                    "id": target_id,
-                    "card": slug,
-                    "column": "target",
-                    "column_label": "Механизмы целевого релиза и остаточные разрывы",
-                    "label": target_label,
-                    "risk_level": card["risk_level"],
-                },
-            ]
-        )
-        edges.extend(
-            [
-                {"id": f"{slug}:current-to-decision", "card": slug, "source": current_id, "target": decision_id},
-                {"id": f"{slug}:decision-to-target", "card": slug, "source": decision_id, "target": target_id},
-            ]
-        )
-    return nodes, edges
-
-
 def _filter_options(entries: dict[str, str], values: list[str]) -> list[dict[str, str]]:
     result = []
     for value in sorted(dict.fromkeys(item for item in values if item)):
@@ -509,6 +565,7 @@ def build_functional_gap_dashboard_snapshot(root: Path, output_dir: Path | None 
 
     open_questions_path = repo_path(root, "analysis/functional-gaps/open-questions.csv")
     open_questions = _read_optional_csv(open_questions_path)
+    source_metadata_labels = _source_metadata_labels(root)
     source_artifacts = [_fingerprint(root, "outputs/functional-gap-map.json", required=True)]
     if open_questions_path.exists():
         source_artifacts.append(_fingerprint(root, "analysis/functional-gaps/open-questions.csv"))
@@ -518,12 +575,11 @@ def build_functional_gap_dashboard_snapshot(root: Path, output_dir: Path | None 
     for raw_card in raw_cards:
         if not isinstance(raw_card, dict):
             raise ValueError("Некорректный outputs/functional-gap-map.json: карточка должна быть объектом")
-        card, card_artifacts, card_warnings = _load_card(root, output_dir, raw_card, open_questions)
+        card, card_artifacts, card_warnings = _load_card(root, output_dir, raw_card, open_questions, source_metadata_labels)
         cards.append(card)
         source_artifacts.extend(card_artifacts)
         source_warnings.extend(card_warnings)
 
-    diagram_nodes, diagram_edges = _diagram_for_cards(cards)
     scenario_rows = [scenario for card in cards for scenario in card["scenarios"]]
     checks = [check for card in cards for check in card["checks"]]
     summary = {
@@ -559,9 +615,6 @@ def build_functional_gap_dashboard_snapshot(root: Path, output_dir: Path | None 
         "source_artifacts": source_artifacts,
         "source_warnings": source_warnings,
         "cards": cards,
-        "diagram": {"nodes": diagram_nodes, "edges": diagram_edges},
-        "diagram_nodes": diagram_nodes,
-        "diagram_edges": diagram_edges,
         "filters": {
             "selected_decisions": _filter_options(GAP_TYPE_LABELS, [card.get("selected_decision", "") for card in cards]),
             "card_statuses": _filter_options({}, [card.get("status", "") for card in cards]),
@@ -662,7 +715,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
     .badge.info { background: var(--info-soft); color: var(--info); border-color: #93c5fd; }
     .badge.neutral { background: var(--neutral-soft); color: var(--neutral); }
     .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
-    .metric, .panel, .node, .card-row {
+    .metric, .panel, .card-row {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 8px;
@@ -695,44 +748,38 @@ def dashboard_html(data: dict[str, Any]) -> str:
       cursor: pointer;
       padding: 0;
     }
-    .diagram {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-      align-items: stretch;
-      margin: 12px 0 16px;
-    }
-    .column {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: var(--panel-soft);
-      padding: 10px;
-      min-width: 0;
-    }
-    .column h3 { font-size: 14px; color: var(--muted); }
-    .node {
-      display: block;
-      width: 100%;
-      padding: 11px;
-      margin-top: 8px;
-      min-height: 116px;
-      border-left: 4px solid var(--neutral);
-    }
-    .node:hover, .node.selected { outline: 2px solid #93c5fd; }
-    .node.ok { border-left-color: var(--accent); }
-    .node.warn { border-left-color: var(--warn); }
-    .node.risk { border-left-color: var(--danger); }
     .node-title { font-weight: 700; overflow-wrap: anywhere; }
-    .node-meta { margin-top: 6px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .layout { display: grid; grid-template-columns: minmax(280px, 0.82fr) minmax(0, 1.18fr); gap: 14px; }
     .panel { padding: 14px; min-width: 0; overflow-wrap: anywhere; }
-    .card-list { display: grid; gap: 10px; }
-    .card-row { padding: 12px; border-left: 4px solid var(--neutral); }
+    .card-strip { margin-bottom: 14px; }
+    .card-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+    .card-row { padding: 12px; border-left: 4px solid var(--neutral); min-height: 118px; }
     .card-row.ok { border-left-color: var(--accent); }
     .card-row.warn { border-left-color: var(--warn); }
     .card-row.risk { border-left-color: var(--danger); }
     .card-row.selected { outline: 2px solid #93c5fd; }
-    .summary-text { white-space: pre-wrap; }
+    .detail-panel { margin-bottom: 18px; }
+    .transition-summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin: 14px 0;
+    }
+    .transition-item {
+      background: var(--panel-soft);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 11px;
+      min-width: 0;
+    }
+    .transition-item h3 { margin: 0 0 6px; color: var(--muted); font-size: 13px; }
+    .transition-item strong { display: block; overflow-wrap: anywhere; }
+    .transition-item p { margin: 6px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .summary-text {
+      white-space: pre-wrap;
+      max-width: 1120px;
+      font-size: 15px;
+      line-height: 1.55;
+    }
     .section { margin-top: 14px; }
     .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: #fff; }
     table { width: 100%; border-collapse: collapse; min-width: 780px; }
@@ -744,7 +791,6 @@ def dashboard_html(data: dict[str, Any]) -> str:
     .hidden-note { margin-bottom: 12px; }
     @media (max-width: 1050px) {
       main { padding: 16px; }
-      .diagram, .layout { grid-template-columns: 1fr; }
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>
@@ -785,21 +831,14 @@ def dashboard_html(data: dict[str, Any]) -> str:
       </div>
     </section>
 
-    <section class="diagram" id="transition-diagram" aria-label="Диаграмма перехода">
-      <div class="column" data-column="current"><h3>Текущая доработка</h3><div data-column-body="current"></div></div>
-      <div class="column" data-column="decision"><h3>Решение перехода</h3><div data-column-body="decision"></div></div>
-      <div class="column" data-column="target"><h3>Механизмы целевого релиза и остаточные разрывы</h3><div data-column-body="target"></div></div>
+    <section class="panel card-strip">
+      <h2>Gap-карточки</h2>
+      <div id="card-list" class="card-list"></div>
     </section>
 
-    <section class="layout">
-      <div class="panel">
-        <h2>Gap-карточки</h2>
-        <div id="card-list" class="card-list"></div>
-      </div>
-      <div class="panel">
-        <div id="selected-card-hidden" class="hidden-note warning panel" hidden>Выбранная карточка скрыта текущими фильтрами.</div>
-        <div id="card-detail"></div>
-      </div>
+    <section class="panel detail-panel">
+      <div id="selected-card-hidden" class="hidden-note warning panel" hidden>Выбранная карточка скрыта текущими фильтрами.</div>
+      <div id="card-detail"></div>
     </section>
   </main>
   <script>
@@ -807,7 +846,7 @@ def dashboard_html(data: dict[str, Any]) -> str:
     const cards = snapshot.cards || [];
     let selectedSlug = cards[0] ? cards[0].subject_card_slug : "";
     const byId = (id) => document.getElementById(id);
-    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[char]));
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\\\"":"&quot;","'":"&#39;"}[char]));
     const badgeClass = (risk) => risk === "ok" ? "ok" : risk === "warn" ? "warn" : risk === "risk" ? "risk" : "neutral";
     const rowsTable = (rows, columns) => {
       if (!rows || rows.length === 0) return '<div class="empty">Нет строк.</div>';
@@ -891,30 +930,6 @@ def dashboard_html(data: dict[str, Any]) -> str:
       return cards.filter(cardMatches);
     }
 
-    function nodeHtml(card, column) {
-      const labels = {
-        current: [card.title, card.subject_card_slug],
-        decision: [card.selected_decision_label, card.selected_decision_summary || card.subject_card_slug],
-        target: [(card.target_objects || []).slice(0, 3).join("; ") || (card.scenario_matrix_missing ? "Сценарная матрица не собрана" : "Механизмы не выделены"), `сценариев: ${card.scenario_count || 0}`],
-      };
-      const [title, meta] = labels[column];
-      return `<button class="node ${badgeClass(card.risk_level)} ${card.subject_card_slug === selectedSlug ? "selected" : ""}" type="button" data-select-card="${esc(card.subject_card_slug)}">
-        <span class="node-title">${esc(title)}</span>
-        <span class="node-meta">${esc(meta || "")}</span>
-        <span class="badges">
-          <span class="badge ${badgeClass(card.risk_level)}">${esc(card.status_label)}</span>
-          <span class="badge">${esc(card.gap_readiness_label)}</span>
-        </span>
-      </button>`;
-    }
-
-    function renderDiagram(cardsToRender) {
-      ["current", "decision", "target"].forEach((column) => {
-        const body = document.querySelector(`[data-column-body="${column}"]`);
-        body.innerHTML = cardsToRender.length ? cardsToRender.map((card) => nodeHtml(card, column)).join("") : '<div class="empty">Нет карточек по текущим фильтрам.</div>';
-      });
-    }
-
     function cardRow(card) {
       return `<button type="button" class="card-row ${badgeClass(card.risk_level)} ${card.subject_card_slug === selectedSlug ? "selected" : ""}" data-select-card="${esc(card.subject_card_slug)}">
         <div class="node-title">${esc(card.title)}</div>
@@ -949,14 +964,20 @@ def dashboard_html(data: dict[str, Any]) -> str:
       const links = selected.artifact_links || {};
       const scenarioStatusBadges = scalarBadges(selected.scenario_statuses, {});
       const sourceWarnings = (selected.source_warnings || []).map((warning) => `<li>${esc(warning.message || "")}</li>`).join("");
+      const targetPreview = (selected.target_objects || []).slice(0, 5).join("; ") || "Механизмы не выделены";
+      const readinessBadge = (selected.status === "ready_for_review" && Number(selected.open_checks_count || 0) === 0)
+        ? ""
+        : `<span class="badge">${esc(selected.gap_readiness_label)}</span>`;
       const scenarioBlock = selected.scenario_matrix_missing
         ? '<div class="panel warning">Сценарная матрица functional-equivalence.csv для карточки еще не собрана.</div>'
         : rowsTable(selected.scenarios, [
             ["scenario_id", "ID"],
             ["scenario", "Сценарий"],
             ["status_label", "Статус"],
-            ["standard_mechanism", "Механизм целевого релиза"],
-            ["target_object", "Целевой объект"],
+            ["source_object", "Объект доработки"],
+            ["source_change_label", "Статус исходника"],
+            ["target_object", "Аналог в целевом релизе"],
+            ["standard_mechanism", "Типовой механизм"],
             ["evidence_ref", "Доказательство"],
             ["gap_or_limit", "Разрыв или ограничение"],
             ["next_action", "Следующее действие"],
@@ -967,12 +988,29 @@ def dashboard_html(data: dict[str, Any]) -> str:
         <div class="badges">
           <span class="badge ${badgeClass(selected.risk_level)}">${esc(selected.selected_decision_label)}</span>
           <span class="badge">${esc(selected.status_label)}</span>
-          <span class="badge">${esc(selected.gap_readiness_label)}</span>
+          ${readinessBadge}
           <span class="badge">открытых проверок: ${Number(selected.open_checks_count || 0)}</span>
           <span class="badge">блокирующих: ${Number(selected.open_blocking_checks_count || 0)}</span>
         </div>
         <h2>${esc(selected.title)}</h2>
         <div class="subtle">${esc(selected.subject_card_slug)}</div>
+        <section class="transition-summary" aria-label="Переход выбранной карточки">
+          <div class="transition-item">
+            <h3>Текущая доработка</h3>
+            <strong>${esc(selected.title)}</strong>
+            <p>${esc(selected.subject_card_slug)}</p>
+          </div>
+          <div class="transition-item">
+            <h3>Решение перехода</h3>
+            <strong>${esc(selected.selected_decision_label)}</strong>
+            <p>${Number(selected.open_checks_count || 0)} открытых проверок</p>
+          </div>
+          <div class="transition-item">
+            <h3>Целевой релиз</h3>
+            <strong>${esc(targetPreview)}</strong>
+            <p>сценариев: ${Number(selected.scenario_count || 0)}</p>
+          </div>
+        </section>
         <p class="summary-text">${esc(selected.selected_decision_summary || "Итоговое решение пока не описано.")}</p>
         <div class="badges">
           ${linkHtml(links.gap_card_browser_href || links.gap_card_href, "gap-card.json")}
@@ -988,24 +1026,24 @@ def dashboard_html(data: dict[str, Any]) -> str:
           ${scenarioBlock}
         </section>
         <section class="section">
-          <h3>Находки в целевом релизе</h3>
-          ${rowsTable(selected.target_findings, [["finding_id","ID"],["finding_type_label","Тип"],["target_object","Объект"],["target_path","Путь"],["confidence_label","Достоверность"],["notes","Заметки"]])}
-        </section>
-        <section class="section">
-          <h3>Сопоставление объектов</h3>
-          ${rowsTable(selected.object_mappings, [["mapping_id","ID"],["source_object","Объект доработки"],["target_object","Объект целевого релиза"],["mapping_type_label","Тип"],["confidence_label","Достоверность"],["decision_label","Решение"],["notes","Заметки"]])}
-        </section>
-        <section class="section">
-          <h3>Гипотезы</h3>
-          ${rowsTable(selected.hypotheses, [["hypothesis_id","ID"],["gap_type_label","Тип разрыва"],["status_label","Статус"],["confidence_label","Достоверность"],["summary","Вывод"],["next_check","Следующая проверка"],["decision_label","Решение"]])}
-        </section>
-        <section class="section">
           <h3>Проверки</h3>
           ${rowsTable(selected.checks, [["check_id","ID"],["check_type_label","Тип"],["status_label","Статус"],["source","Источник"],["question","Вопрос"],["result","Результат"],["blocking","Блокирует"]])}
         </section>
         <section class="section">
           <h3>Открытые вопросы</h3>
           ${rowsTable(selected.open_questions, [["question_id","ID"],["check_id","Проверка"],["question","Вопрос"],["needed_source","Нужный источник"],["blocking","Блокирует"],["status_label","Статус"],["notes","Заметки"]])}
+        </section>
+        <section class="section">
+          <h3>Гипотезы</h3>
+          ${rowsTable(selected.hypotheses, [["hypothesis_id","ID"],["gap_type_label","Тип разрыва"],["status_label","Статус"],["confidence_label","Достоверность"],["summary","Вывод"],["next_check","Следующая проверка"],["decision_label","Решение"]])}
+        </section>
+        <section class="section">
+          <h3>Сопоставление объектов</h3>
+          ${rowsTable(selected.object_mappings, [["mapping_id","ID"],["scenario_id","Сценарий"],["source_object","Объект доработки"],["source_change_label","Статус исходника"],["target_object","Объект целевого релиза"],["object_role_label","Роль"],["mapping_type_label","Тип"],["coverage_status","Покрытие"],["is_gap_driver","Драйвер разрыва"],["confidence_label","Достоверность"],["decision_label","Решение"],["notes","Заметки"]])}
+        </section>
+        <section class="section">
+          <h3>Механизмы целевого релиза и остаточные разрывы</h3>
+          ${rowsTable(selected.target_findings, [["finding_id","ID"],["source_object","Объект доработки"],["finding_type_label","Тип"],["target_object","Объект целевого релиза"],["object_role_label","Роль"],["functional_relevance_label","Значение"],["target_path","Путь"],["confidence_label","Достоверность"],["notes","Заметки"]])}
         </section>
         ${sourceWarnings ? `<section class="section"><h3>Предупреждения источников</h3><ul>${sourceWarnings}</ul></section>` : ""}
       </article>`;
@@ -1016,7 +1054,6 @@ def dashboard_html(data: dict[str, Any]) -> str:
       if (visible.length && !cards.some((card) => card.subject_card_slug === selectedSlug)) {
         selectedSlug = visible[0].subject_card_slug;
       }
-      renderDiagram(visible);
       renderCardList(visible);
       renderCardDetail(visible);
     }

@@ -1,0 +1,11 @@
+schema_version = "queue-seeding-profile/v1"
+name = "initial"
+generator = "initial"
+task_id_prefix = "Q-INITIAL"
+default_type = "discovery"
+default_priority = 100
+default_quality_gates = ["source_lines", "vendor_delta", "positive_search", "negative_search", "needs_infobase_data_marked"]
+
+[inputs]
+required = ["project.toml"]
+optional = ["analysis/indexes/diff-inventory.csv", "analysis/indexes/feature-map.csv"]

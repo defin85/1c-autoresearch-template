@@ -10,7 +10,12 @@ Run after changing reusable template docs, scripts, checks, or files under `temp
 python -m one_c_autoresearch checks template
 python -m one_c_autoresearch checks doctor
 python -m one_c_autoresearch doctor --json --deep --strict
+pytest -q
 ```
+
+The template gate also scans reusable files for absolute workstation paths,
+customer identifiers, fixed product labels, and a fixed research model. A
+fresh generated repository must pass `checks research` before release.
 
 The same gate runs in GitHub Actions via `.github/workflows/verify.yml`.
 

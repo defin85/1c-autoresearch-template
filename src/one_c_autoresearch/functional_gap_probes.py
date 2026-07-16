@@ -245,6 +245,10 @@ def _target_found(rule: EvidenceRule, files: list[Path]) -> Path | None:
         text = _read_text(path).lower()
         if not text:
             continue
+        if rule.kind == "metadata_ref":
+            if target_lower in text:
+                return path
+            continue
         condition_until = ""
         in_multiline_string = False
         for raw_line in text.splitlines():

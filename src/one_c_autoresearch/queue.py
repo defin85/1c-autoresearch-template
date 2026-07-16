@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .common import as_list, read_jsonl, repo_path, utc_now_iso, write_jsonl
-from .doctor import VALID_STATUSES
+
+VALID_STATUSES = {"pending", "claimed", "evidence_pack", "drafted", "needs_review", "needs_followup", "blocked", "done", "skipped"}
 
 
 @contextmanager
@@ -54,6 +55,10 @@ def sort_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(tasks, key=lambda task: (-int(task.get("priority", 0)), str(task.get("id", ""))))
 
 
+def is_claimable_task(task: dict[str, Any], task_type: str | None) -> bool:
+    return not task.get("parallel_adapter") and (task.get("type") != "manual_markup" or task_type == "manual_markup")
+
+
 def get_next_task(queue_path: Path, status: str = "pending", task_type: str | None = None, all_tasks: bool = False, include_blocked: bool = False) -> Any:
     tasks = load_tasks(queue_path)
     done_ids = {str(task.get("id")) for task in tasks if task.get("status") in {"done", "skipped"}}
@@ -61,6 +66,7 @@ def get_next_task(queue_path: Path, status: str = "pending", task_type: str | No
         task
         for task in tasks
         if task.get("status") == status
+        and is_claimable_task(task, task_type)
         and (task_type is None or task.get("type") == task_type)
         and (include_blocked or dependencies_done(task, done_ids))
     ]
@@ -78,6 +84,7 @@ def claim_next_task(queue_path: Path, status: str = "pending", task_type: str | 
             task
             for task in tasks
             if task.get("status") == status
+            and is_claimable_task(task, task_type)
             and (task_type is None or task.get("type") == task_type)
             and dependencies_done(task, done_ids)
         ]

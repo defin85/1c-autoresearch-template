@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .common import read_toml, repo_path, utc_now_iso
+from .v8unpack_autopilot import METADATA_PATH, copy_review_source_alignment
 
 
 DEFAULT_OUTPUT_DIR = "outputs/review"
@@ -678,8 +679,6 @@ def load_subject_registry(root: Path, output_dir: Path) -> list[dict[str, Any]]:
         status = row.get("status", "")
         subject_type = row.get("subject_type", "")
         card_path = row.get("card_path", "")
-        if not card_path:
-            continue
         result.append(
             {
                 **row,
@@ -1047,6 +1046,10 @@ def build_dashboard_data(root: Path, output_dir: Path, subject_card: str = "") -
     subject_registry = load_subject_registry(root, output_dir)
     subject_coverage = load_subject_coverage(root)
     functional_gap_map = load_functional_gap_map(root, output_dir)
+    source_alignment_path = repo_path(root, METADATA_PATH)
+    source_alignment: dict[str, Any] = {}
+    if source_alignment_path.exists():
+        source_alignment = json.loads(source_alignment_path.read_text(encoding="utf-8"))
     if subject_card:
         return subject_card_dashboard_data(root, output_dir, project, subject_cards, subject_card)
 
@@ -1121,7 +1124,7 @@ def build_dashboard_data(root: Path, output_dir: Path, subject_card: str = "") -
         "detail_map_open_question_count": sum(detail_map["open_questions_count"] for detail_map in detail_maps),
         "subject_card_by_status": dict(sorted(Counter(subject_map["status"] for subject_map in subject_maps).items())),
         "subject_registry_count": len(subject_registry),
-        "subject_registry_ready_count": sum(1 for row in subject_registry if row.get("has_card")),
+        "subject_registry_ready_count": sum(1 for row in subject_registry if row.get("status") in {"ready_for_review", "reviewed"}),
         "subject_registry_candidate_count": sum(1 for row in subject_registry if row.get("status") == "candidate"),
         "subject_registry_by_type": dict(sorted(Counter(row.get("subject_type") or "not_set" for row in subject_registry).items())),
         "subject_coverage_count": len(subject_coverage),
@@ -1136,12 +1139,17 @@ def build_dashboard_data(root: Path, output_dir: Path, subject_card: str = "") -
         "functional_gap_reviewed_count": functional_gap_map.get("summary", {}).get("reviewed", 0),
         "functional_gap_open_blocking_count": functional_gap_map.get("summary", {}).get("open_blocking_checks", 0),
     }
+    if source_alignment:
+        source_counts = source_alignment.get("counts", {})
+        for key in ("canonical_v8unpack_rows", "xml_support_rows", "form_template_mixed_rows", "manual_review_rows"):
+            summary[key] = source_counts.get(key, 0)
+        summary["canonical_source"] = source_alignment.get("canonical_source", "")
 
     final_audit_path = repo_path(root, "analysis/final-audit.md")
     final_audit_text = (
         "Финальный аудит доступен отдельным артефактом. "
         f"В дашборд вынесена краткая сводка: BF-контейнеров {summary['feature_count']}, "
-        f"карточек доработок {summary['subject_registry_ready_count']}, "
+        f"готовых карточек доработок {summary['subject_registry_ready_count']}, "
         f"открытых вопросов {summary['open_question_count']}, "
         f"закрытых проверок в ИБ {summary['closed_infobase_check_count']} из {summary['infobase_check_count']}, "
         f"открытых вопросов к ИБ {summary['open_infobase_question_count']}."
@@ -1152,6 +1160,7 @@ def build_dashboard_data(root: Path, output_dir: Path, subject_card: str = "") -
         "generated_at": utc_now_iso(),
         "project": project,
         "summary": summary,
+        "source_alignment": source_alignment,
         "features": features,
         "subject_cards": subject_cards,
         "subject_maps": subject_maps,
@@ -1228,10 +1237,30 @@ def dashboard_html(data: dict[str, Any]) -> str:
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 10px;
       border: 1px solid transparent;
       border-radius: 6px;
       padding: 8px 10px;
       color: var(--text);
+    }}
+    .nav a > span:first-child {{ min-width: 0; }}
+    .nav-count {{
+      flex-shrink: 0;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }}
+    .nav-count.compact {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 52px;
+      padding: 2px 6px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: #ffffff;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
     }}
     .nav a:hover {{ background: var(--panel-soft); text-decoration: none; }}
     .nav a.active {{ background: var(--accent-soft); border-color: #86efac; color: var(--accent); text-decoration: none; }}
@@ -1430,12 +1459,12 @@ def dashboard_html(data: dict[str, Any]) -> str:
       <div class="brand">Карта доработок 1С</div>
       <div class="subtle" id="project-caption"></div>
       <nav class="nav">
-        <a href="#cards" data-nav-view="cards">Карточки доработок <span id="nav-subject-count"></span></a>
-        <a href="#gaps" data-nav-view="gaps">Карта перехода <span id="nav-gap-count"></span></a>
-        <a href="#questions" data-nav-view="questions">Открытые вопросы <span id="nav-open-count"></span></a>
-        <a href="#runtime" data-nav-view="runtime">Проверки в ИБ <span id="nav-runtime-count"></span></a>
-        <a href="#bf" data-nav-view="bf">BF-контейнеры <span id="nav-bf-count"></span></a>
-        <a href="#technical" data-nav-view="technical">Технические карты <span id="nav-technical-count"></span></a>
+        <a href="#cards" data-nav-view="cards"><span>Предметный реестр</span><span class="nav-count compact" id="nav-subject-count"></span></a>
+        <a href="#gaps" data-nav-view="gaps"><span>Карта перехода</span><span class="nav-count" id="nav-gap-count"></span></a>
+        <a href="#questions" data-nav-view="questions"><span>Открытые вопросы</span><span class="nav-count" id="nav-open-count"></span></a>
+        <a href="#runtime" data-nav-view="runtime"><span>Проверки в ИБ</span><span class="nav-count" id="nav-runtime-count"></span></a>
+        <a href="#bf" data-nav-view="bf"><span>BF-контейнеры</span><span class="nav-count" id="nav-bf-count"></span></a>
+        <a href="#technical" data-nav-view="technical"><span>Технические карты</span><span class="nav-count" id="nav-technical-count"></span></a>
         <a href="#audit" data-nav-view="audit">Финальный аудит</a>
       </nav>
     </aside>
@@ -1448,21 +1477,21 @@ def dashboard_html(data: dict[str, Any]) -> str:
         <div class="badges">
           <span class="badge info">Статичный HTML</span>
           <span class="badge info">Навигация по экранам</span>
-          <span class="badge info">Источник: карточки доработок</span>
+          <span class="badge info">Источник: предметный реестр</span>
         </div>
       </section>
 
       <section class="view" data-view="cards" id="cards">
         <div class="screen-head">
           <div>
-            <h2>Реестр предметных доработок</h2>
-            <p>Первый экран показывает канонический реестр: готовые карточки доработок, кандидаты к разбору и покрытие BF. BF и сгенерированные технические карты остаются вторичной доказательной подложкой.</p>
+            <h2>Предметный реестр</h2>
+            <p>Первый экран разделяет готовые карточки доработок, кандидатов к предметному разбору и прочие классификационные решения. BF и сгенерированные технические карты остаются вторичной доказательной подложкой.</p>
           </div>
           <div class="badges" id="card-list-badges"></div>
         </div>
         <div class="grid metrics" id="metrics"></div>
         <div class="section-grid" id="subject-registry-summary"></div>
-        <h2>Предметные доработки и кандидаты</h2>
+        <h2>Готовые карточки и кандидаты</h2>
         <div class="feature-list" id="subject-registry-list"></div>
         <h2>Покрытие BF</h2>
         <div class="panel" id="coverage-summary"></div>
@@ -1668,6 +1697,13 @@ def dashboard_html(data: dict[str, Any]) -> str:
       return `<div class="table-wrap"><table><thead><tr>${{head}}</tr></thead><tbody>${{body}}</tbody></table></div>`;
     }};
     const countList = (items) => Object.entries(items || {{}}).map(([key, value]) => `<span class="badge">${{esc(statusRu[key] || key)}}: ${{value}}</span>`).join(" ");
+    const readySubjectCount = () => data.summary.subject_registry_ready_count !== undefined
+      ? data.summary.subject_registry_ready_count
+      : subjectCards.filter((card) => ["ready_for_review","reviewed"].includes(card.status)).length;
+    const candidateSubjectCount = () => data.summary.subject_registry_candidate_count !== undefined
+      ? data.summary.subject_registry_candidate_count
+      : subjectRegistry.filter((row) => row.status === "candidate").length;
+    const subjectRegistryCount = () => data.summary.subject_registry_count || subjectRegistry.length || subjectCards.length || 0;
 
     function renderHeader() {{
       const project = data.project || {{}};
@@ -1676,16 +1712,17 @@ def dashboard_html(data: dict[str, Any]) -> str:
       if (isSubjectCardScope) {{
         byId("dashboard-title").textContent = `Карточка доработки: ${{dashboardScope.title || dashboardScope.subject_card || ""}}`;
       }}
-      byId("nav-subject-count").textContent = subjectRegistry.length || subjectCards.length || 0;
+      byId("nav-subject-count").textContent = `${{readySubjectCount()}}/${{candidateSubjectCount()}}`;
+      byId("nav-subject-count").title = `Готовые карточки: ${{readySubjectCount()}}, кандидаты: ${{candidateSubjectCount()}}`;
       byId("nav-gap-count").textContent = functionalGapCards.length || 0;
       byId("nav-bf-count").textContent = data.summary.feature_count || 0;
       byId("nav-technical-count").textContent = data.summary.technical_map_count || 0;
       byId("nav-open-count").textContent = data.summary.open_question_count || 0;
       byId("nav-runtime-count").textContent = (runtimeChecks.length || 0) + (infobaseQuestions.length || 0);
       byId("card-list-badges").innerHTML = [
-        `<span class="badge">строк реестра: ${{subjectRegistry.length || subjectCards.length || 0}}</span>`,
-        `<span class="badge ok">готовых карточек: ${{data.summary.subject_registry_ready_count || subjectCards.length || 0}}</span>`,
-        `<span class="badge warn">кандидатов: ${{data.summary.subject_registry_candidate_count || 0}}</span>`,
+        `<span class="badge">строк реестра: ${{subjectRegistryCount()}}</span>`,
+        `<span class="badge ok">готовых карточек: ${{readySubjectCount()}}</span>`,
+        `<span class="badge warn">кандидатов: ${{candidateSubjectCount()}}</span>`,
         `<span class="badge">BF: ${{data.summary.feature_count || 0}}</span>`,
       ].join("");
       byId("runtime-check-badges").innerHTML = [
@@ -1711,9 +1748,9 @@ def dashboard_html(data: dict[str, Any]) -> str:
 
     function renderMetrics() {{
       const metrics = [
-        ["Строк реестра", data.summary.subject_registry_count || subjectRegistry.length || 0],
-        ["Готовые карточки", data.summary.subject_registry_ready_count || subjectCards.length || 0],
-        ["Кандидаты", data.summary.subject_registry_candidate_count || 0],
+        ["Строк реестра", subjectRegistryCount()],
+        ["Готовые карточки доработок", readySubjectCount()],
+        ["Кандидаты к разбору", candidateSubjectCount()],
         ["BF-контейнеры", data.summary.subject_bf_unique_count || data.summary.feature_count],
         ["BF покрыты карточками", data.summary.subject_bf_unique_covered_count || 0],
         ["BF требуют классификации", data.summary.subject_bf_unique_unclassified_count || 0],
@@ -2043,11 +2080,14 @@ def dashboard_html(data: dict[str, Any]) -> str:
     }}
 
     function registryAction(row) {{
+      if (row.status === "candidate") {{
+        if (row.has_card || row.card_path) {{
+          return `<a class="badge warn" href="#card/${{encodeURIComponent(row.slug)}}">Открыть черновик кандидата</a>`;
+        }}
+        return '<span class="badge warn">Требует решения о разделении или объединении</span>';
+      }}
       if (row.has_card || row.card_path) {{
         return `<a class="badge ok" href="#card/${{encodeURIComponent(row.slug)}}">Открыть карточку</a>`;
-      }}
-      if (row.status === "candidate") {{
-        return '<span class="badge warn">Требует решения о разделении или объединении</span>';
       }}
       if (row.status === "supporting") return '<span class="badge">Поддерживающий слой</span>';
       if (row.status === "merged_into_other") return '<span class="badge">Объединено</span>';
@@ -2094,15 +2134,22 @@ def dashboard_html(data: dict[str, Any]) -> str:
     }}
 
     function renderSubjectRegistrySummary() {{
-      const ready = subjectRegistry.filter((row) => row.has_card || row.card_path);
+      const ready = subjectRegistry.filter((row) => ["ready_for_review","reviewed"].includes(row.status));
       const candidates = subjectRegistry.filter((row) => row.status === "candidate");
       const other = subjectRegistry.filter((row) => ["supporting","rejected","merged_into_other"].includes(row.status));
       byId("subject-registry-summary").innerHTML = [
-        `<div class="panel"><h3>Готовые карточки</h3><p><strong>${{ready.length}}</strong></p><p class="subtle">Открываются как отдельные карточки доработок для ревью.</p></div>`,
+        `<div class="panel"><h3>Готовые карточки доработок</h3><p><strong>${{ready.length}}</strong></p><p class="subtle">Только эти строки считаются готовыми карточками для ревью.</p></div>`,
         `<div class="panel"><h3>Кандидаты к разбору</h3><p><strong>${{candidates.length}}</strong></p><p class="subtle">Это BF-гипотезы; они не считаются готовыми доработками.</p></div>`,
         `<div class="panel"><h3>Объединено / отклонено / поддержка</h3><p><strong>${{other.length}}</strong></p><p class="subtle">Отдельные решения классификации без самостоятельной карточки.</p></div>`,
-        `<div class="panel"><h3>Покрытие BF</h3><p><strong>${{data.summary.subject_bf_unique_count || data.summary.feature_count || 0}}</strong></p><p class="subtle">Каждый BF покрыт карточкой либо явно помечен как кандидат, не классифицирован, поддерживающий или технический слой.</p></div>`,
+        `<div class="panel"><h3>Покрытие BF</h3><p><strong>${{data.summary.subject_bf_unique_count || data.summary.feature_count || 0}}</strong></p><p class="subtle">Каждый BF покрыт готовой карточкой либо явно помечен как кандидат, не классифицирован, поддерживающий или технический слой.</p></div>`,
       ].join("");
+    }}
+
+    function renderSubjectRegistryGroup(title, rows, emptyText) {{
+      if (!rows.length) {{
+        return `<section class="subject-section"><h3>${{esc(title)}} · 0</h3><div class="panel empty">${{esc(emptyText)}}</div></section>`;
+      }}
+      return `<section class="subject-section"><h3>${{esc(title)}} · ${{rows.length}}</h3>${{rows.map(renderSubjectRegistryRow).join("")}}</section>`;
     }}
 
     function renderCoverageSummary() {{
@@ -2134,8 +2181,12 @@ def dashboard_html(data: dict[str, Any]) -> str:
         why_separate_card: card.why_separate_card,
       }}));
       byId("subject-registry-list").innerHTML = rows.length
-        ? rows.map(renderSubjectRegistryRow).join("")
-        : '<div class="panel empty">Реестр предметных доработок пока не построен. Выполните команды поиска, классификации и сборки реестра карточек.</div>';
+        ? [
+            renderSubjectRegistryGroup("Готовые карточки доработок", rows.filter((row) => ["ready_for_review","reviewed"].includes(row.status)), "Готовых карточек пока нет."),
+            renderSubjectRegistryGroup("Кандидаты к предметному разбору", rows.filter((row) => row.status === "candidate"), "Кандидатов пока нет."),
+            renderSubjectRegistryGroup("Поддерживающие, объединенные и отклоненные решения", rows.filter((row) => ["supporting","rejected","merged_into_other"].includes(row.status)), "Таких решений пока нет."),
+          ].join("")
+        : '<div class="panel empty">Предметный реестр пока не построен. Выполните команды поиска, классификации и сборки реестра.</div>';
       byId("subject-map-list").innerHTML = "";
     }}
 
@@ -2602,9 +2653,10 @@ def dashboard_html(data: dict[str, Any]) -> str:
         <p>Покрытие построено по текущим индексам и reverse-map состоянию.</p>
         <ul>
           <li>У нас ${{data.summary.feature_count}} BF-контейнеров.</li>
-          <li>Из них выделено ${{data.summary.subject_registry_ready_count || subjectCards.length || 0}} предметных доработок в виде готовых карточек.</li>
-          <li>Каждая BF либо покрыта карточкой доработки, либо явно помечена как кандидат, не классифицирована, поддерживающий слой или технический слой.</li>
-          <li>Дашборд показывает предметные доработки, а BF остаются вторичной навигацией и доказательной подложкой.</li>
+          <li>Из них выделено ${{readySubjectCount()}} готовых карточек доработок.</li>
+          <li>Кандидатов к предметному разбору: ${{candidateSubjectCount()}}.</li>
+          <li>Каждая BF либо покрыта готовой карточкой, либо явно помечена как кандидат, не классифицирована, поддерживающий слой или технический слой.</li>
+          <li>Дашборд показывает предметный реестр, а BF остаются вторичной навигацией и доказательной подложкой.</li>
           <li>Строк сравнения: ${{data.summary.diff_count}}</li>
           <li>Строк финальной проверки: ${{data.summary.final_diff_count}}</li>
           <li>Открытых вопросов: ${{data.summary.open_question_count}}</li>
@@ -2679,6 +2731,7 @@ def build_review_dashboard(root: Path, output_dir: Path | None = None, subject_c
     html_path = output_dir / "index.html"
     data_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
     html_path.write_text(dashboard_html(data), encoding="utf-8", newline="\n")
+    copy_review_source_alignment(root, output_dir)
     return {
         "root": str(root),
         "output_dir": str(output_dir),

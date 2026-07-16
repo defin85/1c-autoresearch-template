@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject>
+  <Form uuid="form-1">
+    <Properties>
+      <Name>ФормаЭлемента</Name>
+      <FormType>Managed</FormType>
+    </Properties>
+    <Items>
+      <Element>
+        <Properties>
+          <Name>ПолеАртикул</Name>
+        </Properties>
+      </Element>
+    </Items>
+  </Form>
+</MetaDataObject>

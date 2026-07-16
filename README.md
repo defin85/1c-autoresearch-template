@@ -2,6 +2,16 @@
 
 Clean process template for evidence-based analysis of 1C customizations, functional gaps, and migration readiness.
 
+Optional reusable contours store canonical state under
+`analysis/customization-registry/`, `analysis/migration-requirements/`, and
+`analysis/parallel-research/`. Generated repositories start with empty
+scaffolds; customer records and run artifacts are never shipped by the template.
+
+Key optional commands are `configuration-source`, `custom-metadata`,
+`customization-registry`, `migration-requirement`, `parallel-research`, and
+`manual-cleanup`. Their paths, source roles, model, worker count, timeout, and
+Git refs are configured in the generated repository's `project.toml`.
+
 Use it when you need to compare a vendor baseline, a customer-modified 1C configuration, optional extensions, and a newer vendor release without losing context across agent runs.
 
 ## What This Template Provides

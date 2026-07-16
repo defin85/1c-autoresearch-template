@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
 import os
 import re
@@ -66,6 +68,56 @@ def read_jsonl(path: Path) -> list[tuple[int, dict[str, Any]]]:
                 continue
             tasks.append((line_number, json.loads(line)))
     return tasks
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def write_json(path: Path, payload: Any, mode: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        if mode is not None:
+            path.chmod(mode)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def sha256(value: Any) -> str:
+    data = value if isinstance(value, bytes) else json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    return sha256(path.read_bytes()) if path.is_file() else ""
+
+
+def path_sha256(path: Path) -> str:
+    if path.is_file():
+        return file_sha256(path)
+    if path.is_dir():
+        return sha256([(item.relative_to(path).as_posix(), file_sha256(item)) for item in sorted(path.rglob("*")) if item.is_file()])
+    return ""
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def run_git(root: Path, args: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-c", "core.quotePath=false", "-C", str(root), *args],
+        text=True,
+        capture_output=True,
+        check=check,
+    )
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
