@@ -8,8 +8,15 @@ version = "0.1.0"
 description = "Portable tooling for 1C autoresearch repositories."
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+workspace = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1"]
+
 [project.scripts]
 one-c-autoresearch = "one_c_autoresearch.cli:main"
+one-c-autoresearch-workspace = "one_c_autoresearch.workspace_api:main"
+
+[tool.setuptools.package-data]
+one_c_autoresearch = ["workspace_static/**/*"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
