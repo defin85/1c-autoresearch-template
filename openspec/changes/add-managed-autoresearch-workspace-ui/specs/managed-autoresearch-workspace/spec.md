@@ -144,19 +144,19 @@ The system SHALL expose an authenticated SSE stream with monotonically increasin
 - **THEN** the client ignores the duplicate without duplicating log content or regressing state
 
 ### Requirement: Protect the local control plane
-The system SHALL bind to loopback by default, enforce one active service instance, establish an HTTP-only same-origin session from a short-lived one-time token delivered in and immediately removed from the URL fragment, require CSRF protection for state changes, validate host and origin, disable permissive CORS, and apply a restrictive content security policy.
+The system SHALL bind to loopback, enforce one active service instance, require same-origin state changes, validate host and origin, disable permissive CORS, and apply a restrictive content security policy without requiring local authentication.
 
 #### Scenario: Cross-origin mutation is attempted
-- **WHEN** a request with an invalid origin or missing session-bound CSRF token attempts to change state
+- **WHEN** a request with an invalid origin attempts to change state
 - **THEN** the server rejects it and performs no mutation or process dispatch
 
 #### Scenario: Second service instance starts
 - **WHEN** another managed-workspace service attempts to use the same user state
 - **THEN** it fails closed and reports the active instance without opening a second run manager
 
-#### Scenario: Bootstrap token is exchanged
-- **WHEN** the local launcher opens the application with a valid short-lived token in the URL fragment
-- **THEN** the frontend removes the fragment before navigation, exchanges it once through a same-origin POST, and receives a protected session without the token appearing in the initial request URL
+#### Scenario: Local application opens
+- **WHEN** the local launcher opens the loopback application
+- **THEN** the interface is immediately available without authentication
 
 ### Requirement: Bound connection tests
 The system SHALL implement fixed tests for supported connection channels with validated schemes and fields, bounded time and response size, no file or Unix-socket access, no cross-origin credential redirect, and no arbitrary user-defined HTTP request.

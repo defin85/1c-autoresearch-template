@@ -23,6 +23,10 @@ This is a concrete 1C autoresearch repository created from `1c-autoresearch-temp
 
 ## Operating Rules
 
+- Develop project behavior here first. Verify it on this concrete repository,
+  then port only customer-independent code, tests, and documentation back to
+  `1c-autoresearch-template`; never copy source dumps, credentials, generated
+  indexes, or deliverables into the template.
 - Process one queue task at a time. `/goal Параллельное исследование` is the
   only multi-worker exception and uses one writer.
 - Use `$1c-autoresearch-queue-worker` when selecting, claiming, executing, or updating queue tasks.

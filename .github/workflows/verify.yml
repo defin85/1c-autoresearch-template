@@ -32,3 +32,26 @@ jobs:
 
       - name: Run doctor
         run: python -m one_c_autoresearch doctor --json --deep --strict
+
+      - name: Test managed workspace API
+        run: pip install '.[workspace]' httpx pytest && pytest -q tests/test_workspace.py tests/test_workspace_api.py
+
+  workspace-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/workspace/package-lock.json
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci
+        working-directory: web/workspace
+      - run: npm run typecheck && npm test && npm run build
+        working-directory: web/workspace
+      - run: npx playwright install --with-deps chromium
+        working-directory: web/workspace
+      - run: npm run test:e2e
+        working-directory: web/workspace
+      - run: python scripts/build_workspace_template.py

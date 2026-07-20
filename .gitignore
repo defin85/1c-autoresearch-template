@@ -9,6 +9,12 @@ __pycache__/
 .mypy_cache/
 .venv/
 node_modules/
+dist/
+*.egg-info/
+.playwright-cli/
+.workspace-runtime/
+web/workspace/test-results/
+web/workspace/playwright-report/
 
 # Generated research repositories may be created next to this template, not inside it.
 do_*_research/

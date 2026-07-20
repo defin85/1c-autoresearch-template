@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+workspace_root=${WORKSPACE_ROOT:-$(cd "$repo_root/../.." && pwd)}
+unit=one-c-autoresearch-workspace.service
+port=${WORKSPACE_PORT:-8765}
+url="http://127.0.0.1:$port"
+
+running() {
+  systemctl --user is-active --quiet "$unit"
+}
+
+start() {
+  if running; then
+    echo "Workspace уже запущен: $url"
+    return
+  fi
+  if [[ ! -x "$repo_root/.venv/bin/one-c-autoresearch-workspace" ]] || ! "$repo_root/.venv/bin/python" -c 'import fastapi, uvicorn' 2>/dev/null; then
+    uv sync --extra workspace
+  fi
+  systemd-run --user --quiet --collect --unit "$unit" --property "WorkingDirectory=$repo_root" --property "TimeoutStopSec=5s" "$repo_root/.venv/bin/one-c-autoresearch-workspace" --no-browser --port "$port" --workspace-root "$workspace_root"
+  for _ in {1..50}; do
+    if curl -fsS "$url/api/v1/health" >/dev/null 2>&1; then
+      journalctl --user -u "$unit" -n 20 --no-pager -o cat | grep -m1 '^Workspace: ' || echo "Workspace запущен: $url"
+      return
+    fi
+    running || { journalctl --user -u "$unit" -n 20 --no-pager; exit 1; }
+    sleep 0.1
+  done
+  echo "Workspace не запустился за 5 секунд. Выполните: scripts/workspace logs" >&2
+  exit 1
+}
+
+stop() {
+  if ! running; then
+    echo "Workspace не запущен"
+    return
+  fi
+  systemctl --user stop "$unit"
+  echo "Workspace остановлен"
+}
+
+case "${1:-start}" in
+  start) start ;;
+  restart|reload) stop; start ;;
+  stop) stop ;;
+  status) running && { echo "Workspace запущен: $url"; systemctl --user --no-pager --lines=0 status "$unit"; } || { echo "Workspace не запущен"; exit 1; } ;;
+  logs) journalctl --user -u "$unit" -n "${WORKSPACE_LOG_LINES:-100}" -f ;;
+  *) echo "Использование: scripts/workspace {start|restart|reload|stop|status|logs}" >&2; exit 2 ;;
+esac

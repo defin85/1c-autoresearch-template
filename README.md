@@ -12,6 +12,39 @@ Key optional commands are `configuration-source`, `custom-metadata`,
 `manual-cleanup`. Their paths, source roles, model, worker count, timeout, and
 Git refs are configured in the generated repository's `project.toml`.
 
+## Managed Browser Workspace
+
+The optional React-admin workspace guides setup and the complete research
+pipeline without requiring the user to enter commands. Install the web extra
+and launch it with one or more approved project roots:
+
+```bash
+pip install 'one-c-autoresearch[workspace]'
+one-c-autoresearch-workspace --workspace-root /path/to/research-projects
+```
+
+From this repository, use the lifecycle wrapper:
+
+```bash
+scripts/workspace start
+scripts/workspace status
+scripts/workspace restart   # `reload` is an alias
+scripts/workspace logs
+scripts/workspace stop
+```
+
+Set `WORKSPACE_PORT=8877` when the default port `8765` is occupied.
+The folder picker starts at the `OneC` project directory; override it with
+`WORKSPACE_ROOT=/path/to/projects`.
+
+The launcher binds to loopback, opens a one-time authenticated URL, and keeps
+SQLite state, credentials, run logs, and UI preferences in the user data
+directory rather than in research repositories. The browser can create or
+open projects, configure source and infobase profiles, assign Codex CLI or
+Claude Code profiles, version stage prompts, run and cancel stages, resolve
+decisions, follow live events, and open sandboxed result dashboards. The CLI
+remains available for automation and recovery.
+
 Use it when you need to compare a vendor baseline, a customer-modified 1C configuration, optional extensions, and a newer vendor release without losing context across agent runs.
 
 ## What This Template Provides

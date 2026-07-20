@@ -20,3 +20,11 @@ def test_doctor_still_detects_damaged_repository_artifacts(tmp_path: Path) -> No
     result = run_doctor(root, mode="research")
     assert result["status"] == "fail"
     assert any(check["id"] == "queue.invalid_status" and check["status"] == "fail" for check in result["checks"])
+
+
+def test_doctor_resolves_manifest_paths_from_repository_root(tmp_path: Path) -> None:
+    root = tmp_path / "repo"; (root / "sources" / "target_cf").mkdir(parents=True)
+    (root / "project.toml").write_text('[project]\nid="relative-paths"\n\n[paths]\ntarget_cf="sources/target_cf"\n', encoding="utf-8")
+    result = run_doctor(root, mode="research", deep=True)
+    check = next(item for item in result["checks"] if item["id"] == "manifest.paths.exists.target_cf")
+    assert check["status"] == "ok"

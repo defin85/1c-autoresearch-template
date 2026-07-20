@@ -15,6 +15,9 @@ This repository is a clean template for reproducible 1C autoresearch projects.
 
 ## Editing Rules
 
+- For changes discovered while working on `sppr-research`, implement and verify
+  the behavior there first, then port only the customer-independent part into
+  this template.
 - Do not copy real `cf`, `cfe`, infobase data, or customer deliverables into this template.
 - Prefer additive changes to the template contract.
 - Keep queue schemas backward-compatible: add optional fields instead of changing existing meanings.

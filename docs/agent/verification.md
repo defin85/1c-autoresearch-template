@@ -13,6 +13,25 @@ python -m one_c_autoresearch doctor --json --deep --strict
 pytest -q
 ```
 
+For managed-workspace changes also run:
+
+```bash
+uv run --with 'fastapi>=0.115,<1' --with 'uvicorn>=0.34,<1' --with httpx --with pytest pytest -q tests/test_workspace.py tests/test_workspace_api.py
+npm --prefix web/workspace ci
+npm --prefix web/workspace run typecheck
+npm --prefix web/workspace test
+npm --prefix web/workspace run build
+(cd web/workspace && npx playwright install chromium && npm run test:e2e)
+python scripts/build_workspace_template.py
+python -m build
+```
+
+Install the resulting wheel once without extras and verify the core CLI help;
+install it again with `[workspace]`, start
+`one-c-autoresearch-workspace --no-browser` and verify `/api/v1/health` plus
+the compiled application shell. The service is deliberately single-worker and
+loopback-only.
+
 The template gate also scans reusable files for absolute workstation paths,
 customer identifiers, fixed product labels, and a fixed research model. A
 fresh generated repository must pass `checks research` before release.

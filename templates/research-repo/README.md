@@ -2,6 +2,11 @@
 
 Concrete 1C autoresearch repository.
 
+This repository can be registered in the optional managed browser workspace.
+The workspace stores sessions, credentials, operational SQLite state, and run
+logs outside this repository; `project.toml` and analysis artifacts remain the
+canonical project state.
+
 Optional canonical layers live under `analysis/customization-registry/`,
 `analysis/migration-requirements/`, and `analysis/parallel-research/`. Use the
 matching CLI groups and `docs/method/` contracts; configure source roles and

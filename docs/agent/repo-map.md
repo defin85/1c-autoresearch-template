@@ -25,6 +25,9 @@ scaffolds and agent entry points are under `templates/research-repo/`.
 | `src/one_c_autoresearch/reverse_map.py` | Reverse functional mapping scaffold, coverage seeding, and workitem continuation helpers. | Fact-to-intent reverse engineering workflow changes. |
 | `src/one_c_autoresearch/subject_cards.py` | Iterative subject-card discovery, registry, seeding, refinement, and validation. | The analyst-owned card pipeline changes. |
 | `src/one_c_autoresearch/functional_gaps.py` | One-card-per-pass migration gap cards with hypotheses, checks, and review artifacts. | Migration gap workflow changes. |
+| `src/one_c_autoresearch/workspace*.py` | Optional managed workspace API, durable state, run manager, and wrapper. | Browser control-plane, security, event, or long-operation behavior changes. |
+| `web/workspace/` | React-admin setup wizard and project workspace source. | Browser workflow, forms, monitoring, or accessibility changes. |
+| `src/one_c_autoresearch/workspace_static/` | Deterministic compiled workspace assets shipped in the wheel. | Rebuild after frontend changes; do not hand-edit. |
 | `templates/research-repo/` | Files copied into a concrete research repository. | Concrete project layout, queue workflow, or generated repo instructions change. |
 | `examples/` | Small examples of intended command shapes. | User-facing examples need to reflect current bootstrap arguments. |
 
@@ -44,6 +47,7 @@ scaffolds and agent entry points are under `templates/research-repo/`.
 | Functional gaps | `templates/research-repo/analysis/functional-gaps/README.md` | `src/one_c_autoresearch/functional_gaps.py`, `src/one_c_autoresearch/doctor.py`, `templates/research-repo/analysis/functional-gaps/*` | `python -m one_c_autoresearch checks doctor`, `python -m one_c_autoresearch functional-gap validate --card <slug>` |
 | Manifest/MCP/web policy | `project.example.toml`, `templates/research-repo/project.toml` | Manifests, `src/one_c_autoresearch/doctor.py`, research `AGENTS.md`, optional `.codex/1c-mcp.toml` checks | `python -m one_c_autoresearch doctor --json --deep`, targeted doctor smoke tests |
 | Agent instructions | `AGENTS.md`, `docs/agent/index.md` | Root and template `AGENTS.md`, `docs/agent/*`, `.agents/skills/*` | `python -m one_c_autoresearch checks template`, generated repo validation |
+| Managed workspace | `openspec/changes/add-managed-autoresearch-workspace-ui/`, `docs/agent/verification.md` | `src/one_c_autoresearch/workspace*.py`, `web/workspace/*`, compiled assets | workspace Python tests, frontend typecheck/test/build, package startup smoke |
 
 ## System Of Record
 

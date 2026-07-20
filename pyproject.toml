@@ -16,7 +16,7 @@ one-c-autoresearch = "one_c_autoresearch.cli:main"
 one-c-autoresearch-workspace = "one_c_autoresearch.workspace_api:main"
 
 [tool.setuptools.package-data]
-one_c_autoresearch = ["workspace_static/**/*"]
+one_c_autoresearch = ["workspace_static/**/*", "workspace_assets/*.zip"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -4,6 +4,9 @@ Thumbs.db
 *.bak
 *.log
 __pycache__/
+.one-c-autoresearch-workspace/
+workspace.sqlite3*
+workspace-runs/
 .pytest_cache/
 .venv/
 node_modules/

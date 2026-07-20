@@ -193,6 +193,14 @@ TEMPLATE_REQUIRED_PATHS = [
     "src/one_c_autoresearch/reverse_map.py",
     "src/one_c_autoresearch/doctor.py",
     "src/one_c_autoresearch/bootstrap.py",
+    "src/one_c_autoresearch/workspace.py",
+    "src/one_c_autoresearch/workspace_api.py",
+    "src/one_c_autoresearch/workspace_runner.py",
+    "src/one_c_autoresearch/workspace_static/index.html",
+    "src/one_c_autoresearch/workspace_assets/research-template.zip",
+    "scripts/build_workspace_template.py",
+    "web/workspace/package.json",
+    "web/workspace/package-lock.json",
     "src/one_c_autoresearch/queue.py",
     "src/one_c_autoresearch/checks.py",
     "src/one_c_autoresearch/configuration_source_parser.py",
@@ -446,10 +454,11 @@ class Doctor:
         for key in ("vendor_baseline", "target_cf", "target_cfe", "next_vendor"):
             value = str(paths.get(key, "")).strip()
             if self.deep and value:
+                target = repo_path(self.root, value)
                 self.checks.add(
                     f"manifest.paths.exists.{key}",
-                    "ok" if Path(value).exists() else "warn",
-                    f"Path {'exists' if Path(value).exists() else 'does not exist'}: {key}" + ("" if Path(value).exists() else f" = {value}"),
+                    "ok" if target.exists() else "warn",
+                    f"Path {'exists' if target.exists() else 'does not exist'}: {key}" + ("" if target.exists() else f" = {value}"),
                 )
 
         rlm = manifest.get("rlm", {})
@@ -550,7 +559,7 @@ class Doctor:
         if not isinstance(servers, dict):
             self.checks.add("codex.project_config.mcp_servers", "fail", ".codex/config.toml has no [mcp_servers] table")
             return
-        manifest = load_manifest(self.root)
+        manifest = read_toml(repo_path(self.root, "project.toml"))
         codex_settings = manifest.get("codex") or {}
         configured_profiles = codex_settings.get("mcp_profiles") or [] if isinstance(codex_settings, dict) else []
         expected = {str(profile): str(profile) for profile in configured_profiles if str(profile).strip()}
