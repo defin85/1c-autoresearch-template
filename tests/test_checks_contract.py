@@ -3,7 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from one_c_autoresearch.doctor import run_doctor
+from one_c_autoresearch.doctor import Doctor, run_doctor
+
+
+def test_placeholder_scan_ignores_dependencies(tmp_path: Path) -> None:
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "dependency.py").write_text("__DEPENDENCY_MARKER__", encoding="utf-8")
+    doctor = Doctor(tmp_path, mode="research")
+    doctor.test_unresolved_placeholders()
+    assert doctor.checks.checks == [{"id": "research.unresolved_placeholders", "status": "ok", "message": "No unresolved template placeholders found"}]
 
 
 def test_doctor_still_detects_damaged_repository_artifacts(tmp_path: Path) -> None:

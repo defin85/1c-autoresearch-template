@@ -1595,6 +1595,8 @@ class Doctor:
         for path in self.root.rglob("*"):
             if not path.is_file():
                 continue
+            if {".git", ".venv", "node_modules", "tests"} & set(path.relative_to(self.root).parts):
+                continue
             if path.suffix not in {".md", ".toml", ".jsonl", ".py", ".txt", ".csv"} and path.name != ".gitignore":
                 continue
             relative = path.relative_to(self.root).as_posix()
