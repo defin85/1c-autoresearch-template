@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "mrq_id", "semantic_key", "title", "state", "source_generation_id", "diff_generation_id", "source_customization", "migration_decision"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "mrq_id": {"type": "string", "pattern": "^MRQ-[0-9A-F]{16}$"},
+    "semantic_key": {"type": "string", "minLength": 1},
+    "title": {"type": "string", "minLength": 1},
+    "state": {"enum": ["draft", "ready_for_review", "approved", "superseded"]},
+    "source_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "diff_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_customization": {
+      "type": "object",
+      "required": ["business_meaning", "scope", "confidence", "rationale", "evidence"],
+      "properties": {
+        "business_meaning": {"type": "string", "minLength": 1},
+        "scope": {"type": "string", "minLength": 1},
+        "confidence": {"enum": ["low", "medium", "high"]},
+        "rationale": {"type": "string", "minLength": 1},
+        "evidence": {"type": "array", "minItems": 1}
+      },
+      "additionalProperties": false
+    },
+    "migration_decision": {
+      "type": "object",
+      "properties": {
+        "decision": {"enum": ["adopt_vendor", "adapt", "retain_custom", "out_of_scope"]},
+        "target_evidence": {"type": "array", "minItems": 1},
+        "target_coverage": {"type": "array", "minItems": 1},
+        "residual_gap": {"type": "string", "minLength": 1},
+        "target_solution": {"type": "string", "minLength": 1},
+        "acceptance_criteria": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "risk": {"type": "string", "minLength": 1},
+        "open_questions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "rationale": {"type": "string", "minLength": 1},
+        "agreement_status": {"enum": ["pending_review", "changes_requested", "approved"]}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

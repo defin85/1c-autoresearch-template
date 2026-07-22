@@ -5,6 +5,7 @@ import html as html_lib
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +91,9 @@ def test_template_portability(root: Path, errors: list[str]) -> None:
 
 def test_template(args: argparse.Namespace) -> int:
     root = Path(args.repo_path).resolve()
+    canonical = root / "templates/research-repo/research/workflow.toml"
+    if canonical.is_file():
+        return test_canonical_template(root)
     errors: list[str] = []
     required_paths = [
         ".github/workflows/verify.yml",
@@ -305,6 +309,30 @@ def test_template(args: argparse.Namespace) -> int:
     if errors:
         raise CheckFailure("\n".join(f"- {error}" for error in errors))
     print(f"Template validation passed: {root}")
+    return 0
+
+
+def test_canonical_template(root: Path) -> int:
+    scaffold = root / "templates/research-repo"
+    required = (
+        "project.toml", "research/workflow.toml", "research/infobases.toml",
+        "research/external-artifacts.toml", "research/indexing.toml",
+        "research/runtime-sync-manifest.json", "src/one_c_autoresearch/service.py",
+        "src/one_c_autoresearch/external_folder.py", "web/workspace/package.json",
+        "tests/test_external_folder.py",
+    )
+    errors = [f"Missing canonical scaffold path: {path}" for path in required if not (scaffold / path).is_file()]
+    workflow = tomllib.loads((scaffold / "research/workflow.toml").read_text(encoding="utf-8"))
+    operations = [step["operation"] for job in workflow.get("jobs", []) for step in job.get("steps", [])]
+    require(len(workflow.get("gates", [])) == 7, "Canonical scaffold must contain seven gates.", errors)
+    require(len(workflow.get("jobs", [])) == 7, "Canonical scaffold must contain seven jobs.", errors)
+    require(len(operations) == 8, "Canonical scaffold must contain eight operations.", errors)
+    for forbidden in ("analysis/queue", "preferences.json", "stage.json"):
+        require(not (scaffold / forbidden).exists(), f"Legacy authority remains: {forbidden}", errors)
+    test_template_portability(root, errors)
+    if errors:
+        raise CheckFailure("\n".join(f"- {error}" for error in errors))
+    print(f"Canonical template validation passed: {root}")
     return 0
 
 

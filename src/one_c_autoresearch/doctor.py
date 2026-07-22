@@ -1612,6 +1612,26 @@ class Doctor:
             self.checks.add("research.unresolved_placeholders", "ok", "No unresolved template placeholders found")
 
     def test_template_repo(self) -> None:
+        canonical = repo_path(self.root, "templates/research-repo/research/workflow.toml")
+        if canonical.is_file():
+            for path in (
+                "templates/research-repo/project.toml",
+                "templates/research-repo/research/workflow.toml",
+                "templates/research-repo/research/runtime-sync-manifest.json",
+                "templates/research-repo/src/one_c_autoresearch/service.py",
+                "templates/research-repo/src/one_c_autoresearch/external_folder.py",
+                "templates/research-repo/web/workspace/package.json",
+            ):
+                self.require_path(path, "template")
+            workflow = read_toml(canonical)
+            operations = [step.get("operation") for job in workflow.get("jobs", []) for step in job.get("steps", [])]
+            for name, actual, expected in (
+                ("gates", len(workflow.get("gates", [])), 7),
+                ("jobs", len(workflow.get("jobs", [])), 7),
+                ("operations", len(operations), 8),
+            ):
+                self.checks.add(f"template.workflow.{name}", "ok" if actual == expected else "fail", f"Canonical workflow {name}: {actual}; expected {expected}")
+            return
         for path in TEMPLATE_REQUIRED_PATHS:
             self.require_path(path, "template")
         self.test_queue("templates/research-repo/analysis/queue/tasks.jsonl")

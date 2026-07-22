@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "kind", "name", "version", "representation_schema", "payload_file_count", "payload_fingerprint"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "kind": {"enum": ["configuration", "extension"]},
+    "name": {"type": "string", "minLength": 1},
+    "version": {"type": "string"},
+    "representation_schema": {"enum": ["xml-hierarchical", "v8unpack", "edt-project"]},
+    "payload_file_count": {"type": "integer", "minimum": 1},
+    "payload_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "uuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "active": {"type": "boolean"}
+  },
+  "allOf": [{"if": {"properties": {"kind": {"const": "configuration"}}}, "then": {"required": ["uuid"]}}, {"if": {"properties": {"kind": {"const": "extension"}}}, "then": {"required": ["uuid", "active"]}}],
+  "additionalProperties": false
+}

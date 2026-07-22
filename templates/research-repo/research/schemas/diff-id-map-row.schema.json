@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["stable_diff_id", "comparison_id", "change_type", "path", "active", "first_seen_generation", "last_seen_generation", "predecessor_diff_id", "successor_diff_id", "content_fingerprint", "notes"],
+  "properties": {
+    "stable_diff_id": {"type": "string", "pattern": "^DIF-[0-9A-F]{16}$"},
+    "comparison_id": {"type": "string", "pattern": "^CMP-[0-9A-F]{16}$"},
+    "change_type": {"enum": ["added", "deleted", "modified", "type_changed"]},
+    "path": {"type": "string", "minLength": 1},
+    "active": {"enum": ["true", "false"]},
+    "first_seen_generation": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "last_seen_generation": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "predecessor_diff_id": {"type": "string", "pattern": "^(|DIF-[0-9A-F]{16})$"},
+    "successor_diff_id": {"type": "string", "pattern": "^(|DIF-[0-9A-F]{16})$"},
+    "content_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "notes": {"type": "string"}
+  },
+  "additionalProperties": false
+}

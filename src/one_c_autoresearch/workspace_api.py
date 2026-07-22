@@ -36,9 +36,8 @@ from .workspace import (
 
 def _web_imports() -> dict[str, Any]:
     try:
-        from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request, Response
+        from fastapi import FastAPI, Header, HTTPException, Request, Response
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
-        from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel, Field
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("Install the optional workspace dependencies: pip install 'one-c-autoresearch[workspace]'") from exc
@@ -55,7 +54,6 @@ StreamingResponse = web["StreamingResponse"]
 FileResponse = web["FileResponse"]
 BaseModel = web["BaseModel"]
 Field = web["Field"]
-Cookie = web["Cookie"]
 Header = web["Header"]
 SOURCE_PATHS = {"vendor_baseline": "sources/vendor_baseline", "target_cf": "sources/target_cf", "target_cfe": "sources/target_cfe", "next_vendor": "sources/next_vendor"}
 
@@ -185,9 +183,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
         response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
-    def require_session(request: Request) -> dict[str, str]:
-        return {"user": "local"}
-
     def require_mutation(request: Request) -> dict[str, str]:
         origin = request.headers.get("origin")
         expected_origin = f"{request.url.scheme}://{request.headers.get('host')}"
@@ -212,18 +207,15 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/projects")
     def list_projects(request: Request):
-        require_session(request)
         return store.projects()
 
     @app.get("/api/v1/infobases/discover")
     def discover_infobases(request: Request):
-        require_session(request)
         path = Path.home() / ".1C" / "1cestart" / "ibases.v8i"
         return {"source": str(path), "infobases": discover_1c_infobases(path)}
 
     @app.get("/api/v1/filesystem/directories")
     def list_directories(request: Request, path: str = ""):
-        require_session(request)
         current = canonical_under(Path(path).expanduser() if path else roots[0], roots)
         if not current.is_dir():
             raise HTTPException(status_code=404, detail="directory not found")
@@ -271,7 +263,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/projects/{project_id}")
     def get_project(project_id: str, request: Request):
-        require_session(request)
         try:
             return store.project(project_id)
         except KeyError:
@@ -346,13 +337,11 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/stages")
     def stages(request: Request):
-        require_session(request)
         from .workspace import STAGES
         return list(STAGES)
 
     @app.get("/api/v1/projects/{project_id}/preferences")
     def preferences(project_id: str, request: Request):
-        require_session(request)
         return store.preferences(project_id)
 
     @app.put("/api/v1/projects/{project_id}/preferences")
@@ -362,7 +351,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/projects/{project_id}/workflow")
     def workflow(project_id: str, request: Request):
-        require_session(request)
         return workflow_snapshot(store, project_id)
 
     @app.post("/api/v1/projects/{project_id}/inspect")
@@ -411,7 +399,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.post("/api/v1/projects/{project_id}/manifest/preview")
     def manifest_preview(project_id: str, body: ManifestUpdate, request: Request):
-        require_session(request)
         project = store.project(project_id); path = Path(project["root"]) / "project.toml"
         _validate_manifest_updates(project, body.updates)
         current_hash = file_sha256(path)
@@ -427,7 +414,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
         @app.get(f"/api/v1/{plural}", name=f"list_{plural}")
         def list_items(request: Request, project_id: str | None = None):
-            require_session(request)
             return store.resources(kind, project_id)
 
         @app.post(f"/api/v1/{plural}", status_code=201, name=f"create_{kind}")
@@ -464,7 +450,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
         @app.get(f"/api/v1/{plural}/{{item_id}}", name=f"get_{kind}")
         def get_item(item_id: str, request: Request):
-            require_session(request)
             try:
                 return store.resource(kind, item_id)
             except KeyError:
@@ -497,7 +482,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/artifacts")
     def artifacts(request: Request, project_id: str | None = None):
-        require_session(request)
         return store.artifacts(project_id)
 
     @app.post("/api/v1/projects/{project_id}/artifacts/discover")
@@ -510,7 +494,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/prompts")
     def prompts(request: Request, project_id: str | None = None):
-        require_session(request)
         return store.prompts(project_id)
 
     @app.post("/api/v1/prompts", status_code=201)
@@ -523,7 +506,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/prompts/{prompt_id}")
     def prompt(prompt_id: str, request: Request):
-        require_session(request)
         try:
             return store.prompt(prompt_id)
         except KeyError:
@@ -547,17 +529,14 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/agent-providers")
     def providers(request: Request):
-        require_session(request)
         return [agent_probe(provider) for provider in sorted(ALLOWED_PROVIDERS)]
 
     @app.get("/api/v1/runs")
     def runs(request: Request, project_id: str | None = None):
-        require_session(request)
         return store.runs(project_id)
 
     @app.get("/api/v1/runs/{run_id}")
     def run(run_id: str, request: Request):
-        require_session(request)
         try:
             return store.run(run_id)
         except KeyError:
@@ -565,7 +544,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/runs/{run_id}/logs")
     def run_logs(run_id: str, request: Request, offset: int = 0, limit: int = 200):
-        require_session(request)
         return store.log_page(run_id, offset, limit)
 
     @app.post("/api/v1/runs", status_code=202)
@@ -592,7 +570,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/approvals")
     def approvals(request: Request, project_id: str | None = None):
-        require_session(request)
         return store.approvals(project_id)
 
     @app.post("/api/v1/approvals", status_code=201)
@@ -612,7 +589,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/events")
     async def events(request: Request, project_id: str, run_id: str | None = None, last_event_id: str | None = Header(default=None, alias="Last-Event-ID")):
-        require_session(request)
         after = int(last_event_id or 0)
 
         async def stream():
@@ -635,7 +611,6 @@ def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] |
 
     @app.get("/api/v1/artifacts/{project_id}/{artifact_path:path}")
     def artifact(project_id: str, artifact_path: str, request: Request, download: bool = False, embed: bool = False):
-        require_session(request)
         project = store.project(project_id)
         root = Path(project["root"])
         try:

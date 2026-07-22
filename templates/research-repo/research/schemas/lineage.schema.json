@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "kind", "source_ids", "target_ids", "rationale", "evidence", "actor", "source_generation_id", "diff_generation_id"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "kind": {"enum": ["split", "merge", "supersede", "revalidate"]},
+    "source_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^MRQ-[0-9A-F]{16}$"}},
+    "target_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^MRQ-[0-9A-F]{16}$"}},
+    "rationale": {"type": "string", "minLength": 1},
+    "evidence": {"type": "array", "minItems": 1},
+    "actor": {"type": "string", "minLength": 1},
+    "source_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "diff_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}

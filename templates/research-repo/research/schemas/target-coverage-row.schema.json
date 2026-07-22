@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["customer_diff_id", "source_generation", "target_diff_ids", "coverage_status", "evidence_ref", "notes"],
+  "properties": {
+    "customer_diff_id": {"type": "string", "pattern": "^DIF-[0-9A-F]{16}$"},
+    "source_generation": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "target_diff_ids": {"type": "string", "pattern": "^(|DIF-[0-9A-F]{16}(;DIF-[0-9A-F]{16})*)$"},
+    "coverage_status": {"enum": ["covered_by_vendor", "still_required", "changed_in_target", "needs_semantic_review"]},
+    "evidence_ref": {"type": "string", "minLength": 1},
+    "notes": {"type": "string"}
+  },
+  "additionalProperties": false
+}

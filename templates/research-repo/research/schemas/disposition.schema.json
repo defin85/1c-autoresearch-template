@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "stable_diff_id", "primary", "source_generation_id", "diff_generation_id"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "stable_diff_id": {"type": "string", "pattern": "^DIF-[0-9A-F]{16}$"},
+    "mrq_id": {"type": "string", "pattern": "^MRQ-[0-9A-F]{16}$"},
+    "primary": {"type": "boolean"},
+    "approved_noise": {"type": "object"},
+    "source_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "diff_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "oneOf": [{"required": ["mrq_id"], "not": {"required": ["approved_noise"]}}, {"required": ["approved_noise"], "not": {"required": ["mrq_id"]}}],
+  "additionalProperties": false
+}

@@ -6,43 +6,6 @@ target_version = "__TARGET_VERSION__"
 next_vendor_version = "__NEXT_VENDOR_VERSION__"
 description = "Concrete 1C autoresearch repository."
 
-[paths]
-vendor_baseline = "__VENDOR_BASELINE__"
-target_cf = "__TARGET_CF__"
-target_cfe = "__TARGET_CFE__"
-next_vendor = "__NEXT_VENDOR__"
-compare_repo = "."
-
-[source_roles]
-vendor = "vendor_baseline"
-customer = "target_cf"
-target_release = "next_vendor"
-
-[parallel_research]
-model = ""
-workers = 3
-unit_size = 3
-timeout_seconds = 1800
-comparison_repo = "analysis/cache/noise/clean-rebase-v8unpack/repo"
-vendor_ref = "HEAD^"
-customer_ref = "HEAD"
-vendor_drift_markers = []
-
-[physical_cleanup]
-enabled = false
-comparison_repo = ""
-normalized_repo = "analysis/cache/clean-rebase/repo"
-vendor_ref = "HEAD^"
-customer_ref = "HEAD"
-batch_size = 30
-workers = 3
-
-[rlm]
-vendor_baseline = "__RLM_VENDOR_BASELINE__"
-target_cf = "__RLM_TARGET_CF__"
-target_cfe = "__RLM_TARGET_CFE__"
-next_vendor = "__RLM_NEXT_VENDOR__"
-
 [mcp]
 enabled = false
 server = ""
@@ -52,7 +15,7 @@ service_root = "mcp"
 [web]
 enabled = false
 url = ""
-username = "codex"
+username = ""
 credential_file = ""
 
 [policy]
@@ -60,13 +23,3 @@ static_sources_first = true
 allow_live_infobase_evidence = false
 mark_runtime_data_dependencies = true
 default_confidence_for_inference = "medium"
-
-[autopilot]
-enabled = false
-diff_inventory = "analysis/indexes/diff-inventory.csv"
-feature_map = "analysis/indexes/feature-map.csv"
-customization_map_md = "outputs/customization-map.md"
-customization_map_xlsx = "outputs/customization-map.xlsx"
-open_questions_csv = "outputs/open-questions.csv"
-open_questions_xlsx = "outputs/open-questions.xlsx"
-final_audit = "analysis/final-audit.md"

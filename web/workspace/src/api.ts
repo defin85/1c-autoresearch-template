@@ -15,10 +15,6 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return value as T;
 }
 
-export async function bootstrap(): Promise<void> {
-  return;
-}
-
 export function mutationHeaders(id = crypto.randomUUID()): HeadersInit {
   return { 'Idempotency-Key': id };
 }

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -33,11 +32,6 @@ def create_research_repo(args: argparse.Namespace) -> int:
     target.mkdir(parents=True, exist_ok=True)
 
     copy_tree_contents(source, target, force=args.force)
-    shutil.copytree(template_root / "src", target / "src", dirs_exist_ok=True)
-    shutil.copytree(template_root / "one_c_autoresearch", target / "one_c_autoresearch", dirs_exist_ok=True)
-    shutil.copy2(template_root / "pyproject.toml", target / "pyproject.toml")
-    shutil.copy2(template_root / "scripts" / "doctor.py", target / "scripts" / "doctor.py")
-    shutil.copy2(template_root / "scripts" / "checks" / "test_research_repo.py", target / "scripts" / "checks" / "test_research_repo.py")
 
     replacements = {
         "__PROJECT_ID__": args.project_id,
@@ -65,5 +59,5 @@ def create_research_repo(args: argparse.Namespace) -> int:
     print(f"Created research repo: {target}")
     print(f"Project id: {args.project_id}")
     print("Next task command:")
-    print("python -m one_c_autoresearch queue get")
+    print("python -m one_c_autoresearch next")
     return 0

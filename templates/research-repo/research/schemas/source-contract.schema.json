@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "acquisition_profile_id", "roles", "artifacts"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "acquisition_profile_id": {"type": "string", "pattern": "^(ibcmd|designer)\\+(xml-hierarchical|v8unpack|edt-project)/v1$"},
+    "roles": {
+      "type": "object",
+      "required": ["vendor_baseline", "target_cf", "next_vendor"],
+      "additionalProperties": false,
+      "properties": {
+        "vendor_baseline": {"$ref": "#/$defs/role"},
+        "target_cf": {"$ref": "#/$defs/role"},
+        "next_vendor": {"$ref": "#/$defs/role"}
+      }
+    },
+    "artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}}
+  },
+  "$defs": {
+    "role": {
+      "type": "object",
+      "required": ["connection_profile", "configuration_name", "root_uuid", "version"],
+      "properties": {
+        "connection_profile": {"type": "string", "minLength": 1},
+        "configuration_name": {"type": "string", "minLength": 1},
+        "root_uuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+        "version": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["role", "kind", "semantic_key", "filename", "declared_size_bytes", "external_artifact_id"],
+      "properties": {
+        "role": {"enum": ["vendor_baseline", "target_cf", "next_vendor"]},
+        "kind": {"enum": ["epf", "erf", "source-tree", "other"]},
+        "semantic_key": {"type": "string", "minLength": 1},
+        "filename": {"type": "string", "minLength": 1},
+        "declared_size_bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^(sha256:)?[0-9a-f]{64}$"},
+        "external_artifact_id": {"type": "string", "pattern": "^EXT-[0-9A-F]{16}$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

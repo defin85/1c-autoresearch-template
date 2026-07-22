@@ -1,8 +1,0 @@
-infobase = "__PROJECT_ID__"
-mcp_server = ""
-url = ""
-service_root = "mcp"
-rlm_project = "__RLM_TARGET_CF__"
-web_url = ""
-username = "codex"
-credential_file = ""

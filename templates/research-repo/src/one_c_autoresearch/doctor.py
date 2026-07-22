@@ -1,0 +1,85 @@
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import tomllib
+from pathlib import Path
+from typing import Any
+
+from .contracts import SECRET_KEYS
+from .workflow import status, validate_project_contract, validate_workflow
+from .sources import validate_active
+
+
+def packaged_secret_failure(relative: str, path: Path) -> bool:
+    name = path.name.lower()
+    candidate = name == ".env" or path.suffix.lower() in {".pem", ".key", ".p12", ".pfx"} or any(word in name for word in ("credential", "secrets"))
+    if not candidate or not path.is_file() or path.stat().st_size > 2_000_000:
+        return False
+    raw = path.read_bytes()
+    return b"PRIVATE KEY-----" in raw.upper() or re.search(br"(?i)['\"]?\b(?:password|passwd|pwd|token|secret)\b['\"]?\s*[:=]\s*['\"]?[^\s'\";]{8,}", raw) is not None
+
+
+def legacy_failures(repo: Path, manifest: dict[str, Any], tracked: list[str]) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    for relative in tracked:
+        path = repo / relative
+        if not path.exists():
+            continue
+        if relative in manifest.get("exact_paths", []) or any(relative.startswith(prefix) for prefix in manifest["path_prefixes"]):
+            failures.append({"code": "legacy.path", "path": relative, "message": "forbidden legacy authority"})
+        if relative.startswith("src/one_c_autoresearch/") and Path(relative).name in manifest["modules"]:
+            failures.append({"code": "legacy.module", "path": relative, "message": "forbidden legacy writer/reader"})
+        if relative.startswith("openspec/") or not path.is_file() or path.stat().st_size > 2_000_000 or path.suffix.lower() not in {".py", ".tsx", ".ts"}:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for token in manifest.get("command_tokens", []) + manifest.get("route_tokens", []) + manifest.get("registration_tokens", []):
+            if any(literal in text for literal in (f'"{token}"', f"'{token}'", f'/{token}')):
+                failures.append({"code": "legacy.command-token", "path": relative, "message": f"forbidden command token: {token}"})
+    return failures
+
+
+def check(repo: Path, strict: bool = False) -> dict[str, Any]:
+    repo = repo.resolve(); failures: list[dict[str, str]] = []; warnings: list[dict[str, str]] = []
+    required = ("project.toml", "research/workflow.toml", "research/infobases.toml", "research/external-artifacts.toml", "research/indexing.toml", "research/forbidden-authorities.json")
+    missing = [path for path in required if not (repo / path).is_file()]
+    if missing:
+        failure = {"code": "contract.unsupported", "path": missing[0], "message": "unsupported repository contract; recreate the repository instead of migrating it"}
+        return {"ok": False, "strict": strict, "failures": [failure], "warnings": [], "snapshot": None, "summary": {"fail": 1, "warn": 0}}
+    manifest = json.loads((repo / "research/forbidden-authorities.json").read_text(encoding="utf-8"))
+    project = tomllib.loads((repo / "project.toml").read_text(encoding="utf-8"))
+    for section in manifest["project_sections"]:
+        if section in project: failures.append({"code": "legacy.project-section", "path": "project.toml", "message": f"forbidden section [{section}]"})
+    try: validate_project_contract(repo)
+    except (ValueError, tomllib.TOMLDecodeError) as exc: failures.append({"code": "project.invalid", "path": "project.toml", "message": str(exc)})
+    tracked = subprocess.run(["git", "ls-files", "-z"], cwd=repo, stdout=subprocess.PIPE, check=True).stdout.decode().split("\0")
+    failures.extend(legacy_failures(repo, manifest, list(filter(None, tracked))))
+    for relative in filter(None, tracked):
+        path = repo / relative
+        if not path.exists():
+            continue
+        if packaged_secret_failure(relative, path):
+            failures.append({"code": "secret.packaged", "path": relative, "message": "tracked packaged credential or private key"})
+        if relative.startswith("openspec/"): continue
+        if path.is_file() and path.stat().st_size <= 2_000_000 and path.suffix.lower() in {".toml", ".json", ".yaml", ".yml"}:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if SECRET_KEYS.search(text) and any(token in text.lower() for token in ('"password"', 'password =', '"token"', 'token =', 'private_key')):
+                failures.append({"code": "secret.tracked", "path": relative, "message": "tracked secret-like field"})
+    try: validate_workflow(repo)
+    except ValueError as exc: failures.append({"code": "workflow.invalid", "path": "research/workflow.toml", "message": str(exc)})
+    try: snapshot = status(repo)
+    except (ValueError, RuntimeError, OSError, KeyError) as exc:
+        snapshot = None; failures.append({"code": "workflow.unreadable", "path": "research/", "message": str(exc)})
+    if strict and snapshot and snapshot["state"] != "complete": failures.append({"code": "workflow.incomplete", "path": "research/", "message": "all seven gates must be complete for strict publication"})
+    if strict:
+        try:
+            validate_active(repo, deep=True, require_tracked_clean=True)
+            from .diffs import validate_active as validate_active_diffs
+            from .mrq import active as active_mrq
+            from .contracts import require_tracked_clean
+            validate_active_diffs(repo, require_tracked_clean_state=True)
+            active_mrq(repo, require_tracked_clean_state=True)
+            require_tracked_clean(repo, [repo / "outputs/projections.json"])
+        except (ValueError, OSError, KeyError, json.JSONDecodeError) as exc: failures.append({"code": "sources.not-publishable", "path": "sources/", "message": str(exc)})
+    return {"ok": not failures, "strict": strict, "failures": failures, "warnings": warnings, "snapshot": snapshot, "summary": {"fail": len(failures), "warn": len(warnings)}}

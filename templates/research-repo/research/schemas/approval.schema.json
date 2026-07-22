@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "event", "target_id", "actor", "rationale", "evidence", "timestamp", "previous_generation", "fingerprint", "source_generation_id", "diff_generation_id"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "event": {"enum": ["approve", "request_changes"]},
+    "target_id": {"type": "string", "pattern": "^(MRQ|DIF)-[0-9A-F]{16}$"},
+    "actor": {"type": "string", "minLength": 1},
+    "rationale": {"type": "string", "minLength": 1},
+    "evidence": {"type": "array"},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "previous_generation": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "diff_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}

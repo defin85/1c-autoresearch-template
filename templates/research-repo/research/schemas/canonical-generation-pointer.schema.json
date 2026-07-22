@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "canonical_generation_id", "source_generation_id", "diff_generation_id"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "canonical_generation_id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "source_generation_id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "diff_generation_id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}

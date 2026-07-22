@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "canonical_generation_id", "source_generation_id", "diff_generation_id", "comparison_epoch_fingerprint", "files", "created_at"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "canonical_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "diff_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "comparison_epoch_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "files": {
+      "type": "object",
+      "required": ["mrq.jsonl", "dispositions.jsonl", "evidence.jsonl", "lineage.jsonl", "approvals.jsonl"],
+      "properties": {
+        "mrq.jsonl": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "dispositions.jsonl": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "evidence.jsonl": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "lineage.jsonl": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approvals.jsonl": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

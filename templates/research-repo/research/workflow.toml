@@ -1,0 +1,68 @@
+schema_version = "1"
+tool_version = "0.1.0"
+
+[[gates]]
+id = "project-configured"
+validator = "project.validate"
+
+[[gates]]
+id = "sources-acquired"
+validator = "sources.validate"
+
+[[gates]]
+id = "diffs-built"
+validator = "diff.validate"
+
+[[gates]]
+id = "diffs-classified"
+validator = "mrq.ownership"
+
+[[gates]]
+id = "source-evidence-complete"
+validator = "mrq.source-evidence"
+
+[[gates]]
+id = "decisions-approved"
+validator = "mrq.approvals"
+
+[[gates]]
+id = "published"
+validator = "workflow.verify"
+
+[[jobs]]
+id = "configure"
+needs = []
+steps = [{ id = "validate-project", operation = "project.validate", operation_version = "1", timeout_seconds = 1800 }]
+
+[[jobs]]
+id = "acquire-sources"
+needs = ["configure"]
+steps = [{ id = "acquire-sources", operation = "sources.acquire", operation_version = "1", timeout_seconds = 1800 }]
+
+[[jobs]]
+id = "build-diffs"
+needs = ["acquire-sources"]
+steps = [{ id = "build-diffs", operation = "diff.build", operation_version = "1", timeout_seconds = 1800, max_retries = 0 }]
+
+[[jobs]]
+id = "index-sources"
+needs = ["build-diffs"]
+steps = [{ id = "index-sources", operation = "indexes.build", operation_version = "1", timeout_seconds = 1800 }]
+
+[[jobs]]
+id = "discover-mrq"
+needs = ["index-sources"]
+steps = [{ id = "discover-mrq", operation = "mrq.discover-next", operation_version = "1", timeout_seconds = 1800, agent_profile = "local", instruction_supplement = "" }]
+
+[[jobs]]
+id = "decide-mrq"
+needs = ["discover-mrq"]
+steps = [{ id = "decide-mrq", operation = "mrq.decide-next", operation_version = "1", timeout_seconds = 1800, agent_profile = "local", instruction_supplement = "" }]
+
+[[jobs]]
+id = "publish"
+needs = ["decide-mrq"]
+steps = [
+  { id = "build-projections", operation = "projections.build", operation_version = "1", timeout_seconds = 1800, max_retries = 0 },
+  { id = "verify-workflow", operation = "workflow.verify", operation_version = "1", timeout_seconds = 1800 },
+]

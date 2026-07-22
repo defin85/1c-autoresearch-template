@@ -1,0 +1,20 @@
+schema_version = "1"
+acquisition_profile = "ibcmd+xml-hierarchical/v1"
+
+[roles.vendor_baseline]
+connection_profile = "local-baseline"
+configuration_name = "__PRODUCT__"
+root_uuid = "00000000-0000-0000-0000-000000000001"
+version = "__BASELINE_VERSION__"
+
+[roles.target_cf]
+connection_profile = "local-target"
+configuration_name = "__PRODUCT__"
+root_uuid = "00000000-0000-0000-0000-000000000001"
+version = "__TARGET_VERSION__"
+
+[roles.next_vendor]
+connection_profile = "local-next-vendor"
+configuration_name = "__PRODUCT__"
+root_uuid = "00000000-0000-0000-0000-000000000001"
+version = "__NEXT_VENDOR_VERSION__"

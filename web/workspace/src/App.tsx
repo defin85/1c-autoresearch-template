@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Admin, CustomRoutes, Layout, Menu, Resource, type DataProvider, type RaRecord } from 'react-admin';
+import { Admin, CustomRoutes, Layout, Menu, type DataProvider, type RaRecord } from 'react-admin';
 import { Route, Link, useNavigate, useParams } from 'react-router-dom';
 import {
   Alert, AppBar, Box, Button, Card, CardActions, CardContent, Chip, CircularProgress,
@@ -10,7 +10,6 @@ import {
 import DashboardIcon from '@mui/icons-material/Dashboard';
 import SettingsIcon from '@mui/icons-material/Settings';
 import { api, mutationHeaders, streamProject, type Stage, type Workflow } from './api';
-import { useQueryClient } from '@tanstack/react-query';
 
 const i18nProvider = {
   translate: (key: string, options?: { _: string }) => (({ 'ra.navigation.skip_nav': 'К содержимому', 'ra.page.dashboard': 'Главная', 'ra.action.refresh': 'Обновить' } as Record<string, string>)[key] || options?._ || key),
@@ -18,7 +17,6 @@ const i18nProvider = {
   getLocale: () => localStorage.getItem('workspace-locale') || 'ru',
 };
 
-const resources = ['projects', 'connections', 'agents', 'prompts', 'runs', 'approvals', 'artifacts'] as const;
 const dataProvider = {
   getList: async resource => {
     const data = await api<RaRecord[]>(`/${resource}`);
@@ -89,9 +87,8 @@ const statusColor = (status: string): 'default' | 'success' | 'error' | 'warning
 
 export function WorkflowPage() {
   const { projectId = '' } = useParams(); const [value, setValue] = useState<Workflow>(); const [online, setOnline] = useState(true); const [error, setError] = useState('');
-  const queryClient = useQueryClient();
   const refresh = useCallback(() => api<Workflow>(`/projects/${projectId}/workflow`).then(setValue).catch(e => setError(e.message)), [projectId]);
-  useEffect(() => { refresh(); const stop = streamProject(projectId, event => { queryClient.invalidateQueries({ queryKey: ['workflow', projectId] }); const payload = JSON.parse(event.data || '{}'); if (payload.run_id) queryClient.invalidateQueries({ queryKey: ['runs', payload.run_id] }); refresh(); }, setOnline); const timer = window.setInterval(refresh, online ? 30000 : 5000); return () => { stop(); clearInterval(timer); }; }, [projectId, queryClient, refresh, online]);
+  useEffect(() => { refresh(); const stop = streamProject(projectId, refresh, setOnline); const timer = window.setInterval(refresh, online ? 30000 : 5000); return () => { stop(); clearInterval(timer); }; }, [projectId, refresh, online]);
   if (!value) return <Box p={4}>{error ? <Alert severity="error">{error}</Alert> : <CircularProgress />}</Box>;
   const done = value.stages.filter(s => s.status === 'completed').length;
   return <Box p={3}><Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" mb={2}><Box><Typography variant="h4">{value.project.name}</Typography><Typography color="text.secondary">{value.project.root}</Typography></Box><Chip color={online ? 'success' : 'warning'} label={online ? 'Обновления в реальном времени' : 'Режим периодического опроса'} /></Stack>
@@ -153,7 +150,6 @@ export function StagePage() {
 
 export function App() {
   return <><GlobalStyles styles={{ '@media (prefers-reduced-motion: reduce)': { '*, *::before, *::after': { animationDuration: '0.01ms !important', animationIterationCount: '1 !important', transitionDuration: '0.01ms !important' } } }} /><Admin dataProvider={dataProvider} i18nProvider={i18nProvider} layout={WorkspaceLayout} dashboard={Home} title="1C Autoresearch" requireAuth={false} disableTelemetry>
-    {resources.map(resource => <Resource key={resource} name={resource} />)}
     <CustomRoutes><Route path="/projects" element={<Home />} /><Route path="/projects/:projectId/setup" element={<SetupWizard />} /><Route path="/projects/:projectId/workflow" element={<WorkflowPage />} /><Route path="/projects/:projectId/stages/:stageId" element={<StagePage />} /><Route path="/connections" element={<ConnectionsPage />} /><Route path="/agents" element={<ResourcePage kind="agents" />} /><Route path="/approvals" element={<ResourcePage kind="approvals" />} /><Route path="/runs" element={<ResourcePage kind="runs" />} /></CustomRoutes>
   </Admin></>;
 }

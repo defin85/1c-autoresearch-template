@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["stable_diff_id", "comparison_id", "source_generation", "before_role", "after_role", "change_type", "path", "object_kind", "object_name", "area", "before_fingerprint", "after_fingerprint", "content_fingerprint"],
+  "properties": {
+    "stable_diff_id": {"type": "string", "pattern": "^DIF-[0-9A-F]{16}$"},
+    "comparison_id": {"type": "string", "pattern": "^CMP-[0-9A-F]{16}$"},
+    "source_generation": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "before_role": {"const": "vendor_baseline"},
+    "after_role": {"enum": ["target_cf", "next_vendor"]},
+    "change_type": {"enum": ["added", "deleted", "modified", "type_changed"]},
+    "path": {"type": "string", "minLength": 1},
+    "object_kind": {"type": "string", "minLength": 1},
+    "object_name": {"type": "string", "minLength": 1},
+    "area": {"type": "string", "minLength": 1},
+    "before_fingerprint": {"type": "string", "pattern": "^(|sha256:[0-9a-f]{64})$"},
+    "after_fingerprint": {"type": "string", "pattern": "^(|sha256:[0-9a-f]{64})$"},
+    "content_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}

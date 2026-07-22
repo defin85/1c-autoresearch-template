@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "generation_id", "source_generation_id", "files", "row_counts"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "files": {"$ref": "#/$defs/fixedFiles"},
+    "row_counts": {
+      "type": "object",
+      "required": ["diff-inventory.csv", "diff-id-map.csv", "target-coverage.csv"],
+      "properties": {
+        "diff-inventory.csv": {"type": "integer", "minimum": 0},
+        "diff-id-map.csv": {"type": "integer", "minimum": 0},
+        "target-coverage.csv": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "fixedFiles": {
+      "type": "object",
+      "required": ["diff-inventory.csv", "diff-id-map.csv", "target-coverage.csv"],
+      "properties": {
+        "diff-inventory.csv": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "diff-id-map.csv": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "target-coverage.csv": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
