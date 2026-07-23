@@ -22,7 +22,7 @@ LOCATION = {
 }
 
 
-def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], bool]], dict[str, Any]], store: EventStore, actor: str = "local-user", select: Callable[[], dict[str, Any] | None] | None = None, approved_operations: set[str] | None = None, agent_profiles: dict[str, dict[str, Any]] | None = None, agent_executor: Callable[..., dict[str, Any]] | None = None) -> dict[str, Any]:
+def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], bool]], dict[str, Any]], store: EventStore, actor: str = "local-user", select: Callable[[], dict[str, Any] | None] | None = None, approved_operations: set[str] | None = None, agent_profiles: dict[str, dict[str, Any]] | None = None, agent_executor: Callable[..., dict[str, Any]] | None = None, source_routing_preview: dict[str, str] | None = None) -> dict[str, Any]:
     run_started = time.monotonic()
     elapsed = lambda: time.monotonic() - run_started
     store.reconcile()
@@ -42,7 +42,7 @@ def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], boo
     except (OSError, json.JSONDecodeError):
         pointers = {}
     context = {"actor": actor, "executor": catalog["executor"], "operation": operation, "operation_version": catalog["version"], "gate_id": work.get("gate_id"), "work_unit": work.get("work_unit"), "work_unit_id": (work.get("work_unit") or {}).get("id"), "source_generation_id": pointers.get("active-source-generation.json", {}).get("generation_id"), "diff_generation_id": pointers.get("active-diff-generation.json", {}).get("generation_id"), "canonical_generation_id": pointers.get("active-generation.json", {}).get("canonical_generation_id"), "index_key": (work.get("work_unit") or {}).get("index_key"), "index_keys": (work.get("work_unit") or {}).get("index_keys")}
-    runtime_payload = {"mode": "ensure"} if operation == "indexes.build" else ({"agent_profile": profile_name, "agent_profile_fingerprint": sha256(canonical_json(profile)) if profile else None, "model": profile.get("model") if profile else None, "instructions_version": profile.get("instructions_version") if profile else None, "instruction_supplement": configured["step"].get("instruction_supplement", ""), "allowed_paths": (work.get("work_unit") or {}).get("allowed_paths", []), "tool_calls": [{"tool": "codex-cli", "sandbox": "read-only"}], "private_reasoning": "unavailable"} if operation in AGENT_OPERATIONS else {})
+    runtime_payload = {"mode": "ensure"} if operation == "indexes.build" else ({"agent_profile": profile_name, "agent_profile_fingerprint": sha256(canonical_json(profile)) if profile else None, "model": profile.get("model") if profile else None, "instructions_version": profile.get("instructions_version") if profile else None, "instruction_supplement": configured["step"].get("instruction_supplement", ""), "allowed_paths": (work.get("work_unit") or {}).get("allowed_paths", []), "tool_calls": [{"tool": "codex-cli", "sandbox": "read-only"}], "private_reasoning": "unavailable"} if operation in AGENT_OPERATIONS else ({**(source_routing_preview or {})} if operation == "sources.acquire" else {}))
     idempotency_key = sha256(canonical_json({"manifest_fingerprint": before["manifest_fingerprint"], "job_id": job_id, "step_id": step_id, "work_unit_id": (work.get("work_unit") or {}).get("id"), "source_generation_id": context["source_generation_id"], "diff_generation_id": context["diff_generation_id"], "canonical_generation_id": context["canonical_generation_id"], "parameters": configured["step"], "runtime_payload": runtime_payload}))
     accepted = store.accepted(idempotency_key)
     if accepted:
@@ -158,12 +158,12 @@ def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], boo
         raise
 
 
-def run_until_blocked(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], bool]], dict[str, Any]], store: EventStore, *, max_units: int = 100, actor: str = "local-user", select: Callable[[], dict[str, Any] | None] | None = None, approved_operations: set[str] | None = None, agent_profiles: dict[str, dict[str, Any]] | None = None, agent_executor: Callable[..., dict[str, Any]] | None = None) -> dict[str, Any]:
+def run_until_blocked(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], bool]], dict[str, Any]], store: EventStore, *, max_units: int = 100, actor: str = "local-user", select: Callable[[], dict[str, Any] | None] | None = None, approved_operations: set[str] | None = None, agent_profiles: dict[str, dict[str, Any]] | None = None, agent_executor: Callable[..., dict[str, Any]] | None = None, source_routing_preview: dict[str, str] | None = None) -> dict[str, Any]:
     if not 1 <= max_units <= 1000:
         raise ValueError("max_units must be 1..1000")
     runs = []
     for _ in range(max_units):
-        result = run_next(repo, invoke, store, actor, select, approved_operations, agent_profiles, agent_executor)
+        result = run_next(repo, invoke, store, actor, select, approved_operations, agent_profiles, agent_executor, source_routing_preview)
         runs.append(result)
         if result["result"] != "progressed":
             break

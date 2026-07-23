@@ -235,10 +235,10 @@ def _project_blockers(repo: Path) -> list[Blocker]:
         return [Blocker("project.invalid", str(exc), "project.configure")]
 
 
-def _source_blockers(repo: Path) -> list[Blocker]:
+def _source_blockers(repo: Path, *, deep: bool = True) -> list[Blocker]:
     from .sources import validate_active
     try:
-        validate_active(repo)
+        validate_active(repo, deep=deep)
         return []
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         return [Blocker("sources.invalid", str(exc), "sources.acquire")]
@@ -272,10 +272,10 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def status(repo: Path) -> dict[str, Any]:
+def status(repo: Path, *, deep: bool = True) -> dict[str, Any]:
     repo = repo.resolve()
     validate_workflow(repo)
-    checks = [_project_blockers(repo), _source_blockers(repo), _diff_blockers(repo)]
+    checks = [_project_blockers(repo), _source_blockers(repo, deep=deep), _diff_blockers(repo)]
     if not any(checks):
         diffs, mrqs, dispositions, approvals = _active_rows(repo)
         customer = {row["stable_diff_id"] for row in diffs if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"}
@@ -291,7 +291,7 @@ def status(repo: Path) -> dict[str, Any]:
         active = [item for item in mrqs if item.get("state") != "superseded"]
         checks.append([] if all(item.get("source_customization", {}).get("evidence") for item in active) else [Blocker("mrq.source_evidence", "active MRQ source evidence is incomplete", "mrq.discover-next")])
         checks.append([] if all(item.get("state") == "approved" and item.get("migration_decision", {}).get("decision") for item in active) else [Blocker("mrq.approvals", "active MRQ decisions are incomplete or unapproved", "mrq.decide-next")])
-        checks.append(_publication_blockers(repo, _pointer(repo, "active-generation.json").get("canonical_generation_id")))
+        checks.append(_publication_blockers(repo, _pointer(repo, "active-generation.json").get("canonical_generation_id"), deep=deep))
     while len(checks) < len(GATES):
         checks.append([Blocker("predecessor.blocked", "a predecessor gate is incomplete", "")])
     gates: list[Gate] = []
@@ -336,16 +336,16 @@ def projection_value(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _publication_blockers(repo: Path, generation: str | None) -> list[Blocker]:
+def _publication_blockers(repo: Path, generation: str | None, *, deep: bool = True) -> list[Blocker]:
     blockers = _projection_blockers(repo, generation)
-    if blockers:
+    if blockers or not deep:
         return blockers
     from .sources import validate_active
     from .diffs import validate_active as validate_active_diffs
     from .mrq import active as active_mrq
     from .contracts import require_tracked_clean
     try:
-        validate_active(repo, require_tracked_clean=True)
+        validate_active(repo, deep=True, require_tracked_clean=True)
         validate_active_diffs(repo, require_tracked_clean_state=True)
         active_mrq(repo, require_tracked_clean_state=True)
         require_tracked_clean(repo, [repo / "outputs/projections.json"])

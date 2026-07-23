@@ -3,8 +3,8 @@
   "type": "object",
   "required": ["schema_version", "acquisition_profile_id", "roles", "artifacts"],
   "properties": {
-    "schema_version": {"const": "1"},
-    "acquisition_profile_id": {"type": "string", "pattern": "^(ibcmd|designer)\\+(xml-hierarchical|v8unpack|edt-project)/v1$"},
+    "schema_version": {"enum": ["1", "2"]},
+    "acquisition_profile_id": {"type": "string"},
     "roles": {
       "type": "object",
       "required": ["vendor_baseline", "target_cf", "next_vendor"],
@@ -44,5 +44,15 @@
       "additionalProperties": false
     }
   },
+  "allOf": [
+    {
+      "if": {"properties": {"schema_version": {"const": "1"}}},
+      "then": {"properties": {"acquisition_profile_id": {"pattern": "^(ibcmd|designer)\\+(xml-hierarchical|v8unpack|edt-project)/v1$"}}}
+    },
+    {
+      "if": {"properties": {"schema_version": {"const": "2"}}},
+      "then": {"properties": {"acquisition_profile_id": {"enum": ["ibcmd+form-aware/v1", "designer+form-aware/v1"]}}}
+    }
+  ],
   "additionalProperties": false
 }

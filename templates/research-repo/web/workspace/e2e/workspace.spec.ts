@@ -5,7 +5,7 @@ test('opens repository workflow without CLI and shows bounded operational views'
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Исследование конфигурации 1С' })).toBeVisible();
   await page.getByRole('button', { name: 'Открыть репозиторий' }).click();
-  await page.getByRole('textbox', { name: 'Название' }).fill('Example');
+  await page.getByRole('textbox', { name: 'Название' }).fill('example');
   await page.getByRole('textbox', { name: 'Путь к репозиторию' }).fill(process.env.E2E_REPO!);
   await page.getByRole('button', { name: 'Открыть', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Диспетчер исследования' })).toBeVisible({ timeout: 30_000 });

@@ -17,7 +17,8 @@ from .contracts import ROLES, atomic_json, canonical_json, confined, external_id
 
 EXPORTERS = ("ibcmd", "designer")
 REPRESENTATIONS = ("xml-hierarchical", "v8unpack", "edt-project")
-PROFILES = {f"{exporter}+{representation}/v1": (exporter, representation) for exporter in EXPORTERS for representation in REPRESENTATIONS}
+PROFILES = {f"{exporter}+form-aware/v1": exporter for exporter in EXPORTERS}
+LEGACY_PROFILES = {f"{exporter}+{representation}/v1": (exporter, representation) for exporter in EXPORTERS for representation in REPRESENTATIONS}
 NORMALIZER_VERSION = "3"
 V8UNPACK_VERSION = "1.2.6"
 EDT_VERSION = "2024.2.5+16"
@@ -107,7 +108,7 @@ def validate_role_contract(repo: Path, tested_profiles: dict[str, dict[str, Any]
             raise ValueError(f"external artifact ID collision: {identifier}")
         seen_id[identifier] = preimage
         item["external_artifact_id"] = identifier
-    return {"schema_version": "1", "acquisition_profile_id": profile_id, "roles": roles, "artifacts": artifacts.get("artifacts", [])}
+    return {"schema_version": "2", "acquisition_profile_id": profile_id, "roles": roles, "artifacts": artifacts.get("artifacts", [])}
 
 
 def normalize_connection_identity(profile: dict[str, Any]) -> str:
@@ -166,12 +167,16 @@ def _run_command(run: callable, command: list[str], *, cancelled: callable | Non
 
 
 def _toolchain_versions(profile_id: str, platform: Path, *, timeout_seconds: int, run: callable, cancelled: callable | None = None) -> dict[str, str]:
-    exporter, representation = PROFILES[profile_id]
+    from .source_tools import classify_version
+    if profile_id in PROFILES:
+        exporter, representation = PROFILES[profile_id], None
+    else:
+        exporter, representation = LEGACY_PROFILES[profile_id]
     ibcmd = _run_command(run, [str(platform / "ibcmd"), "--version"], cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
-    match = re.search(r"\b8\.\d+\.\d+\.\d+\b", ibcmd.stdout)
-    if ibcmd.returncode or not match:
+    status, platform_version, _reason = classify_version("ibcmd", platform / "ibcmd", ibcmd.returncode, ibcmd.stdout)
+    if status != "ready":
         raise RuntimeError("ibcmd version preflight failed")
-    versions = {"platform": match.group(0), "exporter": exporter}
+    versions = {"platform": platform_version, "exporter": exporter}
     if exporter == "designer" and not (platform / "1cv8").is_file():
         raise RuntimeError("Designer executable preflight failed")
     if representation == "v8unpack":
@@ -179,24 +184,24 @@ def _toolchain_versions(profile_id: str, platform: Path, *, timeout_seconds: int
         if not executable:
             raise RuntimeError("v8unpack executable is unavailable")
         result = _run_command(run, [executable, "-h"], cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
-        converter = re.search(r"\bv8unpack\s+(\d+\.\d+\.\d+)\b", result.stdout)
-        if result.returncode or not converter or converter.group(1) != V8UNPACK_VERSION:
+        status, version, _reason = classify_version("v8unpack", Path(executable), result.returncode, result.stdout)
+        if status != "ready":
             raise RuntimeError(f"v8unpack {V8UNPACK_VERSION} is required")
-        versions["converter"] = f"v8unpack {converter.group(1)}"
+        versions["converter"] = f"v8unpack {version}"
     elif representation == "edt-project":
         executable = shutil.which("1cedtcli")
         resolved = str(Path(executable).resolve()) if executable else ""
-        converter = re.search(r"1c-edt-([^/]+?)-x86_64(?:/|$)", resolved)
-        if not converter or converter.group(1) != EDT_VERSION:
+        status, version, _reason = classify_version("edt", Path(resolved), 0, "")
+        if status != "ready":
             raise RuntimeError(f"1C:EDT {EDT_VERSION} is required")
-        versions["converter"] = f"1C:EDT {converter.group(1)}"
+        versions["converter"] = f"1C:EDT {version}"
     return versions
 
 
 def preflight_connection(profile_id: str, platform: Path, connection: dict[str, Any], *, timeout_seconds: int = 120, run: callable = subprocess.run, cancelled: callable | None = None) -> dict[str, Any]:
     if profile_id not in PROFILES:
         raise ValueError("unsupported acquisition profile")
-    exporter = PROFILES[profile_id][0]
+    exporter = PROFILES[profile_id]
     executable = platform / "ibcmd"
     toolchain_versions = _toolchain_versions(profile_id, platform, timeout_seconds=timeout_seconds, run=run, cancelled=cancelled)
     with tempfile.TemporaryDirectory(prefix="ibcmd-preflight-") as data_dir, tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as credentials:
@@ -259,11 +264,15 @@ def configuration_identity(root: Path) -> dict[str, str]:
     return {"uuid": identifier, "name": values["name"], "version": values.get("version", "")}
 
 
-def adapter_plan(profile_id: str, platform: Path, connection: dict[str, str], output: Path, extension_name: str | None = None, *, workspace: Path | None = None, project_name: str | None = None, timeout_seconds: int = 1800) -> list[list[str]]:
-    try:
-        exporter, representation = PROFILES[profile_id]
-    except KeyError as exc:
-        raise ValueError(f"unsupported acquisition profile: {profile_id}") from exc
+def adapter_plan(profile_id: str, platform: Path, connection: dict[str, str], output: Path, extension_name: str | None = None, *, representation: str | None = None, workspace: Path | None = None, project_name: str | None = None, timeout_seconds: int = 1800) -> list[list[str]]:
+    if profile_id in PROFILES:
+        exporter = PROFILES[profile_id]
+        if representation not in {"xml-hierarchical", "v8unpack"}:
+            raise ValueError("form-aware adapter requires a routed representation")
+    elif profile_id in LEGACY_PROFILES:
+        exporter, representation = LEGACY_PROFILES[profile_id]
+    else:
+        raise ValueError(f"unsupported acquisition profile: {profile_id}")
     output = output.resolve()
     extension = [f"--extension={extension_name}"] if extension_name else []
     if exporter == "ibcmd":
@@ -298,6 +307,14 @@ def clean_payload(root: Path) -> None:
     for path in sorted(root.rglob("*"), reverse=True):
         if path.name in NOISE_NAMES:
             shutil.rmtree(path) if path.is_dir() else path.unlink()
+
+
+def reject_links_and_special_files(root: Path) -> None:
+    import stat
+    for path in root.rglob("*"):
+        mode = path.lstat().st_mode
+        if path.is_symlink() or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            raise ValueError("source payload contains a link or special file")
 
 
 def normalize_payload(root: Path) -> None:
@@ -401,7 +418,119 @@ def draft_fingerprint(root: Path) -> str:
     return "sha256:" + sha256(canonical_json(file_manifest(root)))
 
 
-def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, normalizer_version: str = NORMALIZER_VERSION, timeout_seconds: int = 1800, run: callable = subprocess.run, upload_drafts: Path | None = None, cancelled: callable | None = None) -> dict[str, Any]:
+def routing_bindings(repo: Path, connections: dict[str, dict[str, Any]], upload_drafts: Path | None) -> dict[str, str]:
+    from .source_routing import PROBE_CONTRACT_VERSION
+    from .workflow import state_fingerprint
+    safe_connections = {
+        name: {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}}
+        for name, profile in sorted(connections.items())
+    }
+    return {
+        "workflow": "sha256:" + sha256((repo / "research/workflow.toml").read_bytes()),
+        "workflow_state": state_fingerprint(repo),
+        "infobases": "sha256:" + sha256((repo / "research/infobases.toml").read_bytes()),
+        "external_artifacts": "sha256:" + sha256((repo / "research/external-artifacts.toml").read_bytes()),
+        "connections": "sha256:" + sha256(canonical_json(safe_connections)),
+        "upload_draft": draft_fingerprint(upload_drafts) if upload_drafts else "sha256:" + sha256(canonical_json([])),
+        "probe_contract": PROBE_CONTRACT_VERSION,
+    }
+
+
+def _execute_plan(commands: list[list[str]], *, run: callable, timeout_seconds: int, cancelled: callable | None, subject: str) -> None:
+    for command in commands:
+        result = _run_command(run, command, cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
+        if result.returncode:
+            raise RuntimeError(f"source_route_failed:{subject}")
+
+
+def _check_cancelled(cancelled: callable | None, phase: str) -> None:
+    if cancelled and cancelled():
+        raise InterruptedError(f"source acquisition cancelled during {phase}")
+
+
+def _verified_artifact_source(upload_drafts: Path | None, member: dict[str, Any]) -> Path:
+    artifact = member["artifact"]
+    if not upload_drafts:
+        raise ValueError(f"external artifact upload draft is unavailable: {member['name']}")
+    filename = normalize_relative(str(artifact["filename"]))
+    source = confined(upload_drafts, f"{member['role']}/{member['name']}/{filename}")
+    if not source.is_file() or source.stat().st_size != artifact["declared_size_bytes"]:
+        raise ValueError(f"external artifact upload does not match declaration: {member['name']}")
+    import hashlib
+    hasher = hashlib.sha256()
+    with source.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    digest = hasher.hexdigest()
+    if artifact.get("sha256") and digest != str(artifact["sha256"]).removeprefix("sha256:").lower():
+        raise ValueError(f"external artifact upload does not match declaration: {member['name']}")
+    return source
+
+
+def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, timeout_seconds: int = 1800, run: callable = subprocess.run, upload_drafts: Path | None = None, cancelled: callable | None = None) -> dict[str, Any]:
+    from .source_routing import analyze_forms, component_members, plan_groups
+    tested = {name: {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}} for name, profile in connections.items()}
+    contract = validate_role_contract(repo, tested)
+    exporter = PROFILES[contract["acquisition_profile_id"]]
+    members = component_members(contract, connections)
+    with tempfile.TemporaryDirectory(prefix="source-routing-preview-") as temporary:
+        root = Path(temporary)
+        for member in members:
+            _check_cancelled(cancelled, "probe")
+            if member["kind"] in {"source-tree", "other"}:
+                continue
+            output = root / member["role"] / member["routing_group_id"].replace(":", "-")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            if member["kind"] in {"configuration", "extension"}:
+                connection = connections[contract["roles"][member["role"]]["connection_profile"]]
+                _execute_plan(
+                    adapter_plan(contract["acquisition_profile_id"], platform, connection, output, member["name"], representation="xml-hierarchical", timeout_seconds=timeout_seconds),
+                    run=run,
+                    timeout_seconds=timeout_seconds,
+                    cancelled=cancelled,
+                    subject=member["routing_group_id"],
+                )
+            else:
+                source = _verified_artifact_source(upload_drafts, member)
+                _execute_plan(
+                    [["v8unpack", "-E", str(source), str(output), "--temp", str(output.with_name(f".{output.name}.temp")), "--processes", "1"]],
+                    run=run,
+                    timeout_seconds=timeout_seconds,
+                    cancelled=cancelled,
+                    subject=member["routing_group_id"],
+                )
+            if not output.is_dir() or not any(path.is_file() for path in output.rglob("*")):
+                raise ValueError(f"source_probe_empty:{member['routing_group_id']}")
+            reject_links_and_special_files(output)
+            clean_payload(output)
+            normalize_payload(output)
+            _reject_secret_content(output)
+            if member["kind"] in {"configuration", "extension"}:
+                identity = configuration_identity(output)
+                expected = contract["roles"][member["role"]] if member["kind"] == "configuration" else member["extension"]
+                expected_uuid = str(expected["root_uuid"] if member["kind"] == "configuration" else expected["uuid"]).lower()
+                expected_name = expected["configuration_name"] if member["kind"] == "configuration" else expected["name"]
+                if identity["uuid"] != expected_uuid or identity["name"] != expected_name or expected.get("version") and identity["version"] != expected["version"]:
+                    raise ValueError(f"source_probe_identity_mismatch:{member['routing_group_id']}")
+            member["probe"] = analyze_forms(output, member["component_id"])
+        _check_cancelled(cancelled, "route")
+        tool_versions = _toolchain_versions(contract["acquisition_profile_id"], platform, timeout_seconds=min(timeout_seconds, 120), run=run, cancelled=cancelled)
+        manifest = plan_groups(members, exporter, tool_versions)
+        if any(group["representation_schema"] == "v8unpack/v1" for group in manifest["groups"]):
+            converter = _toolchain_versions(f"{exporter}+v8unpack/v1", platform, timeout_seconds=min(timeout_seconds, 120), run=run, cancelled=cancelled)
+            for group in manifest["groups"]:
+                if group["representation_schema"] == "v8unpack/v1":
+                    group["converter_version"] = converter["converter"]
+            manifest.pop("routing_manifest_fingerprint")
+            manifest["routing_manifest_fingerprint"] = "sha256:" + sha256(canonical_json(manifest))
+    bindings = routing_bindings(repo, connections, upload_drafts)
+    probe_results = sorted((member["probe"] for member in members if member.get("probe")), key=lambda item: item["component_id"])
+    required_tools = sorted({group["exporter"] for group in manifest["groups"] if group["exporter"] in {"ibcmd", "designer"}} | ({"v8unpack"} if any(group["representation_schema"] == "v8unpack/v1" for group in manifest["groups"]) else set()))
+    preimage = {"schema_version": "1", "bindings": bindings, "probe_results": probe_results, "routing_manifest": manifest, "required_tools": required_tools}
+    return {**preimage, "routing_plan_fingerprint": "sha256:" + sha256(canonical_json(preimage))}
+
+
+def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, routing_preview: dict[str, Any], normalizer_version: str = NORMALIZER_VERSION, timeout_seconds: int = 1800, run: callable = subprocess.run, upload_drafts: Path | None = None, cancelled: callable | None = None) -> dict[str, Any]:
     if shutil.disk_usage(repo).free < MINIMUM_FREE_BYTES:
         raise OSError("source acquisition requires at least 1 GiB free space")
     tested = {name: {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}} for name, profile in connections.items()}
@@ -411,97 +540,192 @@ def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], 
         fresh = preflight_connection(contract["acquisition_profile_id"], platform, connections[profile_name], timeout_seconds=min(timeout_seconds, 120), run=run, cancelled=cancelled)
         if fresh["tested_fingerprint"] != connections[profile_name].get("tested_fingerprint"):
             raise RuntimeError(f"connection profile changed since its saved test: {role}")
+    fresh_preview = build_routing_preview(repo, platform, connections, timeout_seconds=timeout_seconds, run=run, upload_drafts=upload_drafts, cancelled=cancelled)
+    if routing_preview.get("routing_plan_fingerprint") != fresh_preview["routing_plan_fingerprint"]:
+        raise RuntimeError("routing_preview_stale")
+    from .source_routing import component_members, source_comparison_epoch
+    members = component_members(contract, connections)
+    groups = {item["routing_group_id"]: item for item in fresh_preview["routing_manifest"]["groups"]}
+    probes = {item["component_id"]: item for item in fresh_preview["probe_results"]}
     pointer_path = repo / "research/active-source-generation.json"
     expected_generation = json.loads(pointer_path.read_text(encoding="utf-8")).get("generation_id") if pointer_path.is_file() else None
     staging_parent = repo / "sources/.staging"; staging_parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="acquire-", dir=staging_parent) as temporary:
         staging = Path(temporary)
-        work_root = staging / ".work"
+        work_root = staging / ".work"; work_root.mkdir()
         for role in ROLES:
-            profile_name = contract["roles"][role]["connection_profile"]
-            connection = connections.get(profile_name)
-            if not connection or not isinstance(connection.get("extensions"), list):
-                raise ValueError(f"current extension enumeration is required: {role}")
-            role_root = staging / role; role_root.mkdir()
-            role_work = work_root / role
-            role_work.mkdir(parents=True)
-            components: list[tuple[dict[str, Any] | None, Path]] = [(None, role_root / "configuration")]
-            seen_extensions: set[str] = set()
-            for extension in connection["extensions"]:
-                uuid = str(extension.get("uuid", "")).lower(); name = str(extension.get("name", "")).strip()
-                if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", uuid) or uuid in seen_extensions or not name or not isinstance(extension.get("active"), bool):
-                    raise ValueError(f"invalid or duplicate extension UUID: {role}")
-                seen_extensions.add(uuid)
-                components.append((extension, role_root / f"extensions/{uuid}"))
-            for extension, output in components:
-                extension_name = str(extension["name"]) if extension else None
-                output.parent.mkdir(parents=True, exist_ok=True)
-                component_name = "base" if extension is None else f"ext-{extension['uuid']}"
-                representation = PROFILES[contract["acquisition_profile_id"]][1]
-                work_output = role_work / (f"workspace/{component_name}" if representation == "edt-project" else f"projects/{component_name}")
-                work_output.parent.mkdir(parents=True, exist_ok=True)
-                for command in adapter_plan(contract["acquisition_profile_id"], platform, connection, work_output, extension_name or None, workspace=role_work / "workspace", project_name=component_name, timeout_seconds=timeout_seconds):
-                    result = _run_command(run, command, cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
-                    if result.returncode:
-                        raise RuntimeError(f"source exporter/converter failed for {role} with exit {result.returncode}")
+            (staging / role).mkdir()
+        for member in members:
+            _check_cancelled(cancelled, "export")
+            group = groups[member["routing_group_id"]]
+            role = member["role"]
+            if member["kind"] == "configuration":
+                output = staging / role / "configuration"
+            elif member["kind"] == "extension":
+                output = staging / role / "extensions" / member["routing_group_id"].split(":", 1)[1]
+            else:
+                output = staging / role / "external" / member["name"]
+            output.parent.mkdir(parents=True, exist_ok=True)
+            work_output = work_root / role / member["routing_group_id"].replace(":", "-")
+            if member["kind"] in {"configuration", "extension"}:
+                connection = connections[contract["roles"][role]["connection_profile"]]
+                representation = group["representation_schema"].removesuffix("/v1")
+                _execute_plan(
+                    adapter_plan(contract["acquisition_profile_id"], platform, connection, work_output, member["name"], representation=representation, timeout_seconds=timeout_seconds),
+                    run=run,
+                    timeout_seconds=timeout_seconds,
+                    cancelled=cancelled,
+                    subject=member["routing_group_id"],
+                )
                 if not work_output.is_dir() or not any(path.is_file() for path in work_output.rglob("*")):
-                    raise ValueError(f"empty acquisition component: {role}")
+                    raise ValueError(f"source_export_empty:{member['routing_group_id']}")
+                reject_links_and_special_files(work_output)
                 shutil.copytree(work_output, output)
                 normalize_payload(output)
-                identity = configuration_identity(output); actual_uuid = identity["uuid"]
-                if extension is None and (actual_uuid != str(contract["roles"][role]["root_uuid"]).lower() or identity["name"] != contract["roles"][role]["configuration_name"] or identity["version"] != contract["roles"][role]["version"]):
-                    raise ValueError(f"main configuration identity mismatch: {role}; expected {contract['roles'][role]['configuration_name']}/{contract['roles'][role]['root_uuid']}/{contract['roles'][role]['version']}, actual {identity['name']}/{actual_uuid}/{identity['version']}")
-                if extension is not None:
-                    declared_uuid = str(extension.get("uuid", "")).lower()
-                    if declared_uuid != actual_uuid or identity["name"] != extension_name or extension.get("version") and identity["version"] != extension["version"]: raise ValueError(f"extension identity mismatch: {role}/{extension_name}")
-                payload = file_manifest(output)
-                metadata = {"schema_version": "1", "kind": "configuration" if extension_name is None else "extension", "name": contract["roles"][role]["configuration_name"] if extension_name is None else extension_name, "version": contract["roles"][role]["version"] if extension_name is None else next((item.get("version", "") for item in connection["extensions"] if item.get("name") == extension_name), ""), "representation_schema": PROFILES[contract["acquisition_profile_id"]][1], "payload_file_count": len(payload), "payload_fingerprint": "sha256:" + sha256(canonical_json(payload))}
-                metadata["uuid"] = actual_uuid
-                if extension_name is not None:
-                    metadata["active"] = extension["active"]
-                atomic_json(output / "component-manifest.json", metadata)
-            for artifact in (item for item in contract["artifacts"] if item["role"] == role):
-                identifier = artifact["external_artifact_id"]
-                filename = normalize_relative(str(artifact.get("filename", "")))
-                if not upload_drafts:
-                    raise ValueError(f"external artifact upload draft is unavailable: {identifier}")
-                source = confined(upload_drafts, f"{role}/{identifier}/{filename}")
-                if not source.is_file():
-                    raise ValueError(f"external artifact upload is missing: {identifier}")
-                import hashlib
-                checksum = hashlib.sha256()
-                with source.open("rb") as uploaded:
-                    for chunk in iter(lambda: uploaded.read(1024 * 1024), b""):
-                        checksum.update(chunk)
-                size = source.stat().st_size; digest = checksum.hexdigest()
-                if size != artifact["declared_size_bytes"] or artifact.get("sha256") and digest != str(artifact["sha256"]).removeprefix("sha256:").lower():
-                    raise ValueError(f"external artifact upload does not match declaration: {identifier}")
-                target = role_root / "external" / identifier; target.mkdir(parents=True)
-                source_available = False
-                if artifact["kind"] == "source-tree":
-                    _extract_source_tree(source, target / "source"); source_available = True
+                identity = configuration_identity(output)
+                if member["kind"] == "configuration":
+                    expected = contract["roles"][role]
+                    if (identity["uuid"], identity["name"], identity["version"]) != (str(expected["root_uuid"]).lower(), expected["configuration_name"], expected["version"]):
+                        raise ValueError(f"source_identity_mismatch:{member['routing_group_id']}")
                 else:
-                    shutil.copy2(source, target / filename)
-                    _reject_secret_content(target)
-                    if artifact["kind"] in {"epf", "erf"} and PROFILES[contract["acquisition_profile_id"]][1] == "v8unpack":
-                        extracted = target / "source"
-                        command = ["v8unpack", "-E", str(target / filename), str(extracted), "--temp", str(role_work / f"external-{identifier}-temp"), "--processes", "1"]
-                        result = _run_command(run, command, cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
-                        if result.returncode == 0 and extracted.is_dir() and any(path.is_file() for path in extracted.rglob("*")):
-                            clean_payload(extracted); _reject_secret_content(extracted); source_available = True
-                        else:
-                            shutil.rmtree(extracted, ignore_errors=True)
-                artifact_toml = f'schema_version = "1"\nid = "{identifier}"\nkind = {json.dumps(artifact["kind"])}\nsemantic_key = {json.dumps(artifact["semantic_key"], ensure_ascii=False)}\nfilename = {json.dumps(filename, ensure_ascii=False)}\nsize_bytes = {size}\nsha256 = "{digest}"\nsource_status = "{"available" if source_available else "missing"}"\n'
-                (target / "artifact.toml").write_text(artifact_toml, encoding="utf-8")
+                    extension = member["extension"]
+                    if identity["uuid"] != str(extension["uuid"]).lower() or identity["name"] != extension["name"] or extension.get("version") and identity["version"] != extension["version"]:
+                        raise ValueError(f"source_identity_mismatch:{member['routing_group_id']}")
+            else:
+                source = _verified_artifact_source(upload_drafts, member)
+                output.mkdir()
+                if member["kind"] in {"epf", "erf"}:
+                    extracted = output / "source"
+                    _execute_plan(
+                        [["v8unpack", "-E", str(source), str(extracted), "--temp", str(work_output.with_suffix(".temp")), "--processes", "1"]],
+                        run=run,
+                        timeout_seconds=timeout_seconds,
+                        cancelled=cancelled,
+                        subject=member["routing_group_id"],
+                    )
+                    if not extracted.is_dir() or not any(path.is_file() for path in extracted.rglob("*")):
+                        raise ValueError(f"source_export_empty:{member['routing_group_id']}")
+                    reject_links_and_special_files(extracted)
+                    clean_payload(extracted); normalize_payload(extracted); _reject_secret_content(extracted)
+                elif member["kind"] == "source-tree":
+                    _extract_source_tree(source, output / "source")
+                else:
+                    shutil.copy2(source, output / normalize_relative(member["artifact"]["filename"]))
+                    _reject_secret_content(output)
+            _check_cancelled(cancelled, "validation")
+            payload = file_manifest(output)
+            probe = probes.get(member["component_id"], {})
+            metadata = {
+                "schema_version": "2",
+                "component_id": member["component_id"],
+                "kind": member["kind"],
+                "routing_group_id": member["routing_group_id"],
+                "probe_contract_version": probe.get("probe_contract_version", ""),
+                "probe_fingerprint": probe.get("probe_fingerprint", ""),
+                "form_counts": probe.get("form_counts", {"managed": 0, "ordinary": 0, "inconclusive": 0}),
+                "routing_reason": group["routing_reason"],
+                "exporter": group["exporter"],
+                "representation_schema": group["representation_schema"],
+                "exporter_version": group["exporter_version"],
+                "converter_version": group["converter_version"],
+                "payload_file_count": len(payload),
+                "payload_fingerprint": "sha256:" + sha256(canonical_json(payload)),
+            }
+            atomic_json(output / "component-manifest.json", metadata)
         shutil.rmtree(work_root)
-        if validate_role_contract(repo, tested) != contract:
-            raise RuntimeError("source declarations changed during acquisition")
-        return publish(repo, staging, contract, normalizer_version, expected_generation)
+        if validate_role_contract(repo, tested) != contract or routing_bindings(repo, connections, upload_drafts) != fresh_preview["bindings"]:
+            raise RuntimeError("routing_preview_stale")
+        _check_cancelled(cancelled, "publication")
+        return publish_routed(repo, staging, contract, fresh_preview["routing_manifest"], normalizer_version, expected_generation, source_comparison_epoch)
+
+
+def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], routing_manifest: dict[str, Any], normalizer_version: str, expected_generation: str | None, epoch_builder: callable) -> dict[str, Any]:
+    manifest_preimage = {key: value for key, value in routing_manifest.items() if key != "routing_manifest_fingerprint"}
+    if routing_manifest.get("routing_manifest_fingerprint") != "sha256:" + sha256(canonical_json(manifest_preimage)):
+        raise ValueError("routing manifest fingerprint mismatch")
+    with repository_lock(repo):
+        pointer_path = repo / "research/active-source-generation.json"
+        current = json.loads(pointer_path.read_text(encoding="utf-8")).get("generation_id") if pointer_path.is_file() else None
+        if current != expected_generation:
+            raise RuntimeError("stale active source generation")
+        role_manifests, role_fingerprints = {}, {}
+        for role in ROLES:
+            role_root = confined(staged_roles, role)
+            if not (role_root / "configuration").is_dir():
+                raise ValueError(f"staged role is incomplete: {role}")
+            clean_payload(role_root)
+            role_manifests[role] = file_manifest(role_root)
+            role_fingerprints[role] = "sha256:" + sha256(canonical_json(role_manifests[role]))
+        safe_contract = json.loads(canonical_json(contract))
+        reject_secrets(safe_contract, "source contract")
+        contract_fingerprint = "sha256:" + sha256(canonical_json(safe_contract))
+        routing_fingerprint = routing_manifest["routing_manifest_fingerprint"]
+        preimage = {
+            "source_contract_fingerprint": contract_fingerprint,
+            "normalizer_version": normalizer_version,
+            "roles": role_fingerprints,
+            "routing_manifest_fingerprint": routing_fingerprint,
+        }
+        generation_id = sha256(canonical_json(preimage))
+        destination = repo / "sources/generations" / generation_id
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists():
+            temporary = Path(tempfile.mkdtemp(prefix=f".{generation_id}.", dir=destination.parent))
+            try:
+                for role in ROLES:
+                    shutil.copytree(staged_roles / role, temporary / role)
+                (temporary / "source-contract.json").write_bytes(canonical_json(safe_contract) + b"\n")
+                (temporary / "routing-manifest.json").write_bytes(canonical_json(routing_manifest) + b"\n")
+                for path in temporary.rglob("*"):
+                    if path.is_file():
+                        with path.open("rb") as stream:
+                            os.fsync(stream.fileno())
+                os.replace(temporary, destination)
+                parent_fd = os.open(destination.parent, os.O_RDONLY)
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+            finally:
+                shutil.rmtree(temporary, ignore_errors=True)
+        if (destination / "source-contract.json").read_bytes() != canonical_json(safe_contract) + b"\n" or (destination / "routing-manifest.json").read_bytes() != canonical_json(routing_manifest) + b"\n":
+            raise RuntimeError("existing routed source generation is inconsistent")
+        if any(file_manifest(destination / role) != role_manifests[role] for role in ROLES):
+            raise RuntimeError("existing routed source generation role payload is inconsistent")
+        components = []
+        for role in ROLES:
+            for manifest_path in sorted((destination / role).rglob("component-manifest.json")):
+                component = json.loads(manifest_path.read_text(encoding="utf-8"))
+                path = manifest_path.parent
+                components.append({
+                    "component_id": component["component_id"],
+                    "kind": component["kind"],
+                    "path": path.relative_to(destination).as_posix(),
+                    "representation_schema": component["representation_schema"],
+                    "routing_group_id": component["routing_group_id"],
+                    "fingerprint": "sha256:" + sha256(canonical_json(file_manifest(path))),
+                })
+        pointer = {
+            "schema_version": "2",
+            "generation_id": generation_id,
+            "acquisition_profile_id": contract["acquisition_profile_id"],
+            "normalizer_version": normalizer_version,
+            "source_contract_fingerprint": contract_fingerprint,
+            "roles": role_fingerprints,
+            "routing_manifest_path": "routing-manifest.json",
+            "routing_manifest_fingerprint": routing_fingerprint,
+            "components": components,
+        }
+        pointer["source_comparison_epoch_fingerprint"] = epoch_builder(pointer, routing_manifest)
+        atomic_json(pointer_path, pointer)
+        return pointer
 
 
 def publish(repo: Path, staged_roles: Path, contract: dict[str, Any], normalizer_version: str = NORMALIZER_VERSION, expected_generation: str | None | object = _UNSET) -> dict[str, Any]:
     profile_id = contract["acquisition_profile_id"]
-    representation = PROFILES[profile_id][1]
+    if profile_id not in LEGACY_PROFILES:
+        raise ValueError("routed source publication requires a routing manifest")
+    representation = LEGACY_PROFILES[profile_id][1]
     with repository_lock(repo):
         pointer_path = repo / "research/active-source-generation.json"
         current_generation = json.loads(pointer_path.read_text(encoding="utf-8")).get("generation_id") if pointer_path.is_file() else None
@@ -561,8 +785,13 @@ def publish(repo: Path, staged_roles: Path, contract: dict[str, Any], normalizer
 
 def validate_active(repo: Path, *, deep: bool = False, require_tracked_clean: bool = False) -> dict[str, Any]:
     import subprocess
+    deep = deep or require_tracked_clean
     pointer_path = repo / "research/active-source-generation.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    if pointer.get("schema_version") == "2":
+        return _validate_active_routed(repo, pointer, deep=deep, require_tracked_clean=require_tracked_clean)
+    if pointer.get("schema_version") != "1":
+        raise ValueError("unsupported active source schema version")
     generation_id = str(pointer.get("generation_id", ""))
     if not generation_id or generation_id != Path(generation_id).name:
         raise ValueError("invalid active source generation ID")
@@ -584,13 +813,126 @@ def validate_active(repo: Path, *, deep: bool = False, require_tracked_clean: bo
             raise ValueError(f"active source role fingerprint is missing: {role}")
     if deep and actual != pointer.get("roles"):
         raise ValueError("active source role fingerprint mismatch")
-    if not isinstance(pointer.get("components"), list) or any(not str(item.get("component_id", "")) or not confined(root, str(item.get("path", ""))).is_dir() or item.get("fingerprint") != "sha256:" + sha256(canonical_json(file_manifest(confined(root, item["path"])))) for item in pointer["components"]):
+    if not isinstance(pointer.get("components"), list) or any(not str(item.get("component_id", "")) or not confined(root, str(item.get("path", ""))).is_dir() for item in pointer["components"]):
+        raise ValueError("active source component catalog is missing or stale")
+    if deep and any(item.get("fingerprint") != "sha256:" + sha256(canonical_json(file_manifest(confined(root, item["path"])))) for item in pointer["components"]):
         raise ValueError("active source component catalog is missing or stale")
     preimage = {"schema_version": "1", "acquisition_profile_version": "1", "normalizer_version": pointer["normalizer_version"], "source_contract_sha256": pointer["source_contract_sha256"], "roles": pointer["roles"]}
     if sha256(canonical_json(preimage)) != generation_id:
         raise ValueError("active source generation ID mismatch")
     current_infobases, current_artifacts = load_contract(repo)
     current_contract = {"schema_version": "1", "acquisition_profile_id": current_infobases.get("acquisition_profile"), "roles": current_infobases.get("roles", {}), "artifacts": current_artifacts.get("artifacts", [])}
+    active_contract = {**contract, "artifacts": [{key: value for key, value in item.items() if key != "external_artifact_id"} for item in contract.get("artifacts", [])]}
+    if canonical_json(current_contract) != canonical_json(active_contract):
+        raise ValueError("tracked source declarations changed; reacquisition is required")
+    return pointer
+
+
+def _validate_active_routed(repo: Path, pointer: dict[str, Any], *, deep: bool, require_tracked_clean: bool) -> dict[str, Any]:
+    generation_id = str(pointer.get("generation_id", ""))
+    if len(generation_id) != 64 or generation_id != Path(generation_id).name:
+        raise ValueError("invalid active source generation ID")
+    root = confined(repo / "sources/generations", generation_id)
+    pointer_path = repo / "research/active-source-generation.json"
+    if require_tracked_clean:
+        validate_tracked_clean(repo, [root, pointer_path])
+    contract = json.loads((root / "source-contract.json").read_text(encoding="utf-8"))
+    reject_secrets(contract, "active source contract")
+    contract_fingerprint = "sha256:" + sha256(canonical_json(contract))
+    if contract_fingerprint != pointer.get("source_contract_fingerprint"):
+        raise ValueError("active source contract fingerprint mismatch")
+    manifest = json.loads((root / "routing-manifest.json").read_text(encoding="utf-8"))
+    manifest_preimage = {key: value for key, value in manifest.items() if key != "routing_manifest_fingerprint"}
+    manifest_fingerprint = "sha256:" + sha256(canonical_json(manifest_preimage))
+    if manifest_fingerprint != manifest.get("routing_manifest_fingerprint") or manifest_fingerprint != pointer.get("routing_manifest_fingerprint"):
+        raise ValueError("active source routing manifest fingerprint mismatch")
+    groups = {group["routing_group_id"]: group for group in manifest.get("groups", [])}
+    if len(groups) != len(manifest.get("groups", [])):
+        raise ValueError("duplicate source routing group")
+    group_keys = {"routing_group_id", "kind", "members", "absent_roles", "probe_contract_version", "probe_fingerprints", "form_counts", "routing_reason", "exporter", "representation_schema", "exporter_version", "converter_version"}
+    reasons = {"managed_only", "ordinary_form_present", "inconclusive_form_payload", "no_forms", "binary_container_requires_v8unpack", "declared_source_tree", "raw_artifact"}
+    representations = {"xml-hierarchical/v1", "v8unpack/v1", "source-tree/v1", "raw-binary/v1"}
+    for group in groups.values():
+        member_roles = [member.get("role") for member in group.get("members", [])]
+        if (
+            set(group) != group_keys
+            or group.get("routing_reason") not in reasons
+            or group.get("representation_schema") not in representations
+            or group.get("exporter") not in {"ibcmd", "designer", "verified-upload"}
+            or sorted(member_roles + group.get("absent_roles", [])) != sorted(ROLES)
+            or len(member_roles) != len(set(member_roles))
+            or set(group.get("form_counts", {})) != {"managed", "ordinary", "inconclusive"}
+        ):
+            raise ValueError("invalid source routing group contract")
+    actual_roles = {}
+    catalog = {}
+    for role in ROLES:
+        role_root = confined(root, role)
+        if not role_root.is_dir():
+            raise ValueError(f"active source role is missing: {role}")
+        actual_roles[role] = _immutable_role_fingerprint(str(role_root.resolve())) if deep else pointer.get("roles", {}).get(role, "")
+    if any(not str(value).startswith("sha256:") for value in actual_roles.values()) or deep and actual_roles != pointer.get("roles"):
+        raise ValueError("active source role fingerprint mismatch")
+    for item in pointer.get("components", []):
+        component_root = confined(root, str(item.get("path", "")))
+        component = json.loads((component_root / "component-manifest.json").read_text(encoding="utf-8"))
+        payload_manifest = [entry for entry in file_manifest(component_root) if entry["path"] != "component-manifest.json"] if deep else []
+        group = groups.get(component.get("routing_group_id"))
+        component_keys = {"schema_version", "component_id", "kind", "routing_group_id", "probe_contract_version", "probe_fingerprint", "form_counts", "routing_reason", "exporter", "representation_schema", "exporter_version", "converter_version", "payload_file_count", "payload_fingerprint"}
+        counts_valid = set(component.get("form_counts", {})) == {"managed", "ordinary", "inconclusive"} and all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in component.get("form_counts", {}).values())
+        probe_valid = component.get("probe_contract_version") in {"", "form-probe/v1"} and (component.get("probe_fingerprint") == "" or re.fullmatch(r"sha256:[0-9a-f]{64}", str(component.get("probe_fingerprint"))) is not None)
+        form_route = component.get("routing_reason") in {"managed_only", "ordinary_form_present", "inconclusive_form_payload", "no_forms"}
+        if (
+            set(component) != component_keys
+            or component.get("schema_version") != "2"
+            or not counts_valid
+            or not probe_valid
+            or (form_route and component.get("kind") not in {"configuration", "extension"})
+            or (component.get("representation_schema") == "xml-hierarchical/v1" and component.get("routing_reason") not in {"managed_only", "no_forms"})
+            or (component.get("representation_schema") == "v8unpack/v1" and component.get("routing_reason") not in {"ordinary_form_present", "inconclusive_form_payload", "binary_container_requires_v8unpack"})
+            or item.get("component_id") != component.get("component_id")
+            or item.get("routing_group_id") != component.get("routing_group_id")
+            or item.get("representation_schema") != component.get("representation_schema")
+            or not group
+            or not any(member["component_id"] == component["component_id"] for member in group["members"])
+            or component["representation_schema"] != group["representation_schema"]
+            or component["routing_reason"] != group["routing_reason"]
+            or component["exporter"] != group["exporter"]
+            or component["exporter_version"] != group["exporter_version"]
+            or component["converter_version"] != group["converter_version"]
+            or deep and component["payload_file_count"] != len(payload_manifest)
+            or deep and component["payload_fingerprint"] != "sha256:" + sha256(canonical_json(payload_manifest))
+            or deep and item.get("fingerprint") != "sha256:" + sha256(canonical_json(file_manifest(component_root)))
+        ):
+            raise ValueError("active source component catalog is missing or stale")
+        catalog[component["component_id"]] = component
+    expected_members = {member["component_id"] for group in groups.values() for member in group["members"]}
+    if set(catalog) != expected_members or len(catalog) != len(pointer.get("components", [])):
+        raise ValueError("active source routing coverage mismatch")
+    for group in groups.values():
+        group_components = [catalog[member["component_id"]] for member in group["members"]]
+        expected_probes = sorted(
+            ({"component_id": component["component_id"], "probe_fingerprint": component["probe_fingerprint"]} for component in group_components if component["probe_fingerprint"]),
+            key=lambda item: item["component_id"],
+        )
+        counts = {kind: sum(component["form_counts"][kind] for component in group_components) for kind in ("managed", "ordinary", "inconclusive")}
+        if expected_probes != group["probe_fingerprints"] or counts != group["form_counts"]:
+            raise ValueError("active source routing evidence mismatch")
+    if deep and any(path.is_symlink() or path.name.startswith(".work") or path.suffix.lower() in {".cf", ".cfe", ".epf", ".erf"} for path in root.rglob("*")):
+        raise ValueError("active source generation contains temporary or binary payload")
+    preimage = {
+        "source_contract_fingerprint": contract_fingerprint,
+        "normalizer_version": pointer["normalizer_version"],
+        "roles": pointer["roles"],
+        "routing_manifest_fingerprint": manifest_fingerprint,
+    }
+    if sha256(canonical_json(preimage)) != generation_id:
+        raise ValueError("active source generation ID mismatch")
+    from .source_routing import source_comparison_epoch
+    if pointer.get("source_comparison_epoch_fingerprint") != source_comparison_epoch(pointer, manifest):
+        raise ValueError("active source comparison epoch mismatch")
+    current_infobases, current_artifacts = load_contract(repo)
+    current_contract = {"schema_version": contract.get("schema_version"), "acquisition_profile_id": current_infobases.get("acquisition_profile"), "roles": current_infobases.get("roles", {}), "artifacts": current_artifacts.get("artifacts", [])}
     active_contract = {**contract, "artifacts": [{key: value for key, value in item.items() if key != "external_artifact_id"} for item in contract.get("artifacts", [])]}
     if canonical_json(current_contract) != canonical_json(active_contract):
         raise ValueError("tracked source declarations changed; reacquisition is required")

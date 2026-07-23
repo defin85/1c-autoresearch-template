@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import fcntl
+import re
 import time
 import threading
 from contextlib import asynccontextmanager
@@ -37,6 +38,8 @@ class ActionBody(BaseModel):
 class RunBody(BaseModel):
     expected_fingerprint: str
     approved_operations: list[str] = Field(default_factory=list)
+    source_routing_preview_id: str | None = None
+    routing_plan_fingerprint: str | None = None
     max_units: int = Field(default=100, ge=1, le=1000)
 
 
@@ -142,7 +145,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
     @app.get("/api/v1/projects/{project_id}/workflow")
     def snapshot(project_id: str):
         from .workflow import attach_dispatcher
-        return attach_dispatcher(ApplicationService(repo(project_id)).snapshot(), repo(project_id), operational)
+        return attach_dispatcher(ApplicationService(repo(project_id)).snapshot(deep=False), repo(project_id), operational)
 
     @app.get("/api/v1/projects/{project_id}/workflow/next")
     def next_work(project_id: str): return ApplicationService(repo(project_id)).next()
@@ -158,7 +161,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
     def run_next_step(project_id: str, body: RunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
         mutation(request, idempotency_key); project = repo(project_id)
         from .user_state import load_agent_profiles, load_connections
-        service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts")
+        preview_root = operational / "projects" / project_id / "source-routing-previews"
+        service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts", routing_previews=preview_root)
         from .runner import run_next
         store = EventStore(operational / "projects", project_id)
         result_path = store.root / ("idempotency-" + sha256(idempotency_key.encode()) + ".json")
@@ -170,7 +174,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             if body.expected_fingerprint != service.snapshot()["workflow_fingerprint"]: raise RuntimeError("stale workflow fingerprint")
             invoke = lambda operation, payload, cancelled: service.apply(operation, payload, service.snapshot()["workflow_fingerprint"], cancelled)
             if set(body.approved_operations) - {"sources.acquire", "mrq.discover-next", "mrq.decide-next"}: raise ValueError("unsupported run approval")
-            result = run_next(service.repo, invoke, store, select=service.next, approved_operations=set(body.approved_operations), agent_profiles=load_agent_profiles(project, operational))
+            source_preview = {"source_routing_preview_id": body.source_routing_preview_id, "routing_plan_fingerprint": body.routing_plan_fingerprint} if body.source_routing_preview_id and body.routing_plan_fingerprint else None
+            result = run_next(service.repo, invoke, store, select=service.next, approved_operations=set(body.approved_operations), agent_profiles=load_agent_profiles(project, operational), source_routing_preview=source_preview)
             from .contracts import atomic_json
             atomic_json(result_path, result)
             return result
@@ -179,7 +184,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
     def run_until(project_id: str, body: RunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
         mutation(request, idempotency_key); project = repo(project_id)
         from .user_state import load_agent_profiles, load_connections
-        service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts")
+        preview_root = operational / "projects" / project_id / "source-routing-previews"
+        service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts", routing_previews=preview_root)
         if set(body.approved_operations) - {"sources.acquire", "mrq.discover-next", "mrq.decide-next"}: raise ValueError("unsupported run approval")
         from .runner import run_until_blocked
         store = EventStore(operational / "projects", project_id)
@@ -190,7 +196,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 result = json.loads(result_path.read_text(encoding="utf-8")); result["snapshot"] = service.snapshot(); return result
             if body.expected_fingerprint != service.snapshot()["workflow_fingerprint"]: raise RuntimeError("stale workflow fingerprint")
             invoke = lambda operation, payload, cancelled: service.apply(operation, payload, service.snapshot()["workflow_fingerprint"], cancelled)
-            result = run_until_blocked(service.repo, invoke, store, max_units=body.max_units, select=service.next, approved_operations=set(body.approved_operations), agent_profiles=load_agent_profiles(project, operational))
+            source_preview = {"source_routing_preview_id": body.source_routing_preview_id, "routing_plan_fingerprint": body.routing_plan_fingerprint} if body.source_routing_preview_id and body.routing_plan_fingerprint else None
+            result = run_until_blocked(service.repo, invoke, store, max_units=body.max_units, select=service.next, approved_operations=set(body.approved_operations), agent_profiles=load_agent_profiles(project, operational), source_routing_preview=source_preview)
             from .contracts import atomic_json
             atomic_json(result_path, result)
             return result
@@ -204,7 +211,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
     @app.get("/api/v1/projects/{project_id}/dispatcher")
     def dispatcher_projection(project_id: str):
         from .workflow import attach_dispatcher
-        snapshot = attach_dispatcher(ApplicationService(repo(project_id)).snapshot(), repo(project_id), operational)
+        snapshot = attach_dispatcher(ApplicationService(repo(project_id)).snapshot(deep=False), repo(project_id), operational)
         return snapshot.get("dispatcher", {"schema_version": "1", "revision": 0, "fresh_at": "", "circuits": [], "jobs": {}})
 
     @app.post("/api/v1/projects/{project_id}/dispatcher/{job_id}/{action}")
@@ -370,12 +377,112 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         infobases, artifacts = load_contract(repo(project_id))
         from .user_state import load_connections
         available = load_connections(repo(project_id), operational)
-        summaries = {name: {"available": True, "kind": value.get("kind"), "tested": current_profile_test(value, infobases["acquisition_profile"]), "profile_id": value.get("profile_id"), "extensions": value.get("extensions", []), "extension_count": len(value.get("extensions", [])), "tool_versions": value.get("tool_versions", {})} for name, value in available.items()}
+        summaries = {name: {"available": True, "kind": value.get("kind"), "tested": current_profile_test(value, infobases["acquisition_profile"]), "profile_id": value.get("profile_id"), "platform_path": value.get("platform_path", ""), "extensions": value.get("extensions", []), "extension_count": len(value.get("extensions", [])), "tool_versions": value.get("tool_versions", {})} for name, value in available.items()}
         drafts = operational / "projects" / project_id / "upload-drafts"
         declared = [{**item, "external_artifact_id": external_id(item["kind"], item["semantic_key"]), "uploaded": (drafts / item["role"] / external_id(item["kind"], item["semantic_key"]) / item["filename"]).is_file()} for item in artifacts.get("artifacts", [])]
         project = repo(project_id)
         pointer = lambda name: json.loads((project / "research" / name).read_text(encoding="utf-8")) if (project / "research" / name).is_file() else {}
         return {"profiles": sorted(PROFILES), "infobases": infobases, "infobases_fingerprint": "sha256:" + sha256((project / "research/infobases.toml").read_bytes()), "external_artifacts": {"schema_version": artifacts.get("schema_version"), "artifacts": declared}, "upload_draft_fingerprint": draft_fingerprint(drafts), "connection_profiles": summaries, "active_source": pointer("active-source-generation.json"), "active_diff": pointer("active-diff-generation.json")}
+
+    @app.get("/api/v1/projects/{project_id}/source-tools")
+    def source_tools(project_id: str):
+        project = repo(project_id)
+        from .source_tools import discover_tools
+        from .user_state import load_connections
+        roots = [str(item.get("platform_path", "")) for item in load_connections(project, operational).values()]
+        return discover_tools(roots)
+
+    @app.post("/api/v1/projects/{project_id}/source-routing-previews", status_code=202)
+    def create_source_routing_preview(project_id: str, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key)
+        project = repo(project_id)
+        from .contracts import atomic_json
+        from .user_state import load_connections, workspace_id
+        connections = load_connections(project, operational)
+        roots = {str(item.get("platform_path", "")) for item in connections.values()}
+        if len(roots) != 1 or not next(iter(roots)):
+            raise ValueError("one generation-wide platform path is required")
+        preview_root = operational / "projects" / project_id / "source-routing-previews"
+        preview_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        store = EventStore(operational / "projects", project_id)
+        with (preview_root / ".lock").open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            for old_path in preview_root.glob("*.json"):
+                previous = json.loads(old_path.read_text(encoding="utf-8"))
+                if previous.get("status") in {"pending", "running"}:
+                    store.cancel(previous["preview_id"], "replacement")
+                    previous.update({"status": "cancelled", "bindings": {}, "probe_results": [], "routing_manifest": {}, "required_tools": []}); atomic_json(old_path, previous)
+                    store.emit("run.finished", previous["preview_id"], {"status": "cancelled", "duration_seconds": 0, "operation": "sources.routing-preview"})
+            import uuid
+            preview_id = str(uuid.uuid4())
+            path = preview_root / f"{preview_id}.json"
+            atomic_json(path, {"schema_version": "1", "preview_id": preview_id, "project_id": workspace_id(project), "status": "pending", "routing_plan_fingerprint": "", "bindings": {}, "probe_results": [], "routing_manifest": {}, "required_tools": []})
+            from .events import process_identity
+            from .workflow import state_fingerprint
+            preview_started = time.monotonic()
+            store.emit("run.created", preview_id, {"status": "running", "actor": "local-user", "process_identity": process_identity(), "workflow_fingerprint": state_fingerprint(project), "operation": "sources.routing-preview"})
+
+        def worker():
+            with (preview_root / ".lock").open("a+b") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if record["status"] == "cancelled" or store.cancellation(preview_id):
+                    return
+                record["status"] = "running"; atomic_json(path, record)
+            cancelled = lambda: bool(store.cancellation(preview_id)) or json.loads(path.read_text(encoding="utf-8")).get("status") == "cancelled"
+            def finish(value):
+                with (preview_root / ".lock").open("a+b") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    current = json.loads(path.read_text(encoding="utf-8"))
+                    if current.get("status") == "cancelled":
+                        return
+                    if value["status"] == "ready":
+                        decisions = [{"routing_group_id": group["routing_group_id"], "form_counts": group["form_counts"], "representation_schema": group["representation_schema"], "routing_reason": group["routing_reason"]} for group in value["routing_manifest"]["groups"][:1000]]
+                        outputs = {"group_count": len(value["routing_manifest"]["groups"]), "required_tools": value["required_tools"], "decisions": decisions}
+                        store.emit("step.output", preview_id, {"status": "completed", "outputs": outputs, "output_fingerprint": value["routing_plan_fingerprint"]}, job_id="acquire-sources", step_id="routing-preview", attempt=1)
+                    store.emit("run.finished", preview_id, {"status": "completed" if value["status"] == "ready" else value["status"], "duration_seconds": time.monotonic() - preview_started, "operation": "sources.routing-preview"})
+                    atomic_json(path, value)
+            try:
+                from .sources import build_routing_preview
+                value = build_routing_preview(project, Path(next(iter(roots))), connections, upload_drafts=operational / "projects" / project_id / "upload-drafts", cancelled=cancelled)
+                if cancelled():
+                    return
+                finish({**record, **value, "status": "ready"})
+            except InterruptedError:
+                current = json.loads(path.read_text(encoding="utf-8"))
+                current["status"] = "cancelled"; atomic_json(path, current)
+            except Exception as exc:
+                finish({**record, "status": "failed", "error_code": "routing_preview_failed", "error": f"routing preview failed ({type(exc).__name__})"})
+
+        threading.Thread(target=worker, name=f"source-routing-preview-{preview_id}", daemon=True).start()
+        return {"preview_id": preview_id, "status": "pending"}
+
+    @app.get("/api/v1/projects/{project_id}/source-routing-previews/{preview_id}")
+    def get_source_routing_preview(project_id: str, preview_id: str):
+        repo(project_id)
+        if not re.fullmatch(r"[0-9a-f-]{36}", preview_id):
+            raise HTTPException(404, "routing preview not found")
+        path = operational / "projects" / project_id / "source-routing-previews" / f"{preview_id}.json"
+        if not path.is_file():
+            raise HTTPException(404, "routing preview not found")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @app.delete("/api/v1/projects/{project_id}/source-routing-previews/{preview_id}")
+    def cancel_source_routing_preview(project_id: str, preview_id: str, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); repo(project_id)
+        path = operational / "projects" / project_id / "source-routing-previews" / f"{preview_id}.json"
+        if not path.is_file():
+            raise HTTPException(404, "routing preview not found")
+        from .contracts import atomic_json
+        with (path.parent / ".lock").open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("status") in {"pending", "running"}:
+                store = EventStore(operational / "projects", project_id)
+                store.cancel(preview_id, "local-user")
+                record["status"] = "cancelled"; atomic_json(path, record)
+                store.emit("run.finished", preview_id, {"status": "cancelled", "duration_seconds": 0, "operation": "sources.routing-preview"})
+        return {"preview_id": preview_id, "status": record["status"]}
 
     @app.put("/api/v1/projects/{project_id}/connection-profiles/{profile_id}")
     def put_connection(project_id: str, profile_id: str, body: ConnectionBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):

@@ -1,25 +1,73 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
-  "required": ["schema_version", "generation_id", "acquisition_profile_id", "representation_schema", "normalizer_version", "source_contract_sha256", "roles", "components"],
-  "properties": {
-    "schema_version": {"const": "1"},
-    "generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "acquisition_profile_id": {"type": "string", "pattern": "^(ibcmd|designer)\\+(xml-hierarchical|v8unpack|edt-project)/v1$"},
-    "representation_schema": {"enum": ["xml-hierarchical", "v8unpack", "edt-project"]},
-    "normalizer_version": {"type": "string", "minLength": 1},
-    "source_contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+  "$defs": {
     "roles": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["vendor_baseline", "target_cf", "next_vendor"],
       "properties": {
         "vendor_baseline": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
         "target_cf": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
         "next_vendor": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
-      },
-      "additionalProperties": false
+      }
     },
-    "components": {"type": "array", "minItems": 3, "items": {"type": "object", "required": ["component_id", "kind", "path", "fingerprint"], "properties": {"component_id": {"type": "string", "minLength": 1}, "kind": {"enum": ["configuration", "extension", "external"]}, "path": {"type": "string", "minLength": 1}, "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}, "additionalProperties": false}}
+    "component1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component_id", "kind", "path", "fingerprint"],
+      "properties": {
+        "component_id": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["configuration", "extension", "external"]},
+        "path": {"type": "string", "minLength": 1},
+        "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "component2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component_id", "kind", "path", "fingerprint", "representation_schema", "routing_group_id"],
+      "properties": {
+        "component_id": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["configuration", "extension", "epf", "erf", "source-tree", "other"]},
+        "path": {"type": "string", "minLength": 1},
+        "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "representation_schema": {"enum": ["xml-hierarchical/v1", "v8unpack/v1", "source-tree/v1", "raw-binary/v1"]},
+        "routing_group_id": {"type": "string", "minLength": 1}
+      }
+    }
   },
-  "additionalProperties": false
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "generation_id", "acquisition_profile_id", "representation_schema", "normalizer_version", "source_contract_sha256", "roles", "components"],
+      "properties": {
+        "schema_version": {"const": "1"},
+        "generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "acquisition_profile_id": {"type": "string", "pattern": "^(ibcmd|designer)\\+(xml-hierarchical|v8unpack|edt-project)/v1$"},
+        "representation_schema": {"enum": ["xml-hierarchical", "v8unpack", "edt-project"]},
+        "normalizer_version": {"type": "string", "minLength": 1},
+        "source_contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "roles": {"$ref": "#/$defs/roles"},
+        "components": {"type": "array", "minItems": 3, "items": {"$ref": "#/$defs/component1"}}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "generation_id", "acquisition_profile_id", "normalizer_version", "source_contract_fingerprint", "roles", "routing_manifest_path", "routing_manifest_fingerprint", "source_comparison_epoch_fingerprint", "components"],
+      "properties": {
+        "schema_version": {"const": "2"},
+        "generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "acquisition_profile_id": {"enum": ["ibcmd+form-aware/v1", "designer+form-aware/v1"]},
+        "normalizer_version": {"type": "string", "minLength": 1},
+        "source_contract_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "roles": {"$ref": "#/$defs/roles"},
+        "routing_manifest_path": {"const": "routing-manifest.json"},
+        "routing_manifest_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "source_comparison_epoch_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "components": {"type": "array", "minItems": 3, "items": {"$ref": "#/$defs/component2"}}
+      }
+    }
+  ]
 }

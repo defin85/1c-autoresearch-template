@@ -1,20 +1,135 @@
-import { render, screen } from '@testing-library/react';
-import { beforeEach, expect, test, vi } from 'vitest';
-import { App, groupEvents } from './App';
+import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, expect, test, vi } from "vitest";
+import { App, RoutingPreviewSummary, ToolInventory, groupEvents } from "./App";
 
-beforeEach(() => { vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => [] })); });
+beforeEach(() => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue({ ok: true, json: async () => [] }),
+  );
+});
 
-test('shows repository-owned workspace entry', async () => {
+test("shows repository-owned workspace entry", async () => {
   render(<App />);
-  expect(await screen.findByText('Исследование конфигурации 1С')).toBeInTheDocument();
-  expect(screen.getByText(/Репозиторий хранит состояние процесса/)).toBeInTheDocument();
+  expect(
+    await screen.findByText("Исследование конфигурации 1С"),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/Репозиторий хранит состояние процесса/),
+  ).toBeInTheDocument();
 });
 
-test('groups workflow events as run, job, step and attempt', () => {
+test("groups workflow events as run, job, step and attempt", () => {
   const grouped = groupEvents([
-    { sequence: 1, timestamp: '2026-01-01T00:00:00Z', type: 'run.created', run_id: 'run-1', payload: {} },
-    { sequence: 2, timestamp: '2026-01-01T00:00:01Z', type: 'step.started', run_id: 'run-1', job_id: 'job-1', step_id: 'step-1', attempt: 1, payload: {} },
+    {
+      sequence: 1,
+      timestamp: "2026-01-01T00:00:00Z",
+      type: "run.created",
+      run_id: "run-1",
+      payload: {},
+    },
+    {
+      sequence: 2,
+      timestamp: "2026-01-01T00:00:01Z",
+      type: "step.started",
+      run_id: "run-1",
+      job_id: "job-1",
+      step_id: "step-1",
+      attempt: 1,
+      payload: {},
+    },
   ]);
-  expect(grouped['run-1'].run.run[0]).toHaveLength(1);
-  expect(grouped['run-1']['job-1']['step-1'][1][0].sequence).toBe(2);
+  expect(grouped["run-1"].run.run[0]).toHaveLength(1);
+  expect(grouped["run-1"]["job-1"]["step-1"][1][0].sequence).toBe(2);
 });
+
+test("shows accessible source tool installations and current use", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          complete: true,
+          tools: [
+            {
+              tool_id: "ibcmd",
+              status: "ready",
+              purpose: "exporter",
+              instances: [
+                {
+                  version: "8.3.27.1989",
+                  status: "ready",
+                  path: "/opt/1cv8/ibcmd",
+                },
+              ],
+            },
+          ],
+        }),
+      }),
+  );
+  render(
+    <ToolInventory
+      project={{ id: "p", name: "p", root: "/repo" }}
+      selectedProfile="ibcmd+form-aware/v1"
+    />,
+  );
+  expect(await screen.findByText("проверка завершена")).toBeInTheDocument();
+  fireEvent.click(screen.getByText("Показать установки, версии и пути"));
+  expect(
+    screen.getByRole("table", {
+      name: "Установки инструментов получения исходников",
+    }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("требуется текущим маршрутом")).toBeInTheDocument();
+});
+
+test.each([
+  [{ managed: 1, ordinary: 0, inconclusive: 0 }, "managed_only", []],
+  [{ managed: 0, ordinary: 1, inconclusive: 0 }, "ordinary_form_present", []],
+  [{ managed: 1, ordinary: 1, inconclusive: 0 }, "ordinary_form_present", []],
+  [
+    { managed: 0, ordinary: 0, inconclusive: 1 },
+    "inconclusive_form_payload",
+    ["next_vendor"],
+  ],
+])(
+  "shows routing preview matrix %#",
+  (form_counts, routing_reason, absent_roles) => {
+    const { container } = render(
+      <RoutingPreviewSummary
+        preview={{
+          preview_id: "p",
+          status: "ready",
+          routing_plan_fingerprint: "sha256:test",
+          required_tools: ["ibcmd", "v8unpack"],
+          routing_manifest: {
+            groups: [
+              {
+                routing_group_id: "configuration",
+                form_counts,
+                routing_reason,
+                exporter: "ibcmd",
+                representation_schema: ordinaryOrUnknown(form_counts)
+                  ? "v8unpack/v1"
+                  : "xml-hierarchical/v1",
+                absent_roles,
+              },
+            ],
+          },
+        }}
+      />,
+    );
+    expect(container).toHaveTextContent(
+      `Управляемые: ${form_counts.managed}; обычные: ${form_counts.ordinary}; неопределённые: ${form_counts.inconclusive}`,
+    );
+    expect(container).toHaveTextContent(routing_reason);
+    if (absent_roles.length)
+      expect(container).toHaveTextContent("Отсутствуют роли: next_vendor");
+  },
+);
+
+function ordinaryOrUnknown(counts: { ordinary: number; inconclusive: number }) {
+  return counts.ordinary > 0 || counts.inconclusive > 0;
+}

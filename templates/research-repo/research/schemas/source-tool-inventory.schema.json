@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "complete", "checked_at", "inventory_fingerprint", "tools", "diagnostics"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "complete": {"type": "boolean"},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "inventory_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tool_id", "status", "purpose", "instances"],
+        "properties": {
+          "tool_id": {"enum": ["ibcmd", "designer", "edt", "v8unpack"]},
+          "status": {"enum": ["ready", "incompatible", "unavailable", "degraded"]},
+          "purpose": {"enum": ["exporter", "conditional_converter", "legacy_only"]},
+          "instances": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "version", "path", "platform_root", "capabilities", "reason_code"],
+              "properties": {
+                "status": {"enum": ["ready", "incompatible", "probe_failed"]},
+                "version": {"type": "string"},
+                "path": {"type": "string"},
+                "platform_root": {"type": "string"},
+                "capabilities": {"type": "array", "uniqueItems": true, "items": {"enum": ["hierarchical_export", "binary_save", "extension_enumeration", "container_unpack", "edt_project_conversion"]}},
+                "reason_code": {"enum": ["", "version_incompatible", "version_unparseable", "version_command_failed", "probe_timeout", "probe_output_limit_reached", "not_regular_file", "not_executable", "platform_version_unverified"]}
+              }
+            }
+          }
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "subject", "omitted_count"],
+        "properties": {
+          "code": {"enum": ["candidate_limit_reached", "scan_deadline_reached", "probe_timeout", "probe_output_limit_reached"]},
+          "subject": {"type": "string", "minLength": 1},
+          "omitted_count": {"type": "integer", "minimum": 0}
+        }
+      }
+    }
+  }
+}

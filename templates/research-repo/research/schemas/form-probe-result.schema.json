@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "probe_contract_version", "component_id", "records", "form_counts", "probe_fingerprint"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "probe_contract_version": {"const": "form-probe/v1"},
+    "component_id": {"type": "string", "minLength": 1},
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["component_id", "form_id", "classification", "marker"],
+        "properties": {
+          "component_id": {"type": "string", "minLength": 1},
+          "form_id": {"type": "string", "minLength": 1},
+          "classification": {"enum": ["managed", "ordinary", "inconclusive"]},
+          "marker": {"enum": ["managed-logform-namespace/v1", "ordinary-form-namespace/v1", "unknown-form-namespace/v1", "xml-unparseable/v1"]},
+          "unknown_structure_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "form_counts": {"$ref": "#/$defs/form_counts"},
+    "probe_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "form_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["managed", "ordinary", "inconclusive"],
+      "properties": {
+        "managed": {"type": "integer", "minimum": 0},
+        "ordinary": {"type": "integer", "minimum": 0},
+        "inconclusive": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

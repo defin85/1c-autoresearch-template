@@ -18,6 +18,11 @@ AGREEMENT_STATES = {"pending_review", "changes_requested", "approved"}
 
 
 def comparison_epoch_fingerprint(source: dict[str, Any]) -> str:
+    if source.get("schema_version") == "2":
+        value = str(source.get("source_comparison_epoch_fingerprint", ""))
+        if not value.startswith("sha256:"):
+            raise ValueError("routed source comparison epoch is missing")
+        return value.removeprefix("sha256:")
     return sha256(canonical_json({"acquisition_profile_id": source["acquisition_profile_id"], "normalizer_version": source["normalizer_version"], "representation_schema": source["representation_schema"]}))
 
 

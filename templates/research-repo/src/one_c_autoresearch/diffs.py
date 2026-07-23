@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .contracts import atomic_json, canonical_json, comparison_id, confined, diff_id, normalize_relative, repository_lock, require_tracked_clean, sha256
+from .contracts import atomic_json, canonical_json, comparison_id, confined, content_id, diff_id, normalize_relative, repository_lock, require_tracked_clean, sha256
 
 
 INVENTORY_HEADER = ("stable_diff_id", "comparison_id", "source_generation", "before_role", "after_role", "change_type", "path", "object_kind", "object_name", "area", "before_fingerprint", "after_fingerprint", "content_fingerprint")
@@ -49,26 +49,29 @@ def compare(before_root: Path, after_root: Path, metadata: dict[str, str]) -> li
         raise ValueError("invalid NUL-delimited Git output")
     seen: set[tuple[str, str]] = set()
     rows: list[dict[str, str]] = []
-    cmp_id = comparison_id(metadata["comparison_kind"], metadata["before_role"], metadata["after_role"], metadata["acquisition_profile_id"], metadata["representation_schema"], metadata["normalizer_version"])
+    cmp_id = metadata.get("comparison_id") or comparison_id(metadata["comparison_kind"], metadata["before_role"], metadata["after_role"], metadata["acquisition_profile_id"], metadata["representation_schema"], metadata["normalizer_version"])
     for status_raw, path_raw in zip(fields[::2], fields[1::2], strict=True):
         try:
             status = status_raw.decode("ascii")
             change_type = STATUSES[status]
         except (UnicodeDecodeError, KeyError) as exc:
             raise ValueError(f"unsupported Git status: {status_raw!r}") from exc
-        relative = _relative(path_raw, (before_root, after_root))
+        payload_relative = _relative(path_raw, (before_root, after_root))
+        if payload_relative == "component-manifest.json":
+            continue
+        relative = f"{metadata.get('path_prefix', '').rstrip('/')}/{payload_relative}".lstrip("/")
         key = (change_type, relative)
         if key in seen:
             raise ValueError(f"duplicate Git row: {key}")
         seen.add(key)
-        before = before_root / relative
-        after = after_root / relative
+        before = before_root / payload_relative
+        after = after_root / payload_relative
         before_fp, after_fp = _fingerprint(before), _fingerprint(after)
         if before_fp and before_fp == after_fp and before.is_file() == after.is_file():
             continue
         content = "sha256:" + sha256(canonical_json({"before": before_fp, "after": after_fp}))
         rows.append({
-            "stable_diff_id": diff_id(cmp_id, relative, change_type), "comparison_id": cmp_id,
+            "stable_diff_id": diff_id(cmp_id, relative, change_type, metadata.get("schema_version", "1")), "comparison_id": cmp_id,
             "source_generation": metadata["source_generation"], "before_role": metadata["before_role"],
             "after_role": metadata["after_role"], "change_type": change_type, "path": relative,
             "object_kind": "file", "object_name": Path(relative).name, "area": relative.partition("/")[0],
@@ -108,12 +111,17 @@ def validate_active(repo: Path, *, require_tracked_clean_state: bool = False) ->
     if sha256(canonical_json({"files": actual_hashes, "schema_version": "1", "source_generation_id": source_id})) != generation:
         raise ValueError("active diff generation ID mismatch")
     seen: set[str] = set(); customer: set[str] = set()
+    routed = source.get("schema_version") == "2"
+    routed_ids = {
+        (kind, before, after): content_id("CMP-", {"after_role": after, "before_role": before, "comparison_kind": kind, "schema_version": "2", "source_comparison_epoch_fingerprint": source["source_comparison_epoch_fingerprint"]})
+        for kind, before, after in COMPARISONS
+    } if routed else {}
     for row in rows["diff-inventory.csv"]:
         if row["source_generation"] != source_id or row["before_role"] != "vendor_baseline" or row["after_role"] not in {"target_cf", "next_vendor"}:
             raise ValueError("mixed or invalid diff roles")
         kind = "customer-customization" if row["after_role"] == "target_cf" else "target-release"
-        cmp_id = comparison_id(kind, row["before_role"], row["after_role"], source["acquisition_profile_id"], source["representation_schema"], source["normalizer_version"])
-        expected = diff_id(cmp_id, row["path"], row["change_type"])
+        cmp_id = routed_ids[(kind, row["before_role"], row["after_role"])] if routed else comparison_id(kind, row["before_role"], row["after_role"], source["acquisition_profile_id"], source["representation_schema"], source["normalizer_version"])
+        expected = diff_id(cmp_id, row["path"], row["change_type"], "2" if routed else "1")
         if row["comparison_id"] != cmp_id or row["stable_diff_id"] != expected or expected in seen:
             raise ValueError(f"invalid or duplicate stable DIF: {row['stable_diff_id']}")
         seen.add(expected)
@@ -130,6 +138,10 @@ def validate_active(repo: Path, *, require_tracked_clean_state: bool = False) ->
 
 
 def build(repo: Path, source_pointer: dict[str, Any]) -> dict[str, Any]:
+    if source_pointer.get("schema_version") == "2":
+        from .sources import validate_active as validate_source
+        if validate_source(repo, deep=False) != source_pointer:
+            raise RuntimeError("stale or invalid source generation")
     with repository_lock(repo):
         current = __import__("json").loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
         if current != source_pointer:
@@ -138,6 +150,12 @@ def build(repo: Path, source_pointer: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_locked(repo: Path, source_pointer: dict[str, Any]) -> dict[str, Any]:
+    if source_pointer.get("schema_version") == "2":
+        return _build_routed(repo, source_pointer)
+    if source_pointer.get("schema_version") == "1":
+        raise ValueError("new diff builds require routed source schema version 2")
+    if source_pointer.get("schema_version") is not None:
+        raise ValueError("unsupported source schema version")
     source_id = source_pointer["generation_id"]
     source_root = repo / "sources/generations" / source_id
     profile = source_pointer["acquisition_profile_id"]
@@ -146,9 +164,15 @@ def _build_locked(repo: Path, source_pointer: dict[str, Any]) -> dict[str, Any]:
     inventory: list[dict[str, str]] = []
     for kind, before, after in COMPARISONS:
         inventory.extend(compare(source_root / before, source_root / after, {"comparison_kind": kind, "before_role": before, "after_role": after, "acquisition_profile_id": profile, "representation_schema": representation, "normalizer_version": normalizer, "source_generation": source_id}))
+    return _publish_inventory(repo, source_pointer, inventory)
+
+
+def _publish_inventory(repo: Path, source_pointer: dict[str, Any], inventory: list[dict[str, str]]) -> dict[str, Any]:
+    source_id = source_pointer["generation_id"]
+    routed = source_pointer.get("schema_version") == "2"
     id_preimages: dict[str, bytes] = {}
     for row in inventory:
-        preimage = canonical_json({"change_type": row["change_type"], "comparison_id": row["comparison_id"], "path": row["path"], "schema_version": "1"})
+        preimage = canonical_json({"change_type": row["change_type"], "comparison_id": row["comparison_id"], "path": row["path"], "schema_version": "2" if routed else "1"})
         if row["stable_diff_id"] in id_preimages and id_preimages[row["stable_diff_id"]] != preimage:
             raise ValueError(f"truncated DIF hash collision: {row['stable_diff_id']}")
         id_preimages[row["stable_diff_id"]] = preimage
@@ -165,7 +189,13 @@ def _build_locked(repo: Path, source_pointer: dict[str, Any]) -> dict[str, Any]:
             successors[deleted[0]["stable_diff_id"]] = added[0]["stable_diff_id"]
     previous: dict[str, dict[str, str]] = {}
     pointer_path = repo / "research/active-diff-generation.json"
-    current_comparisons = {row["comparison_id"] for row in inventory} or {comparison_id(kind, before, after, profile, representation, normalizer) for kind, before, after in COMPARISONS}
+    current_comparisons = {row["comparison_id"] for row in inventory}
+    if not current_comparisons:
+        if routed:
+            epoch = source_pointer["source_comparison_epoch_fingerprint"]
+            current_comparisons = {content_id("CMP-", {"after_role": after, "before_role": before, "comparison_kind": kind, "schema_version": "2", "source_comparison_epoch_fingerprint": epoch}) for kind, before, after in COMPARISONS}
+        else:
+            current_comparisons = {comparison_id(kind, before, after, source_pointer["acquisition_profile_id"], source_pointer["representation_schema"], source_pointer["normalizer_version"]) for kind, before, after in COMPARISONS}
     if pointer_path.is_file():
         old_pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
         old_map = repo / "analysis/indexes/generations" / str(old_pointer.get("generation_id", "")) / "diff-id-map.csv"
@@ -223,3 +253,36 @@ def _build_locked(repo: Path, source_pointer: dict[str, Any]) -> dict[str, Any]:
         pointer = {"schema_version": "1", "generation_id": generation_id, "source_generation_id": source_id, "files": hashes, "row_counts": {"diff-inventory.csv": len(inventory), "diff-id-map.csv": len(id_map), "target-coverage.csv": len(coverage)}}
         atomic_json(repo / "research/active-diff-generation.json", pointer)
         return pointer
+
+
+def _build_routed(repo: Path, source_pointer: dict[str, Any]) -> dict[str, Any]:
+    source_id = source_pointer["generation_id"]
+    source_root = repo / "sources/generations" / source_id
+    manifest = json.loads((source_root / source_pointer["routing_manifest_path"]).read_text(encoding="utf-8"))
+    epoch = source_pointer["source_comparison_epoch_fingerprint"]
+    components = {item["component_id"]: item for item in source_pointer["components"]}
+    inventory = []
+    empty_parent = repo / "analysis/indexes/.staging"
+    empty_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=empty_parent) as empty:
+        empty_root = Path(empty)
+        for kind, before, after in COMPARISONS:
+            cmp_id = content_id("CMP-", {"after_role": after, "before_role": before, "comparison_kind": kind, "schema_version": "2", "source_comparison_epoch_fingerprint": epoch})
+            for group in manifest["groups"]:
+                by_role = {member["role"]: components[member["component_id"]] for member in group["members"]}
+                prefix = "configuration" if group["routing_group_id"] == "configuration" else group["routing_group_id"].replace("extension:", "extensions/", 1).replace("external:", "external/", 1)
+                before_root = source_root / by_role[before]["path"] if before in by_role else empty_root
+                after_root = source_root / by_role[after]["path"] if after in by_role else empty_root
+                inventory.extend(compare(before_root, after_root, {
+                    "comparison_kind": kind,
+                    "before_role": before,
+                    "after_role": after,
+                    "acquisition_profile_id": source_pointer["acquisition_profile_id"],
+                    "representation_schema": group["representation_schema"],
+                    "normalizer_version": source_pointer["normalizer_version"],
+                    "source_generation": source_id,
+                    "comparison_id": cmp_id,
+                    "path_prefix": prefix,
+                    "schema_version": "2",
+                }))
+    return _publish_inventory(repo, source_pointer, inventory)

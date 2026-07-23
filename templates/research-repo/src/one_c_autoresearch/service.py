@@ -11,17 +11,18 @@ from .contracts import atomic_bytes, atomic_json, canonical_json, confined, reje
 
 
 class ApplicationService:
-    def __init__(self, repo: Path, rlm_executable: str | None = None, connections: dict[str, dict[str, Any]] | None = None, upload_drafts: Path | None = None):
+    def __init__(self, repo: Path, rlm_executable: str | None = None, connections: dict[str, dict[str, Any]] | None = None, upload_drafts: Path | None = None, routing_previews: Path | None = None):
         self.repo = repo.resolve()
         self.rlm_executable = rlm_executable or indexes.discover_executable(self.repo)
         if self.rlm_executable:
             indexes.validate_engine_version(self.repo, self.rlm_executable)
         self.connections = connections
         self.upload_drafts = upload_drafts
+        self.routing_previews = routing_previews
         workflow.validate_workflow(self.repo)
 
-    def snapshot(self) -> dict[str, Any]:
-        return workflow.status(self.repo)
+    def snapshot(self, *, deep: bool = True) -> dict[str, Any]:
+        return workflow.status(self.repo, deep=deep)
 
     def next(self) -> dict[str, Any] | None:
         snapshot = self.snapshot()
@@ -114,7 +115,7 @@ class ApplicationService:
         return {"operation": "project.configure", "project_fingerprint": "sha256:" + sha256(path.read_bytes())}
 
     def _acquire_sources(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if set(payload) - {"timeout_seconds"}:
+        if set(payload) - {"timeout_seconds", "source_routing_preview_id", "routing_plan_fingerprint"}:
             raise ValueError("invalid source acquisition payload")
         if not self.connections:
             raise RuntimeError("current user-scope connection profiles are unavailable")
@@ -122,7 +123,17 @@ class ApplicationService:
         if len(platform_paths) != 1 or not next(iter(platform_paths)):
             raise ValueError("one generation-wide platform path is required")
         platform = Path(next(iter(platform_paths)))
-        return sources.acquire(self.repo, platform, self.connections, timeout_seconds=int(payload.get("timeout_seconds", 1800)), upload_drafts=self.upload_drafts, cancelled=self._cancelled)
+        preview_id = str(payload.get("source_routing_preview_id", ""))
+        if not self.routing_previews or not preview_id or Path(preview_id).name != preview_id:
+            raise RuntimeError("routing_preview_stale")
+        preview_path = self.routing_previews / f"{preview_id}.json"
+        if not preview_path.is_file():
+            raise RuntimeError("routing_preview_stale")
+        preview = json.loads(preview_path.read_text(encoding="utf-8"))
+        from .user_state import workspace_id
+        if preview.get("project_id") != workspace_id(self.repo) or preview.get("status") != "ready" or preview.get("routing_plan_fingerprint") != payload.get("routing_plan_fingerprint"):
+            raise RuntimeError("routing_preview_stale")
+        return sources.acquire(self.repo, platform, self.connections, routing_preview=preview, timeout_seconds=int(payload.get("timeout_seconds", 1800)), upload_drafts=self.upload_drafts, cancelled=self._cancelled)
 
     def _configure_sources(self, payload: dict[str, Any]) -> dict[str, Any]:
         external_keys = {"external_artifact_preview_id", "selected_entries", "expected_declaration_fingerprint", "expected_draft_fingerprint", "confirm"}

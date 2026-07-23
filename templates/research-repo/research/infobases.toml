@@ -1,5 +1,5 @@
 schema_version = "1"
-acquisition_profile = "ibcmd+xml-hierarchical/v1"
+acquisition_profile = "ibcmd+form-aware/v1"
 
 [roles.vendor_baseline]
 connection_profile = "local-baseline"

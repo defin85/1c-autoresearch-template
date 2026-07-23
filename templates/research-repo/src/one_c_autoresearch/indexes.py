@@ -47,33 +47,40 @@ def discover(repo: Path) -> list[dict[str, Any]]:
     generation = str(pointer["generation_id"])
     root = confined(repo / "sources/generations", generation)
     config = tomllib.loads((repo / "research/indexing.toml").read_text(encoding="utf-8"))
-    if pointer.get("representation_schema") not in {"xml-hierarchical", "v8unpack", "edt-project"}:
+    if pointer.get("schema_version") == "2":
+        candidates = [
+            (item["component_id"], confined(root, item["path"]) / "source" if item["kind"] in {"epf", "erf", "source-tree"} else confined(root, item["path"]), item["representation_schema"])
+            for item in pointer.get("components", [])
+        ]
+    elif pointer.get("schema_version") == "1" and pointer.get("representation_schema") in {"xml-hierarchical", "v8unpack", "edt-project"}:
+        candidates = []
+        for role in ROLES:
+            role_root = confined(root, role)
+            candidates.append((f"{role}:configuration", role_root / "configuration", pointer["representation_schema"]))
+            extensions = role_root / "extensions"
+            if extensions.is_dir():
+                candidates.extend((f"{role}:extension:{item.name.lower()}", item, pointer["representation_schema"]) for item in extensions.iterdir() if item.is_dir())
+            external = role_root / "external"
+            if external.is_dir():
+                candidates.extend((f"{role}:external:{item.name}", item / "source", pointer["representation_schema"]) for item in external.iterdir() if item.is_dir())
+    else:
         raise ValueError(f"unsupported source representation for indexing: {pointer.get('representation_schema')}")
     result: list[dict[str, Any]] = []
-    for role in ROLES:
-        role_root = confined(root, role)
-        candidates = [(f"{role}:configuration", role_root / "configuration")]
-        extensions = role_root / "extensions"
-        if extensions.is_dir():
-            candidates.extend((f"{role}:extension:{item.name.lower()}", item) for item in extensions.iterdir() if item.is_dir())
-        external = role_root / "external"
-        if external.is_dir():
-            candidates.extend((f"{role}:external:{item.name}", item / "source") for item in external.iterdir() if item.is_dir())
-        for component_id, component_root in sorted(candidates):
-            if not component_root.is_dir():
-                continue
-            relative = component_root.relative_to(root).as_posix()
-            bsl_count = sum(1 for path in component_root.rglob("*.bsl") if path.is_file())
-            result.append({
-                "component_id": component_id,
-                "path": relative,
-                "fingerprint": _component_fingerprint(str(component_root.resolve())),
-                "representation": pointer["representation_schema"],
-                "source_generation_id": generation,
-                "engine": config["engine"],
-                "engine_version": str(config["engine_version"]),
-                "bsl_file_count": bsl_count,
-            })
+    for component_id, component_root, representation in sorted(candidates):
+        if not component_root.is_dir():
+            continue
+        relative = component_root.relative_to(root).as_posix()
+        bsl_count = sum(1 for path in component_root.rglob("*.bsl") if path.is_file())
+        result.append({
+            "component_id": component_id,
+            "path": relative,
+            "fingerprint": _component_fingerprint(str(component_root.resolve())),
+            "representation": representation,
+            "source_generation_id": generation,
+            "engine": config["engine"],
+            "engine_version": str(config["engine_version"]),
+            "bsl_file_count": bsl_count,
+        })
     return sorted(result, key=lambda item: item["component_id"])
 
 
@@ -157,6 +164,9 @@ def statuses(repo: Path, state_root: Path | None = None, probe: Callable[[Path],
 
 
 def ensure(repo: Path, builder: Callable[[Path, str], dict[str, Any]], *, selected: list[str] | None = None, rebuild: bool = False, confirmed: bool = False, state_root: Path | None = None, probe: Callable[[Path], dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    pointer = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+    if pointer.get("schema_version") == "1":
+        raise ValueError("new index builds require routed source schema version 2")
     if rebuild and not confirmed:
         raise ValueError("index rebuild requires explicit confirmation")
     state_root = state_root or Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "one-c-autoresearch/indexes"

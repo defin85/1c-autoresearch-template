@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "preview_id", "project_id", "status", "routing_plan_fingerprint", "bindings", "probe_results", "routing_manifest", "required_tools"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "preview_id": {"type": "string", "minLength": 1},
+    "project_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["pending", "running", "ready", "failed", "cancelled"]},
+    "routing_plan_fingerprint": {"type": "string", "pattern": "^(|sha256:[0-9a-f]{64})$"},
+    "bindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workflow": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "workflow_state": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "infobases": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "external_artifacts": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "connections": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "upload_draft": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "probe_contract": {"const": "form-probe/v1"}
+      }
+    },
+    "probe_results": {"type": "array", "items": {"$ref": "form-probe-result.schema.json"}},
+    "routing_manifest": {"oneOf": [{"type": "object", "maxProperties": 0}, {"$ref": "source-routing-manifest.schema.json"}]},
+    "required_tools": {"type": "array", "uniqueItems": true, "items": {"enum": ["ibcmd", "designer", "v8unpack"]}},
+    "error_code": {"const": "routing_preview_failed"},
+    "error": {"type": "string", "maxLength": 1000}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "ready"}}},
+      "then": {
+        "properties": {
+          "routing_plan_fingerprint": {"pattern": "^sha256:[0-9a-f]{64}$"},
+          "bindings": {"required": ["workflow", "workflow_state", "infobases", "external_artifacts", "connections", "upload_draft", "probe_contract"]},
+          "routing_manifest": {"required": ["schema_version", "routing_contract_version", "groups", "routing_manifest_fingerprint"]}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "failed"}}},
+      "then": {"required": ["error_code", "error"]}
+    }
+  ]
+}
