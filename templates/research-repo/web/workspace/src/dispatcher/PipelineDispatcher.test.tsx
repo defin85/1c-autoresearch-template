@@ -17,7 +17,7 @@ const snapshotWithDispatcher = {
     ],
     jobs: {},
     items: {
-      dif_queue: [{ id: 'DIF-001', path: 'Catalogs/Test.xml', kind: 'changed', state: 'queued' }],
+      dif_queue: [{ id: 'DIF-001', path: 'Catalogs/Test.xml', kind: 'extension_intervention', state: 'queued', intervention_kind: 'method_interception', object_scope: 'adopted', target_coverage: 'needs_semantic_review', dependency_count: 1, blocker_codes: ['unresolved_dependency'] }],
       meaning_diffs: [{ id: 'DIF-002', path: 'Documents/Test.xml', kind: 'changed', state: 'meaning' }],
       noise_diffs: [{ id: 'DIF-003', path: 'Forms/Test.xml', kind: 'changed', state: 'noise' }],
       proposals: [{ id: 'group-1', job_id: 'discover-mrq', kind: 'group.ready', semantic_key: 'orders', dif_ids: ['DIF-002'], evidence_count: 2, noise_count: 0, mrq_id: '', created_at: '2026-07-21T12:00:00Z' }],
@@ -59,6 +59,9 @@ test('PipelineDispatcher renders four circuits and freshness label', async () =>
   expect(screen.getByText('Легенда')).toBeInTheDocument();
   expect(screen.getByText('Целевая база')).toBeInTheDocument();
   expect(screen.getByText('Классификатор MRQ')).toBeInTheDocument();
+  expect(screen.getByText(/method_interception · adopted · needs_semantic_review/)).toBeInTheDocument();
+  expect(screen.getByText('unresolved_dependency')).toBeInTheDocument();
+  expect(screen.getByText(/Необработанных физических строк расширений:/)).toBeInTheDocument();
   expect(document.querySelectorAll('[data-stage-state="active"]')).toHaveLength(1);
   expect(document.querySelectorAll('[data-stage-state="future"]')).toHaveLength(4);
 });

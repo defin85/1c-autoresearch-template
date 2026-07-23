@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "extension_analyzer_version", "source_generation_id", "source_comparison_epoch_fingerprint", "routing_manifest_fingerprint", "extension_adapter_versions", "component_bindings", "record_counts", "data_files", "output_fingerprint"],
+  "properties": {
+    "schema_version": {"const": "2"},
+    "extension_analyzer_version": {"type": "string", "minLength": 1},
+    "source_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_comparison_epoch_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "routing_manifest_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "extension_adapter_versions": {"type": "array", "items": {"type": "string", "pattern": "^[^@]+@[^@]+$"}},
+    "component_bindings": {"type": "array", "items": {"$ref": "#/$defs/binding"}},
+    "record_counts": {"$ref": "#/$defs/counts"},
+    "data_files": {"$ref": "#/$defs/files"},
+    "output_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "binding": {
+      "type": "object",
+      "required": ["role", "component_id", "component_path", "component_fingerprint", "extension_uuid", "active", "representation_schema", "adapter_id", "adapter_version"],
+      "properties": {
+        "role": {"enum": ["vendor_baseline", "target_cf", "next_vendor"]},
+        "component_id": {"type": "string", "minLength": 1},
+        "component_path": {"type": "string", "minLength": 1},
+        "component_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "extension_uuid": {"type": "string", "pattern": "^[0-9a-f-]{36}$"},
+        "active": {"type": "boolean"},
+        "representation_schema": {"enum": ["xml-hierarchical/v1", "v8unpack/v1"]},
+        "adapter_id": {"type": "string", "minLength": 1},
+        "adapter_version": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "counts": {
+      "type": "object",
+      "required": ["extension_diff", "extension_dependencies", "extension_physical_diff", "extension_path_coverage"],
+      "properties": {
+        "extension_diff": {"type": "integer", "minimum": 0},
+        "extension_dependencies": {"type": "integer", "minimum": 0},
+        "extension_physical_diff": {"type": "integer", "minimum": 0},
+        "extension_path_coverage": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "files": {
+      "type": "object",
+      "required": ["extension-diff.jsonl", "extension-dependencies.jsonl", "extension-physical-diff.csv", "extension-path-coverage.csv"],
+      "properties": {
+        "extension-diff.jsonl": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "extension-dependencies.jsonl": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "extension-physical-diff.csv": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "extension-path-coverage.csv": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

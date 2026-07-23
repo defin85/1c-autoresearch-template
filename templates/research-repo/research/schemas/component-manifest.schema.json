@@ -39,8 +39,16 @@
         "exporter_version": {"type": "string"},
         "converter_version": {"type": "string"},
         "payload_file_count": {"type": "integer", "minimum": 1},
-        "payload_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
-      }
+        "payload_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "uuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string"},
+        "active": {"type": "boolean"}
+      },
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "configuration"}}}, "then": {"required": ["uuid", "name", "version"]}},
+        {"if": {"properties": {"kind": {"const": "extension"}}}, "then": {"required": ["uuid", "name", "version", "active"]}}
+      ]
     }
   ]
 }

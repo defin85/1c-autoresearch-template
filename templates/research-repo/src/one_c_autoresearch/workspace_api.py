@@ -721,20 +721,19 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         return FileResponse(path, media_type="application/octet-stream", headers={"Content-Disposition": "attachment", "Content-Security-Policy": "sandbox"})
 
     @app.get("/api/v1/projects/{project_id}/registries/{name}")
-    def registry(project_id: str, name: str, offset: int = 0, limit: int = 100):
-        if name not in {"diff-inventory", "target-coverage", "mrq"} or not 1 <= limit <= 500 or offset < 0: raise ValueError("invalid registry page")
-        project = repo(project_id)
-        if name == "mrq":
-            from .mrq import active
-            rows = active(project)["mrq.jsonl"]
-        else:
-            pointer = json.loads((project / "research/active-diff-generation.json").read_text(encoding="utf-8"))
-            import csv
-            if not pointer.get("generation_id"):
-                return {"offset": offset, "limit": limit, "items": [], "has_more": False}
-            path = project / "analysis/indexes/generations" / pointer["generation_id"] / f"{name}.csv"
-            with path.open(encoding="utf-8", newline="") as stream: rows = list(csv.DictReader(stream))
-        return {"offset": offset, "limit": limit, "items": rows[offset:offset + limit], "has_more": offset + limit < len(rows)}
+    def registry(
+        project_id: str,
+        name: str,
+        offset: int = 0,
+        limit: int = 100,
+        expected_generation: str = "",
+    ):
+        return ApplicationService(repo(project_id)).registry(
+            name,
+            offset,
+            limit,
+            expected_generation,
+        )
 
     @app.get("/api/v1/projects/{project_id}/artifacts/{artifact_path:path}")
     def artifact(project_id: str, artifact_path: str):

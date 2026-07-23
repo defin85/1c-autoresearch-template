@@ -14,9 +14,13 @@ FILES = (
     "AGENTS.md", "README.md", "pyproject.toml", "uv.lock",
     "research/workflow.toml", "research/indexing.toml", "research/forbidden-authorities.json",
     "tests/test_external_folder.py", "tests/test_source_routing.py", "tests/test_source_tools.py",
-    "tests/test_sources.py", "tests/test_diffs.py", "tests/test_runner.py", "tests/test_workspace_api.py",
+    "tests/test_sources.py", "tests/test_diffs.py", "tests/test_extension_analyzer.py",
+    "tests/test_runner.py", "tests/test_workspace_api.py",
 )
-TREES = ("src/one_c_autoresearch", "one_c_autoresearch", "research/schemas", "web/workspace", "tests/fixtures/source-routing")
+TREES = (
+    "src/one_c_autoresearch", "one_c_autoresearch", "research/schemas", "web/workspace",
+    "tests/fixtures/source-routing", "tests/fixtures/extension-semantic",
+)
 IGNORED_PARTS = {"__pycache__", ".pytest_cache", ".venv", "node_modules", "test-results", ".git"}
 FORBIDDEN_SUFFIXES = {".cf", ".cfe", ".epf", ".erf", ".dt", ".pyc", ".pyo"}
 FORBIDDEN_TEXT = (re.compile(r"/run/" + r"media/"), re.compile(r"/home/[A-Za-z0-9._-]+/"), re.compile(r"sppr", re.I))
@@ -42,7 +46,6 @@ def write_seed(root: Path) -> None:
     (research / "external-artifacts.toml").write_text('schema_version = "1"\nartifacts = []\n', encoding="utf-8")
     (research / "active-diff-generation.json").write_text("{}\n", encoding="utf-8")
     (root / "outputs").mkdir(exist_ok=True)
-    (root / "outputs/projections.json").write_text("{}\n", encoding="utf-8")
     for path in (root / "sources/generations", root / "analysis/indexes/generations", root / "analysis/migration-requirements/generations", root / "research/generations", root / "outputs"):
         path.mkdir(parents=True, exist_ok=True); (path / ".gitkeep").touch()
     (root / ".gitignore").write_text('.venv/\nnode_modules/\n__pycache__/\n*.py[cod]\n', encoding="utf-8")

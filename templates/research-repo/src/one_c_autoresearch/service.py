@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tomllib
 from copy import deepcopy
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,53 @@ class ApplicationService:
 
     def snapshot(self, *, deep: bool = True) -> dict[str, Any]:
         return workflow.status(self.repo, deep=deep)
+
+    def registry(
+        self,
+        name: str,
+        offset: int = 0,
+        limit: int = 100,
+        expected_generation: str = "",
+    ) -> dict[str, Any]:
+        allowed = {"diff-inventory", "target-coverage", "mrq", "extension-diff", "extension-dependencies", "extension-path-coverage", "extension-physical-diff"}
+        if name not in allowed or offset < 0 or not 1 <= limit <= 500:
+            raise ValueError("invalid registry page")
+        generation_id = ""
+        if name == "mrq":
+            state = mrq.active(self.repo)
+            generation_id = str(state["pointer"].get("diff_generation_id", ""))
+            if expected_generation and expected_generation != generation_id:
+                raise RuntimeError("stale diff generation")
+            rows = state["mrq.jsonl"][offset : offset + limit + 1]
+        else:
+            pointer = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
+            generation_id = str(pointer.get("generation_id", ""))
+            if expected_generation and expected_generation != generation_id:
+                raise RuntimeError("stale diff generation")
+            if not generation_id:
+                rows = []
+            else:
+                suffix = ".jsonl" if name in {"extension-diff", "extension-dependencies"} else ".csv"
+                path = self.repo / "analysis/indexes/generations" / generation_id / f"{name}{suffix}"
+                if not path.is_file() and name.startswith("extension-") and pointer.get("schema_version") == "1":
+                    rows = []
+                elif suffix == ".jsonl":
+                    with path.open(encoding="utf-8") as stream:
+                        rows = [
+                            json.loads(line)
+                            for line in islice((line for line in stream if line.strip()), offset, offset + limit + 1)
+                        ]
+                else:
+                    import csv
+                    with path.open(encoding="utf-8", newline="") as stream:
+                        rows = list(islice(csv.DictReader(stream), offset, offset + limit + 1))
+        return {
+            "diff_generation_id": generation_id,
+            "offset": offset,
+            "limit": limit,
+            "items": rows[:limit],
+            "has_more": len(rows) > limit,
+        }
 
     def next(self) -> dict[str, Any] | None:
         snapshot = self.snapshot()
@@ -181,12 +229,14 @@ class ApplicationService:
         if sources.validate_active(self.repo, deep=True) != pointer:
             raise RuntimeError("active source generation changed during validation")
         prior_pointer = json.loads((self.repo / "research/active-generation.json").read_text(encoding="utf-8"))
-        result = diffs.build(self.repo, pointer)
+        result = diffs.build(self.repo, pointer, cancelled=self._cancelled)
         prior_generation = prior_pointer.get("canonical_generation_id")
+        analyzer = json.loads((self.repo / "analysis/indexes/generations" / result["generation_id"] / "extension-analyzer-manifest.json").read_text(encoding="utf-8"))
+        new_epoch = mrq.comparison_epoch_fingerprint(pointer, analyzer)
         if prior_generation:
             prior_manifest = json.loads((self.repo / "research/generations" / prior_generation / "manifest.json").read_text(encoding="utf-8"))
-            if prior_manifest.get("comparison_epoch_fingerprint") != mrq.comparison_epoch_fingerprint(pointer):
-                mrq.publish(self.repo, {name: [] for name in mrq.FILES}, pointer["generation_id"], result["generation_id"], pointer, prior_generation)
+        if not prior_generation or prior_manifest.get("comparison_epoch_fingerprint") != new_epoch:
+            mrq.publish(self.repo, {name: [] for name in mrq.FILES}, pointer["generation_id"], result["generation_id"], pointer, prior_generation)
         return result
 
     def _mrq_revalidate_unchanged(self, payload: dict[str, Any]) -> dict[str, Any]:

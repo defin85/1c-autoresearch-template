@@ -2013,19 +2013,29 @@ function Events({ project }: { project: Project }) {
   );
 }
 
-function Registry({ project }: { project: Project }) {
+export function Registry({ project }: { project: Project }) {
   const [name, setName] = useState("diff-inventory");
   const [offset, setOffset] = useState(0);
   const [page, setPage] = useState<{
+    diff_generation_id?: string;
     items: Record<string, unknown>[];
     has_more: boolean;
   }>({ items: [], has_more: false });
+  const generation = useRef("");
   const [error, setError] = useState("");
   useEffect(() => {
+    const expected =
+      offset > 0 && generation.current
+        ? `&expected_generation=${generation.current}`
+        : "";
     api<typeof page>(
-      `/projects/${project.id}/registries/${name}?offset=${offset}&limit=100`,
+      `/projects/${project.id}/registries/${name}?offset=${offset}&limit=100${expected}`,
     )
-      .then(setPage)
+      .then((value) => {
+        generation.current = value.diff_generation_id || "";
+        setPage(value);
+        setError("");
+      })
       .catch((error) => {
         setPage({ items: [], has_more: false });
         setError(error.message);
@@ -2035,16 +2045,26 @@ function Registry({ project }: { project: Project }) {
     <Stack spacing={2}>
       {error && <Alert severity="warning">{error}</Alert>}
       <FormControl>
-        <InputLabel>Реестр</InputLabel>
+        <InputLabel id="registry-label">Реестр</InputLabel>
         <Select
+          labelId="registry-label"
           label="Реестр"
           value={name}
           onChange={(event) => {
             setName(event.target.value);
             setOffset(0);
+            generation.current = "";
           }}
         >
-          {["diff-inventory", "target-coverage", "mrq"].map((item) => (
+          {[
+            "diff-inventory",
+            "target-coverage",
+            "extension-diff",
+            "extension-dependencies",
+            "extension-path-coverage",
+            "extension-physical-diff",
+            "mrq",
+          ].map((item) => (
             <MenuItem key={item} value={item}>
               {item}
             </MenuItem>
@@ -2053,7 +2073,12 @@ function Registry({ project }: { project: Project }) {
       </FormControl>
       <Typography variant="caption">
         Строки {offset + 1}–{offset + page.items.length}; размер страницы 100.
+        {page.diff_generation_id &&
+          ` Поколение различий: ${page.diff_generation_id}.`}
       </Typography>
+      {page.items.length === 0 && (
+        <Alert severity="info">В выбранном реестре нет записей.</Alert>
+      )}
       {page.items.map((item, index) => (
         <Card
           variant="outlined"
@@ -2062,6 +2087,7 @@ function Registry({ project }: { project: Project }) {
           <CardContent>
             <Box
               component="pre"
+              aria-label={`Запись реестра ${String(item.stable_diff_id || item.mrq_id || index + 1)}`}
               sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
             >
               {JSON.stringify(item, null, 2)}

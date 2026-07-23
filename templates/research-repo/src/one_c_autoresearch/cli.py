@@ -29,6 +29,10 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
     commands.add_parser("next")
+    registry = commands.add_parser("registry")
+    registry.add_argument("name", choices=("diff-inventory", "target-coverage", "mrq", "extension-diff", "extension-dependencies", "extension-path-coverage", "extension-physical-diff"))
+    registry.add_argument("--offset", type=int, default=0)
+    registry.add_argument("--limit", type=int, default=100)
     run = commands.add_parser("run-next")
     run.add_argument("--approve-source-acquisition", action="store_true")
     run.add_argument("--approve-agent-proposal", action="store_true")
@@ -67,6 +71,8 @@ def main(argv: list[str] | None = None) -> int:
         value = service.snapshot()
     elif args.command == "next":
         value = service.next()
+    elif args.command == "registry":
+        value = service.registry(args.name, args.offset, args.limit)
     elif args.command in {"run-next", "run-until-blocked"}:
         from .events import EventStore
         from .user_state import load_agent_profiles

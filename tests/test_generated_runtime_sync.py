@@ -4,6 +4,7 @@ from argparse import Namespace
 import importlib.util
 import json
 from pathlib import Path
+import os
 import subprocess
 import sys
 import zipfile
@@ -56,3 +57,8 @@ def test_packaged_template_matches_scaffold_and_starts_fresh_repo(tmp_path: Path
         cwd=repo, text=True, capture_output=True, check=True,
     )
     assert '"project-configured"' in result.stdout
+    environment = {**os.environ, "PYTHONPATH": str(repo / "src")}
+    subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "tests/test_extension_analyzer.py"],
+        cwd=repo, env=environment, check=True,
+    )

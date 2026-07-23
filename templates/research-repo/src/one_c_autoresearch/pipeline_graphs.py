@@ -183,7 +183,9 @@ def discover_analyze_one(state: DiscoverState, stable_diff_id: str, *, executor:
 
     if not bindings_check():
         return {**state, "status": "stale", "blocker": {"code": "dispatcher.bindings.stale", "message": "active generations changed during analysis", "action": "mrq.discover-next"}}
-    work_unit = {"id": stable_diff_id, "kind": "uncovered-diff", "diff": _read_diff_inventory(repo) and next((row for row in _read_diff_inventory(repo) if row["stable_diff_id"] == stable_diff_id), {}), "allowed_paths": [_path_for(repo, stable_diff_id)]}
+    from .workflow import semantic_diff_context
+    fact = next((row for row in _read_diff_inventory(repo) if row["stable_diff_id"] == stable_diff_id), None)
+    work_unit = {"id": stable_diff_id, "kind": "uncovered-diff", **semantic_diff_context(repo, stable_diff_id, fact)}
     payload = executor(repo, profile, "mrq.discover-next", work_unit, supplement, timeout_seconds, cancelled)
     result: AnalyzeResult = {"stable_diff_id": stable_diff_id, "kind": "meaning" if payload.get("semantic_key") else "noise", "proposal": payload, "evidence": payload.get("evidence", []), "rationale": str(payload.get("rationale", ""))}
     analyzed = dict(state.get("analyzed", {}))
@@ -217,7 +219,18 @@ def discover_preliminary_group(state: DiscoverState, anchor: str, *, executor: C
     meanings = list(state.get("meanings", []))
     inventory = {row["stable_diff_id"]: row for row in _read_diff_inventory(repo)}
     candidates = _stable_group_candidates(anchor, meanings, inventory)
-    work_unit = {"id": anchor, "kind": "preliminary-group", "candidate_diff_ids": candidates, "allowed_paths": [str(inventory.get(identifier, {}).get("path", "")) for identifier in candidates if inventory.get(identifier, {}).get("path")]}
+    from .workflow import semantic_diff_context
+    semantic = [semantic_diff_context(repo, identifier, inventory[identifier]) for identifier in candidates if inventory.get(identifier, {}).get("object_kind") == "extension_intervention"]
+    work_unit = {
+        "id": anchor,
+        "kind": "preliminary-group",
+        "candidate_diff_ids": candidates,
+        "semantic_extension_context": semantic,
+        "allowed_paths": sorted(
+            {str(inventory[identifier]["path"]) for identifier in candidates if inventory.get(identifier, {}).get("path")}
+            | {path for context in semantic for path in context["allowed_paths"]}
+        ),
+    }
     proposal_payload = executor(repo, profile, "mrq.discover-next", work_unit, supplement, timeout_seconds, cancelled)
     proposal: GroupProposal = {
         "anchor_diff_id": anchor,

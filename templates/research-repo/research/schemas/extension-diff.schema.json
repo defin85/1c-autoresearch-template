@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "stable_diff_id", "comparison_id", "before_role", "after_role", "extension_uuid", "change_type", "object_scope", "intervention_kind", "intervention_key", "extension_object_identity", "affected_base_identity", "symbol_identity", "structural_sublocation", "before_structural_fingerprint", "after_structural_fingerprint", "before_evidence_fingerprint", "after_evidence_fingerprint", "evidence", "dependency_ids", "diagnostic_codes"],
+  "properties": {
+    "schema_version": {"const": "2"},
+    "stable_diff_id": {"type": "string", "pattern": "^DIF-[0-9A-F]{16}$"},
+    "comparison_id": {"type": "string", "pattern": "^CMP-[0-9A-F]{16}$"},
+    "before_role": {"const": "vendor_baseline"},
+    "after_role": {"enum": ["target_cf", "next_vendor"]},
+    "extension_uuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "change_type": {"enum": ["added", "deleted", "modified"]},
+    "object_scope": {"enum": ["owned", "adopted"]},
+    "intervention_kind": {"enum": ["object_definition", "metadata_change", "form_change", "command_change", "role_change", "module_addition", "method_extension", "method_interception", "base_reference"]},
+    "intervention_key": {"type": "string", "minLength": 1},
+    "extension_object_identity": {"type": "string", "minLength": 1},
+    "affected_base_identity": {"type": "string"},
+    "symbol_identity": {"type": "string"},
+    "structural_sublocation": {"type": "string"},
+    "before_structural_fingerprint": {"type": "string"},
+    "after_structural_fingerprint": {"type": "string"},
+    "before_evidence_fingerprint": {"type": "string"},
+    "after_evidence_fingerprint": {"type": "string"},
+    "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}},
+    "dependency_ids": {"type": "array", "items": {"type": "string"}},
+    "diagnostic_codes": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "required": ["role", "side", "path", "fingerprint"],
+      "properties": {
+        "role": {"enum": ["vendor_baseline", "target_cf", "next_vendor"]},
+        "side": {"enum": ["before", "after"]},
+        "path": {"type": "string", "minLength": 1},
+        "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

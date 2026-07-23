@@ -47,7 +47,17 @@ export interface DispatcherItems {
   approval_count: number;
 }
 
-export interface DifCard { id: string; path: string; kind: string; state: string }
+export interface DifCard {
+  id: string;
+  path: string;
+  kind: string;
+  state: string;
+  intervention_kind?: string;
+  object_scope?: string;
+  target_coverage?: string;
+  dependency_count?: number;
+  blocker_codes?: string[];
+}
 export interface ProposalCard { id: string; job_id: string; kind: string; semantic_key: string; dif_ids: string[]; evidence_count: number; noise_count: number; mrq_id: string; created_at: string }
 export interface MrqCard { id: string; title: string; semantic_key: string; state: string; dif_ids: string[]; evidence_count: number }
 export interface BatchCard { id: string; mrq_ids: string[]; reason: string }

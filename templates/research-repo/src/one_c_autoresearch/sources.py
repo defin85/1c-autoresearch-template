@@ -631,6 +631,10 @@ def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], 
                 "payload_file_count": len(payload),
                 "payload_fingerprint": "sha256:" + sha256(canonical_json(payload)),
             }
+            if member["kind"] in {"configuration", "extension"}:
+                metadata.update({"uuid": identity["uuid"], "name": identity["name"], "version": identity["version"]})
+            if member["kind"] == "extension":
+                metadata["active"] = bool(member["extension"]["active"])
             atomic_json(output / "component-manifest.json", metadata)
         shutil.rmtree(work_root)
         if validate_role_contract(repo, tested) != contract or routing_bindings(repo, connections, upload_drafts) != fresh_preview["bindings"]:
@@ -879,6 +883,10 @@ def _validate_active_routed(repo: Path, pointer: dict[str, Any], *, deep: bool, 
         payload_manifest = [entry for entry in file_manifest(component_root) if entry["path"] != "component-manifest.json"] if deep else []
         group = groups.get(component.get("routing_group_id"))
         component_keys = {"schema_version", "component_id", "kind", "routing_group_id", "probe_contract_version", "probe_fingerprint", "form_counts", "routing_reason", "exporter", "representation_schema", "exporter_version", "converter_version", "payload_file_count", "payload_fingerprint"}
+        if component.get("kind") in {"configuration", "extension"}:
+            component_keys |= {"uuid", "name", "version"}
+        if component.get("kind") == "extension":
+            component_keys.add("active")
         counts_valid = set(component.get("form_counts", {})) == {"managed", "ordinary", "inconclusive"} and all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in component.get("form_counts", {}).values())
         probe_valid = component.get("probe_contract_version") in {"", "form-probe/v1"} and (component.get("probe_fingerprint") == "" or re.fullmatch(r"sha256:[0-9a-f]{64}", str(component.get("probe_fingerprint"))) is not None)
         form_route = component.get("routing_reason") in {"managed_only", "ordinary_form_present", "inconclusive_form_payload", "no_forms"}
@@ -887,6 +895,12 @@ def _validate_active_routed(repo: Path, pointer: dict[str, Any], *, deep: bool, 
             or component.get("schema_version") != "2"
             or not counts_valid
             or not probe_valid
+            or component.get("kind") in {"configuration", "extension"} and (
+                not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", str(component.get("uuid", "")))
+                or not str(component.get("name", ""))
+                or not isinstance(component.get("version"), str)
+            )
+            or component.get("kind") == "extension" and not isinstance(component.get("active"), bool)
             or (form_route and component.get("kind") not in {"configuration", "extension"})
             or (component.get("representation_schema") == "xml-hierarchical/v1" and component.get("routing_reason") not in {"managed_only", "no_forms"})
             or (component.get("representation_schema") == "v8unpack/v1" and component.get("routing_reason") not in {"ordinary_form_present", "inconclusive_form_payload", "binary_container_requires_v8unpack"})

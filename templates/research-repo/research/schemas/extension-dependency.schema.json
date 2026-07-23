@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "dependency_id", "stable_diff_id", "role", "extension_uuid", "dependency_kind", "normalized_source_reference", "resolved_base_identity", "outcome", "evidence", "diagnostic_code"],
+  "properties": {
+    "schema_version": {"const": "2"},
+    "dependency_id": {"type": "string", "minLength": 1},
+    "stable_diff_id": {"type": "string", "pattern": "^DIF-[0-9A-F]{16}$"},
+    "role": {"enum": ["vendor_baseline", "target_cf", "next_vendor"]},
+    "extension_uuid": {"type": "string", "pattern": "^[0-9a-f-]{36}$"},
+    "dependency_kind": {"type": "string", "minLength": 1},
+    "normalized_source_reference": {"type": "string", "minLength": 1},
+    "resolved_base_identity": {"type": "string"},
+    "outcome": {"enum": ["present_compatible", "present_changed", "missing", "unresolved"]},
+    "evidence": {"type": "array", "items": {"$ref": "extension-diff.schema.json#/$defs/evidence"}},
+    "diagnostic_code": {"type": "string"}
+  },
+  "additionalProperties": false
+}

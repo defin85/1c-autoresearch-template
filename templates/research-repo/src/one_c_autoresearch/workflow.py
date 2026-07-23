@@ -272,6 +272,49 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _csv(path: Path) -> list[dict[str, str]]:
+    if not path.is_file():
+        return []
+    with path.open(encoding="utf-8", newline="") as stream:
+        return list(csv.DictReader(stream))
+
+
+def semantic_diff_context(repo: Path, stable_diff_id: str, fact: dict[str, Any] | None = None) -> dict[str, Any]:
+    pointer = _pointer(repo, "active-diff-generation.json")
+    root = repo / "analysis/indexes/generations" / str(pointer.get("generation_id"))
+    if fact is None:
+        with (root / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
+            fact = next((row for row in csv.DictReader(stream) if row.get("stable_diff_id") == stable_diff_id), None)
+    if fact is None:
+        physical = root / "extension-physical-diff.csv"
+        if physical.is_file():
+            with physical.open(encoding="utf-8", newline="") as stream:
+                if any(row.get("stable_diff_id") == stable_diff_id for row in csv.DictReader(stream)):
+                    raise ValueError(f"raw extension audit DIF is not a workflow work unit: {stable_diff_id}")
+        raise ValueError(f"unknown active DIF: {stable_diff_id}")
+    context: dict[str, Any] = {"diff": fact, "allowed_paths": [fact["path"]]}
+    if pointer.get("schema_version") != "2" or fact.get("object_kind") != "extension_intervention":
+        return context
+    details = next((row for row in _jsonl(root / "extension-diff.jsonl") if row.get("stable_diff_id") == stable_diff_id), None)
+    if details is None:
+        raise ValueError(f"semantic extension DIF details are missing: {stable_diff_id}")
+    dependencies = [row for row in _jsonl(root / "extension-dependencies.jsonl") if row.get("stable_diff_id") == stable_diff_id]
+    with (root / "target-coverage.csv").open(encoding="utf-8", newline="") as stream:
+        coverage = next((row for row in csv.DictReader(stream) if row.get("customer_diff_id") == stable_diff_id), None)
+    context.update({
+        "extension": details,
+        "dependencies": dependencies,
+        "target_coverage": coverage,
+        "allowed_paths": sorted({f"{item['role']}/extensions/{details['extension_uuid']}/{item['path']}" for item in details["evidence"]}),
+        "compatibility_summary": {
+            "dependency_outcomes": sorted({item["outcome"] for item in dependencies}),
+            "diagnostic_codes": details["diagnostic_codes"],
+            "target_coverage_status": coverage.get("coverage_status", "") if coverage else "",
+        },
+    })
+    return context
+
+
 def status(repo: Path, *, deep: bool = True) -> dict[str, Any]:
     repo = repo.resolve()
     validate_workflow(repo)
@@ -366,10 +409,14 @@ def next_work(repo: Path) -> dict[str, Any] | None:
                 pending = sorted((item for item in diffs if item.get("before_role") == "vendor_baseline" and item.get("after_role") == "target_cf" and item["stable_diff_id"] not in owned), key=lambda item: item["stable_diff_id"])
                 if pending:
                     target_pointer = _pointer(repo, "active-diff-generation.json")
-                    coverage_path = repo / "analysis/indexes/generations" / target_pointer["generation_id"] / "target-coverage.csv"
-                    with coverage_path.open(encoding="utf-8", newline="") as stream:
-                        coverage = {item["customer_diff_id"]: item for item in csv.DictReader(stream)}
-                    result["work_unit"] = {"id": pending[0]["stable_diff_id"], "kind": "uncovered-diff", "diff": pending[0], "target_coverage": coverage.get(pending[0]["stable_diff_id"]), "source_generation_id": _pointer(repo, "active-source-generation.json")["generation_id"], "diff_generation_id": target_pointer["generation_id"], "allowed_paths": [pending[0]["path"]]}
+                    if pending[0].get("object_kind") == "extension_intervention":
+                        context = semantic_diff_context(repo, pending[0]["stable_diff_id"], pending[0])
+                    else:
+                        coverage_path = repo / "analysis/indexes/generations" / target_pointer["generation_id"] / "target-coverage.csv"
+                        with coverage_path.open(encoding="utf-8", newline="") as stream:
+                            coverage = next((item for item in csv.DictReader(stream) if item["customer_diff_id"] == pending[0]["stable_diff_id"]), None)
+                        context = {"diff": pending[0], "target_coverage": coverage, "allowed_paths": [pending[0]["path"]]}
+                    result["work_unit"] = {"id": pending[0]["stable_diff_id"], "kind": "uncovered-diff", **context, "source_generation_id": _pointer(repo, "active-source-generation.json")["generation_id"], "diff_generation_id": target_pointer["generation_id"]}
             elif blocker["action"] == "mrq.decide-next":
                 _diffs, mrqs, dispositions, _approvals = _active_rows(repo)
                 pending = sorted((item for item in mrqs if item.get("state") != "superseded" and item.get("state") != "approved"), key=lambda item: item["mrq_id"])
@@ -377,7 +424,8 @@ def next_work(repo: Path) -> dict[str, Any] | None:
                     item = pending[0]
                     owned = {relation["stable_diff_id"] for relation in dispositions if relation.get("mrq_id") == item["mrq_id"] and relation.get("primary")}
                     paths = sorted({evidence["path"] for evidence in item.get("source_customization", {}).get("evidence", []) if evidence.get("stable_diff_id") in owned})
-                    result["work_unit"] = {"id": item["mrq_id"], "kind": "migration-decision" if not item.get("migration_decision", {}).get("decision") else "approval", "mrq": item, "source_generation_id": item["source_generation_id"], "diff_generation_id": item["diff_generation_id"], "allowed_paths": paths}
+                    semantic = [semantic_diff_context(repo, identifier) for identifier in sorted(owned) if next((row for row in diffs if row["stable_diff_id"] == identifier), {}).get("object_kind") == "extension_intervention"]
+                    result["work_unit"] = {"id": item["mrq_id"], "kind": "migration-decision" if not item.get("migration_decision", {}).get("decision") else "approval", "mrq": item, "semantic_extension_context": semantic, "source_generation_id": item["source_generation_id"], "diff_generation_id": item["diff_generation_id"], "allowed_paths": sorted(set(paths) | {path for context in semantic for path in context["allowed_paths"]})}
             return result
     return None
 
@@ -449,12 +497,29 @@ def _dispatcher_items(repo: Path, store: Any) -> dict[str, Any]:
         owners = {row.get("stable_diff_id") for row in dispositions if row.get("primary")}
         noise = {row.get("stable_diff_id") for row in dispositions if row.get("approved_noise")}
         active_mrqs = sorted((row for row in mrqs if row.get("state") != "superseded"), key=lambda row: row["mrq_id"])
+        pointer = _pointer(repo, "active-diff-generation.json")
+        diff_root = repo / "analysis/indexes/generations" / str(pointer.get("generation_id"))
+        extension_rows = _jsonl(diff_root / "extension-diff.jsonl") if pointer.get("schema_version") == "2" else []
+        dependency_rows = _jsonl(diff_root / "extension-dependencies.jsonl") if pointer.get("schema_version") == "2" else []
+        coverage_rows = _csv(diff_root / "target-coverage.csv")
+        extension_by_id = {row["stable_diff_id"]: row for row in extension_rows}
+        dependencies_by_id: dict[str, list[dict[str, Any]]] = {}
+        for dependency in dependency_rows:
+            dependencies_by_id.setdefault(dependency["stable_diff_id"], []).append(dependency)
+        coverage_by_id = {row["customer_diff_id"]: row for row in coverage_rows}
+        card = lambda row, state: _dif_card(
+            row,
+            state,
+            extension_by_id.get(row["stable_diff_id"]),
+            coverage_by_id.get(row["stable_diff_id"]),
+            dependencies_by_id.get(row["stable_diff_id"], []),
+        )
         from .mrq_batches import classify
         batches = classify(active_mrqs)
         return {
-            "dif_queue": [_dif_card(row, "queued") for row in customer if row["stable_diff_id"] not in owners][:32],
-            "meaning_diffs": [_dif_card(row, "meaning") for row in customer if row["stable_diff_id"] in owners and row["stable_diff_id"] not in noise][:16],
-            "noise_diffs": [_dif_card(row, "noise") for row in customer if row["stable_diff_id"] in noise][:16],
+            "dif_queue": [card(row, "queued") for row in customer if row["stable_diff_id"] not in owners][:32],
+            "meaning_diffs": [card(row, "meaning") for row in customer if row["stable_diff_id"] in owners and row["stable_diff_id"] not in noise][:16],
+            "noise_diffs": [card(row, "noise") for row in customer if row["stable_diff_id"] in noise][:16],
             "proposals": [_proposal_card(row) for row in store.proposals() if row.get("kind") == "approval" and row.get("consumed_at") is None][:16],
             "mrqs": [_mrq_card(row, dispositions) for row in active_mrqs[:32]],
             "batches": [{"id": batch.batch_id, "mrq_ids": list(batch.mrq_ids), "reason": batch.basis} for batch in batches[:16]],
@@ -465,8 +530,29 @@ def _dispatcher_items(repo: Path, store: Any) -> dict[str, Any]:
         return {"dif_queue": [], "meaning_diffs": [], "noise_diffs": [], "proposals": [], "mrqs": [], "batches": [], "decisions": [], "approval_count": 0}
 
 
-def _dif_card(row: dict[str, Any], state: str) -> dict[str, Any]:
-    return {"id": row.get("stable_diff_id", ""), "path": row.get("path", ""), "kind": row.get("kind", ""), "state": state}
+def _dif_card(
+    row: dict[str, Any],
+    state: str,
+    extension: dict[str, Any] | None = None,
+    target: dict[str, Any] | None = None,
+    dependencies: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    card = {"id": row.get("stable_diff_id", ""), "path": row.get("path", ""), "kind": row.get("object_kind", ""), "state": state}
+    if extension:
+        card.update({key: extension.get(key, "") for key in ("extension_uuid", "intervention_kind", "object_scope", "affected_base_identity")})
+        card["evidence_count"] = len(extension.get("evidence", []))
+        values = dependencies or []
+        card["dependency_count"] = len(values)
+        card["compatibility_summary"] = {
+            outcome: sum(item.get("outcome") == outcome for item in values)
+            for outcome in ("present_compatible", "present_changed", "missing", "unresolved")
+        }
+        card["target_coverage"] = (target or {}).get("coverage_status", "")
+        card["blocker_codes"] = sorted(
+            set(extension.get("diagnostic_codes", []))
+            | {item["diagnostic_code"] for item in values if item.get("diagnostic_code")}
+        )
+    return card
 
 
 def _proposal_card(row: dict[str, Any]) -> dict[str, Any]:
@@ -541,9 +627,10 @@ def _prepare_aggregates(repo: Path) -> dict[str, Any]:
         if coverage_path.is_file():
             with coverage_path.open(encoding="utf-8", newline="") as stream:
                 coverage_count = sum(1 for _ in csv.DictReader(stream))
-        return {"diff_count": diff_count, "target_coverage_count": coverage_count}
+        extension_count = len(_jsonl(diff_root / "extension-diff.jsonl"))
+        return {"diff_count": diff_count, "target_coverage_count": coverage_count, "semantic_extension_diff_count": extension_count}
     except (OSError, ValueError, KeyError):
-        return {"diff_count": 0, "target_coverage_count": 0}
+        return {"diff_count": 0, "target_coverage_count": 0, "semantic_extension_diff_count": 0}
 
 
 def _analyze_aggregates(repo: Path) -> dict[str, Any]:
@@ -551,9 +638,13 @@ def _analyze_aggregates(repo: Path) -> dict[str, Any]:
         from .pipeline_graphs import select_dif_window, _read_diff_inventory
         customer = _read_diff_inventory(repo)
         window = select_dif_window(repo)
-        return {"customer_diff_count": len(customer), "window_size": len(window), "max_window": 32, "max_parallel": 4}
+        semantic = sum(row.get("object_kind") == "extension_intervention" for row in customer)
+        pointer = _pointer(repo, "active-diff-generation.json")
+        root = repo / "analysis/indexes/generations" / str(pointer.get("generation_id"))
+        raw_count = len(_csv(root / "extension-physical-diff.csv"))
+        return {"customer_diff_count": len(customer), "semantic_extension_diff_count": semantic, "raw_extension_diff_count": raw_count, "window_size": len(window), "max_window": 32, "max_parallel": 4}
     except Exception:
-        return {"customer_diff_count": 0, "window_size": 0, "max_window": 32, "max_parallel": 4}
+        return {"customer_diff_count": 0, "semantic_extension_diff_count": 0, "window_size": 0, "max_window": 32, "max_parallel": 4}
 
 
 def _form_mrq_aggregates(repo: Path) -> dict[str, Any]:

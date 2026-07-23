@@ -1,13 +1,62 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
-  "required": ["schema_version", "generation_id", "source_generation_id", "files", "row_counts"],
-  "properties": {
-    "schema_version": {"const": "1"},
-    "generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "source_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "files": {"$ref": "#/$defs/fixedFiles"},
-    "row_counts": {
+  "oneOf": [
+    {"$ref": "#/$defs/version1"},
+    {"$ref": "#/$defs/version2"}
+  ],
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "identity": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "version1": {
+      "type": "object",
+      "required": ["schema_version", "generation_id", "source_generation_id", "files", "row_counts"],
+      "properties": {
+        "schema_version": {"const": "1"},
+        "generation_id": {"$ref": "#/$defs/identity"},
+        "source_generation_id": {"$ref": "#/$defs/identity"},
+        "files": {"$ref": "#/$defs/files1"},
+        "row_counts": {"$ref": "#/$defs/counts1"}
+      },
+      "additionalProperties": false
+    },
+    "version2": {
+      "type": "object",
+      "required": ["schema_version", "generation_id", "source_generation_id", "files", "row_counts"],
+      "properties": {
+        "schema_version": {"const": "2"},
+        "generation_id": {"$ref": "#/$defs/identity"},
+        "source_generation_id": {"$ref": "#/$defs/identity"},
+        "files": {"$ref": "#/$defs/files2"},
+        "row_counts": {"$ref": "#/$defs/counts2"}
+      },
+      "additionalProperties": false
+    },
+    "files1": {
+      "type": "object",
+      "required": ["diff-inventory.csv", "diff-id-map.csv", "target-coverage.csv"],
+      "properties": {
+        "diff-inventory.csv": {"$ref": "#/$defs/hash"},
+        "diff-id-map.csv": {"$ref": "#/$defs/hash"},
+        "target-coverage.csv": {"$ref": "#/$defs/hash"}
+      },
+      "additionalProperties": false
+    },
+    "files2": {
+      "type": "object",
+      "required": ["diff-inventory.csv", "diff-id-map.csv", "target-coverage.csv", "extension-analyzer-manifest.json", "extension-diff.jsonl", "extension-dependencies.jsonl", "extension-physical-diff.csv", "extension-path-coverage.csv"],
+      "properties": {
+        "diff-inventory.csv": {"$ref": "#/$defs/hash"},
+        "diff-id-map.csv": {"$ref": "#/$defs/hash"},
+        "target-coverage.csv": {"$ref": "#/$defs/hash"},
+        "extension-analyzer-manifest.json": {"$ref": "#/$defs/hash"},
+        "extension-diff.jsonl": {"$ref": "#/$defs/hash"},
+        "extension-dependencies.jsonl": {"$ref": "#/$defs/hash"},
+        "extension-physical-diff.csv": {"$ref": "#/$defs/hash"},
+        "extension-path-coverage.csv": {"$ref": "#/$defs/hash"}
+      },
+      "additionalProperties": false
+    },
+    "counts1": {
       "type": "object",
       "required": ["diff-inventory.csv", "diff-id-map.csv", "target-coverage.csv"],
       "properties": {
@@ -16,19 +65,20 @@
         "target-coverage.csv": {"type": "integer", "minimum": 0}
       },
       "additionalProperties": false
-    }
-  },
-  "$defs": {
-    "fixedFiles": {
+    },
+    "counts2": {
       "type": "object",
-      "required": ["diff-inventory.csv", "diff-id-map.csv", "target-coverage.csv"],
+      "required": ["diff-inventory.csv", "diff-id-map.csv", "target-coverage.csv", "extension-diff.jsonl", "extension-dependencies.jsonl", "extension-physical-diff.csv", "extension-path-coverage.csv"],
       "properties": {
-        "diff-inventory.csv": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "diff-id-map.csv": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "target-coverage.csv": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        "diff-inventory.csv": {"type": "integer", "minimum": 0},
+        "diff-id-map.csv": {"type": "integer", "minimum": 0},
+        "target-coverage.csv": {"type": "integer", "minimum": 0},
+        "extension-diff.jsonl": {"type": "integer", "minimum": 0},
+        "extension-dependencies.jsonl": {"type": "integer", "minimum": 0},
+        "extension-physical-diff.csv": {"type": "integer", "minimum": 0},
+        "extension-path-coverage.csv": {"type": "integer", "minimum": 0}
       },
       "additionalProperties": false
     }
-  },
-  "additionalProperties": false
+  }
 }

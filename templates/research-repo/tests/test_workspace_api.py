@@ -13,6 +13,34 @@ from one_c_autoresearch.sources import draft_fingerprint
 REPO = Path(__file__).parents[1]
 
 
+def test_extension_registries_are_paged_and_bound_to_active_diff(tmp_path: Path):
+    import json
+    repo = tmp_path / "repo"; (repo / "research").mkdir(parents=True)
+    (repo / "project.toml").write_bytes((REPO / "project.toml").read_bytes())
+    (repo / "research/workflow.toml").write_bytes((REPO / "research/workflow.toml").read_bytes())
+    generation = "a" * 64
+    (repo / "research/active-diff-generation.json").write_text(json.dumps({"schema_version": "2", "generation_id": generation}), encoding="utf-8")
+    root = repo / "analysis/indexes/generations" / generation; root.mkdir(parents=True)
+    (root / "extension-diff.jsonl").write_text('{"stable_diff_id":"DIF-A"}\n{"stable_diff_id":"DIF-B"}\n', encoding="utf-8")
+    app = create_app(tmp_path / "state", [repo], testing=True)
+    headers = {"Origin": "http://testserver", "Idempotency-Key": "bookmark"}
+    with TestClient(app) as client:
+        project = client.post("/api/v1/projects", json={"name": "test", "root": str(repo)}, headers=headers).json()
+        page = client.get(f"/api/v1/projects/{project['id']}/registries/extension-diff?offset=0&limit=1").json()
+        second = client.get(
+            f"/api/v1/projects/{project['id']}/registries/extension-diff"
+            f"?offset=1&limit=1&expected_generation={generation}"
+        ).json()
+        stale = client.get(
+            f"/api/v1/projects/{project['id']}/registries/extension-diff"
+            "?offset=1&limit=1&expected_generation="
+            + "b" * 64
+        )
+    assert page == {"diff_generation_id": generation, "offset": 0, "limit": 1, "items": [{"stable_diff_id": "DIF-A"}], "has_more": True}
+    assert second["items"] == [{"stable_diff_id": "DIF-B"}] and not second["has_more"]
+    assert stale.status_code == 409 and "stale diff generation" in stale.text
+
+
 @pytest.mark.parametrize(
     ("counts", "reason", "absent_roles", "tools_complete"),
     [

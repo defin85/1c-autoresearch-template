@@ -17,12 +17,23 @@ CONFIDENCE = {"low", "medium", "high"}
 AGREEMENT_STATES = {"pending_review", "changes_requested", "approved"}
 
 
-def comparison_epoch_fingerprint(source: dict[str, Any]) -> str:
+def comparison_epoch_fingerprint(source: dict[str, Any], diff: dict[str, Any] | None = None) -> str:
     if source.get("schema_version") == "2":
         value = str(source.get("source_comparison_epoch_fingerprint", ""))
         if not value.startswith("sha256:"):
             raise ValueError("routed source comparison epoch is missing")
-        return value.removeprefix("sha256:")
+        if diff is None:
+            return value.removeprefix("sha256:")
+        diff = diff or source
+        analyzer = str(diff.get("extension_analyzer_version", ""))
+        adapters = diff.get("extension_adapter_versions")
+        if not analyzer or not isinstance(adapters, list) or adapters != sorted(adapters) or any(not str(item).strip() for item in adapters):
+            raise ValueError("extension comparison contract is missing")
+        return sha256(canonical_json({
+            "extension_adapter_versions": adapters,
+            "extension_analyzer_version": analyzer,
+            "source_comparison_epoch_fingerprint": value,
+        }))
     return sha256(canonical_json({"acquisition_profile_id": source["acquisition_profile_id"], "normalizer_version": source["normalizer_version"], "representation_schema": source["representation_schema"]}))
 
 
@@ -37,6 +48,22 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
         for row in rows:
             stream.write(canonical_json(row) + b"\n")
         stream.flush(); os.fsync(stream.fileno())
+
+
+def _diff_facts(repo: Path, diff_id: str) -> dict[str, dict[str, Any]]:
+    import csv
+    root = repo / "analysis/indexes/generations" / diff_id
+    with (root / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
+        facts = {row["stable_diff_id"]: row for row in csv.DictReader(stream)}
+    for detail in _jsonl(root / "extension-diff.jsonl"):
+        fact = facts.get(str(detail.get("stable_diff_id", "")))
+        if fact is not None:
+            extension = detail.get("extension_uuid", "")
+            fact["semantic_evidence"] = [
+                {"path": f"{item['role']}/extensions/{extension}/{item['path']}", "fingerprint": item["fingerprint"]}
+                for item in detail.get("evidence", [])
+            ]
+    return facts
 
 
 def active(repo: Path, *, require_tracked_clean_state: bool = False) -> dict[str, Any]:
@@ -62,15 +89,14 @@ def active(repo: Path, *, require_tracked_clean_state: bool = False) -> dict[str
     for name in FILES:
         if sha256((root / name).read_bytes()) != manifest["files"][name]:
             raise ValueError(f"canonical artifact hash mismatch: {name}")
-    epoch_fingerprint = comparison_epoch_fingerprint(source_pointer)
+    analyzer = json.loads((repo / "analysis/indexes/generations" / str(diff_id) / "extension-analyzer-manifest.json").read_text(encoding="utf-8")) if diff_pointer.get("schema_version") == "2" else None
+    epoch_fingerprint = comparison_epoch_fingerprint(source_pointer, analyzer)
     if manifest.get("comparison_epoch_fingerprint") != epoch_fingerprint:
         raise ValueError("canonical comparison epoch mismatch")
     preimage = {"schema_version": "1", "source_generation_id": source_id, "diff_generation_id": diff_id, "comparison_epoch_fingerprint": epoch_fingerprint, "files": manifest["files"]}
     if sha256(canonical_json(preimage)) != generation:
         raise ValueError("canonical generation ID mismatch")
-    import csv
-    with (repo / "analysis/indexes/generations" / str(diff_id) / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
-        customer = {row["stable_diff_id"]: row for row in csv.DictReader(stream) if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"}
+    customer = {key: row for key, row in _diff_facts(repo, str(diff_id)).items() if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"}
     validate_graph({name: result[name] for name in FILES}, str(pointer.get("source_generation_id")), str(diff_id), customer)
     return result
 
@@ -127,7 +153,9 @@ def validate_graph(rows: dict[str, list[dict[str, Any]]], source_id: str, diff_i
             if item["state"] != "superseded" and isinstance(valid_customer_diffs, dict):
                 fact = valid_customer_diffs.get(evidence["stable_diff_id"])
                 expected_fingerprint = fact.get("after_fingerprint") or fact.get("before_fingerprint") if fact else None
-                if not fact or evidence["path"] != fact.get("path") or evidence["fingerprint"] != expected_fingerprint:
+                semantic_evidence = fact.get("semantic_evidence", []) if fact else []
+                matches_semantic = any(evidence["path"] == item["path"] and evidence["fingerprint"] == item["fingerprint"] for item in semantic_evidence)
+                if not fact or not matches_semantic and (evidence["path"] != fact.get("path") or evidence["fingerprint"] != expected_fingerprint):
                     raise ValueError(f"source evidence does not match active physical DIF: {item['mrq_id']}")
             if evidence.get("opaque_external") and evidence.get("evidence_id") not in runtime_evidence:
                 raise ValueError(f"opaque external MRQ evidence requires a runtime record: {item['mrq_id']}")
@@ -203,7 +231,9 @@ def publish(repo: Path, rows: dict[str, list[dict[str, Any]]], source_id: str, d
         current = json.loads((repo / "research/active-generation.json").read_text(encoding="utf-8"))
         if current.get("canonical_generation_id") != expected_generation:
             raise RuntimeError("stale canonical generation")
-        epoch_fingerprint = comparison_epoch_fingerprint(epoch)
+        diff_pointer = json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
+        analyzer = json.loads((repo / "analysis/indexes/generations" / diff_id / "extension-analyzer-manifest.json").read_text(encoding="utf-8")) if diff_pointer.get("schema_version") == "2" else None
+        epoch_fingerprint = comparison_epoch_fingerprint(epoch, analyzer)
         if expected_generation:
             prior_manifest = json.loads((repo / "research/generations" / expected_generation / "manifest.json").read_text(encoding="utf-8"))
             if prior_manifest.get("comparison_epoch_fingerprint") == epoch_fingerprint:
@@ -212,12 +242,9 @@ def publish(repo: Path, rows: dict[str, list[dict[str, Any]]], source_id: str, d
                     raise ValueError("same-epoch approval ledger prefix was changed")
             elif any(rows[name] for name in FILES):
                 raise ValueError("a new comparison epoch must start with empty MRQ ledgers")
-        import csv
-        diff_pointer = json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
         if diff_pointer.get("generation_id") != diff_id or diff_pointer.get("source_generation_id") != source_id:
             raise RuntimeError("stale source or diff generation")
-        with (repo / "analysis/indexes/generations" / diff_id / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
-            valid_customer_diffs = {row["stable_diff_id"]: row for row in csv.DictReader(stream) if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"}
+        valid_customer_diffs = {key: row for key, row in _diff_facts(repo, diff_id).items() if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"}
         validate_graph(rows, source_id, diff_id, valid_customer_diffs)
         parent = repo / "analysis/migration-requirements/.staging"; parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=parent) as temporary:
@@ -260,15 +287,14 @@ def revalidate_unchanged(repo: Path, new_source: dict[str, Any], new_diff: dict[
     root = repo / "analysis/migration-requirements/generations" / generation
     state = {name: _jsonl(root / name) for name in FILES}
     old_manifest = json.loads((repo / "research/generations" / previous["canonical_generation_id"] / "manifest.json").read_text(encoding="utf-8"))
-    if old_manifest.get("comparison_epoch_fingerprint") != comparison_epoch_fingerprint(new_source):
+    analyzer = json.loads((repo / "analysis/indexes/generations" / new_diff["generation_id"] / "extension-analyzer-manifest.json").read_text(encoding="utf-8")) if new_diff.get("schema_version") == "2" else None
+    if old_manifest.get("comparison_epoch_fingerprint") != comparison_epoch_fingerprint(new_source, analyzer):
         raise ValueError("a new comparison epoch cannot revalidate prior MRQ state")
     rows = {name: deepcopy(state[name]) for name in FILES}
     import csv
-    with (repo / "analysis/indexes/generations" / previous["diff_generation_id"] / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
-        old_all = {item["stable_diff_id"]: item for item in csv.DictReader(stream)}
+    old_all = _diff_facts(repo, previous["diff_generation_id"])
     old_facts = {key: item for key, item in old_all.items() if item.get("before_role") == "vendor_baseline" and item.get("after_role") == "target_cf"}
-    with (repo / "analysis/indexes/generations" / new_diff["generation_id"] / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
-        new_all = {item["stable_diff_id"]: item for item in csv.DictReader(stream)}
+    new_all = _diff_facts(repo, new_diff["generation_id"])
     facts = {key: item for key, item in new_all.items() if item.get("before_role") == "vendor_baseline" and item.get("after_role") == "target_cf"}
     retained = [item for item in rows["dispositions.jsonl"] if item.get("stable_diff_id") in facts and (item.get("mrq_id") or old_facts.get(item["stable_diff_id"], {}).get("content_fingerprint") == facts[item["stable_diff_id"]].get("content_fingerprint"))]
     for relation in retained:
@@ -287,7 +313,10 @@ def revalidate_unchanged(repo: Path, new_source: dict[str, Any], new_diff: dict[
         refreshed = []
         for evidence in item.get("source_customization", {}).get("evidence", []):
             fact = facts.get(evidence.get("stable_diff_id"))
-            if fact and evidence.get("path") == fact.get("path"):
+            semantic = next((value for value in fact.get("semantic_evidence", []) if value["path"] == evidence.get("path")), None) if fact else None
+            if semantic:
+                refreshed.append({**evidence, "fingerprint": semantic["fingerprint"]})
+            elif fact and evidence.get("path") == fact.get("path"):
                 refreshed.append({**evidence, "fingerprint": fact.get("after_fingerprint") or fact.get("before_fingerprint")})
         item.setdefault("source_customization", {})["evidence"] = refreshed
         if not refreshed:

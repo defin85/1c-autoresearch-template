@@ -1,6 +1,12 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, expect, test, vi } from "vitest";
-import { App, RoutingPreviewSummary, ToolInventory, groupEvents } from "./App";
+import {
+  App,
+  Registry,
+  RoutingPreviewSummary,
+  ToolInventory,
+  groupEvents,
+} from "./App";
 
 beforeEach(() => {
   vi.stubGlobal(
@@ -83,6 +89,40 @@ test("shows accessible source tool installations and current use", async () => {
     }),
   ).toBeInTheDocument();
   expect(screen.getByText("требуется текущим маршрутом")).toBeInTheDocument();
+});
+
+test("shows semantic and raw extension registries with an accessible empty state", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        diff_generation_id: "a".repeat(64),
+        items: [],
+        has_more: false,
+      }),
+    }),
+  );
+  render(<Registry project={{ id: "p", name: "p", root: "/repo" }} />);
+  expect(
+    await screen.findByText("В выбранном реестре нет записей."),
+  ).toBeInTheDocument();
+  fireEvent.mouseDown(screen.getByLabelText("Реестр"));
+  expect(
+    screen.getByRole("option", { name: "extension-diff" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("option", { name: "extension-dependencies" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("option", { name: "extension-physical-diff" }),
+  ).toBeInTheDocument();
+  fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("option", { name: "extension-diff" }),
+    ).not.toBeInTheDocument(),
+  );
 });
 
 test.each([
