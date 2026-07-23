@@ -70,6 +70,9 @@ def test_source_tree_unpack_is_confined_and_secret_scanned(tmp_path: Path):
         value.writestr("config.txt", "token=very-private-token")
     with pytest.raises(ValueError, match="detected secret"):
         _extract_source_tree(archive, tmp_path / "secret-test")
+    with zipfile.ZipFile(archive, "w") as value:
+        value.writestr("help.html", "password:pwd</strong>")
+    _extract_source_tree(archive, tmp_path / "placeholder-test")
 
 
 def test_configuration_identity_rejects_entities_and_reads_name_version(tmp_path: Path):

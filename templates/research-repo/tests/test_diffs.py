@@ -9,6 +9,72 @@ from one_c_autoresearch.contracts import canonical_json, sha256
 from one_c_autoresearch.diffs import COMPARISONS, COVERAGE_HEADER, VERSION_FILES, _build_routed, _publish_inventory, build, compare, validate_active
 
 
+def _routed_repo(
+    repo: Path,
+    extension_roles: set[str],
+    representation: str = "xml-hierarchical/v1",
+) -> dict:
+    source_id = sha256(canonical_json({"representation": representation, "roles": sorted(extension_roles)}))
+    source_root = repo / "sources/generations" / source_id
+    uuid = "471acdde-293c-497c-bd55-e6ab48d98dc4"
+    components = []
+    groups = [
+        {"routing_group_id": "configuration", "representation_schema": "xml-hierarchical/v1", "members": []},
+        {"routing_group_id": f"extension:{uuid}", "representation_schema": representation, "members": []},
+    ]
+    for role in ("vendor_baseline", "target_cf", "next_vendor"):
+        configuration = source_root / role / "configuration"
+        configuration.mkdir(parents=True)
+        (configuration / "Configuration.xml").write_text(
+            '<MetaDataObject><Configuration uuid="11111111-1111-1111-1111-111111111111"><Properties><Name>Demo</Name></Properties></Configuration></MetaDataObject>',
+            encoding="utf-8",
+        )
+        component_id = f"{role}:configuration"
+        groups[0]["members"].append({"role": role, "component_id": component_id})
+        components.append({"component_id": component_id, "kind": "configuration", "path": f"{role}/configuration", "fingerprint": "sha256:" + "1" * 64})
+    for role in sorted(extension_roles):
+        extension = source_root / role / "extensions" / uuid
+        extension.mkdir(parents=True)
+        manifest = {
+            "schema_version": "2", "component_id": f"{role}:extension:{uuid}", "kind": "extension",
+            "routing_group_id": f"extension:{uuid}", "probe_contract_version": "", "probe_fingerprint": "",
+            "form_counts": {"managed": 0, "ordinary": int(representation == "v8unpack/v1"), "inconclusive": 0},
+            "routing_reason": "ordinary_form_present" if representation == "v8unpack/v1" else "no_forms",
+            "exporter": "ibcmd", "representation_schema": representation, "exporter_version": "8.3",
+            "converter_version": "v8unpack 1" if representation == "v8unpack/v1" else "",
+            "payload_file_count": 3 if representation == "v8unpack/v1" else 1,
+            "payload_fingerprint": "sha256:" + "2" * 64,
+            "uuid": uuid, "name": "DemoExtension", "version": "1.0", "active": True,
+        }
+        (extension / "component-manifest.json").write_bytes(canonical_json(manifest) + b"\n")
+        if representation == "v8unpack/v1":
+            catalog = extension / "Catalog/Products"
+            catalog.mkdir(parents=True)
+            (extension / "ConfigurationExtension.json").write_text('{"compatibility_version":"","name":"DemoExtension"}', encoding="utf-8")
+            (catalog / "Catalog.id.json").write_text('{"uuid":"22222222-2222-2222-2222-222222222222"}', encoding="utf-8")
+            (catalog / "Catalog.json").write_text('{"name":"Products"}', encoding="utf-8")
+        else:
+            (extension / "Catalog.xml").write_text(
+                '<MetaDataObject><Catalog uuid="22222222-2222-2222-2222-222222222222"><Properties><ObjectBelonging>Own</ObjectBelonging><Name>Products</Name></Properties></Catalog></MetaDataObject>',
+                encoding="utf-8",
+            )
+        component_id = f"{role}:extension:{uuid}"
+        groups[1]["members"].append({"role": role, "component_id": component_id})
+        components.append({"component_id": component_id, "kind": "extension", "path": f"{role}/extensions/{uuid}", "fingerprint": "sha256:" + sha256(canonical_json(manifest))})
+    routing = {"schema_version": "2", "routing_contract_version": "form-routing/v1", "groups": groups}
+    routing["routing_manifest_fingerprint"] = "sha256:" + sha256(canonical_json(routing))
+    (source_root / "routing-manifest.json").write_bytes(canonical_json(routing) + b"\n")
+    pointer = {
+        "schema_version": "2", "generation_id": source_id, "acquisition_profile_id": "ibcmd+form-aware/v1",
+        "normalizer_version": "3", "routing_manifest_path": "routing-manifest.json",
+        "routing_manifest_fingerprint": routing["routing_manifest_fingerprint"],
+        "source_comparison_epoch_fingerprint": "sha256:" + "3" * 64, "components": components,
+    }
+    (repo / "research").mkdir(exist_ok=True)
+    (repo / "research/active-source-generation.json").write_bytes(canonical_json(pointer) + b"\n")
+    return pointer
+
+
 def _legacy_fixture_build(repo: Path, pointer: dict) -> dict:
     source_root = repo / "sources/generations" / pointer["generation_id"]
     inventory = []
@@ -145,59 +211,7 @@ def test_forced_truncated_dif_collision_fails_closed(tmp_path: Path, monkeypatch
 
 
 def test_routed_build_publishes_closed_semantic_extension_generation(tmp_path: Path):
-    source_id = "f" * 64
-    source_root = tmp_path / "sources/generations" / source_id
-    uuid = "471acdde-293c-497c-bd55-e6ab48d98dc4"
-    components = []
-    groups = [{
-        "routing_group_id": "configuration",
-        "representation_schema": "xml-hierarchical/v1",
-        "members": [],
-    }, {
-        "routing_group_id": f"extension:{uuid}",
-        "representation_schema": "xml-hierarchical/v1",
-        "members": [],
-    }]
-    for role in ("vendor_baseline", "target_cf", "next_vendor"):
-        configuration = source_root / role / "configuration"
-        configuration.mkdir(parents=True)
-        (configuration / "Configuration.xml").write_text(
-            '<MetaDataObject><Configuration uuid="11111111-1111-1111-1111-111111111111"><Properties><Name>Demo</Name></Properties></Configuration></MetaDataObject>',
-            encoding="utf-8",
-        )
-        component_id = f"{role}:configuration"
-        groups[0]["members"].append({"role": role, "component_id": component_id})
-        components.append({"component_id": component_id, "kind": "configuration", "path": f"{role}/configuration", "fingerprint": "sha256:" + "1" * 64})
-    for role in ("target_cf", "next_vendor"):
-        extension = source_root / role / "extensions" / uuid
-        extension.mkdir(parents=True)
-        manifest = {
-            "schema_version": "2", "component_id": f"{role}:extension:{uuid}", "kind": "extension",
-            "routing_group_id": f"extension:{uuid}", "probe_contract_version": "", "probe_fingerprint": "",
-            "form_counts": {"managed": 0, "ordinary": 0, "inconclusive": 0}, "routing_reason": "no_forms",
-            "exporter": "ibcmd", "representation_schema": "xml-hierarchical/v1", "exporter_version": "8.3",
-            "converter_version": "", "payload_file_count": 1, "payload_fingerprint": "sha256:" + "2" * 64,
-            "uuid": uuid, "name": "DemoExtension", "version": "1.0", "active": True,
-        }
-        (extension / "component-manifest.json").write_bytes(canonical_json(manifest) + b"\n")
-        (extension / "Catalog.xml").write_text(
-            '<MetaDataObject><Catalog uuid="22222222-2222-2222-2222-222222222222"><Properties><ObjectBelonging>Own</ObjectBelonging><Name>Products</Name></Properties></Catalog></MetaDataObject>',
-            encoding="utf-8",
-        )
-        component_id = f"{role}:extension:{uuid}"
-        groups[1]["members"].append({"role": role, "component_id": component_id})
-        components.append({"component_id": component_id, "kind": "extension", "path": f"{role}/extensions/{uuid}", "fingerprint": "sha256:" + sha256(canonical_json(manifest))})
-    routing = {"schema_version": "2", "routing_contract_version": "form-routing/v1", "groups": groups}
-    routing["routing_manifest_fingerprint"] = "sha256:" + sha256(canonical_json(routing))
-    (source_root / "routing-manifest.json").write_bytes(canonical_json(routing) + b"\n")
-    pointer = {
-        "schema_version": "2", "generation_id": source_id, "acquisition_profile_id": "ibcmd+form-aware/v1",
-        "normalizer_version": "3", "routing_manifest_path": "routing-manifest.json",
-        "routing_manifest_fingerprint": routing["routing_manifest_fingerprint"],
-        "source_comparison_epoch_fingerprint": "sha256:" + "3" * 64, "components": components,
-    }
-    (tmp_path / "research").mkdir()
-    (tmp_path / "research/active-source-generation.json").write_bytes(canonical_json(pointer) + b"\n")
+    pointer = _routed_repo(tmp_path, {"target_cf", "next_vendor"})
     result = _build_routed(tmp_path, pointer)
     assert result["schema_version"] == "2" and tuple(sorted(result["files"])) == tuple(sorted(VERSION_FILES["2"]))
     root = tmp_path / "analysis/indexes/generations" / result["generation_id"]
@@ -216,3 +230,92 @@ def test_routed_build_publishes_closed_semantic_extension_generation(tmp_path: P
     (root / "unexpected.json").write_text("{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="mixed or incomplete"):
         validate_active(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("roles", "representation"),
+    [
+        ({"target_cf"}, "xml-hierarchical/v1"),
+        ({"vendor_baseline", "target_cf"}, "xml-hierarchical/v1"),
+        ({"vendor_baseline"}, "xml-hierarchical/v1"),
+        ({"next_vendor"}, "xml-hierarchical/v1"),
+        ({"vendor_baseline", "target_cf", "next_vendor"}, "xml-hierarchical/v1"),
+        ({"target_cf"}, "v8unpack/v1"),
+        ({"vendor_baseline", "target_cf"}, "v8unpack/v1"),
+        ({"vendor_baseline"}, "v8unpack/v1"),
+        ({"next_vendor"}, "v8unpack/v1"),
+        ({"vendor_baseline", "target_cf", "next_vendor"}, "v8unpack/v1"),
+    ],
+)
+def test_routed_role_representation_matrix_is_byte_repeatable(
+    tmp_path: Path,
+    roles: set[str],
+    representation: str,
+) -> None:
+    pointer = _routed_repo(tmp_path, roles, representation)
+    first = _build_routed(tmp_path, pointer)
+    root = tmp_path / "analysis/indexes/generations" / first["generation_id"]
+    payloads = {name: (root / name).read_bytes() for name in VERSION_FILES["2"]}
+    second = _build_routed(tmp_path, pointer)
+    assert second == first
+    assert payloads == {name: (root / name).read_bytes() for name in VERSION_FILES["2"]}
+    with (root / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
+        inventory = list(csv.DictReader(stream))
+    with (root / "extension-physical-diff.csv").open(encoding="utf-8", newline="") as stream:
+        physical = list(csv.DictReader(stream))
+    assert not {row["stable_diff_id"] for row in inventory} & {row["stable_diff_id"] for row in physical}
+    assert validate_active(tmp_path) == first
+
+
+@pytest.mark.parametrize("failure", ["serialization", "publication"])
+def test_routed_failures_leave_active_pointer_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    import one_c_autoresearch.diffs as diff_module
+
+    pointer = _routed_repo(tmp_path, {"target_cf"})
+    _build_routed(tmp_path, pointer)
+    active = tmp_path / "research/active-diff-generation.json"
+    before = active.read_bytes()
+    if failure == "serialization":
+        monkeypatch.setattr(
+            diff_module,
+            "_write_jsonl",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("serialization failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            diff_module,
+            "atomic_json",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("publication failed")),
+        )
+    with pytest.raises(OSError, match="failed"):
+        _build_routed(tmp_path, pointer)
+    assert active.read_bytes() == before
+
+
+def test_routed_build_rejects_source_changed_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import one_c_autoresearch.diffs as diff_module
+
+    pointer = _routed_repo(tmp_path, {"target_cf"})
+    original = diff_module._write_jsonl
+    changed = False
+
+    def change_source(*args, **kwargs):
+        nonlocal changed
+        original(*args, **kwargs)
+        if not changed:
+            changed = True
+            (tmp_path / "research/active-source-generation.json").write_bytes(
+                canonical_json({**pointer, "generation_id": "0" * 64}) + b"\n"
+            )
+
+    monkeypatch.setattr(diff_module, "_write_jsonl", change_source)
+    with pytest.raises(RuntimeError, match="stale source"):
+        _build_routed(tmp_path, pointer)
+    assert not (tmp_path / "research/active-diff-generation.json").exists()

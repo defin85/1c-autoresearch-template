@@ -371,6 +371,7 @@ def _record(
     diagnostics: list[str] | None = None,
     mapping_identity: str = "",
     technical_identity: str = "",
+    evidence_sensitive: bool = True,
 ) -> dict[str, Any]:
     if scope not in {"owned", "adopted"} or kind not in KINDS:
         raise ValueError("invalid normalized extension intervention")
@@ -379,6 +380,7 @@ def _record(
         "affected_base_identity": base_identity,
         "diagnostic_codes": sorted(set(diagnostics or [])),
         "evidence": evidence_items,
+        "evidence_sensitive": evidence_sensitive,
         "evidence_fingerprint": _fingerprint(evidence_items),
         "extension_object_identity": object_identity,
         "extension_uuid": extension_uuid,
@@ -462,10 +464,17 @@ def parse_component(
             structure={"field": field, "value": value},
             evidence=manifest_evidence,
             sublocation=field,
+            evidence_sensitive=False,
         )
         for field, value in root_fields.items()
     ]
     object_contexts: list[tuple[str, str, str, str, str, str, str]] = []
+
+    def parent_context(relative: str) -> tuple[str, str, str, str, str, str, str] | None:
+        return next(
+            (item for item in reversed(object_contexts) if relative.startswith(item[0])),
+            None,
+        )
     v8_ids: dict[tuple[str, str], tuple[str, dict[str, str]]] = {}
     unaccounted_paths: list[str] = []
     entries = list(root.rglob("*"))
@@ -511,14 +520,7 @@ def parse_component(
             object_type = _local(object_node.tag)
             name = _xml_value(object_node, "Name") or path.stem
             scope = "adopted" if _fold(_xml_value(object_node, "ObjectBelonging")) == "adopted" else "owned"
-            parent = next(
-                (
-                    item
-                    for item in sorted(object_contexts, key=lambda item: len(item[0]), reverse=True)
-                    if relative.startswith(item[0])
-                ),
-                None,
-            )
+            parent = parent_context(relative)
             if parent and ({part.casefold() for part in Path(relative).parts} & {"forms", "commands"}):
                 scope = parent[1]
             own_uuid = _fold(object_node.attrib.get("uuid", ""))
@@ -648,14 +650,7 @@ def parse_component(
                 v8_ids[(path.parent.relative_to(root).as_posix(), object_type)] = (own_uuid, evidence)
                 continue
             if path.name.endswith(".elem.json"):
-                parent = next(
-                    (
-                        item
-                        for item in sorted(object_contexts, key=lambda item: len(item[0]), reverse=True)
-                        if relative.startswith(item[0])
-                    ),
-                    None,
-                )
+                parent = parent_context(relative)
                 object_identity = parent[2] if parent else _fold(path.parent.relative_to(root).as_posix())
                 rows.append(
                     _record(
@@ -678,7 +673,8 @@ def parse_component(
                 raise ValueError(f"missing_v8unpack_identity:{relative}")
             own_uuid, identity_evidence = identity
             belonging = _fold(value.get("object_belonging") or value.get("ObjectBelonging"))
-            scope = "adopted" if belonging == "adopted" else "owned"
+            base_matches = (base_index or {}).get(f"uuid:{own_uuid}", [])
+            scope = "adopted" if belonging == "adopted" or (not belonging and base_matches) else "owned"
             base_identity = _fold(qualified) if scope == "adopted" else ""
             object_identity = _fold(qualified) if scope == "adopted" else f"uuid:{own_uuid}"
             object_contexts.append(
@@ -760,12 +756,8 @@ def parse_component(
                 raise ValueError(f"invalid_bsl_text:{relative}") from exc
             object_type, object_name, module = _object_context(relative)
             object_identity = f"{object_type}.{object_name}"
-            parent = next(
-                (
-                    item
-                    for item in sorted(object_contexts, key=lambda item: len(item[0]), reverse=True)
-                    if relative.startswith(item[0]) or (item[4], item[5]) == (object_type, object_name)
-                ),
+            parent = parent_context(relative) or next(
+                (item for item in reversed(object_contexts) if (item[4], item[5]) == (object_type, object_name)),
                 None,
             )
             scope = parent[1] if parent else "owned"
@@ -804,10 +796,7 @@ def parse_component(
                 )
         else:
             lowered = {part.casefold() for part in Path(relative).parts}
-            parent = next(
-                (item for item in sorted(object_contexts, key=lambda item: len(item[0]), reverse=True) if relative.startswith(item[0])),
-                None,
-            )
+            parent = parent_context(relative)
             if representation == "v8unpack/v1" and relative == "version.bin":
                 rows.append(
                     _record(
@@ -1008,7 +997,15 @@ def compare_snapshots(
         for key in sorted(set(left) | set(right)):
             old, new = left.get(key), right.get(key)
             change = "added" if old is None else "deleted" if new is None else "modified"
-            if old and new and old["structural_fingerprint"] == new["structural_fingerprint"]:
+            if (
+                old
+                and new
+                and old["structural_fingerprint"] == new["structural_fingerprint"]
+                and (
+                    not old.get("evidence_sensitive", True)
+                    or old["evidence_fingerprint"] == new["evidence_fingerprint"]
+                )
+            ):
                 continue
             snapshot = new or old
             assert snapshot is not None

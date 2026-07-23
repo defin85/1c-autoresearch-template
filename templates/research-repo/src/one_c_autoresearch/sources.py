@@ -327,7 +327,11 @@ def normalize_payload(root: Path) -> None:
 
 
 def _reject_secret_content(root: Path) -> None:
-    patterns = (re.compile(br"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"), re.compile(br"(?i)\b(?:password|passwd|pwd|token|secret)\s*[:=]\s*['\"]?[^\s'\";]{8,}"))
+    secret_value = br"(?:'[^'\r\n]{8,}'|\"[^\"\r\n]{8,}\"|[A-Za-z0-9_./+=-]{8,})"
+    patterns = (
+        re.compile(br"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+        re.compile(br"(?i)\b(?:password|passwd|pwd|token|secret)\s*[:=]\s*" + secret_value),
+    )
     for path in sorted(root.rglob("*")):
         if path.is_file() and path.stat().st_size <= 16 * 1024 * 1024:
             raw = path.read_bytes()

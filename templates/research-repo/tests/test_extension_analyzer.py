@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import gc
 from pathlib import Path
+import tracemalloc
 
 import pytest
 
@@ -128,6 +130,21 @@ def test_derived_manifest_drift_does_not_create_root_diffs(tmp_path: Path) -> No
     assert compare_snapshots(before, after, "CMP-X") == []
 
 
+def test_method_body_change_is_not_hidden_by_unchanged_signature(tmp_path: Path) -> None:
+    before_root = _component(tmp_path / "before", "xml-hierarchical/v1")
+    after_root = _component(tmp_path / "after", "xml-hierarchical/v1")
+    module = after_root / "Catalogs/Products/Ext/ObjectModule.bsl"
+    module.write_text(module.read_text(encoding="utf-8").replace("КонецПроцедуры", "Value = 2;\nКонецПроцедуры"), encoding="utf-8")
+
+    rows = compare_snapshots(
+        {UUID: parse_component(before_root, "xml-hierarchical/v1", UUID)},
+        {UUID: parse_component(after_root, "xml-hierarchical/v1", UUID)},
+        "CMP-X",
+    )
+
+    assert [(row["change_type"], row["intervention_kind"]) for row in rows] == [("modified", "method_extension")]
+
+
 def test_adopted_object_with_exact_role_base_identity_is_compatible(tmp_path: Path) -> None:
     root = _component(tmp_path / "adopted", "xml-hierarchical/v1")
     metadata = root / "Catalogs/Products.xml"
@@ -243,6 +260,38 @@ def test_v8unpack_version_string_is_not_a_metadata_reference(tmp_path: Path) -> 
         row for row in parse_component(root, "v8unpack/v1", UUID)
         if row["intervention_kind"] == "base_reference"
     ]
+
+
+def test_v8unpack_adoption_uses_uuid_and_name_and_conflicts_remain_unresolved(
+    tmp_path: Path,
+) -> None:
+    root = _component(tmp_path / "adopted-v8", "v8unpack/v1")
+    uuid_key = "uuid:11111111-1111-1111-1111-111111111111"
+    exact = {"identity": "catalog.products", "evidence": []}
+    rows = parse_component(
+        root,
+        "v8unpack/v1",
+        UUID,
+        base_index={uuid_key: [exact], "catalog.products": [exact]},
+    )
+    assert next(
+        row for row in rows if row["intervention_kind"] == "object_definition"
+    )["object_scope"] == "adopted"
+    analysis = analyze_role_union(
+        {"vendor_baseline": {}, "target_cf": {UUID: root}, "next_vendor": {}},
+        "sha256:" + "a" * 64,
+        main_config_indexes={
+            "target_cf": {
+                uuid_key: [{"identity": "catalog.renamed", "evidence": []}],
+                "catalog.products": [exact],
+            }
+        },
+    )
+    assert any(
+        row["outcome"] == "unresolved"
+        and row["diagnostic_code"] == "unresolved_dependency"
+        for row in analysis["dependency_rows"]
+    )
 
 
 def test_role_union_compare_and_target_coverage(tmp_path: Path) -> None:
@@ -406,6 +455,45 @@ def test_fail_closed_for_unsafe_xml_and_unknown_representation(tmp_path: Path) -
     (linked / "unsafe").symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(ValueError, match="unsafe_component_path"):
         parse_component(linked, "xml-hierarchical/v1", UUID)
+
+
+def test_invalid_text_malformed_xml_and_source_directives_fail_or_remain_data(
+    tmp_path: Path,
+) -> None:
+    malformed = _component(tmp_path / "malformed", "xml-hierarchical/v1")
+    (malformed / "Catalogs/Products.xml").write_text("<MetaDataObject>", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid_xml"):
+        parse_component(malformed, "xml-hierarchical/v1", UUID)
+    invalid = _component(tmp_path / "invalid-text", "xml-hierarchical/v1")
+    (invalid / "Catalogs/Products/Ext/ObjectModule.bsl").write_bytes(b"\xff\xfe\x00")
+    with pytest.raises(ValueError, match="invalid_bsl_text"):
+        parse_component(invalid, "xml-hierarchical/v1", UUID)
+    inert = _component(tmp_path / "inert", "xml-hierarchical/v1")
+    marker = tmp_path / "must-not-exist"
+    (inert / "Catalogs/Products/Ext/ObjectModule.bsl").write_text(
+        f'ЗапуститьПриложение("touch {marker}");\n',
+        encoding="utf-8",
+    )
+    parse_component(inert, "xml-hierarchical/v1", UUID)
+    assert not marker.exists()
+
+
+def test_peak_raw_payload_memory_is_bounded_by_current_file(tmp_path: Path) -> None:
+    peaks = []
+    for count in (4, 16):
+        root = _component(tmp_path / f"payloads-{count}", "xml-hierarchical/v1")
+        payload_root = root / "Catalogs/Products/Forms"
+        payload_root.mkdir(parents=True)
+        for index in range(count):
+            (payload_root / f"payload-{index:02}.bin").write_bytes(b"x" * 256_000)
+        gc.collect()
+        tracemalloc.start()
+        first = parse_component(root, "xml-hierarchical/v1", UUID)
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        assert first == parse_component(root, "xml-hierarchical/v1", UUID)
+        peaks.append(peak)
+    assert peaks[1] < peaks[0] * 3
 
 
 def test_diagnostic_samples_are_bounded_and_report_total(tmp_path: Path) -> None:
