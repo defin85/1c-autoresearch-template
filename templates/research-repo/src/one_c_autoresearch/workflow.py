@@ -540,6 +540,8 @@ def _dif_card(
     card = {"id": row.get("stable_diff_id", ""), "path": row.get("path", ""), "kind": row.get("object_kind", ""), "state": state}
     if extension:
         card.update({key: extension.get(key, "") for key in ("extension_uuid", "intervention_kind", "object_scope", "affected_base_identity")})
+        role = extension.get("before_role") if row.get("change_type") == "deleted" else extension.get("after_role")
+        card["component_id"] = f"{role}:extension:{extension.get('extension_uuid', '')}"
         card["evidence_count"] = len(extension.get("evidence", []))
         values = dependencies or []
         card["dependency_count"] = len(values)

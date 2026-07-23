@@ -1,5 +1,9 @@
 import json
 import csv
+import os
+import shutil
+import subprocess
+import sys
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -319,3 +323,110 @@ def test_routed_build_rejects_source_changed_before_publication(
     with pytest.raises(RuntimeError, match="stale source"):
         _build_routed(tmp_path, pointer)
     assert not (tmp_path / "research/active-diff-generation.json").exists()
+
+
+def test_routed_invalid_staged_candidate_is_not_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import one_c_autoresearch.diffs as diff_module
+
+    pointer = _routed_repo(tmp_path, {"target_cf"})
+    first = _build_routed(tmp_path, pointer)
+    active = tmp_path / "research/active-diff-generation.json"
+    before = active.read_bytes()
+    original = diff_module._write_jsonl
+
+    def corrupt(path, rows):
+        original(path, rows)
+        if path.name == "extension-diff.jsonl" and rows:
+            value = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+            value["unexpected"] = True
+            path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(diff_module, "_write_jsonl", corrupt)
+    with pytest.raises(ValueError, match="invalid or non-canonical JSONL"):
+        _build_routed(tmp_path, pointer)
+    assert active.read_bytes() == before
+    assert validate_active(tmp_path) == first
+
+
+def test_routed_semantically_invalid_candidate_is_not_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import one_c_autoresearch.diffs as diff_module
+
+    pointer = _routed_repo(tmp_path, {"target_cf"})
+    first = _build_routed(tmp_path, pointer)
+    active = tmp_path / "research/active-diff-generation.json"
+    before = active.read_bytes()
+    original = diff_module._write_jsonl
+
+    def corrupt(path, rows):
+        if path.name == "extension-diff.jsonl" and rows:
+            rows = [{**rows[0], "stable_diff_id": "DIF-BAD"}, *rows[1:]]
+        original(path, rows)
+
+    monkeypatch.setattr(diff_module, "_write_jsonl", corrupt)
+    with pytest.raises(ValueError):
+        _build_routed(tmp_path, pointer)
+    assert active.read_bytes() == before
+    assert validate_active(tmp_path) == first
+
+
+@pytest.mark.parametrize("upgrade", ["analyzer", "adapter"])
+def test_routed_contract_upgrade_and_repository_revision_rollback(
+    tmp_path: Path,
+    upgrade: str,
+) -> None:
+    pointer = _routed_repo(tmp_path, {"target_cf"})
+    original = _build_routed(tmp_path, pointer)
+    active = tmp_path / "research/active-diff-generation.json"
+    package = Path(__file__).parents[1] / "src/one_c_autoresearch"
+    shutil.copytree(package, tmp_path / "src/one_c_autoresearch")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=tmp_path, check=True)
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, text=True, capture_output=True,
+    ).stdout.strip()
+    analyzer = tmp_path / "src/one_c_autoresearch/extension_analyzer.py"
+    text = analyzer.read_text(encoding="utf-8")
+    if upgrade == "analyzer":
+        text = text.replace(
+            'ANALYZER_VERSION = "extension-semantic/v1"',
+            'ANALYZER_VERSION = "extension-semantic/v1.upgrade"',
+            1,
+        )
+    else:
+        text = text.replace('"xml-hierarchical@1"', '"xml-hierarchical@upgrade"', 1)
+    analyzer.write_text(text, encoding="utf-8")
+    environment = {**os.environ, "PYTHONPATH": str(tmp_path / "src")}
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json; from pathlib import Path; from one_c_autoresearch.diffs import _build_routed; "
+            "p=Path('.'); s=json.loads((p/'research/active-source-generation.json').read_text()); _build_routed(p,s)",
+        ],
+        cwd=tmp_path, env=environment, check=True,
+    )
+    upgraded = json.loads(active.read_text(encoding="utf-8"))
+    assert upgraded["generation_id"] != original["generation_id"]
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "upgrade"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "checkout", "-q", baseline], cwd=tmp_path, check=True)
+    validated = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json; from pathlib import Path; from one_c_autoresearch.diffs import validate_active; "
+            "print(json.dumps(validate_active(Path('.'))))",
+        ],
+        cwd=tmp_path, env=environment, check=True, text=True, capture_output=True,
+    )
+    assert json.loads(validated.stdout) == original
+    assert not (tmp_path / "analysis/indexes/generations" / upgraded["generation_id"]).exists()

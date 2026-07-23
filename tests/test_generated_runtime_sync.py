@@ -59,6 +59,13 @@ def test_packaged_template_matches_scaffold_and_starts_fresh_repo(tmp_path: Path
     assert '"project-configured"' in result.stdout
     environment = {**os.environ, "PYTHONPATH": str(repo / "src")}
     subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "tests/test_extension_analyzer.py"],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_extension_analyzer.py",
+            "tests/test_diffs.py",
+        ],
         cwd=repo, env=environment, check=True,
     )

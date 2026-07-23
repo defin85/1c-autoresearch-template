@@ -46,9 +46,6 @@ INTERVENTION_KINDS = {
 }
 DEPENDENCY_OUTCOMES = {"present_compatible", "present_changed", "missing", "unresolved"}
 TARGET_COVERAGE_STATUSES = {"covered_by_vendor", "still_required", "changed_in_target", "needs_semantic_review"}
-ADAPTER_CONTRACTS = {"xml-hierarchical/v1": ("xml-hierarchical", "1"), "v8unpack/v1": ("v8unpack", "1")}
-
-
 def _valid_fingerprint(value: Any, *, optional: bool = False) -> bool:
     return bool(optional and value == "") or bool(re.fullmatch(r"sha256:[0-9a-f]{64}", str(value)))
 
@@ -161,8 +158,13 @@ def _read_jsonl(path: Path, keys: set[str]) -> list[dict[str, Any]]:
     return rows
 
 
-def validate_active(repo: Path, *, require_tracked_clean_state: bool = False) -> dict[str, Any]:
-    pointer = json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
+def validate_active(
+    repo: Path,
+    *,
+    require_tracked_clean_state: bool = False,
+    candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    pointer = candidate or json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
     source = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
     generation = str(pointer.get("generation_id", "")); source_id = str(source.get("generation_id", ""))
     if pointer.get("source_generation_id") != source_id or not generation:
@@ -171,7 +173,7 @@ def validate_active(repo: Path, *, require_tracked_clean_state: bool = False) ->
     if version not in VERSION_FILES:
         raise ValueError("unsupported active diff schema version")
     root = confined(repo / "analysis/indexes/generations", generation)
-    if require_tracked_clean_state:
+    if require_tracked_clean_state and candidate is None:
         require_tracked_clean(repo, [root, repo / "research/active-diff-generation.json"])
     headers = {"diff-inventory.csv": INVENTORY_HEADER, "diff-id-map.csv": ID_MAP_HEADER, "target-coverage.csv": COVERAGE_HEADER}
     rows: dict[str, list[dict[str, str]]] = {}
@@ -250,7 +252,8 @@ def validate_active(repo: Path, *, require_tracked_clean_state: bool = False) ->
         binding_by_role_uuid = {}
         for binding in manifest["component_bindings"]:
             component = source_components.get(binding["component_id"])
-            expected_adapter = ADAPTER_CONTRACTS.get(binding["representation_schema"])
+            adapter = ADAPTERS.get(binding["representation_schema"], "")
+            expected_adapter = tuple(adapter.split("@", 1)) if "@" in adapter else None
             if (
                 not component
                 or component.get("kind") != "extension"
@@ -685,6 +688,18 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
         }
         manifest["output_fingerprint"] = "sha256:" + sha256(canonical_json(manifest))
         (staging / "extension-analyzer-manifest.json").write_bytes(canonical_json(manifest) + b"\n")
+        for name, header in (
+            ("diff-inventory.csv", INVENTORY_HEADER),
+            ("diff-id-map.csv", ID_MAP_HEADER),
+            ("target-coverage.csv", COVERAGE_HEADER),
+            ("extension-physical-diff.csv", INVENTORY_HEADER),
+            ("extension-path-coverage.csv", PATH_COVERAGE_HEADER),
+        ):
+            _read_csv(staging / name, header)
+        _read_jsonl(staging / "extension-diff.jsonl", DETAIL_KEYS)
+        _read_jsonl(staging / "extension-dependencies.jsonl", DEPENDENCY_KEYS)
+        if set(manifest) != MANIFEST_KEYS or (staging / "extension-analyzer-manifest.json").read_bytes() != canonical_json(manifest) + b"\n":
+            raise ValueError("invalid staged extension analyzer manifest")
         hashes = {name: sha256((staging / name).read_bytes()) for name in VERSION_FILES["2"]}
         generation_id = sha256(canonical_json({"files": hashes, "schema_version": "2", "source_generation_id": source_id}))
         destination = repo / "analysis/indexes/generations" / generation_id
@@ -711,6 +726,7 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
         )
         if current_source != source_pointer:
             raise RuntimeError("stale source generation before diff publication")
+        validate_active(repo, candidate=pointer)
         atomic_json(pointer_path, pointer)
         return pointer
 

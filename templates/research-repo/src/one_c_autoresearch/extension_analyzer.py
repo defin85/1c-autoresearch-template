@@ -155,6 +155,17 @@ def parse_bsl_methods(text: str, module_context: str) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda item: canonical_json(item))
 
 
+def _base_method_structure(method: dict[str, Any], *, extension: bool = False) -> dict[str, Any]:
+    return {
+        "async": method["async"],
+        "export": method["export"],
+        "method_kind": method["method_kind"],
+        "module_context": method["module_context"],
+        "name": method["annotation_target"] if extension else method["name"],
+        "parameters": method["parameters"],
+    }
+
+
 def intervention_key(snapshot: dict[str, Any]) -> str:
     preimage = {
         "affected_base_identity": snapshot.get("affected_base_identity", ""),
@@ -229,6 +240,7 @@ def resolve_dependency(
     source_reference: str,
     base_matches: list[dict[str, Any]],
     extension_matches: list[dict[str, Any]] | None = None,
+    expected_structural_fingerprint: str = "",
 ) -> dict[str, Any]:
     """Resolve one normalized reference against the same-role main configuration."""
     reference = _fold(source_reference)
@@ -239,7 +251,16 @@ def resolve_dependency(
     elif len(matches) == 1:
         match = matches[0]
         resolved = _fold(match.get("identity"))
-        outcome = "present_compatible" if resolved == reference else "present_changed"
+        matched_reference = _fold(match.get("source_reference") or resolved)
+        outcome = (
+            "present_compatible"
+            if matched_reference == reference
+            and (
+                not expected_structural_fingerprint
+                or match.get("structural_fingerprint") == expected_structural_fingerprint
+            )
+            else "present_changed"
+        )
         evidence = sorted(
             ({**item, "role": role, "side": "before" if role == "vendor_baseline" else "after"} for item in match.get("evidence", [])),
             key=canonical_json,
@@ -330,7 +351,7 @@ def _scalar_properties(value: dict[str, Any]) -> dict[str, Any]:
         "file_uuid", "v8unpack", "code_encoding_obj", "code_info_obj",
     }
     return {
-        _fold(key): value[key]
+        _fold(key): _fold(value[key]) if isinstance(value[key], str) else value[key]
         for key in sorted(value)
         if key not in ignored and isinstance(value[key], (str, int, float, bool))
     }
@@ -372,6 +393,8 @@ def _record(
     mapping_identity: str = "",
     technical_identity: str = "",
     evidence_sensitive: bool = True,
+    dependency_structure: dict[str, Any] | None = None,
+    dependency_source_reference: str = "",
 ) -> dict[str, Any]:
     if scope not in {"owned", "adopted"} or kind not in KINDS:
         raise ValueError("invalid normalized extension intervention")
@@ -379,6 +402,8 @@ def _record(
     row = {
         "affected_base_identity": base_identity,
         "diagnostic_codes": sorted(set(diagnostics or [])),
+        "dependency_structural_fingerprint": _fingerprint(dependency_structure) if dependency_structure else "",
+        "dependency_source_reference": dependency_source_reference,
         "evidence": evidence_items,
         "evidence_sensitive": evidence_sensitive,
         "evidence_fingerprint": _fingerprint(evidence_items),
@@ -468,13 +493,19 @@ def parse_component(
         )
         for field, value in root_fields.items()
     ]
-    object_contexts: list[tuple[str, str, str, str, str, str, str]] = []
+    object_contexts: dict[str, tuple[str, str, str, str, str, str, str, dict[str, Any] | None]] = {}
+    contexts_by_identity: dict[tuple[str, str], tuple[str, str, str, str, str, str, str, dict[str, Any] | None]] = {}
 
-    def parent_context(relative: str) -> tuple[str, str, str, str, str, str, str] | None:
-        return next(
-            (item for item in reversed(object_contexts) if relative.startswith(item[0])),
-            None,
-        )
+    def parent_context(relative: str) -> tuple[str, str, str, str, str, str, str, dict[str, Any] | None] | None:
+        for parent in Path(relative).parents:
+            context = object_contexts.get(parent.as_posix().rstrip("/") + "/")
+            if context:
+                return context
+        return None
+
+    def register_context(context: tuple[str, str, str, str, str, str, str, dict[str, Any] | None]) -> None:
+        object_contexts[context[0]] = context
+        contexts_by_identity[(context[4], context[5])] = context
     v8_ids: dict[tuple[str, str], tuple[str, dict[str, str]]] = {}
     unaccounted_paths: list[str] = []
     entries = list(root.rglob("*"))
@@ -545,7 +576,8 @@ def parse_component(
                     base_identity = "unresolved:" + sha256(canonical_json(unresolved))
                     diagnostics.append("unresolved_adoption_identity")
             object_identity = f"uuid:{own_uuid}" if scope == "owned" and _UUID.fullmatch(own_uuid) else _fold(qualified)
-            object_contexts.append(
+            dependency_structure = {"metadata_type": _fold(object_type), "name": _fold(name), "uuid": own_uuid}
+            register_context(
                 (
                     relative.removesuffix(".xml") + "/",
                     scope,
@@ -554,16 +586,17 @@ def parse_component(
                     _fold(object_type),
                     _fold(name),
                     f"uuid:{own_uuid}" if scope == "adopted" and _UUID.fullmatch(own_uuid) else "",
+                    dependency_structure if scope == "adopted" else None,
                 )
             )
             lowered = {part.casefold() for part in Path(relative).parts}
             kind = (
                 "form_change"
-                if "forms" in lowered
+                if lowered & {"form", "forms"}
                 else "command_change"
-                if "commands" in lowered
+                if lowered & {"command", "commands"}
                 else "role_change"
-                if "roles" in lowered
+                if lowered & {"role", "roles"}
                 else "object_definition"
             )
             structure = {
@@ -587,6 +620,7 @@ def parse_component(
                     diagnostics=diagnostics,
                     mapping_identity=f"uuid:{own_uuid}" if scope == "adopted" and _UUID.fullmatch(own_uuid) else "",
                     technical_identity=_fold(qualified),
+                    dependency_structure=dependency_structure if scope == "adopted" else None,
                 )
             )
             for property_name, property_value in _xml_scalar_properties(object_node).items():
@@ -601,6 +635,7 @@ def parse_component(
                         base_identity=base_identity,
                         sublocation=f"{_fold(qualified)}.property:{property_name}",
                         mapping_identity=f"uuid:{own_uuid}" if scope == "adopted" and _UUID.fullmatch(own_uuid) else "",
+                        dependency_structure=dependency_structure if scope == "adopted" else None,
                     )
                 )
             for reference in _xml_references(object_node):
@@ -615,6 +650,7 @@ def parse_component(
                         base_identity=reference,
                         sublocation=f"{_fold(qualified)}.reference:{reference}",
                         mapping_identity=f"uuid:{own_uuid}" if scope == "adopted" and _UUID.fullmatch(own_uuid) else "",
+                        dependency_structure=dependency_structure if scope == "adopted" else None,
                     )
                 )
         elif representation == "v8unpack/v1" and path.name.endswith(".json"):
@@ -677,7 +713,8 @@ def parse_component(
             scope = "adopted" if belonging == "adopted" or (not belonging and base_matches) else "owned"
             base_identity = _fold(qualified) if scope == "adopted" else ""
             object_identity = _fold(qualified) if scope == "adopted" else f"uuid:{own_uuid}"
-            object_contexts.append(
+            dependency_structure = {"metadata_type": _fold(object_type), "name": _fold(name), "uuid": own_uuid}
+            register_context(
                 (
                     path.parent.relative_to(root).as_posix().rstrip("/") + "/",
                     scope,
@@ -686,16 +723,17 @@ def parse_component(
                     _fold(object_type),
                     _fold(name),
                     f"uuid:{own_uuid}" if scope == "adopted" else "",
+                    dependency_structure if scope == "adopted" else None,
                 )
             )
             lowered = {part.casefold() for part in Path(relative).parts}
             kind = (
                 "form_change"
-                if "form" in lowered
+                if lowered & {"form", "forms"}
                 else "command_change"
-                if "command" in lowered
+                if lowered & {"command", "commands"}
                 else "role_change"
-                if "role" in lowered
+                if lowered & {"role", "roles"}
                 else "object_definition"
             )
             structure = {
@@ -719,6 +757,7 @@ def parse_component(
                     sublocation=_fold(qualified),
                     mapping_identity=f"uuid:{own_uuid}" if scope == "adopted" else "",
                     technical_identity=_fold(qualified),
+                    dependency_structure=dependency_structure if scope == "adopted" else None,
                 )
             )
             for property_name, property_value in _scalar_properties(value).items():
@@ -733,6 +772,7 @@ def parse_component(
                         base_identity=base_identity,
                         mapping_identity=f"uuid:{own_uuid}" if scope == "adopted" else "",
                         sublocation=f"{_fold(qualified)}.property:{property_name}",
+                        dependency_structure=dependency_structure if scope == "adopted" else None,
                     )
                 )
             for reference in _json_references(value):
@@ -747,6 +787,7 @@ def parse_component(
                         base_identity=reference,
                         sublocation=f"{_fold(qualified)}.reference:{reference}",
                         mapping_identity=f"uuid:{own_uuid}" if scope == "adopted" else "",
+                        dependency_structure=dependency_structure if scope == "adopted" else None,
                     )
                 )
         elif path.suffix.casefold() == ".bsl":
@@ -756,10 +797,7 @@ def parse_component(
                 raise ValueError(f"invalid_bsl_text:{relative}") from exc
             object_type, object_name, module = _object_context(relative)
             object_identity = f"{object_type}.{object_name}"
-            parent = parent_context(relative) or next(
-                (item for item in reversed(object_contexts) if (item[4], item[5]) == (object_type, object_name)),
-                None,
-            )
+            parent = parent_context(relative) or contexts_by_identity.get((object_type, object_name))
             scope = parent[1] if parent else "owned"
             object_identity = parent[2] if parent else object_identity
             base_identity = parent[3] if parent else ""
@@ -792,6 +830,12 @@ def parse_component(
                         symbol_identity=symbol,
                         sublocation=f"{module}.{method['name']}",
                         mapping_identity=parent[6] if parent else "",
+                        dependency_structure=_base_method_structure(method, extension=True) if scope == "adopted" else None,
+                        dependency_source_reference=(
+                            f"{base_identity}#{module}.{method['annotation_target']}"
+                            if scope == "adopted" and method["annotation_target"]
+                            else ""
+                        ),
                     )
                 )
         else:
@@ -821,6 +865,7 @@ def parse_component(
                         base_identity=parent[3],
                         sublocation=_fold(relative),
                         mapping_identity=parent[6],
+                        dependency_structure=parent[7],
                     )
                 )
             else:
@@ -909,10 +954,29 @@ def build_main_config_index(root: Path, cancelled: callable | None = None) -> di
                 "metadata_type": _fold(object_type),
                 "name": name,
                 "uuid": identifier,
-                "properties": _v8_structure(value),
             }
             object_evidence = [identity_evidence, evidence]
             object_type = _fold(object_type)
+        elif path.suffix.casefold() == ".bsl":
+            try:
+                methods = parse_bsl_methods(payload.decode("utf-8-sig"), _object_context(relative)[2])
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"invalid_bsl_text:{relative}") from exc
+            except ValueError as exc:
+                if not str(exc).startswith("unsupported_bsl_structure:"):
+                    raise
+                continue
+            object_type, object_name, module = _object_context(relative)
+            identity = f"{object_type}.{object_name}"
+            for method in methods:
+                entry = {
+                    "identity": identity,
+                    "source_reference": f"{identity}#{module}.{method['name']}",
+                    "structural_fingerprint": _fingerprint(_base_method_structure(method)),
+                    "evidence": [evidence],
+                }
+                result.setdefault(f"{identity}#{module}.{method['name']}", []).append(entry)
+            continue
         else:
             continue
         if not name:
@@ -1156,19 +1220,25 @@ def analyze_role_union(
                 ),
                 {},
             )
-            name_matches = indexes.get(role, {}).get(_fold(reference), [])
+            dependency_reference = snapshot.get("dependency_source_reference") or reference
+            name_matches = indexes.get(role, {}).get(_fold(dependency_reference), [])
             mapping_matches = indexes.get(role, {}).get(snapshot.get("mapping_identity", ""), [])
             matches_by_value = {
                 canonical_json(item): item
-                for item in name_matches + mapping_matches
+                for item in (
+                    name_matches
+                    if dependency_reference != reference
+                    else name_matches + mapping_matches
+                )
             }
             dependency = resolve_dependency(
                 detail,
                 role,
                 "base_reference" if detail["intervention_kind"] == "base_reference" else "adopted_object",
-                reference,
+                dependency_reference,
                 list(matches_by_value.values()),
                 [{"identity": reference}] if _fold(reference) in extension_identities[role] else [],
+                snapshot.get("dependency_structural_fingerprint", ""),
             )
             dependencies.append(dependency)
             detail["dependency_ids"].append(dependency["dependency_id"])
@@ -1200,16 +1270,17 @@ def analyze_role_union(
         )
     coverage = []
     unaccounted_paths = []
+    semantic_owners: dict[tuple[str, str], set[str]] = {}
+    for detail in details:
+        for item in detail["evidence"]:
+            relative = f"extensions/{detail['extension_uuid']}/{item['path']}"
+            for path in (relative, f"{item['role']}/{relative}"):
+                semantic_owners.setdefault(
+                    (detail["comparison_id"], path),
+                    set(),
+                ).add(detail["stable_diff_id"])
     for raw in sorted(raw_rows or [], key=lambda item: (item["comparison_id"], item["path"], item["stable_diff_id"])):
-        owners = sorted(
-            detail["stable_diff_id"]
-            for detail in details
-            if detail["comparison_id"] == raw["comparison_id"]
-            and any(
-                raw["path"].endswith(f"extensions/{detail['extension_uuid']}/{item['path']}")
-                for item in detail["evidence"]
-            )
-        )
+        owners = sorted(semantic_owners.get((raw["comparison_id"], raw["path"]), set()))
         noise = ""
         if not owners and raw["path"].endswith("/component-manifest.json"):
             noise = "component_manifest"

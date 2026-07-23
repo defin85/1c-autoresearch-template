@@ -239,6 +239,7 @@ def test_acquire_exports_all_three_roles_before_one_publication(tmp_path: Path, 
         uuid = extension["uuid"] if is_extension else "00000000-0000-0000-0000-000000000001"
         name = "Extension" if is_extension else "Cfg"
         (output / "Configuration.xml").write_text(f'<MetaDataObject><Configuration uuid="{uuid}"><Properties><Name>{name}</Name><Version>{version}</Version></Properties></Configuration></MetaDataObject>', encoding="utf-8")
+        (output / "ConfigDumpInfo.xml").write_text("<noise/>", encoding="utf-8")
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
     preview = build_routing_preview(tmp_path, Path("/opt/1cv8"), profiles, run=fake_run)
     pointer = acquire(tmp_path, Path("/opt/1cv8"), profiles, routing_preview=preview, run=fake_run)
@@ -247,6 +248,7 @@ def test_acquire_exports_all_three_roles_before_one_publication(tmp_path: Path, 
     assert validate_active(tmp_path, deep=True) == pointer
     assert all((root / role / "configuration/Configuration.xml").is_file() for role in profiles)
     assert all((root / role / "extensions" / extension["uuid"] / "Configuration.xml").is_file() for role in profiles)
+    assert not any(path.name == "ConfigDumpInfo.xml" for path in root.rglob("*"))
     assert not any(path.name.endswith((".cf", ".cfe")) or path.name.startswith(".work") for path in root.rglob("*"))
     pointer_path = tmp_path / "research/active-source-generation.json"
     prior = pointer_path.read_bytes()

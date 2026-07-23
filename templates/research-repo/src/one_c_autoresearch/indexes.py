@@ -96,6 +96,9 @@ def required_component_ids(repo: Path, paths: list[str], roles: tuple[str, ...])
     result = set()
     for value in paths:
         parts = value.replace("\\", "/").split("/")
+        selected_roles = roles
+        if parts[0] in ROLES:
+            selected_roles = (parts.pop(0),)
         if parts[0] == "configuration":
             suffix = "configuration"
         elif len(parts) >= 2 and parts[0] == "extensions":
@@ -104,7 +107,7 @@ def required_component_ids(repo: Path, paths: list[str], roles: tuple[str, ...])
             suffix = f"external:{parts[1]}"
         else:
             raise ValueError(f"source evidence path does not identify one component: {value}")
-        result.update(f"{role}:{suffix}" for role in roles if f"{role}:{suffix}" in available)
+        result.update(f"{role}:{suffix}" for role in selected_roles if f"{role}:{suffix}" in available)
     return sorted(result)
 
 

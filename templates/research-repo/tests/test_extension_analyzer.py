@@ -11,6 +11,7 @@ from one_c_autoresearch.extension_analyzer import (
     AnalyzerDiagnosticError,
     KINDS,
     analyze_role_union,
+    build_main_config_index,
     compare_snapshots,
     comparison_id,
     parse_bsl_methods,
@@ -119,6 +120,80 @@ def test_equivalent_representations_have_equal_semantic_fingerprints() -> None:
     ]
 
 
+def test_equivalent_representations_cover_all_intervention_kinds(tmp_path: Path) -> None:
+    xml = _component(tmp_path / "xml", "xml-hierarchical/v1")
+    unpack = _component(tmp_path / "unpack", "v8unpack/v1")
+    adopted_uuid = "33333333-3333-3333-3333-333333333333"
+    (xml / "Configuration.xml").write_text(
+        '<MetaDataObject><Configuration><Properties><Name>Demo</Name></Properties></Configuration></MetaDataObject>',
+        encoding="utf-8",
+    )
+
+    def xml_object(group: str, kind: str, name: str, uuid: str, belonging: str = "Own", extra: str = "") -> None:
+        path = xml / f"{group}/{name}.xml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f'<MetaDataObject xmlns:xr="urn:test"><{kind} uuid="{uuid}"><Properties>'
+            f"<ObjectBelonging>{belonging}</ObjectBelonging><Name>{name}</Name>{extra}"
+            f"</Properties></{kind}></MetaDataObject>",
+            encoding="utf-8",
+        )
+
+    def unpack_object(group: str, kind: str, name: str, uuid: str, extra: dict | None = None) -> None:
+        root = unpack / group / name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / f"{kind}.id.json").write_text(json.dumps({"uuid": uuid}), encoding="utf-8")
+        (root / f"{kind}.json").write_text(json.dumps({"name": name, **(extra or {})}), encoding="utf-8")
+
+    xml_object(
+        "Catalogs", "Catalog", "Adopted", adopted_uuid, "Adopted",
+        '<Owner xr:type="xr:MDObjectRef">Document.Orders</Owner>',
+    )
+    unpack_object("Catalogs", "Catalog", "Adopted", adopted_uuid, {"owner": "Document.Orders"})
+    xml_object("Forms", "Form", "Main", "44444444-4444-4444-4444-444444444444")
+    unpack_object("Forms", "Form", "Main", "44444444-4444-4444-4444-444444444444")
+    xml_object("Commands", "Command", "Run", "55555555-5555-5555-5555-555555555555")
+    unpack_object("Commands", "Command", "Run", "55555555-5555-5555-5555-555555555555")
+    xml_object("Roles", "Role", "Admin", "66666666-6666-6666-6666-666666666666")
+    unpack_object("Roles", "Role", "Admin", "66666666-6666-6666-6666-666666666666")
+    for root, path in (
+        (xml, "Catalogs/Adopted/Ext/ObjectModule.bsl"),
+        (unpack, "Catalogs/Adopted/Catalog.obj.bsl"),
+    ):
+        module = root / path
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.write_text(
+            '&Вместо("ПриЗаписи")\nПроцедура ReplaceWrite(Value) Экспорт\nКонецПроцедуры\n',
+            encoding="utf-8",
+        )
+    for root, path in (
+        (xml, "Catalogs/ModuleOnly/Ext/ObjectModule.bsl"),
+        (unpack, "Catalogs/ModuleOnly/Catalog.obj.bsl"),
+    ):
+        module = root / path
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.write_text("Value = 1;\n", encoding="utf-8")
+    for root in (xml, unpack):
+        binary = root / "Forms/Main/Ext/Form.bin"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_bytes(b"same-form-payload")
+
+    base_index = {
+        f"uuid:{adopted_uuid}": [{
+            "identity": "catalog.adopted",
+            "structural_fingerprint": "sha256:" + "0" * 64,
+            "evidence": [],
+        }]
+    }
+    xml_rows = parse_component(xml, "xml-hierarchical/v1", UUID, base_index=base_index)
+    unpack_rows = parse_component(unpack, "v8unpack/v1", UUID, base_index=base_index)
+    kinds = {row["intervention_kind"] for row in xml_rows}
+    assert kinds == KINDS
+    assert [(row["intervention_key"], row["structural_fingerprint"]) for row in xml_rows] == [
+        (row["intervention_key"], row["structural_fingerprint"]) for row in unpack_rows
+    ]
+
+
 def test_derived_manifest_drift_does_not_create_root_diffs(tmp_path: Path) -> None:
     before_root = _component(tmp_path / "before", "xml-hierarchical/v1")
     after_root = _component(tmp_path / "after", "xml-hierarchical/v1")
@@ -198,6 +273,80 @@ def test_dependency_outcomes_cover_changed_missing_unresolved_and_cross_extensio
         "unresolved",
         "unresolved_cross_extension",
     )
+
+
+def test_dependency_requires_exact_structural_identity() -> None:
+    detail = {"intervention_key": "INT-X", "extension_uuid": UUID, "stable_diff_id": "DIF-X"}
+    match = {
+        "identity": "catalog.products",
+        "structural_fingerprint": "sha256:" + "1" * 64,
+        "evidence": [],
+    }
+    compatible = resolve_dependency(
+        detail, "target_cf", "adopted_object", "catalog.products", [match],
+        expected_structural_fingerprint="sha256:" + "1" * 64,
+    )
+    changed = resolve_dependency(
+        detail, "target_cf", "adopted_object", "catalog.products", [match],
+        expected_structural_fingerprint="sha256:" + "2" * 64,
+    )
+    assert compatible["outcome"] == "present_compatible"
+    assert changed["outcome"] == "present_changed"
+
+
+def test_adopted_method_dependency_uses_role_main_signature(tmp_path: Path) -> None:
+    extension = _component(tmp_path / "extension", "xml-hierarchical/v1")
+    metadata = extension / "Catalogs/Products.xml"
+    metadata.write_text(
+        metadata.read_text(encoding="utf-8").replace("<ObjectBelonging>Own", "<ObjectBelonging>Adopted"),
+        encoding="utf-8",
+    )
+    main = tmp_path / "main"
+    (main / "Catalogs/Products/Ext").mkdir(parents=True)
+    (main / "Catalogs/Products.xml").write_text(
+        '<MetaDataObject><Catalog uuid="11111111-1111-1111-1111-111111111111"><Properties><Name>Products</Name></Properties></Catalog></MetaDataObject>',
+        encoding="utf-8",
+    )
+    module = main / "Catalogs/Products/Ext/ObjectModule.bsl"
+    module.write_text(
+        "Процедура ПриЗаписи(Value, Optional = 1) Экспорт\nКонецПроцедуры\n",
+        encoding="utf-8",
+    )
+    conditional = main / "CommonModules/Unrelated/Ext"
+    conditional.mkdir(parents=True)
+    (conditional / "Module.bsl").write_text(
+        "#Если Сервер Тогда\nПроцедура OnlyServer()\nКонецПроцедуры\n#КонецЕсли\n",
+        encoding="utf-8",
+    )
+    snapshot = next(
+        row for row in parse_component(extension, "xml-hierarchical/v1", UUID)
+        if row["intervention_kind"] == "method_extension"
+    )
+    detail = {"intervention_key": snapshot["intervention_key"], "extension_uuid": UUID, "stable_diff_id": "DIF-X"}
+    reference = snapshot["dependency_source_reference"]
+    matches = build_main_config_index(main)[reference]
+    assert resolve_dependency(
+        detail, "target_cf", "adopted_object", reference, matches,
+        expected_structural_fingerprint=snapshot["dependency_structural_fingerprint"],
+    )["outcome"] == "present_compatible"
+    analysis = analyze_role_union(
+        {"vendor_baseline": {}, "target_cf": {UUID: extension}, "next_vendor": {}},
+        "sha256:" + "a" * 64,
+        main_config_indexes={"target_cf": build_main_config_index(main)},
+    )
+    method_detail = next(
+        row for row in analysis["detail_rows"]
+        if row["intervention_kind"] == "method_extension"
+    )
+    assert [
+        row["outcome"] for row in analysis["dependency_rows"]
+        if row["stable_diff_id"] == method_detail["stable_diff_id"]
+    ] == ["present_compatible"]
+    module.write_text("Процедура ПриЗаписи(Changed) Экспорт\nКонецПроцедуры\n", encoding="utf-8")
+    assert resolve_dependency(
+        detail, "target_cf", "adopted_object", reference, build_main_config_index(main)[reference],
+        expected_structural_fingerprint=snapshot["dependency_structural_fingerprint"],
+    )["outcome"] == "present_changed"
 
 
 def test_explicit_metadata_reference_becomes_base_reference(tmp_path: Path) -> None:

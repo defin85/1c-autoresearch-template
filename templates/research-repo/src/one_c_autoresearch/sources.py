@@ -617,6 +617,7 @@ def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], 
                     shutil.copy2(source, output / normalize_relative(member["artifact"]["filename"]))
                     _reject_secret_content(output)
             _check_cancelled(cancelled, "validation")
+            clean_payload(output)
             payload = file_manifest(output)
             probe = probes.get(member["component_id"], {})
             metadata = {

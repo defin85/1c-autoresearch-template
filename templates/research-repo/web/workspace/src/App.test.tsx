@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, test, vi } from "vitest";
 import {
   App,
@@ -123,6 +123,58 @@ test("shows semantic and raw extension registries with an accessible empty state
       screen.queryByRole("option", { name: "extension-diff" }),
     ).not.toBeInTheDocument(),
   );
+});
+
+test("pages registries with a generation guard and renders dependency and raw audit records", async () => {
+  const fetchMock = vi.fn().mockImplementation((url: string) => {
+    if (url.includes("offset=100"))
+      return Promise.resolve({
+        ok: false,
+        json: async () => ({ detail: "stale diff generation" }),
+      });
+    if (url.includes("extension-dependencies"))
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({
+          diff_generation_id: "a".repeat(64),
+          items: [{ dependency_id: "DEP-A", outcome: "unresolved" }],
+          has_more: false,
+        }),
+      });
+    if (url.includes("extension-physical-diff"))
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({
+          diff_generation_id: "a".repeat(64),
+          items: [{ stable_diff_id: "DIF-RAW", path: "extensions/x/raw.xml" }],
+          has_more: false,
+        }),
+      });
+    return Promise.resolve({
+      ok: true,
+      json: async () => ({
+        diff_generation_id: "a".repeat(64),
+        items: [{ stable_diff_id: "DIF-A" }],
+        has_more: true,
+      }),
+    });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { container } = render(<Registry project={{ id: "p", name: "p", root: "/repo" }} />);
+  const registry = within(container);
+  expect(await registry.findByText(/"stable_diff_id": "DIF-A"/)).toBeInTheDocument();
+  fireEvent.click(registry.getByText("Далее"));
+  expect(await registry.findByText("stale diff generation")).toBeInTheDocument();
+  expect(fetchMock.mock.calls[1][0]).toContain(
+    `expected_generation=${"a".repeat(64)}`,
+  );
+
+  fireEvent.mouseDown(registry.getByLabelText("Реестр"));
+  fireEvent.click(screen.getByRole("option", { name: "extension-dependencies" }));
+  expect(await registry.findByText(/"outcome": "unresolved"/)).toBeInTheDocument();
+  fireEvent.mouseDown(registry.getByLabelText("Реестр"));
+  fireEvent.click(screen.getByRole("option", { name: "extension-physical-diff" }));
+  expect(await registry.findByText(/extensions\/x\/raw.xml/)).toBeInTheDocument();
 });
 
 test.each([

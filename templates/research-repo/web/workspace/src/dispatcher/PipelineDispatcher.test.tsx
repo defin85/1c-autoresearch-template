@@ -17,7 +17,7 @@ const snapshotWithDispatcher = {
     ],
     jobs: {},
     items: {
-      dif_queue: [{ id: 'DIF-001', path: 'Catalogs/Test.xml', kind: 'extension_intervention', state: 'queued', intervention_kind: 'method_interception', object_scope: 'adopted', target_coverage: 'needs_semantic_review', dependency_count: 1, blocker_codes: ['unresolved_dependency'] }],
+      dif_queue: [{ id: 'DIF-001', path: 'Catalogs/Test.xml', kind: 'extension_intervention', state: 'queued', intervention_kind: 'method_interception', object_scope: 'adopted', target_coverage: 'needs_semantic_review', extension_uuid: '471acdde-293c-497c-bd55-e6ab48d98dc4', component_id: 'target_cf:extension:471acdde-293c-497c-bd55-e6ab48d98dc4', affected_base_identity: 'catalog.products', evidence_count: 2, dependency_count: 1, compatibility_summary: { unresolved: 1 }, blocker_codes: ['unresolved_dependency'] }],
       meaning_diffs: [{ id: 'DIF-002', path: 'Documents/Test.xml', kind: 'changed', state: 'meaning' }],
       noise_diffs: [{ id: 'DIF-003', path: 'Forms/Test.xml', kind: 'changed', state: 'noise' }],
       proposals: [{ id: 'group-1', job_id: 'discover-mrq', kind: 'group.ready', semantic_key: 'orders', dif_ids: ['DIF-002'], evidence_count: 2, noise_count: 0, mrq_id: '', created_at: '2026-07-21T12:00:00Z' }],
@@ -60,6 +60,10 @@ test('PipelineDispatcher renders four circuits and freshness label', async () =>
   expect(screen.getByText('Целевая база')).toBeInTheDocument();
   expect(screen.getByText('Классификатор MRQ')).toBeInTheDocument();
   expect(screen.getByText(/method_interception · adopted · needs_semantic_review/)).toBeInTheDocument();
+  expect(screen.getByText(/Компонент: target_cf:extension:/)).toBeInTheDocument();
+  expect(screen.getByText('Базовый объект: catalog.products')).toBeInTheDocument();
+  expect(screen.getAllByText('Доказательств: 2').length).toBeGreaterThan(0);
+  expect(screen.getByText('Совместимость: unresolved=1')).toBeInTheDocument();
   expect(screen.getByText('unresolved_dependency')).toBeInTheDocument();
   expect(screen.getByText(/Необработанных физических строк расширений:/)).toBeInTheDocument();
   expect(document.querySelectorAll('[data-stage-state="active"]')).toHaveLength(1);

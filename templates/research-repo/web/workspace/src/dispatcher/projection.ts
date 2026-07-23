@@ -55,7 +55,12 @@ export interface DifCard {
   intervention_kind?: string;
   object_scope?: string;
   target_coverage?: string;
+  extension_uuid?: string;
+  component_id?: string;
+  affected_base_identity?: string;
+  evidence_count?: number;
   dependency_count?: number;
+  compatibility_summary?: Record<string, number>;
   blocker_codes?: string[];
 }
 export interface ProposalCard { id: string; job_id: string; kind: string; semantic_key: string; dif_ids: string[]; evidence_count: number; noise_count: number; mrq_id: string; created_at: string }

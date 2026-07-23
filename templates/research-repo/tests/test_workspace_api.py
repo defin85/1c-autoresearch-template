@@ -14,6 +14,7 @@ REPO = Path(__file__).parents[1]
 
 
 def test_extension_registries_are_paged_and_bound_to_active_diff(tmp_path: Path):
+    import csv
     import json
     repo = tmp_path / "repo"; (repo / "research").mkdir(parents=True)
     (repo / "project.toml").write_bytes((REPO / "project.toml").read_bytes())
@@ -22,23 +23,44 @@ def test_extension_registries_are_paged_and_bound_to_active_diff(tmp_path: Path)
     (repo / "research/active-diff-generation.json").write_text(json.dumps({"schema_version": "2", "generation_id": generation}), encoding="utf-8")
     root = repo / "analysis/indexes/generations" / generation; root.mkdir(parents=True)
     (root / "extension-diff.jsonl").write_text('{"stable_diff_id":"DIF-A"}\n{"stable_diff_id":"DIF-B"}\n', encoding="utf-8")
+    (root / "extension-dependencies.jsonl").write_text(
+        '{"dependency_id":"DEP-A","outcome":"unresolved","diagnostic_code":"unresolved_dependency"}\n'
+        '{"dependency_id":"DEP-B","outcome":"missing","diagnostic_code":""}\n',
+        encoding="utf-8",
+    )
+    for name, rows in {
+        "extension-path-coverage.csv": [
+            {"raw_diff_id": "DIF-RAW-A", "semantic_diff_ids": '["DIF-A"]'},
+            {"raw_diff_id": "DIF-RAW-B", "semantic_diff_ids": '["DIF-B"]'},
+        ],
+        "extension-physical-diff.csv": [
+            {"stable_diff_id": "DIF-RAW-A", "path": "extensions/x/a.xml"},
+            {"stable_diff_id": "DIF-RAW-B", "path": "extensions/x/b.xml"},
+        ],
+    }.items():
+        with (root / name).open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=tuple(rows[0])); writer.writeheader(); writer.writerows(rows)
     app = create_app(tmp_path / "state", [repo], testing=True)
     headers = {"Origin": "http://testserver", "Idempotency-Key": "bookmark"}
     with TestClient(app) as client:
         project = client.post("/api/v1/projects", json={"name": "test", "root": str(repo)}, headers=headers).json()
-        page = client.get(f"/api/v1/projects/{project['id']}/registries/extension-diff?offset=0&limit=1").json()
-        second = client.get(
-            f"/api/v1/projects/{project['id']}/registries/extension-diff"
-            f"?offset=1&limit=1&expected_generation={generation}"
-        ).json()
-        stale = client.get(
-            f"/api/v1/projects/{project['id']}/registries/extension-diff"
-            "?offset=1&limit=1&expected_generation="
-            + "b" * 64
-        )
-    assert page == {"diff_generation_id": generation, "offset": 0, "limit": 1, "items": [{"stable_diff_id": "DIF-A"}], "has_more": True}
-    assert second["items"] == [{"stable_diff_id": "DIF-B"}] and not second["has_more"]
-    assert stale.status_code == 409 and "stale diff generation" in stale.text
+        pages = {}
+        for name in ("extension-diff", "extension-dependencies", "extension-path-coverage", "extension-physical-diff"):
+            first = client.get(f"/api/v1/projects/{project['id']}/registries/{name}?offset=0&limit=1").json()
+            second = client.get(
+                f"/api/v1/projects/{project['id']}/registries/{name}"
+                f"?offset=1&limit=1&expected_generation={generation}"
+            ).json()
+            stale = client.get(
+                f"/api/v1/projects/{project['id']}/registries/{name}"
+                "?offset=1&limit=1&expected_generation=" + "b" * 64
+            )
+            pages[name] = (first, second)
+            assert first["has_more"] and not second["has_more"]
+            assert stale.status_code == 409 and "stale diff generation" in stale.text
+    assert pages["extension-diff"][0]["items"] == [{"stable_diff_id": "DIF-A"}]
+    assert pages["extension-dependencies"][0]["items"][0]["outcome"] == "unresolved"
+    assert pages["extension-physical-diff"][0]["items"][0]["stable_diff_id"] == "DIF-RAW-A"
 
 
 @pytest.mark.parametrize(

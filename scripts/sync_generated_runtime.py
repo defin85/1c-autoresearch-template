@@ -14,7 +14,7 @@ FILES = (
     "AGENTS.md", "README.md", "pyproject.toml", "uv.lock",
     "research/workflow.toml", "research/indexing.toml", "research/forbidden-authorities.json",
     "tests/test_external_folder.py", "tests/test_source_routing.py", "tests/test_source_tools.py",
-    "tests/test_sources.py", "tests/test_diffs.py", "tests/test_extension_analyzer.py",
+    "tests/test_sources.py", "tests/test_diffs.py", "tests/test_extension_analyzer.py", "tests/test_indexes.py",
     "tests/test_runner.py", "tests/test_workspace_api.py",
 )
 TREES = (
