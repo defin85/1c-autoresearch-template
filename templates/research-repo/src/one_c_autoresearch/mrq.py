@@ -66,21 +66,32 @@ def _diff_facts(repo: Path, diff_id: str) -> dict[str, dict[str, Any]]:
     return facts
 
 
-def active(repo: Path, *, require_tracked_clean_state: bool = False) -> dict[str, Any]:
+def active(
+    repo: Path,
+    *,
+    require_tracked_clean_state: bool = False,
+    pointer_candidate: dict[str, Any] | None = None,
+    source_candidate: dict[str, Any] | None = None,
+    diff_candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if pointer_candidate is None:
+        from .stage_recompute import recover_active_publication
+
+        recover_active_publication(repo)
     pointer_path = repo / "research/active-generation.json"
-    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer = pointer_candidate or json.loads(pointer_path.read_text(encoding="utf-8"))
     generation = pointer.get("canonical_generation_id")
     if not generation:
         return {"pointer": pointer, **{name: [] for name in FILES}}
     root = repo / "analysis/migration-requirements/generations" / generation
-    if require_tracked_clean_state:
+    if require_tracked_clean_state and pointer_candidate is None:
         require_tracked_clean(repo, [root, repo / "research/generations" / generation, pointer_path])
     result = {"pointer": pointer, **{name: _jsonl(root / name) for name in FILES}}
     manifest = json.loads((repo / "research/generations" / generation / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("canonical_generation_id") != generation:
         raise ValueError("canonical generation manifest mismatch")
-    source_pointer = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
-    diff_pointer = json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
+    source_pointer = source_candidate or json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+    diff_pointer = diff_candidate or json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
     source_id, diff_id = pointer.get("source_generation_id"), pointer.get("diff_generation_id")
     if source_id != source_pointer.get("generation_id") or diff_id != diff_pointer.get("generation_id") or diff_pointer.get("source_generation_id") != source_id:
         raise ValueError("mixed active generations")
@@ -226,20 +237,21 @@ def validate_graph(rows: dict[str, list[dict[str, Any]]], source_id: str, diff_i
         raise ValueError("a customer DIF has conflicting primary dispositions")
 
 
-def publish(repo: Path, rows: dict[str, list[dict[str, Any]]], source_id: str, diff_id: str, epoch: dict[str, str], expected_generation: str | None) -> dict[str, Any]:
+def publish(repo: Path, rows: dict[str, list[dict[str, Any]]], source_id: str, diff_id: str, epoch: dict[str, str], expected_generation: str | None, *, activate: bool = True, diff_candidate: dict[str, Any] | None = None, preserve_approval_prefix: bool = True) -> dict[str, Any]:
     with repository_lock(repo):
         current = json.loads((repo / "research/active-generation.json").read_text(encoding="utf-8"))
         if current.get("canonical_generation_id") != expected_generation:
             raise RuntimeError("stale canonical generation")
-        diff_pointer = json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
+        diff_pointer = diff_candidate or json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
         analyzer = json.loads((repo / "analysis/indexes/generations" / diff_id / "extension-analyzer-manifest.json").read_text(encoding="utf-8")) if diff_pointer.get("schema_version") == "2" else None
         epoch_fingerprint = comparison_epoch_fingerprint(epoch, analyzer)
         if expected_generation:
             prior_manifest = json.loads((repo / "research/generations" / expected_generation / "manifest.json").read_text(encoding="utf-8"))
             if prior_manifest.get("comparison_epoch_fingerprint") == epoch_fingerprint:
-                previous = _jsonl(repo / "analysis/migration-requirements/generations" / expected_generation / "approvals.jsonl")
-                if rows["approvals.jsonl"][:len(previous)] != previous:
-                    raise ValueError("same-epoch approval ledger prefix was changed")
+                if preserve_approval_prefix:
+                    previous = _jsonl(repo / "analysis/migration-requirements/generations" / expected_generation / "approvals.jsonl")
+                    if rows["approvals.jsonl"][:len(previous)] != previous:
+                        raise ValueError("same-epoch approval ledger prefix was changed")
             elif any(rows[name] for name in FILES):
                 raise ValueError("a new comparison epoch must start with empty MRQ ledgers")
         if diff_pointer.get("generation_id") != diff_id or diff_pointer.get("source_generation_id") != source_id:
@@ -273,11 +285,12 @@ def publish(repo: Path, rows: dict[str, list[dict[str, Any]]], source_id: str, d
             if any(sha256((destination / name).read_bytes()) != digest for name, digest in hashes.items()):
                 raise ValueError("existing canonical generation payload is inconsistent")
             pointer = {"schema_version": "1", "canonical_generation_id": generation, "source_generation_id": source_id, "diff_generation_id": diff_id}
-            atomic_json(repo / "research/active-generation.json", pointer)
+            if activate:
+                atomic_json(repo / "research/active-generation.json", pointer)
             return pointer
 
 
-def revalidate_unchanged(repo: Path, new_source: dict[str, Any], new_diff: dict[str, Any], actor: str, rationale: str, timestamp: str) -> dict[str, Any]:
+def revalidate_unchanged(repo: Path, new_source: dict[str, Any], new_diff: dict[str, Any], actor: str, rationale: str, timestamp: str, *, activate: bool = True) -> dict[str, Any]:
     if not actor.strip() or not rationale.strip() or not timestamp.strip():
         raise ValueError("revalidation actor, rationale, and timestamp are required")
     previous = json.loads((repo / "research/active-generation.json").read_text(encoding="utf-8"))
@@ -296,18 +309,80 @@ def revalidate_unchanged(repo: Path, new_source: dict[str, Any], new_diff: dict[
     old_facts = {key: item for key, item in old_all.items() if item.get("before_role") == "vendor_baseline" and item.get("after_role") == "target_cf"}
     new_all = _diff_facts(repo, new_diff["generation_id"])
     facts = {key: item for key, item in new_all.items() if item.get("before_role") == "vendor_baseline" and item.get("after_role") == "target_cf"}
-    retained = [item for item in rows["dispositions.jsonl"] if item.get("stable_diff_id") in facts and (item.get("mrq_id") or old_facts.get(item["stable_diff_id"], {}).get("content_fingerprint") == facts[item["stable_diff_id"]].get("content_fingerprint"))]
+    with (repo / "analysis/indexes/generations" / new_diff["generation_id"] / "target-coverage.csv").open(encoding="utf-8", newline="") as stream:
+        coverage = {item["customer_diff_id"]: {key: item[key] for key in ("customer_diff_id", "target_diff_ids", "coverage_status", "evidence_ref")} for item in csv.DictReader(stream)}
+    with (repo / "analysis/indexes/generations" / previous["diff_generation_id"] / "target-coverage.csv").open(encoding="utf-8", newline="") as stream:
+        old_coverage = {item["customer_diff_id"]: {key: item[key] for key in ("customer_diff_id", "target_diff_ids", "coverage_status", "evidence_ref")} for item in csv.DictReader(stream)}
+    from .stage_recompute import compatibility_fingerprint
+    compatibility: dict[str, str] = {}
+    compatible: set[str] = set()
+    affected_reasons: dict[str, list[str]] = {}
+    for item in rows["mrq.jsonl"]:
+        relations = [relation for relation in rows["dispositions.jsonl"] if relation.get("mrq_id") == item["mrq_id"]]
+        identifiers = {relation["stable_diff_id"] for relation in relations}
+        candidate_item = deepcopy(item)
+        candidate_item["source_generation_id"] = new_source["generation_id"]
+        candidate_item["diff_generation_id"] = new_diff["generation_id"]
+        candidate_relations = [{**relation, "source_generation_id": new_source["generation_id"], "diff_generation_id": new_diff["generation_id"]} for relation in relations]
+        for evidence in candidate_item.get("source_customization", {}).get("evidence", []):
+            fact = facts.get(evidence.get("stable_diff_id"))
+            refreshed = next((value["fingerprint"] for value in fact.get("semantic_evidence", []) if value["path"] == evidence.get("path")), None) if fact else None
+            if refreshed is None and fact and evidence.get("path") == fact.get("path"):
+                refreshed = fact.get("after_fingerprint") or fact.get("before_fingerprint")
+            if refreshed is not None:
+                evidence["fingerprint"] = refreshed
+        candidate_item.get("migration_decision", {})["target_coverage"] = [coverage.get(value.get("customer_diff_id")) for value in candidate_item.get("migration_decision", {}).get("target_coverage", [])]
+        old_fp = compatibility_fingerprint(item, relations, {key: {name: value for name, value in fact.items() if name != "source_generation"} for key, fact in old_facts.items()}, old_coverage, rows["approvals.jsonl"])
+        new_fp = compatibility_fingerprint(candidate_item, candidate_relations, {key: {name: value for name, value in fact.items() if name != "source_generation"} for key, fact in facts.items()}, coverage, rows["approvals.jsonl"])
+        source_ok = all(
+            (fact := facts.get(evidence.get("stable_diff_id"))) is not None
+            and (
+                next((value["fingerprint"] for value in fact.get("semantic_evidence", []) if value["path"] == evidence.get("path")), None)
+                or (fact.get("after_fingerprint") or fact.get("before_fingerprint") if evidence.get("path") == fact.get("path") else None)
+            ) == evidence.get("fingerprint")
+            for evidence in item.get("source_customization", {}).get("evidence", [])
+        )
+        target_ok = all(
+            not evidence.get("stable_diff_id")
+            or evidence["stable_diff_id"] in new_all
+            and old_all.get(evidence["stable_diff_id"], {}).get("content_fingerprint") == new_all[evidence["stable_diff_id"]].get("content_fingerprint")
+            for evidence in item.get("migration_decision", {}).get("target_evidence", [])
+        )
+        coverage_ok = all(
+            coverage.get(value.get("customer_diff_id")) == {key: value.get(key, "") for key in ("customer_diff_id", "target_diff_ids", "coverage_status", "evidence_ref")}
+            for value in item.get("migration_decision", {}).get("target_coverage", [])
+        )
+        diffs_ok = all(identifier in facts and old_facts.get(identifier, {}).get("content_fingerprint") == facts[identifier].get("content_fingerprint") for identifier in identifiers)
+        if relations and old_fp == new_fp and diffs_ok and source_ok and target_ok and coverage_ok:
+            compatible.add(item["mrq_id"])
+            compatibility[item["mrq_id"]] = new_fp
+        else:
+            affected_reasons[item["mrq_id"]] = sorted({
+                *(["missing_disposition"] if not relations else []),
+                *(["primary_or_supporting_dif_changed"] if not diffs_ok else []),
+                *(["source_evidence_changed"] if not source_ok else []),
+                *(["target_evidence_changed"] if not target_ok else []),
+                *(["target_coverage_changed"] if not coverage_ok else []),
+                *(["compatibility_closure_changed"] if old_fp != new_fp else []),
+            })
+    rows["mrq.jsonl"] = [item for item in rows["mrq.jsonl"] if item["mrq_id"] in compatible]
+    rows["lineage.jsonl"] = [
+        item for item in rows["lineage.jsonl"]
+        if set(item.get("source_ids", []) + item.get("target_ids", [])) <= compatible
+    ]
+    retained = [
+        item
+        for item in rows["dispositions.jsonl"]
+        if item.get("mrq_id") in compatible and item.get("stable_diff_id") in facts
+    ]
     for relation in retained:
         identifier = relation["stable_diff_id"]
         if old_facts.get(identifier, {}).get("content_fingerprint") != facts[identifier].get("content_fingerprint"):
             raise ValueError(f"changed DIF requires an explicit updated MRQ proposal: {identifier}")
-    owned = {item["stable_diff_id"] for item in retained if item.get("mrq_id")}
-    missing = [item["mrq_id"] for item in rows["mrq.jsonl"] if any(relation.get("mrq_id") == item["mrq_id"] and relation["stable_diff_id"] not in owned for relation in rows["dispositions.jsonl"])]
-    if missing:
-        raise ValueError(f"disappeared MRQ meaning requires explicit supersede evidence: {missing[0]}")
     rows["dispositions.jsonl"] = retained
-    with (repo / "analysis/indexes/generations" / new_diff["generation_id"] / "target-coverage.csv").open(encoding="utf-8", newline="") as stream:
-        coverage = {item["customer_diff_id"]: {key: item[key] for key in ("customer_diff_id", "target_diff_ids", "coverage_status", "evidence_ref")} for item in csv.DictReader(stream)}
+    # Утверждения остаются в прежнем неизменяемом поколении. Новое поколение
+    # требует отдельного ручного утверждения даже для совместимого MRQ.
+    rows["approvals.jsonl"] = []
     for item in rows["mrq.jsonl"]:
         item["source_generation_id"] = new_source["generation_id"]; item["diff_generation_id"] = new_diff["generation_id"]
         refreshed = []
@@ -331,16 +406,36 @@ def revalidate_unchanged(repo: Path, new_source: dict[str, Any], new_diff: dict[
         if any(value is None or {key: old.get(key, "") for key in value} != value for old, value in zip(current_coverage, refreshed_coverage)):
             raise ValueError(f"MRQ target coverage requires an explicit update: {item['mrq_id']}")
         item.get("migration_decision", {})["target_coverage"] = refreshed_coverage
-        rows["lineage.jsonl"].append({"schema_version": "1", "kind": "revalidate", "source_ids": [item["mrq_id"]], "target_ids": [item["mrq_id"]], "rationale": rationale, "evidence": [{"old_source_generation_id": previous["source_generation_id"], "new_source_generation_id": new_source["generation_id"], "old_diff_generation_id": previous["diff_generation_id"], "new_diff_generation_id": new_diff["generation_id"], "affected_fields": ["source_generation_id", "diff_generation_id"]}], "actor": actor, "source_generation_id": new_source["generation_id"], "diff_generation_id": new_diff["generation_id"]})
+        rows["lineage.jsonl"].append({"schema_version": "1", "kind": "revalidate", "source_ids": [item["mrq_id"]], "target_ids": [item["mrq_id"]], "rationale": rationale, "evidence": [{"old_source_generation_id": previous["source_generation_id"], "new_source_generation_id": new_source["generation_id"], "old_diff_generation_id": previous["diff_generation_id"], "new_diff_generation_id": new_diff["generation_id"], "affected_fields": ["source_generation_id", "diff_generation_id"], "compatibility_fingerprint": compatibility[item["mrq_id"]]}], "actor": actor, "source_generation_id": new_source["generation_id"], "diff_generation_id": new_diff["generation_id"]})
         if item.get("state") == "approved":
-            candidate = deepcopy(item); candidate["state"] = "ready_for_review"; candidate["migration_decision"]["agreement_status"] = "pending_review"
-            rows["approvals.jsonl"].append({"schema_version": "1", "event": "approve", "target_id": item["mrq_id"], "actor": actor, "rationale": rationale, "evidence": item["source_customization"]["evidence"], "timestamp": timestamp, "previous_generation": generation, "fingerprint": sha256(canonical_json(candidate)), "source_generation_id": new_source["generation_id"], "diff_generation_id": new_diff["generation_id"]})
+            item["state"] = "ready_for_review"
+            item["migration_decision"]["agreement_status"] = "pending_review"
     for relation in rows["dispositions.jsonl"]:
         relation["source_generation_id"] = new_source["generation_id"]; relation["diff_generation_id"] = new_diff["generation_id"]
-        noise = relation.get("approved_noise")
-        if noise:
-            rows["approvals.jsonl"].append({"schema_version": "1", "event": "approve", "target_id": relation["stable_diff_id"], "actor": actor, "rationale": rationale, "evidence": noise["evidence"], "timestamp": timestamp, "previous_generation": generation, "fingerprint": sha256(canonical_json(noise)), "source_generation_id": new_source["generation_id"], "diff_generation_id": new_diff["generation_id"]})
-    return publish(repo, rows, new_source["generation_id"], new_diff["generation_id"], new_source, previous["canonical_generation_id"])
+    pointer = publish(
+        repo,
+        rows,
+        new_source["generation_id"],
+        new_diff["generation_id"],
+        new_source,
+        previous["canonical_generation_id"],
+        activate=activate,
+        diff_candidate=None if activate else new_diff,
+        preserve_approval_prefix=False,
+    )
+    return {
+        **pointer,
+        "retained_mrq": sorted(compatible),
+        "affected_mrq": sorted({item["mrq_id"] for item in state["mrq.jsonl"]} - compatible),
+        "affected_mrq_reasons": affected_reasons,
+        "new_dif": sorted(set(facts) - set(old_facts)),
+        "changed_dif": sorted(
+            identifier
+            for identifier in set(facts) & set(old_facts)
+            if facts[identifier].get("content_fingerprint") != old_facts[identifier].get("content_fingerprint")
+        ),
+        "disappeared_dif": sorted(set(old_facts) - set(facts)),
+    }
 
 
 def propose(rows: dict[str, list[dict[str, Any]]], semantic_key: str, title: str, source_id: str, diff_id: str, stable_diff_ids: list[str], supporting_diff_ids: list[str], evidence: list[dict[str, Any]], business_meaning: str, scope: str, confidence: str, rationale: str) -> str:

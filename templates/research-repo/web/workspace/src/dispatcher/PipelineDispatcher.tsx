@@ -6,7 +6,7 @@
 // подробностей. ``prefers-reduced-motion`` отключает анимацию без потери данных.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Alert, Box, Button, Chip, CircularProgress, Divider, LinearProgress, Paper, Stack, Typography } from '@mui/material';
+import { Alert, Box, Button, Checkbox, Chip, CircularProgress, Divider, FormControlLabel, LinearProgress, Paper, Stack, Typography } from '@mui/material';
 import { ArrowDownward, ArrowForward, Check, CheckCircle, DataObject, Hub, Psychology, Storage, TaskAlt, WarningAmber } from '@mui/icons-material';
 import { Controls, Handle, Position, ReactFlow, ReactFlowProvider, type NodeProps, type NodeTypes } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
@@ -28,7 +28,7 @@ interface DispatcherNodeData extends Record<string, unknown> {
   circuit: CircuitId;
   circuitState: string;
   aggregates: Record<string, number | string>;
-  lease?: { owner: string; renewed_at: string; state: string; work_unit_id: string };
+  lease?: { owner: string; renewed_at: string; state: string; work_unit_id: string; summary?: Record<string, unknown> };
   fresh: boolean;
   animate: boolean;
   isSelected: boolean;
@@ -140,6 +140,28 @@ interface DispatcherActionResponse {
   outcome: DispatcherOutcome;
 }
 
+interface RecomputePlan {
+  boundary: string;
+  plan_fingerprint: string;
+  workflow_fingerprint?: string;
+  steps: Array<{ operation?: string; step_id?: string; kind?: string; conditional?: boolean }>;
+  required_confirmations?: string[];
+  possible_result?: string;
+  possible_results?: string[];
+  stop_before?: string;
+  manual_stop?: string | null;
+  generations?: Record<string, string>;
+  active_pointers?: Record<string, { generation_id?: string; canonical_generation_id?: string } | null>;
+}
+
+interface RecomputeRun {
+  run_id: string;
+  status: string;
+  plan_fingerprint: string;
+  result?: string | Record<string, unknown>;
+  next_work_unit_id?: string;
+}
+
 async function postDispatcherAction(projectId: string, jobId: CircuitId extends never ? string : 'discover-mrq' | 'decide-mrq', action: string, fingerprint: string, body: DispatcherActionPayload): Promise<DispatcherOutcome> {
   const response = await api<DispatcherActionResponse>(`/projects/${projectId}/dispatcher/${jobId}/${action}`, {
     method: 'POST',
@@ -151,13 +173,54 @@ async function postDispatcherAction(projectId: string, jobId: CircuitId extends 
 
 interface ContextActions { onOpenSources?: () => void; onOpenIndexes?: () => void; onOpenSettings?: () => void }
 
-function DispatcherPanel({ projectId, projection, fingerprint, selectedCircuit, onClose, onOpenSources, onOpenIndexes, onOpenSettings }: { projectId: string; projection: DispatcherProjection; fingerprint: string; selectedCircuit: CircuitId | null; onClose: () => void } & ContextActions) {
+type LeaseAction = 'start' | 'stop' | 'resume' | 'retry' | 'cancel' | 'approve';
+
+export function leaseActionMatrix(
+  lease: DispatcherNodeData['lease'] | undefined,
+  circuitReady: boolean,
+  recomputeActive: boolean,
+  approvalAvailable: boolean,
+  now = Date.now(),
+): Record<LeaseAction, boolean> {
+  const expired = lease?.state === 'running' && now - Date.parse(lease.renewed_at) >= 30_000;
+  const state = expired ? 'expired' : lease?.state ?? 'absent';
+  return {
+    start: state === 'absent' && circuitReady && !recomputeActive,
+    stop: state === 'running',
+    resume: state === 'resumable' && !recomputeActive,
+    retry: ['resumable', 'failed', 'stale', 'expired'].includes(state) && !recomputeActive,
+    cancel: state !== 'absent' && state !== 'complete',
+    approve: state === 'blocked' && approvalAvailable,
+  };
+}
+
+export function DispatcherPanel({ projectId, projection, fingerprint, selectedCircuit, onClose, onOpenSources, onOpenIndexes, onOpenSettings }: { projectId: string; projection: DispatcherProjection; fingerprint: string; selectedCircuit: CircuitId | null; onClose: () => void } & ContextActions) {
   const [busy, setBusy] = useState(false);
   const [outcome, setOutcome] = useState<DispatcherOutcome | null>(null);
+  const [plan, setPlan] = useState<RecomputePlan | null>(null);
+  const [confirmations, setConfirmations] = useState<string[]>([]);
+  const [recomputeRun, setRecomputeRun] = useState<RecomputeRun | null>(null);
   const [error, setError] = useState('');
   const job = selectedCircuit === 'analyze-dif' || selectedCircuit === 'form-mrq' ? 'discover-mrq' : selectedCircuit === 'decide-target' ? 'decide-mrq' : null;
   const lease = job ? projection.jobs[job] : undefined;
+  const recomputeLease = projection.jobs['stage-recompute'];
+  const recomputeActive = recomputeLease?.state === 'running';
+  useEffect(() => {
+    const latest = projection.stage_recompute_run;
+    if (latest && (!recomputeRun || latest.run_id === recomputeRun.run_id)) {
+      const next = latest.result?.next as { work_unit?: { id?: string }; id?: string } | undefined;
+      setRecomputeRun({
+        run_id: latest.run_id,
+        status: latest.status,
+        plan_fingerprint: latest.plan?.plan_fingerprint || recomputeRun?.plan_fingerprint || '',
+        result: latest.result || undefined,
+        next_work_unit_id: next?.work_unit?.id || next?.id,
+      });
+    }
+  }, [projection.stage_recompute_run, recomputeRun?.run_id]);
   const pendingApproval = job ? projection.items.proposals.find((proposal) => proposal.job_id === job && proposal.kind === 'approval') : undefined;
+  const circuitReady = projection.circuits.find((item) => item.id === selectedCircuit)?.state === 'ready';
+  const actions = leaseActionMatrix(lease, circuitReady, recomputeActive, Boolean(pendingApproval));
 
   const run = useCallback(async (action: 'start' | 'stop' | 'resume' | 'cancel' | 'retry') => {
     if (!job) return;
@@ -192,21 +255,114 @@ function DispatcherPanel({ projectId, projection, fingerprint, selectedCircuit, 
     }
   }, [job, pendingApproval, projectId, fingerprint]);
 
+  const previewRecompute = useCallback(async () => {
+    setBusy(true);
+    setError('');
+    setPlan(null);
+    setConfirmations([]);
+    try {
+      const result = await api<RecomputePlan>(`/projects/${projectId}/stage-recompute/preview`, {
+        method: 'POST',
+        headers: mutationHeaders(),
+        body: JSON.stringify({ boundary: 'diffs', expected_workflow_fingerprint: fingerprint }),
+      });
+      setPlan(result);
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : 'Не удалось построить план пересчёта');
+    } finally {
+      setBusy(false);
+    }
+  }, [fingerprint, projectId]);
+
+  const startRecompute = useCallback(async () => {
+    if (!plan || confirmations.length !== (plan.required_confirmations ?? []).length) return;
+    setBusy(true);
+    setError('');
+    try {
+      const result = await api<RecomputeRun>(`/projects/${projectId}/stage-recompute/runs`, {
+        method: 'POST',
+        headers: mutationHeaders(),
+        body: JSON.stringify({
+          boundary: 'diffs',
+          workflow_fingerprint: fingerprint,
+          plan_fingerprint: plan.plan_fingerprint,
+          confirmations: [...confirmations].sort(),
+        }),
+      });
+      setRecomputeRun(result);
+      setPlan(null);
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : 'Не удалось запустить пересчёт');
+    } finally {
+      setBusy(false);
+    }
+  }, [confirmations, fingerprint, plan, projectId]);
+
+  const cancelRecompute = useCallback(async () => {
+    const runId = String(recomputeLease?.summary?.run_id || recomputeRun?.run_id || '');
+    if (!runId) return;
+    setBusy(true);
+    setError('');
+    try {
+      setRecomputeRun(await api<RecomputeRun>(`/projects/${projectId}/stage-recompute/runs/${encodeURIComponent(runId)}/cancel`, {
+        method: 'POST',
+        headers: mutationHeaders(),
+        body: JSON.stringify({}),
+      }));
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : 'Не удалось отменить пересчёт');
+    } finally {
+      setBusy(false);
+    }
+  }, [projectId, recomputeLease, recomputeRun]);
+
   if (!selectedCircuit) return null;
   return (
-    <Paper elevation={8} className="nodrag nowheel" sx={{ position: 'absolute', zIndex: 5, right: 16, bottom: 16, width: 430, maxWidth: 'calc(100% - 32px)', p: 2 }}>
+    <Paper elevation={8} className="nodrag nowheel" sx={{ position: 'absolute', zIndex: 5, right: 16, bottom: 16, width: 500, maxWidth: 'calc(100% - 32px)', maxHeight: 'calc(100% - 32px)', overflowY: 'auto', p: 2 }}>
     <Stack spacing={1.4}>
       {error && <Alert severity="error">{error}</Alert>}
       <Stack direction="row" alignItems="center"><Typography variant="subtitle1" fontWeight={700} flex={1}>{CIRCUIT_LABEL[selectedCircuit]}</Typography><Button size="small" onClick={onClose}>Закрыть</Button></Stack>
-      {selectedCircuit === 'prepare-diffs' ? <Stack direction="row" spacing={1} flexWrap="wrap">{onOpenSources && <Button variant="contained" onClick={onOpenSources}>Настроить источники</Button>}{onOpenIndexes && <Button variant="outlined" onClick={onOpenIndexes}>Проверить индексы</Button>}</Stack> : <><Typography variant="caption">Аренда: {lease ? `${lease.owner} (${lease.state})` : 'не захвачена'} · ревизия {projection.revision}</Typography><Stack direction="row" spacing={1} flexWrap="wrap">
-        <Button variant="contained" disabled={busy} onClick={() => void run('start')}>Запустить</Button>
-        <Button variant="outlined" disabled={busy} onClick={() => void run('stop')}>Мягкая остановка</Button>
-        <Button variant="outlined" disabled={busy} onClick={() => void run('resume')}>Продолжить</Button>
-        <Button color="warning" disabled={busy} onClick={() => void run('retry')}>Явный повтор</Button>
-        <Button color="error" disabled={busy} onClick={() => void run('cancel')}>Отменить</Button>
-        {pendingApproval && <Button color="success" variant="contained" disabled={busy} onClick={() => void approve()}>Одобрить предложение</Button>}
-        {onOpenSettings && <Button onClick={onOpenSettings}>Профили и параметры</Button>}
-      </Stack></>}
+      {selectedCircuit === 'prepare-diffs' ? <Stack direction="row" spacing={1} flexWrap="wrap">{onOpenSources && <Button variant="contained" onClick={onOpenSources}>Настроить источники</Button>}{onOpenIndexes && <Button variant="outlined" onClick={onOpenIndexes}>Проверить индексы</Button>}</Stack> : <>
+      <Paper component="section" variant="outlined" aria-labelledby="current-job-title" sx={{ p: 1.4 }}>
+        <Typography id="current-job-title" variant="subtitle2" fontWeight={700}>Текущее задание</Typography>
+        <Typography variant="caption" display="block" mb={1}>Аренда: {lease ? `${lease.owner} (${leasePresentation(lease, '').state})` : 'не захвачена'} · ревизия {projection.revision}</Typography>
+        {recomputeActive && <Alert severity="info" sx={{ mb: 1 }}>Идёт пересчёт этапа. Запуск и продолжение обычного задания временно недоступны.</Alert>}
+        <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+          <Button variant="contained" disabled={busy || !actions.start} onClick={() => void run('start')}>Запустить</Button>
+          <Button variant="outlined" disabled={busy || !actions.stop} onClick={() => void run('stop')}>Мягкая остановка</Button>
+          <Button variant="outlined" disabled={busy || !actions.resume} onClick={() => void run('resume')}>Продолжить</Button>
+          <Button color="warning" disabled={busy || !actions.retry} onClick={() => void run('retry')}>Явный повтор</Button>
+          <Button color="error" disabled={busy || !actions.cancel} onClick={() => void run('cancel')}>Отменить задание</Button>
+          {pendingApproval && <Button color="success" variant="contained" disabled={busy || !actions.approve} onClick={() => void approve()}>Одобрить предложение</Button>}
+          {onOpenSettings && <Button onClick={onOpenSettings}>Профили и параметры</Button>}
+        </Stack>
+      </Paper>
+      <Paper component="section" variant="outlined" aria-labelledby="recompute-title" sx={{ p: 1.4 }}>
+        <Typography id="recompute-title" variant="subtitle2" fontWeight={700}>Пересчёт этапа</Typography>
+        {selectedCircuit === 'analyze-dif' ? <Stack spacing={1} mt={0.7}>
+          <Typography variant="body2">Граница: различия. Сначала будет построен план без изменения репозитория.</Typography>
+          {recomputeActive ? <>
+            <Alert severity="info">Выполняется шаг: {String(recomputeLease.summary?.current_step || recomputeLease.summary?.step_id || 'подготовка')}</Alert>
+            <Button color="error" variant="outlined" disabled={busy} onClick={() => void cancelRecompute()}>Отменить пересчёт</Button>
+          </> : <Button variant="outlined" disabled={busy || Boolean(lease)} onClick={() => void previewRecompute()}>Пересчитать с этапа</Button>}
+          {lease && !recomputeActive && <Typography variant="caption">Сначала завершите, повторите или отмените текущее задание.</Typography>}
+          {plan && <Paper variant="outlined" sx={{ p: 1.2 }} aria-label="Предварительный просмотр пересчёта">
+            <Typography variant="body2" fontWeight={700}>План пересчёта</Typography>
+            <Typography variant="caption" display="block">Отпечаток: {plan.plan_fingerprint}</Typography>
+            {plan.generations && <Typography variant="caption" display="block">Поколения: {Object.entries(plan.generations).map(([key, value]) => `${key}=${value}`).join(', ')}</Typography>}
+            {plan.active_pointers && <Typography variant="caption" display="block">Поколения: {Object.entries(plan.active_pointers).map(([key, value]) => `${key}=${value?.generation_id || value?.canonical_generation_id || 'нет'}`).join(', ')}</Typography>}
+            <Stack component="ol" spacing={0.4} sx={{ pl: 2.5, my: 1 }}>
+              {plan.steps.map((step, index) => <Typography component="li" variant="body2" key={step.step_id || `${step.operation}-${index}`}>{step.operation || step.kind || step.step_id}{step.conditional ? ' (условно)' : ''}</Typography>)}
+            </Stack>
+            {(plan.possible_result || plan.possible_results) && <Typography variant="body2">Возможный результат: {plan.possible_result || plan.possible_results?.join(', ')}</Typography>}
+            {(plan.stop_before || plan.manual_stop) && <Typography variant="body2">Ближайшая ручная остановка: {plan.stop_before || plan.manual_stop}</Typography>}
+            {(plan.required_confirmations ?? []).map((confirmation) => <FormControlLabel key={confirmation} control={<Checkbox checked={confirmations.includes(confirmation)} onChange={(_, checked) => setConfirmations((current) => checked ? [...current, confirmation] : current.filter((item) => item !== confirmation))} />} label={`Подтверждаю: ${confirmation}`} />)}
+            <Button variant="contained" disabled={busy || confirmations.length !== (plan.required_confirmations ?? []).length} onClick={() => void startRecompute()}>Запустить пересчёт</Button>
+          </Paper>}
+          {recomputeRun && <Alert severity={recomputeRun.status === 'failed' ? 'warning' : 'success'}>Пересчёт: {typeof recomputeRun.result === 'object' ? String(recomputeRun.result.status || recomputeRun.status) : recomputeRun.result || recomputeRun.status}{recomputeRun.next_work_unit_id ? `; следующая работа: ${recomputeRun.next_work_unit_id}` : ''}</Alert>}
+        </Stack> : <Alert severity="info" sx={{ mt: 0.7 }}>Для этапов MRQ массовый сброс не поддерживается. Используйте явный повтор, пересмотр или реструктуризацию текущего задания.</Alert>}
+      </Paper>
+      </>}
       {outcome && (
         <Alert severity={outcome.status === 'failed' || outcome.status === 'blocked' || outcome.status === 'stale' ? 'warning' : 'success'}>
           <Typography>Статус: {outcome.status}; ревизия: {outcome.revision}</Typography>

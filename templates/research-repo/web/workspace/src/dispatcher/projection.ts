@@ -32,6 +32,7 @@ export interface DispatcherProjection {
   fresh_at: string;
   circuits: CircuitProjection[];
   jobs: Record<string, CircuitLease>;
+  stage_recompute_run?: { run_id: string; status: string; result?: Record<string, unknown> | null; plan?: { plan_fingerprint?: string } };
   items: DispatcherItems;
   error?: string;
 }

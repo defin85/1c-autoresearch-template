@@ -534,7 +534,7 @@ def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dic
     return {**preimage, "routing_plan_fingerprint": "sha256:" + sha256(canonical_json(preimage))}
 
 
-def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, routing_preview: dict[str, Any], normalizer_version: str = NORMALIZER_VERSION, timeout_seconds: int = 1800, run: callable = subprocess.run, upload_drafts: Path | None = None, cancelled: callable | None = None) -> dict[str, Any]:
+def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, routing_preview: dict[str, Any], normalizer_version: str = NORMALIZER_VERSION, timeout_seconds: int = 1800, run: callable = subprocess.run, upload_drafts: Path | None = None, cancelled: callable | None = None, activate: bool = True) -> dict[str, Any]:
     if shutil.disk_usage(repo).free < MINIMUM_FREE_BYTES:
         raise OSError("source acquisition requires at least 1 GiB free space")
     tested = {name: {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}} for name, profile in connections.items()}
@@ -645,10 +645,10 @@ def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], 
         if validate_role_contract(repo, tested) != contract or routing_bindings(repo, connections, upload_drafts) != fresh_preview["bindings"]:
             raise RuntimeError("routing_preview_stale")
         _check_cancelled(cancelled, "publication")
-        return publish_routed(repo, staging, contract, fresh_preview["routing_manifest"], normalizer_version, expected_generation, source_comparison_epoch)
+        return publish_routed(repo, staging, contract, fresh_preview["routing_manifest"], normalizer_version, expected_generation, source_comparison_epoch, activate=activate)
 
 
-def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], routing_manifest: dict[str, Any], normalizer_version: str, expected_generation: str | None, epoch_builder: callable) -> dict[str, Any]:
+def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], routing_manifest: dict[str, Any], normalizer_version: str, expected_generation: str | None, epoch_builder: callable, *, activate: bool = True) -> dict[str, Any]:
     manifest_preimage = {key: value for key, value in routing_manifest.items() if key != "routing_manifest_fingerprint"}
     if routing_manifest.get("routing_manifest_fingerprint") != "sha256:" + sha256(canonical_json(manifest_preimage)):
         raise ValueError("routing manifest fingerprint mismatch")
@@ -726,7 +726,8 @@ def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], rou
             "components": components,
         }
         pointer["source_comparison_epoch_fingerprint"] = epoch_builder(pointer, routing_manifest)
-        atomic_json(pointer_path, pointer)
+        if activate:
+            atomic_json(pointer_path, pointer)
         return pointer
 
 
@@ -792,20 +793,24 @@ def publish(repo: Path, staged_roles: Path, contract: dict[str, Any], normalizer
         return pointer
 
 
-def validate_active(repo: Path, *, deep: bool = False, require_tracked_clean: bool = False) -> dict[str, Any]:
+def validate_active(repo: Path, *, deep: bool = False, require_tracked_clean: bool = False, candidate: dict[str, Any] | None = None) -> dict[str, Any]:
     import subprocess
+    if candidate is None:
+        from .stage_recompute import recover_active_publication
+
+        recover_active_publication(repo)
     deep = deep or require_tracked_clean
     pointer_path = repo / "research/active-source-generation.json"
-    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer = candidate or json.loads(pointer_path.read_text(encoding="utf-8"))
     if pointer.get("schema_version") == "2":
-        return _validate_active_routed(repo, pointer, deep=deep, require_tracked_clean=require_tracked_clean)
+        return _validate_active_routed(repo, pointer, deep=deep, require_tracked_clean=require_tracked_clean and candidate is None)
     if pointer.get("schema_version") != "1":
         raise ValueError("unsupported active source schema version")
     generation_id = str(pointer.get("generation_id", ""))
     if not generation_id or generation_id != Path(generation_id).name:
         raise ValueError("invalid active source generation ID")
     root = confined(repo / "sources/generations", generation_id)
-    if require_tracked_clean:
+    if require_tracked_clean and candidate is None:
         validate_tracked_clean(repo, [root, pointer_path])
     contract_path = root / "source-contract.json"
     contract = json.loads(contract_path.read_text(encoding="utf-8"))

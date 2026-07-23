@@ -253,16 +253,23 @@ def _diff_blockers(repo: Path) -> list[Blocker]:
 
 
 def _active_rows(repo: Path) -> tuple[list[dict[str, str]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    diff_pointer = _pointer(repo, "active-diff-generation.json")
+    from .stage_recompute import active_pointers
+    pointers = active_pointers(repo)
+    diff_pointer = pointers["diff"]
     diff_root = repo / "analysis/indexes/generations" / str(diff_pointer.get("generation_id"))
     with (diff_root / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
         diffs = [row for row in csv.DictReader(stream) if row.get("comparison_id", "").startswith("CMP-")]
-    pointer = _pointer(repo, "active-generation.json")
+    pointer = pointers["mrq"]
     generation = pointer.get("canonical_generation_id")
     if not generation:
         return diffs, [], [], []
     from .mrq import active
-    state = active(repo)
+    state = active(
+        repo,
+        pointer_candidate=pointer,
+        source_candidate=pointers["source"],
+        diff_candidate=diff_pointer,
+    )
     return diffs, state["mrq.jsonl"], state["dispositions.jsonl"], state["approvals.jsonl"]
 
 
@@ -317,6 +324,9 @@ def semantic_diff_context(repo: Path, stable_diff_id: str, fact: dict[str, Any] 
 
 def status(repo: Path, *, deep: bool = True) -> dict[str, Any]:
     repo = repo.resolve()
+    from .stage_recompute import recover_active_publication
+
+    recover_active_publication(repo)
     validate_workflow(repo)
     checks = [_project_blockers(repo), _source_blockers(repo, deep=deep), _diff_blockers(repo)]
     if not any(checks):
@@ -481,6 +491,8 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
         "fresh_at": updated_at or datetime.now(timezone.utc).isoformat(),
         "circuits": circuits,
         "jobs": {lease["job_id"]: lease for lease in leases},
+        "stage_recompute": next((lease for lease in leases if lease["job_id"] == "stage-recompute"), None),
+        "stage_recompute_run": store.latest_stage_recompute(),
         "items": _dispatcher_items(repo, store),
     }
 

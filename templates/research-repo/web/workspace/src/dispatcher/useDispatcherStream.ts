@@ -63,7 +63,7 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
       eventSource = new EventSource(`/api/v1/projects/${projectId}/events/stream?cursor=${cursorRef.current}`, { withCredentials: true });
       eventSource.addEventListener('workflow', (event) => {
         try {
-          const payload = JSON.parse((event as MessageEvent).data) as { sequence: number; payload?: { revision?: number; kind?: string } };
+          const payload = JSON.parse((event as MessageEvent).data) as { sequence: number; job_id?: string; payload?: { revision?: number; kind?: string; operation?: string } };
           if (typeof payload.sequence !== 'number' || payload.sequence <= cursorRef.current) return;
           if (cursorRef.current > 0 && payload.sequence !== cursorRef.current + 1) {
             setResyncing(true);
@@ -73,7 +73,7 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
           }
           cursorRef.current = payload.sequence;
           // при любом событии диспетчера перечитываем снимок, чтобы получить консистентную проекцию с тем же revision
-          if (payload.payload?.kind?.startsWith('dispatcher.')) {
+          if (payload.payload?.kind?.startsWith('dispatcher.') || payload.job_id === 'stage-recompute' || payload.payload?.operation === 'stage-recompute') {
             void loadSnapshot();
           }
         } catch {

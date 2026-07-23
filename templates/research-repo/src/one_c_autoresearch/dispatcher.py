@@ -100,23 +100,16 @@ class DispatcherBindings:
 def load_bindings(repo: Path, project_id: str, job_id: str, work_unit_id: str, agent_profile: dict | None, instruction_supplement: str) -> DispatcherBindings:
     """Собирает привязки из активного состояния репозитория и профиля агента."""
 
-    import json
-    pointers = {}
-    for name in ("active-source-generation.json", "active-diff-generation.json", "active-generation.json"):
-        path = repo / "research" / name
-        try:
-            pointers[name] = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            pointers[name] = {}
-    from .workflow import state_fingerprint
+    from .stage_recompute import active_state
+    pointers, workflow_fingerprint = active_state(repo)
     return DispatcherBindings(
         project_id=project_id,
         job_id=job_id,
         work_unit_id=work_unit_id,
-        source_generation_id=str(pointers.get("active-source-generation.json", {}).get("generation_id", "")),
-        diff_generation_id=str(pointers.get("active-diff-generation.json", {}).get("generation_id", "")),
-        canonical_generation_id=str(pointers.get("active-generation.json", {}).get("canonical_generation_id", "")),
-        workflow_fingerprint=state_fingerprint(repo),
+        source_generation_id=str((pointers.get("source") or {}).get("generation_id", "")),
+        diff_generation_id=str((pointers.get("diff") or {}).get("generation_id", "")),
+        canonical_generation_id=str((pointers.get("mrq") or {}).get("canonical_generation_id", "")),
+        workflow_fingerprint=workflow_fingerprint,
         agent_profile_fingerprint=sha256(canonical_json(agent_profile)) if agent_profile else "",
         instruction_supplement=instruction_supplement,
     )

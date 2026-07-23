@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tomllib
 from copy import deepcopy
+from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -102,13 +103,14 @@ class ApplicationService:
             raise ValueError("invalid workflow step patch")
         return workflow.preview_step_patch(self.repo, payload["step_id"], payload["parameters"], payload["expected_manifest_fingerprint"])
 
-    def apply(self, operation: str, payload: dict[str, Any], expected_fingerprint: str, cancelled: callable | None = None) -> dict[str, Any]:
+    def apply(self, operation: str, payload: dict[str, Any], expected_fingerprint: str, cancelled: callable | None = None, *, staged: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
         reject_secrets(payload, "operation payload")
         current = workflow.state_fingerprint(self.repo)
         if expected_fingerprint != current:
             raise RuntimeError("stale workflow fingerprint")
         self._expected_fingerprint = expected_fingerprint
         self._cancelled = cancelled
+        self._staged = staged
         handlers = {
             "project.configure": self._configure,
             "sources.configure": lambda value: self._locked(self._configure_sources, value),
@@ -132,7 +134,7 @@ class ApplicationService:
             "mrq.publish-source-batch": self._mrq_publish_source_batch,
             "projections.build": lambda value: self._locked(self._build_projections, value),
             "workflow.patch-step": lambda value: self._locked(self._patch_step, value),
-            "workflow.verify": lambda payload: self.snapshot() if not payload else (_ for _ in ()).throw(ValueError("workflow.verify takes no parameters")),
+            "workflow.verify": self._verify_workflow,
         }
         try:
             handler = handlers[operation]
@@ -140,11 +142,21 @@ class ApplicationService:
             raise ValueError(f"unsupported typed operation: {operation}") from exc
         return handler(payload)
 
+    def _verify_workflow(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload:
+            raise ValueError("workflow.verify takes no parameters")
+        from .doctor import check
+        result = check(self.repo, strict=True)
+        if not result["ok"]:
+            raise RuntimeError(json.dumps({"code": "workflow.verify.failed", "blockers": result["failures"]}, ensure_ascii=False, sort_keys=True))
+        return result
+
     def _locked(self, handler, payload: dict[str, Any]) -> dict[str, Any]:
         with repository_lock(self.repo):
             if workflow.state_fingerprint(self.repo) != self._expected_fingerprint:
                 raise RuntimeError("stale workflow fingerprint")
-            return handler(payload)
+            result = handler(payload)
+            return {**result, "workflow_fingerprint": workflow.state_fingerprint(self.repo)}
 
     def _configure(self, payload: dict[str, Any]) -> dict[str, Any]:
         allowed = {"product", "baseline_version", "target_version", "next_vendor_version", "description"}
@@ -181,7 +193,12 @@ class ApplicationService:
         from .user_state import workspace_id
         if preview.get("project_id") != workspace_id(self.repo) or preview.get("status") != "ready" or preview.get("routing_plan_fingerprint") != payload.get("routing_plan_fingerprint"):
             raise RuntimeError("routing_preview_stale")
-        return sources.acquire(self.repo, platform, self.connections, routing_preview=preview, timeout_seconds=int(payload.get("timeout_seconds", 1800)), upload_drafts=self.upload_drafts, cancelled=self._cancelled)
+        if datetime.fromisoformat(str(preview.get("expires_at", ""))) <= datetime.now(timezone.utc):
+            raise RuntimeError("routing_preview_stale")
+        result = sources.acquire(self.repo, platform, self.connections, routing_preview=preview, timeout_seconds=int(payload.get("timeout_seconds", 1800)), upload_drafts=self.upload_drafts, cancelled=self._cancelled, activate=self._staged is None)
+        if self._staged is not None:
+            self._staged["source"] = result
+        return result
 
     def _configure_sources(self, payload: dict[str, Any]) -> dict[str, Any]:
         external_keys = {"external_artifact_preview_id", "selected_entries", "expected_declaration_fingerprint", "expected_draft_fingerprint", "confirm"}
@@ -225,11 +242,16 @@ class ApplicationService:
     def _build_diffs(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload:
             raise ValueError("diff.build takes no parameters")
-        pointer = json.loads((self.repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
-        if sources.validate_active(self.repo, deep=True) != pointer:
+        from .stage_recompute import active_pointers
+        pointers = active_pointers(self.repo) if self._staged is None else {}
+        pointer = self._staged.get("source") if self._staged and self._staged.get("source") else pointers["source"]
+        if self._staged is None and sources.validate_active(self.repo, deep=True) != pointer:
             raise RuntimeError("active source generation changed during validation")
-        prior_pointer = json.loads((self.repo / "research/active-generation.json").read_text(encoding="utf-8"))
-        result = diffs.build(self.repo, pointer, cancelled=self._cancelled)
+        prior_pointer = pointers["mrq"] if self._staged is None else active_pointers(self.repo)["mrq"]
+        result = diffs.build(self.repo, pointer, cancelled=self._cancelled, activate=self._staged is None)
+        if self._staged is not None:
+            self._staged["diff"] = result
+            return result
         prior_generation = prior_pointer.get("canonical_generation_id")
         analyzer = json.loads((self.repo / "analysis/indexes/generations" / result["generation_id"] / "extension-analyzer-manifest.json").read_text(encoding="utf-8"))
         new_epoch = mrq.comparison_epoch_fingerprint(pointer, analyzer)
@@ -242,9 +264,17 @@ class ApplicationService:
     def _mrq_revalidate_unchanged(self, payload: dict[str, Any]) -> dict[str, Any]:
         if set(payload) != {"actor", "rationale", "timestamp"}:
             raise ValueError("invalid unchanged MRQ revalidation")
-        source = json.loads((self.repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
-        diff = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
-        return mrq.revalidate_unchanged(self.repo, source, diff, payload["actor"], payload["rationale"], payload["timestamp"])
+        from .stage_recompute import active_pointers
+        pointers = active_pointers(self.repo)
+        source = self._staged.get("source") if self._staged and self._staged.get("source") else pointers["source"]
+        diff = self._staged.get("diff") if self._staged and self._staged.get("diff") else pointers["diff"]
+        result = mrq.revalidate_unchanged(self.repo, source, diff, payload["actor"], payload["rationale"], payload["timestamp"], activate=self._staged is None)
+        if self._staged is not None:
+            self._staged["mrq"] = {
+                key: result[key]
+                for key in ("schema_version", "canonical_generation_id", "source_generation_id", "diff_generation_id")
+            }
+        return result
 
     def _mrq_rows(self) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
         state = mrq.active(self.repo)

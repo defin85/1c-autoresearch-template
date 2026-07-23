@@ -15,7 +15,8 @@ FILES = (
     "research/workflow.toml", "research/indexing.toml", "research/forbidden-authorities.json",
     "tests/test_external_folder.py", "tests/test_source_routing.py", "tests/test_source_tools.py",
     "tests/test_sources.py", "tests/test_diffs.py", "tests/test_extension_analyzer.py", "tests/test_indexes.py",
-    "tests/test_runner.py", "tests/test_workspace_api.py",
+    "tests/test_runner.py", "tests/test_workspace_api.py", "tests/test_stage_recompute.py",
+    "tests/test_stage_recompute_api.py",
 )
 TREES = (
     "src/one_c_autoresearch", "one_c_autoresearch", "research/schemas", "web/workspace",

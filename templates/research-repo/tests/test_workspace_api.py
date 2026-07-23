@@ -191,10 +191,11 @@ def test_api_uses_repository_snapshot_and_typed_actions(tmp_path: Path, monkeypa
         events = client.get(f"/api/v1/projects/{project['id']}/events").json()["events"]
         assert [item["type"] for item in events] == ["run.created", "run.finished"]
         verified = client.post(f"/api/v1/projects/{project['id']}/actions", json={"operation": "workflow.verify", "payload": {}, "expected_fingerprint": snapshot["workflow_fingerprint"]}, headers=headers | {"Idempotency-Key": "verify-1"})
-        assert verified.status_code == 200
+        assert verified.status_code == 409
+        assert "workflow.verify.failed" in verified.json()["detail"]
         (tmp_path / "state/projects" / project["id"] / "events.jsonl").unlink()
         repeated = client.post(f"/api/v1/projects/{project['id']}/actions", json={"operation": "workflow.verify", "payload": {}, "expected_fingerprint": snapshot["workflow_fingerprint"]}, headers=headers | {"Idempotency-Key": "verify-1"})
-        assert repeated.status_code == 200 and repeated.json() == verified.json()
+        assert repeated.status_code == 409
         assert client.get("/api/v1/health", headers={"Host": "evil.example"}).status_code == 400
         assert client.post(f"/api/v1/projects/{project['id']}/actions", json={"operation": "workflow.verify", "payload": {}, "expected_fingerprint": snapshot["workflow_fingerprint"]}, headers={"Idempotency-Key": "forged"}).status_code == 403
         assert "default-src 'self'" in client.get("/api/v1/health").headers["content-security-policy"]

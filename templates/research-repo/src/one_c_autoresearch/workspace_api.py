@@ -7,10 +7,11 @@ import re
 import time
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .contracts import confined, sha256
+from .contracts import confined, repository_lock, sha256
 from .events import EventStore
 from .service import ApplicationService
 
@@ -66,6 +67,22 @@ class AgentProfileBody(BaseModel):
     profile: dict[str, Any]
 
 
+class StagePreviewBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    boundary: str = Field(max_length=32)
+    expected_workflow_fingerprint: str = Field(min_length=1, max_length=200)
+    source_routing_preview_id: str | None = Field(default=None, max_length=200)
+
+
+class StageRunBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    boundary: str = Field(max_length=32)
+    workflow_fingerprint: str = Field(min_length=1, max_length=200)
+    plan_fingerprint: str = Field(min_length=1, max_length=200)
+    confirmations: list[str] = Field(max_length=8)
+    predecessor_run_id: str | None = Field(default=None, max_length=200)
+
+
 def create_app(state_root: Path | None = None, approved_roots: list[Path] | None = None, testing: bool = False, connection_tester=None):
     operational = (state_root or (Path.home() / ".local/state/one-c-autoresearch")).resolve()
     operational.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -74,6 +91,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
     dispatcher_sessions: dict[tuple[str, str], tuple[Any, Any]] = {}
     dispatcher_sessions_lock = threading.RLock()
     folder_streams: dict[str, threading.BoundedSemaphore] = {}
+    stage_cancellations: dict[str, threading.Event] = {}
+    stage_cancellations_lock = threading.RLock()
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -110,7 +129,12 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
     def mutation(request: Request, idempotency_key: str | None) -> None:
         expected = f"{request.url.scheme}://{request.headers.get('host')}"
         if request.headers.get("origin") != expected: raise HTTPException(403, "origin validation failed")
-        if not idempotency_key: raise HTTPException(400, "Idempotency-Key is required")
+        if not idempotency_key or len(idempotency_key) > 200: raise HTTPException(400, "valid Idempotency-Key is required")
+
+    def same_origin(request: Request) -> None:
+        expected = f"{request.url.scheme}://{request.headers.get('host')}"
+        if request.headers.get("origin") != expected:
+            raise HTTPException(403, "origin validation failed")
 
     @app.middleware("http")
     async def security(request: Request, call_next):
@@ -214,6 +238,259 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         snapshot = attach_dispatcher(ApplicationService(repo(project_id)).snapshot(deep=False), repo(project_id), operational)
         return snapshot.get("dispatcher", {"schema_version": "1", "revision": 0, "fresh_at": "", "circuits": [], "jobs": {}})
 
+    def stage_preview(project: Path, body: StagePreviewBody, *, require_source_preview: bool = True) -> dict[str, Any]:
+        if body.boundary not in {"sources", "diffs", "projections"}:
+            raise ValueError("unsupported stage recompute boundary")
+        if require_source_preview and body.boundary == "sources" and not body.source_routing_preview_id:
+            raise ValueError("source_routing_preview_id is required for sources")
+        if body.boundary != "sources" and body.source_routing_preview_id is not None:
+            raise ValueError("source_routing_preview_id is only valid for sources")
+        from .stage_recompute import preview
+        return preview(
+            project,
+            boundary=body.boundary,
+            expected_workflow_fingerprint=body.expected_workflow_fingerprint,
+            source_routing_preview_id=body.source_routing_preview_id,
+            operational_root=operational,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/stage-recompute/preview")
+    def preview_stage_recompute(project_id: str, body: StagePreviewBody, request: Request):
+        same_origin(request)
+        return stage_preview(repo(project_id), body)
+
+    @app.post("/api/v1/projects/{project_id}/stage-recompute/runs", status_code=202)
+    def run_stage_recompute(project_id: str, body: StageRunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key)
+        project = repo(project_id)
+        candidates = [None]
+        if body.boundary == "sources":
+            preview_root = operational / "projects" / project_id / "source-routing-previews"
+            candidates = [path.stem for path in sorted(preview_root.glob("*.json"))]
+        plan = None
+        for preview_id in candidates:
+            try:
+                candidate = stage_preview(
+                    project,
+                    StagePreviewBody(
+                        boundary=body.boundary,
+                        expected_workflow_fingerprint=body.workflow_fingerprint,
+                        source_routing_preview_id=preview_id,
+                    ),
+                    require_source_preview=False,
+                )
+            except RuntimeError:
+                continue
+            if candidate.get("plan_fingerprint") == body.plan_fingerprint:
+                plan = candidate
+                break
+        if plan is None:
+            raise RuntimeError("stale stage recompute plan fingerprint")
+        if plan.get("plan_fingerprint") != body.plan_fingerprint:
+            raise RuntimeError("stale stage recompute plan fingerprint")
+        required = plan["required_confirmations"]
+        if sorted(body.confirmations) != sorted(required) or len(set(body.confirmations)) != len(body.confirmations):
+            raise ValueError("confirmations must exactly match the stage recompute plan")
+        from .contracts import canonical_json
+        request_value = {
+            "project_id": project_id,
+            "boundary": body.boundary,
+            "workflow_fingerprint": body.workflow_fingerprint,
+            "plan_fingerprint": body.plan_fingerprint,
+            "confirmations": sorted(body.confirmations),
+            "predecessor_run_id": body.predecessor_run_id,
+        }
+        request_fingerprint = "sha256:" + sha256(canonical_json(request_value))
+        from .sqlite_state import DispatcherStore
+        with DispatcherStore(project, operational) as store:
+            record, created = store.start_stage_recompute(
+                str(idempotency_key),
+                request_fingerprint,
+                body.boundary,
+                plan,
+                body.predecessor_run_id,
+            )
+            predecessor = store.stage_run(body.predecessor_run_id) if body.predecessor_run_id else None
+        public = {key: record[key] for key in ("run_id", "status", "boundary", "idempotency_key_fingerprint")}
+        public["plan_fingerprint"] = plan["plan_fingerprint"]
+        if not created:
+            if record.get("result") is not None:
+                public["result"] = record["result"]
+            return public
+
+        run_id = record["run_id"]
+        lease_token = record["lease_token"]
+        cancelled = threading.Event()
+        with stage_cancellations_lock:
+            stage_cancellations[run_id] = cancelled
+        event_store = EventStore(operational / "projects", project_id)
+        from .events import process_identity
+        event_store.emit(
+            "run.created",
+            run_id,
+            {
+                "status": "running",
+                "actor": "local-user",
+                "process_identity": process_identity(),
+                "workflow_fingerprint": body.workflow_fingerprint,
+                "operation": "stage-recompute",
+                "boundary": body.boundary,
+                "plan_fingerprint": plan["plan_fingerprint"],
+                "idempotency_key_fingerprint": record["idempotency_key_fingerprint"],
+            },
+        )
+
+        def worker() -> None:
+            started = time.monotonic()
+            status = "failed"
+            result: dict[str, Any]
+            try:
+                from .stage_recompute import execute
+                import inspect
+                def emit(event_type: str, value: dict[str, Any]):
+                    step_id = str(value["step_id"])
+                    operation = str(value["operation"])
+                    common = {
+                        "boundary": body.boundary,
+                        "plan_fingerprint": plan["plan_fingerprint"],
+                        "idempotency_key_fingerprint": record["idempotency_key_fingerprint"],
+                    }
+                    hierarchy = {"job_id": "stage-recompute", "step_id": step_id, "attempt": 1}
+                    if event_type == "step.started":
+                        with repository_lock(project), DispatcherStore(project, operational) as progress_store:
+                            if not progress_store.renew_stage_lease(run_id, lease_token, {**common, "current_step": operation, "step_id": step_id}):
+                                raise RuntimeError("stage recompute lease lost")
+                            return event_store.emit(
+                                "step.started",
+                                run_id,
+                                {
+                                    **common,
+                                    "status": "running",
+                                    "actor": "local-user",
+                                    "operation": operation,
+                                    "inputs": {"boundary": body.boundary},
+                                    "input_fingerprint": value["input_fingerprint"],
+                                },
+                                **hierarchy,
+                            )
+                    if lease_is_lost():
+                        raise RuntimeError("stage recompute lease lost")
+                    result = value.get("result", {})
+                    def fenced_emit(kind: str, payload: dict[str, Any]):
+                        with repository_lock(project), DispatcherStore(project, operational) as progress_store:
+                            if not progress_store.renew_stage_lease(run_id, lease_token):
+                                raise RuntimeError("stage recompute lease lost")
+                            return event_store.emit(kind, run_id, payload, **hierarchy)
+
+                    fenced_emit(
+                        "step.output",
+                        {**common, "status": "completed", "outputs": result, "output_fingerprint": value["output_fingerprint"]},
+                    )
+                    fenced_emit(
+                        "step.validation",
+                        {**common, "status": "completed", "validation": "passed"},
+                    )
+                    return fenced_emit(
+                        "step.finished",
+                        {**common, "status": "completed", "actor": "local-user", "operation": operation, "duration_seconds": 0},
+                    )
+                def lease_is_lost() -> bool:
+                    if cancelled.is_set():
+                        return True
+                    with DispatcherStore(project, operational) as check_store:
+                        return not check_store.renew_stage_lease(run_id, lease_token)
+                arguments = {
+                    "lease_token": lease_token,
+                    "cancelled": lease_is_lost,
+                    "emit": emit,
+                    "operational_root": operational,
+                }
+                if predecessor is not None:
+                    if "predecessor_run" not in inspect.signature(execute).parameters:
+                        raise RuntimeError("stage recompute core does not support predecessor resume")
+                    arguments["predecessor_run"] = predecessor
+                result = execute(
+                    project,
+                    plan,
+                    **arguments,
+                )
+                if lease_is_lost():
+                    raise RuntimeError("stage recompute lease lost")
+                if result.get("status") == "awaiting_manual_work":
+                    event_store.emit(
+                        "approval.required",
+                        run_id,
+                        {
+                            "status": "blocked",
+                            "boundary": body.boundary,
+                            "plan_fingerprint": plan["plan_fingerprint"],
+                            "idempotency_key_fingerprint": record["idempotency_key_fingerprint"],
+                            "next": result.get("next"),
+                        },
+                        job_id="stage-recompute",
+                        step_id="manual-stop",
+                        attempt=1,
+                    )
+                status = str(result.get("status", "completed"))
+                if status == "awaiting_manual_work":
+                    status = "blocked"
+                if status not in {"completed", "blocked", "failed", "cancelled", "interrupted"}:
+                    status = "completed"
+            except InterruptedError:
+                status, result = "cancelled", {"status": "cancelled"}
+            except Exception as exc:
+                status, result = "failed", {
+                    "status": "failed",
+                    "error_class": type(exc).__name__,
+                    "message": "stage recompute failed",
+                    "boundary": body.boundary,
+                    "steps": getattr(exc, "steps", []),
+                }
+            with DispatcherStore(project, operational) as store:
+                current = store.finish_stage_recompute(run_id, lease_token, status, result)
+            if current:
+                event_store.emit(
+                    "run.finished",
+                    run_id,
+                    {
+                        "status": status,
+                        "duration_seconds": time.monotonic() - started,
+                        "operation": "stage-recompute",
+                        "boundary": body.boundary,
+                        "plan_fingerprint": plan["plan_fingerprint"],
+                        "idempotency_key_fingerprint": record["idempotency_key_fingerprint"],
+                        "result": result,
+                    },
+                )
+            with stage_cancellations_lock:
+                stage_cancellations.pop(run_id, None)
+
+        threading.Thread(target=worker, name=f"stage-recompute-{run_id}", daemon=True).start()
+        return public
+
+    @app.post("/api/v1/projects/{project_id}/stage-recompute/runs/{run_id}/cancel")
+    def cancel_stage_recompute(project_id: str, run_id: str, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key)
+        project = repo(project_id)
+        from .sqlite_state import DispatcherStore
+        with DispatcherStore(project, operational) as store:
+            record = store.stage_run(run_id)
+            if record is None:
+                raise HTTPException(404, "stage recompute run not found")
+            if record["status"] == "running" and not store.stage_token_current(run_id, record["lease_token"]):
+                raise RuntimeError("stage recompute lease token is no longer current")
+            new_cancellation = store.bind_stage_cancellation(str(idempotency_key), run_id)
+            if not new_cancellation:
+                return {"run_id": run_id, "status": "cancellation_requested"}
+            if record["status"] == "running":
+                with stage_cancellations_lock:
+                    signal = stage_cancellations.get(run_id)
+                    if signal is not None:
+                        signal.set()
+                EventStore(operational / "projects", project_id).cancel(run_id, "local-user")
+                return {"run_id": run_id, "status": "cancellation_requested"}
+        return {"run_id": run_id, "status": record["status"]}
+
     @app.post("/api/v1/projects/{project_id}/dispatcher/{job_id}/{action}")
     def dispatcher_action(project_id: str, job_id: str, action: str, request: Request, body: dict[str, Any] | None = Body(default=None), idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
         if job_id not in {"discover-mrq", "decide-mrq"}:
@@ -227,6 +504,11 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         from .user_state import load_agent_profiles
         from .workflow import step_configurations
         event_store = EventStore(operational / "projects", project_id)
+        if action in {"start", "resume", "retry"}:
+            from .sqlite_state import DispatcherStore
+            with DispatcherStore(project, operational) as gate_store:
+                if gate_store.lease("stage-recompute") is not None:
+                    raise RuntimeError("stage recompute lease blocks dispatcher start and continuation")
         action_result_path = event_store.root / ("idempotency-dispatcher-" + sha256(idempotency_key.encode()) + ".json")
         action_lock = None
         if action not in {"approve-batch", "approve-decision"}:
@@ -447,7 +729,12 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 value = build_routing_preview(project, Path(next(iter(roots))), connections, upload_drafts=operational / "projects" / project_id / "upload-drafts", cancelled=cancelled)
                 if cancelled():
                     return
-                finish({**record, **value, "status": "ready"})
+                finish({
+                    **record,
+                    **value,
+                    "status": "ready",
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+                })
             except InterruptedError:
                 current = json.loads(path.read_text(encoding="utf-8"))
                 current["status"] = "cancelled"; atomic_json(path, current)

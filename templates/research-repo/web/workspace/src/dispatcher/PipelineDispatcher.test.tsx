@@ -1,6 +1,6 @@
-import { render, screen } from '@testing-library/react';
-import { beforeEach, expect, test, vi } from 'vitest';
-import { PipelineDispatcher, shortWorkId } from './PipelineDispatcher';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { DispatcherPanel, leaseActionMatrix, PipelineDispatcher, shortWorkId } from './PipelineDispatcher';
 import type { DispatcherProjection } from './projection';
 
 const snapshotWithDispatcher = {
@@ -46,6 +46,8 @@ beforeEach(() => {
   });
 });
 
+afterEach(cleanup);
+
 test('PipelineDispatcher renders four circuits and freshness label', async () => {
   render(<PipelineDispatcher projectId="proj-1" />);
   expect((await screen.findAllByText('Подготовка')).length).toBeGreaterThan(0);
@@ -90,4 +92,89 @@ test('PipelineDispatcher shows a soft-stopped lease without imitating work', asy
   render(<PipelineDispatcher projectId="proj-1" initialProjection={projection} initialFingerprint="sha256:abc" />);
   expect((await screen.findAllByText('Остановлен')).length).toBeGreaterThan(0);
   expect(screen.queryByText('Анализирует')).not.toBeInTheDocument();
+});
+
+test.each([
+  ['absent', undefined, ['start']],
+  ['running', 'running', ['stop', 'cancel']],
+  ['resumable', 'resumable', ['resume', 'retry', 'cancel']],
+  ['blocked', 'blocked', ['cancel', 'approve']],
+  ['failed', 'failed', ['retry', 'cancel']],
+  ['stale', 'stale', ['retry', 'cancel']],
+  ['expired', 'running', ['retry', 'cancel']],
+] as const)('lease action matrix: %s', (name, state, enabled) => {
+  const now = Date.now();
+  const lease = state ? {
+    owner: 'agent',
+    state,
+    work_unit_id: 'DIF-001',
+    renewed_at: new Date(name === 'expired' ? now - 31_000 : now).toISOString(),
+  } : undefined;
+  const matrix = leaseActionMatrix(lease, true, false, true, now);
+  expect(Object.entries(matrix).filter(([, value]) => value).map(([key]) => key)).toEqual(enabled);
+});
+
+test('panel separates current task and recompute preview before run', async () => {
+  const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
+  projection.circuits[1].state = 'complete';
+  const fetchMock = vi.mocked(fetch);
+  fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/stage-recompute/preview')) {
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({
+          boundary: 'diffs',
+          plan_fingerprint: 'sha256:plan',
+          steps: [{ step_id: '1:diff.build', operation: 'diff.build' }],
+          required_confirmations: ['confirm_recompute'],
+          possible_result: 'unchanged',
+          stop_before: 'mrq.discover-next',
+          generations: { source: 'src-1', diff: 'diff-1' },
+        }),
+      } as Response);
+    }
+    if (url.endsWith('/stage-recompute/runs')) {
+      return Promise.resolve({ ok: true, json: async () => ({ run_id: 'run-1', status: 'running', plan_fingerprint: 'sha256:plan' }) } as Response);
+    }
+    return Promise.resolve({ ok: true, json: async () => ({}) } as Response);
+  });
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="analyze-dif" onClose={() => {}} />);
+  expect(screen.getByRole('region', { name: 'Текущее задание' })).toBeInTheDocument();
+  expect(screen.getByRole('region', { name: 'Пересчёт этапа' })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Пересчитать с этапа' }));
+  expect(await screen.findByLabelText('Предварительный просмотр пересчёта')).toHaveTextContent('diff.build');
+  expect(screen.getByRole('button', { name: 'Запустить пересчёт' })).toBeDisabled();
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Подтверждаю: confirm_recompute' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Запустить пересчёт' }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    '/api/v1/projects/proj-1/stage-recompute/runs',
+    expect.objectContaining({ method: 'POST' }),
+  ));
+});
+
+test('active recompute disables normal start and has a separate cancel', () => {
+  const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
+  projection.jobs['stage-recompute'] = {
+    job_id: 'stage-recompute',
+    thread_id: 'thread-recompute',
+    work_unit_id: 'diffs',
+    owner: 'system',
+    acquired_at: new Date().toISOString(),
+    renewed_at: new Date().toISOString(),
+    state: 'running',
+    summary: { run_id: 'run-1', current_step: 'diff.build' },
+  };
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="analyze-dif" onClose={() => {}} />);
+  expect(screen.getByRole('button', { name: 'Запустить' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Отменить пересчёт' })).toBeEnabled();
+  expect(screen.getByText(/Выполняется шаг: diff.build/)).toBeInTheDocument();
+  expect(screen.getByText(/временно недоступны/)).toBeInTheDocument();
+});
+
+test('MRQ panel guides to explicit actions without reset', () => {
+  const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="form-mrq" onClose={() => {}} />);
+  expect(screen.getByText(/массовый сброс не поддерживается/)).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Пересчитать с этапа' })).not.toBeInTheDocument();
 });

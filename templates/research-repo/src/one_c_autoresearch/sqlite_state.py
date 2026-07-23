@@ -17,12 +17,13 @@ import json
 import os
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .contracts import canonical_json, sha256
+from .contracts import canonical_json, repository_lock, sha256
 from .user_state import state_root, workspace_id
 
 
@@ -104,6 +105,26 @@ def _ensure_dispatcher_tables(conn) -> None:
                 summary TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS stage_recompute_runs (
+                run_id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                idempotency_key_fingerprint TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                lease_token TEXT NOT NULL,
+                boundary TEXT NOT NULL,
+                plan TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result TEXT,
+                predecessor_run_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS stage_recompute_cancellations (
+                idempotency_key TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS dispatcher_proposals (
                 key TEXT PRIMARY KEY,
                 job_id TEXT NOT NULL,
@@ -115,6 +136,9 @@ def _ensure_dispatcher_tables(conn) -> None:
             );
             """
         )
+        columns = {row[1] for row in cur.execute("PRAGMA table_info(dispatcher_leases)")}
+        if "lease_token" not in columns:
+            cur.execute("ALTER TABLE dispatcher_leases ADD COLUMN lease_token TEXT")
         conn.commit()
     finally:
         cur.close()
@@ -241,9 +265,13 @@ class DispatcherStore:
 
         renewed_at = _now_iso()
         acquired_at = renewed_at
-        with self._lock, self.conn:
+        with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
+                if job_id != "stage-recompute":
+                    cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = 'stage-recompute'")
+                    if cur.fetchone() is not None:
+                        return False
                 cur.execute("SELECT renewed_at, owner FROM dispatcher_leases WHERE job_id = ?", (job_id,))
                 existing = cur.fetchone()
                 now = time.time()
@@ -301,7 +329,7 @@ class DispatcherStore:
         return True
 
     def release_lease(self, job_id: str) -> bool:
-        with self._lock, self.conn:
+        with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
                 cur.execute("DELETE FROM dispatcher_leases WHERE job_id = ?", (job_id,))
@@ -331,6 +359,193 @@ class DispatcherStore:
             finally:
                 cur.close()
         return [{"job_id": r[0], "thread_id": r[1], "work_unit_id": r[2], "owner": r[3], "process_identity": json.loads(r[4]) if r[4] else None, "acquired_at": r[5], "renewed_at": r[6], "state": r[7], "summary": json.loads(r[8]) if r[8] else {}} for r in rows]
+
+    # -- каскадный пересчёт -------------------------------------------
+
+    def start_stage_recompute(
+        self,
+        idempotency_key: str,
+        request_fingerprint: str,
+        boundary: str,
+        plan: dict[str, Any],
+        predecessor_run_id: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Атомарно сохраняет запрос и захватывает взаимно исключающую аренду."""
+
+        with repository_lock(self.repo), self._lock, self.conn:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("SELECT run_id, request_fingerprint FROM stage_recompute_runs WHERE idempotency_key = ?", (idempotency_key,))
+                existing = cur.fetchone()
+                if existing is not None:
+                    if existing[1] != request_fingerprint:
+                        raise RuntimeError("idempotency key is already bound to another stage recompute request")
+                    return self._stage_run_locked(cur, str(existing[0])), False
+                if predecessor_run_id is not None:
+                    predecessor = self._stage_run_locked(cur, predecessor_run_id)
+                    if (
+                        predecessor is None
+                        or predecessor["boundary"] != boundary
+                        or predecessor["status"] not in {"failed", "cancelled", "resumable"}
+                    ):
+                        raise RuntimeError("incompatible stage recompute predecessor")
+                cur.execute("SELECT job_id, thread_id, renewed_at FROM dispatcher_leases")
+                leases = cur.fetchall()
+                mrq = [row for row in leases if row[0] != "stage-recompute"]
+                if mrq:
+                    raise RuntimeError(f"dispatcher lease is busy: {mrq[0][0]}")
+                active_stage = next((row for row in leases if row[0] == "stage-recompute"), None)
+                if active_stage is not None and is_stale(str(active_stage[2])):
+                    cur.execute(
+                        "UPDATE stage_recompute_runs SET status = 'resumable', result = ?, updated_at = ? WHERE run_id = ? AND status = 'running'",
+                        (canonical_json({"status": "resumable", "reason": "lease_expired"}).decode(), _now_iso(), active_stage[1]),
+                    )
+                    cur.execute("DELETE FROM dispatcher_leases WHERE job_id = 'stage-recompute'")
+                    leases = []
+                busy = [str(row[0]) for row in leases]
+                if busy:
+                    raise RuntimeError(f"dispatcher lease is busy: {busy[0]}")
+                run_id = str(uuid.uuid4())
+                token = str(uuid.uuid4())
+                now = _now_iso()
+                key_fingerprint = "sha256:" + sha256(idempotency_key.encode())
+                summary = {"run_id": run_id, "boundary": boundary, "plan_fingerprint": plan["plan_fingerprint"]}
+                cur.execute(
+                    "INSERT INTO dispatcher_leases (job_id, thread_id, work_unit_id, owner, process_identity, acquired_at, renewed_at, state, summary, lease_token) VALUES (?, ?, ?, ?, NULL, ?, ?, 'running', ?, ?)",
+                    ("stage-recompute", run_id, boundary, run_id, now, now, canonical_json(summary).decode(), token),
+                )
+                cur.execute(
+                    "INSERT INTO stage_recompute_runs (run_id, idempotency_key, idempotency_key_fingerprint, request_fingerprint, lease_token, boundary, plan, status, result, predecessor_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', NULL, ?, ?, ?)",
+                    (run_id, idempotency_key, key_fingerprint, request_fingerprint, token, boundary, canonical_json(plan).decode(), predecessor_run_id, now, now),
+                )
+                return self._stage_run_locked(cur, run_id), True
+            finally:
+                cur.close()
+
+    def stage_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                return self._stage_run_locked(cur, run_id)
+            finally:
+                cur.close()
+
+    def latest_stage_recompute(self) -> dict[str, Any] | None:
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("SELECT run_id FROM stage_recompute_runs ORDER BY created_at DESC, run_id DESC LIMIT 1")
+                row = cur.fetchone()
+                return self._stage_run_locked(cur, str(row[0])) if row else None
+            finally:
+                cur.close()
+
+    def _stage_run_locked(self, cur, run_id: str) -> dict[str, Any] | None:
+        cur.execute(
+            "SELECT run_id, idempotency_key_fingerprint, request_fingerprint, lease_token, boundary, plan, status, result, predecessor_run_id, created_at, updated_at FROM stage_recompute_runs WHERE run_id = ?",
+            (run_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "run_id": row[0],
+            "idempotency_key_fingerprint": row[1],
+            "request_fingerprint": row[2],
+            "lease_token": row[3],
+            "boundary": row[4],
+            "plan": json.loads(row[5]),
+            "status": row[6],
+            "result": json.loads(row[7]) if row[7] else None,
+            "predecessor_run_id": row[8],
+            "created_at": row[9],
+            "updated_at": row[10],
+        }
+
+    def stage_token_current(self, run_id: str, lease_token: str) -> bool:
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT 1 FROM dispatcher_leases WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
+                    (run_id, lease_token),
+                )
+                return cur.fetchone() is not None
+            finally:
+                cur.close()
+
+    def renew_stage_lease(self, run_id: str, lease_token: str, summary: dict[str, Any] | None = None) -> bool:
+        with self._lock, self.conn:
+            cur = self.conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT renewed_at FROM dispatcher_leases WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
+                    (run_id, lease_token),
+                )
+                row = cur.fetchone()
+                if row is None or is_stale(str(row[0])):
+                    return False
+                if summary is None:
+                    cur.execute(
+                        "UPDATE dispatcher_leases SET renewed_at = ? WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
+                        (_now_iso(), run_id, lease_token),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE dispatcher_leases SET renewed_at = ?, summary = ? WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
+                        (_now_iso(), canonical_json(summary).decode(), run_id, lease_token),
+                    )
+                return cur.rowcount == 1
+            finally:
+                cur.close()
+
+    def finish_stage_recompute(self, run_id: str, lease_token: str, status: str, result: dict[str, Any]) -> bool:
+        """Записывает итог и освобождает аренду только для текущего токена."""
+
+        with repository_lock(self.repo), self._lock, self.conn:
+            cur = self.conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT 1 FROM dispatcher_leases WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
+                    (run_id, lease_token),
+                )
+                if cur.fetchone() is None:
+                    return False
+                now = _now_iso()
+                cur.execute(
+                    "UPDATE stage_recompute_runs SET status = ?, result = ?, updated_at = ? WHERE run_id = ? AND lease_token = ?",
+                    (status, canonical_json(result).decode(), now, run_id, lease_token),
+                )
+                cur.execute(
+                    "DELETE FROM dispatcher_leases WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
+                    (run_id, lease_token),
+                )
+                return cur.rowcount > 0
+            finally:
+                cur.close()
+
+    def cancel_stage_recompute(self, run_id: str, lease_token: str) -> bool:
+        return self.finish_stage_recompute(run_id, lease_token, "cancelled", {"status": "cancelled"})
+
+    def bind_stage_cancellation(self, idempotency_key: str, run_id: str) -> bool:
+        """Связывает отдельный ключ отмены с одним запуском."""
+
+        with self._lock, self.conn:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("SELECT run_id FROM stage_recompute_cancellations WHERE idempotency_key = ?", (idempotency_key,))
+                existing = cur.fetchone()
+                if existing is not None:
+                    if existing[0] != run_id:
+                        raise RuntimeError("idempotency key is already bound to another stage recompute cancellation")
+                    return False
+                cur.execute(
+                    "INSERT INTO stage_recompute_cancellations (idempotency_key, run_id, created_at) VALUES (?, ?, ?)",
+                    (idempotency_key, run_id, _now_iso()),
+                )
+                return True
+            finally:
+                cur.close()
 
     # -- предложения ---------------------------------------------------
 

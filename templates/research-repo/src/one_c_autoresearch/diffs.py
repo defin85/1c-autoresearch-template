@@ -163,9 +163,14 @@ def validate_active(
     *,
     require_tracked_clean_state: bool = False,
     candidate: dict[str, Any] | None = None,
+    source_candidate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if candidate is None:
+        from .stage_recompute import recover_active_publication
+
+        recover_active_publication(repo)
     pointer = candidate or json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
-    source = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+    source = source_candidate or json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
     generation = str(pointer.get("generation_id", "")); source_id = str(source.get("generation_id", ""))
     if pointer.get("source_generation_id") != source_id or not generation:
         raise ValueError("active diff generation is stale")
@@ -467,23 +472,23 @@ def validate_active(
     return pointer
 
 
-def build(repo: Path, source_pointer: dict[str, Any], cancelled: callable | None = None) -> dict[str, Any]:
+def build(repo: Path, source_pointer: dict[str, Any], cancelled: callable | None = None, *, activate: bool = True) -> dict[str, Any]:
     if source_pointer.get("schema_version") == "2":
         from .sources import validate_active as validate_source
-        if validate_source(repo, deep=False) != source_pointer:
+        if activate and validate_source(repo, deep=False) != source_pointer:
             raise RuntimeError("stale or invalid source generation")
     with repository_lock(repo):
         current = __import__("json").loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
-        if current != source_pointer:
+        if activate and current != source_pointer:
             raise RuntimeError("stale source generation")
         if cancelled and cancelled():
             raise InterruptedError("diff build cancelled before comparison")
-        return _build_locked(repo, source_pointer, cancelled=cancelled)
+        return _build_locked(repo, source_pointer, cancelled=cancelled, activate=activate)
 
 
-def _build_locked(repo: Path, source_pointer: dict[str, Any], cancelled: callable | None = None) -> dict[str, Any]:
+def _build_locked(repo: Path, source_pointer: dict[str, Any], cancelled: callable | None = None, *, activate: bool = True) -> dict[str, Any]:
     if source_pointer.get("schema_version") == "2":
-        return _build_routed(repo, source_pointer, cancelled=cancelled)
+        return _build_routed(repo, source_pointer, cancelled=cancelled, activate=activate)
     raise ValueError("new diff builds require routed source schema version 2")
 
 
@@ -575,7 +580,7 @@ def _publish_inventory(repo: Path, source_pointer: dict[str, Any], inventory: li
         return pointer
 
 
-def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], inventory: list[dict[str, str]], analysis: dict[str, Any]) -> dict[str, Any]:
+def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], inventory: list[dict[str, str]], analysis: dict[str, Any], *, activate: bool = True) -> dict[str, Any]:
     from .extension_analyzer import target_coverage as semantic_target_coverage
 
     source_id = source_pointer["generation_id"]
@@ -721,17 +726,16 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
                 "extension-physical-diff.csv": len(physical), "extension-path-coverage.csv": len(path_coverage),
             },
         }
-        current_source = json.loads(
-            (repo / "research/active-source-generation.json").read_text(encoding="utf-8")
-        )
-        if current_source != source_pointer:
+        current_source = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+        if activate and current_source != source_pointer:
             raise RuntimeError("stale source generation before diff publication")
-        validate_active(repo, candidate=pointer)
-        atomic_json(pointer_path, pointer)
+        validate_active(repo, candidate=pointer, source_candidate=source_pointer)
+        if activate:
+            atomic_json(pointer_path, pointer)
         return pointer
 
 
-def _build_routed(repo: Path, source_pointer: dict[str, Any], cancelled: callable | None = None) -> dict[str, Any]:
+def _build_routed(repo: Path, source_pointer: dict[str, Any], cancelled: callable | None = None, *, activate: bool = True) -> dict[str, Any]:
     from .extension_analyzer import analyze_role_union, build_main_config_index, comparison_id_v2
 
     source_id = source_pointer["generation_id"]
@@ -803,4 +807,4 @@ def _build_routed(repo: Path, source_pointer: dict[str, Any], cancelled: callabl
     inventory.extend(analysis["semantic_rows"])
     if cancelled and cancelled():
         raise InterruptedError("diff build cancelled before publication")
-    return _publish_routed_inventory(repo, source_pointer, inventory, analysis)
+    return _publish_routed_inventory(repo, source_pointer, inventory, analysis, activate=activate)
