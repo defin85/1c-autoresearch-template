@@ -8,7 +8,13 @@ import sys
 from pathlib import Path
 
 
-csv.field_size_limit(sys.maxsize)
+field_size_limit = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(field_size_limit)
+        break
+    except OverflowError:
+        field_size_limit //= 10
 
 
 def parse_args() -> argparse.Namespace:

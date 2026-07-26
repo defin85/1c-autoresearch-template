@@ -1,7 +1,7 @@
 {
   "name": "one-c-autoresearch-workspace",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit && vite build",
@@ -14,6 +14,7 @@
     "@emotion/styled": "^11.14.0",
     "@mui/icons-material": "^7.2.0",
     "@mui/material": "^7.2.0",
+    "@xyflow/react": "^12.11.2",
     "react": "^19.1.0",
     "react-admin": "^5.10.1",
     "react-dom": "^19.1.0"

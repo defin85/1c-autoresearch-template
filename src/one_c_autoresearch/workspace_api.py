@@ -1,672 +1,1370 @@
 from __future__ import annotations
 
-import argparse
-import asyncio
-import configparser
 import json
 import os
+import fcntl
 import re
-import secrets
-import socket
-import sys
-import urllib.parse
-import webbrowser
-import zipfile
+import time
+import threading
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, Literal
 
-from .common import file_sha256
-from .workspace import (
-    ALLOWED_CONNECTIONS,
-    ALLOWED_PROVIDERS,
-    RunManager,
-    WorkspacePaths,
-    WorkspaceStore,
-    agent_probe,
-    canonical_under,
-    redact,
-    render_project_manifest,
-    test_connection,
-    update_project_manifest,
-    validate_agent_profile,
-    workflow_snapshot,
-)
+from .contracts import canonical_json, confined, repository_lock, sha256
+from .events import EventStore, RETRYABLE_RUN_STATUSES
+from .service import ApplicationService
 
 
-def _web_imports() -> dict[str, Any]:
+def _reviewed_noise_is_active(canonical: dict[str, Any], reviewed: list[dict[str, Any]]) -> bool:
+    for expected in reviewed:
+        noise = {key: expected[key] for key in ("rationale", "actor", "evidence")}
+        disposition = next(
+            (
+                item
+                for item in canonical["dispositions.jsonl"]
+                if item.get("stable_diff_id") == expected["stable_diff_id"]
+                and item.get("primary") is True
+                and item.get("approved_noise") == noise
+            ),
+            None,
+        )
+        if disposition is None or not any(
+            item.get("event") == "approve"
+            and item.get("target_id") == expected["stable_diff_id"]
+            and item.get("actor") == expected["actor"]
+            and item.get("rationale") == expected["rationale"]
+            and item.get("evidence") == expected["evidence"]
+            and item.get("timestamp") == expected["timestamp"]
+            and item.get("fingerprint") == sha256(canonical_json(noise))
+            and item.get("source_generation_id") == disposition.get("source_generation_id")
+            and item.get("diff_generation_id") == disposition.get("diff_generation_id")
+            for item in canonical["approvals.jsonl"]
+        ):
+            return False
+    return True
+
+
+def _imports() -> dict[str, Any]:
     try:
-        from fastapi import FastAPI, Header, HTTPException, Request, Response
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+        from fastapi import Body, FastAPI, Header, HTTPException, Request
+        from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+        from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel, Field
     except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("Install the optional workspace dependencies: pip install 'one-c-autoresearch[workspace]'") from exc
+        raise RuntimeError("Install one-c-autoresearch[workspace]") from exc
     return locals()
 
 
-web = _web_imports()
-FastAPI = web["FastAPI"]
-HTTPException = web["HTTPException"]
-Request = web["Request"]
-Response = web["Response"]
-JSONResponse = web["JSONResponse"]
-StreamingResponse = web["StreamingResponse"]
-FileResponse = web["FileResponse"]
-BaseModel = web["BaseModel"]
-Field = web["Field"]
-Header = web["Header"]
-SOURCE_PATHS = {"vendor_baseline": "sources/vendor_baseline", "target_cf": "sources/target_cf", "target_cfe": "sources/target_cfe", "next_vendor": "sources/next_vendor"}
+web = _imports(); FastAPI = web["FastAPI"]; HTTPException = web["HTTPException"]; Request = web["Request"]; JSONResponse = web["JSONResponse"]; FileResponse = web["FileResponse"]; StreamingResponse = web["StreamingResponse"]; BaseModel = web["BaseModel"]; Field = web["Field"]; StaticFiles = web["StaticFiles"]; Body = web["Body"]
 
 
-def discover_1c_infobases(path: Path) -> list[dict[str, Any]]:
-    if not path.is_file():
-        return []
-    parser = configparser.ConfigParser(interpolation=None, strict=False)
-    parser.optionxform = str
-    parser.read_string(path.read_text(encoding="utf-8-sig", errors="replace"))
-    result = []
-    for name in parser.sections():
-        section = parser[name]
-        connection = section.get("Connect", "").strip()
-        if not connection:
-            continue
-        server = re.search(r'Srvr="([^"]+)"', connection, re.IGNORECASE)
-        reference = re.search(r'Ref="([^"]+)"', connection, re.IGNORECASE)
-        file_path = re.search(r'File="([^"]+)"', connection, re.IGNORECASE)
-        if not ((server and reference) or file_path):
-            continue
-        result.append({
-            "name": name,
-            "connection_string": connection,
-            "connection_kind": "server" if server else "file",
-            "server": server.group(1) if server else "",
-            "reference": reference.group(1) if reference else "",
-            "file": file_path.group(1) if file_path else "",
-            "folder": section.get("Folder", ""),
-            "platform_version": section.get("DefaultVersion", section.get("Version", "")),
-            "credentials_ignored": bool(re.search(r"/(?:N|P)(?:\"|\s)", section.get("AdditionalParameters", ""), re.IGNORECASE)),
-        })
-    return sorted(result, key=lambda item: (item["folder"].casefold(), item["name"].casefold()))
-
-
-class ProjectCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
-    root: str
-    product: str = ""
-    baseline_version: str = ""
-    target_version: str = ""
-
-
-class CredentialBody(BaseModel):
-    username: str = Field(default="", max_length=200)
-    secret: str = Field(min_length=1, max_length=4096)
-
-
-class ResourceBody(BaseModel):
-    id: str | None = None
-    project_id: str | None = None
-    data: dict[str, Any] = Field(default_factory=dict)
-    secret: str | None = None
+class ActionBody(BaseModel):
+    operation: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    expected_fingerprint: str
 
 
 class RunBody(BaseModel):
-    project_id: str
-    stage_id: str
-    payload: dict[str, Any] = Field(default_factory=dict)
+    expected_fingerprint: str
+    approved_operations: list[str] = Field(default_factory=list)
+    source_routing_preview_id: str | None = None
+    routing_plan_fingerprint: str | None = None
+    max_units: int = Field(default=100, ge=1, le=1000)
 
 
-class ManifestUpdate(BaseModel):
-    expected_hash: str
-    updates: dict[str, dict[str, Any]]
+class CancelBody(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
 
 
-def acquire_instance_lock(path: Path) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as exc:
-        content = path.read_text(encoding="utf-8", errors="replace")
-        try:
-            pid = int(content.partition("pid=")[2].splitlines()[0])
-            os.kill(pid, 0)
-        except (ValueError, OSError):
-            path.unlink(missing_ok=True)
-            return acquire_instance_lock(path)
-        raise RuntimeError(f"managed workspace already active: {content}") from exc
-    os.write(fd, f"pid={os.getpid()}\n".encode())
-    return fd
+class StepPatchBody(BaseModel):
+    step_id: str
+    parameters: dict[str, Any]
+    expected_manifest_fingerprint: str
 
 
-def create_app(paths: WorkspacePaths | None = None, approved_roots: list[Path] | None = None, testing: bool = False):
-    workspace_paths = paths or WorkspacePaths.default()
-    roots = [path.resolve() for path in (approved_roots or [Path.cwd()])]
-    store = WorkspaceStore(workspace_paths)
-    manager = RunManager(store, allow_fake=testing)
-    lock_fd: int | None = None
+class BookmarkBody(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    root: str
+
+
+class ConnectionBody(BaseModel):
+    profile: dict[str, Any]
+
+
+class AgentProfileBody(BaseModel):
+    profile: dict[str, Any]
+
+
+class StagePreviewBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    boundary: str = Field(max_length=32)
+    expected_workflow_fingerprint: str = Field(min_length=1, max_length=200)
+    source_routing_preview_id: str | None = Field(default=None, max_length=200)
+
+
+class StageRunBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    boundary: str = Field(max_length=32)
+    workflow_fingerprint: str = Field(min_length=1, max_length=200)
+    plan_fingerprint: str = Field(min_length=1, max_length=200)
+    confirmations: list[str] = Field(max_length=8)
+    predecessor_run_id: str | None = Field(default=None, max_length=200)
+
+
+class DispatcherActionBody(BaseModel):
+    model_config = {"extra": "forbid"}
+    actor: str = Field(default="local-user", min_length=1, max_length=200)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=86_400)
+    proposal_key: str | None = Field(default=None, max_length=200)
+    expected_fingerprint: str | None = Field(default=None, max_length=200)
+    payload: dict[str, Any] | None = None
+    policy_source: Literal["reuse-snapshot", "current-policy"] | None = None
+    predecessor_run_id: str | None = Field(default=None, max_length=200)
+    expected_workflow_fingerprint: str | None = Field(default=None, max_length=200)
+    expected_input_fingerprints: dict[str, str] | None = None
+
+
+def create_app(state_root: Path | None = None, approved_roots: list[Path] | None = None, testing: bool = False, connection_tester=None):
+    operational = (state_root or (Path.home() / ".local/state/one-c-autoresearch")).resolve()
+    operational.mkdir(parents=True, exist_ok=True, mode=0o700)
+    roots = [item.resolve() for item in (approved_roots or [Path.cwd()])]
+    bookmarks_path = operational / "bookmarks.json"
+    dispatcher_sessions: dict[tuple[str, str], tuple[Any, Any]] = {}
+    dispatcher_sessions_lock = threading.RLock()
+    folder_streams: dict[str, threading.BoundedSemaphore] = {}
+    stage_cancellations: dict[str, threading.Event] = {}
+    stage_cancellations_lock = threading.RLock()
 
     @asynccontextmanager
-    async def lifespan(_app) -> AsyncIterator[None]:
-        nonlocal lock_fd
-        if not testing:
-            lock_fd = acquire_instance_lock(workspace_paths.lock)
-        manager.start_monitor()
+    async def lifespan(_app):
         yield
-        manager.close()
-        store.close()
-        if lock_fd is not None:
-            os.close(lock_fd)
-            workspace_paths.lock.unlink(missing_ok=True)
+        with dispatcher_sessions_lock:
+            sessions = list(dispatcher_sessions.values())
+            dispatcher_sessions.clear()
+        for coordinator, store in sessions:
+            coordinator.close()
+            store.close()
 
     app = FastAPI(title="1C Autoresearch Workspace", version="1", lifespan=lifespan)
-    app.state.store = store
-    app.state.manager = manager
-    app.state.approved_roots = roots
 
-    @app.exception_handler(ValueError)
-    async def value_error(_request: Request, exc: ValueError):
-        return JSONResponse({"detail": redact(str(exc)), "code": "validation_error"}, status_code=422)
+    def bookmarks() -> list[dict[str, str]]:
+        if not bookmarks_path.is_file(): return []
+        return json.loads(bookmarks_path.read_text(encoding="utf-8"))
 
-    @app.exception_handler(RuntimeError)
-    async def runtime_error(_request: Request, exc: RuntimeError):
-        return JSONResponse({"detail": redact(str(exc)), "code": "conflict"}, status_code=409)
+    def save_bookmarks(values: list[dict[str, str]]) -> None:
+        temporary = bookmarks_path.with_suffix(".tmp"); temporary.write_text(json.dumps(values, ensure_ascii=False, sort_keys=True), encoding="utf-8"); os.replace(temporary, bookmarks_path)
+
+    def repo(project_id: str) -> Path:
+        item = next((value for value in bookmarks() if value["id"] == project_id), None)
+        if not item: raise HTTPException(404, "project bookmark not found")
+        root = Path(item["root"]).resolve()
+        if not any(root == allowed or allowed in root.parents for allowed in roots):
+            raise HTTPException(409, "stale or unauthorized project bookmark")
+        try:
+            from .workflow import validate_project_contract, validate_workflow
+            validate_project_contract(root); validate_workflow(root)
+        except (OSError, ValueError, KeyError) as exc:
+            raise HTTPException(409, "unsupported repository contract; recreate the repository instead of migrating it") from exc
+        return confined(root, ".")
+
+    def mutation(request: Request, idempotency_key: str | None) -> None:
+        expected = f"{request.url.scheme}://{request.headers.get('host')}"
+        if request.headers.get("origin") != expected: raise HTTPException(403, "origin validation failed")
+        if not idempotency_key or len(idempotency_key) > 200: raise HTTPException(400, "valid Idempotency-Key is required")
+
+    def same_origin(request: Request) -> None:
+        expected = f"{request.url.scheme}://{request.headers.get('host')}"
+        if request.headers.get("origin") != expected:
+            raise HTTPException(403, "origin validation failed")
 
     @app.middleware("http")
-    async def security_headers(request: Request, call_next):
-        host_header = request.headers.get("host", "")
-        host = host_header[1:].split("]", 1)[0] if host_header.startswith("[") else host_header.split(":", 1)[0]
-        if host not in {"127.0.0.1", "localhost", "testserver"}:
-            return JSONResponse({"detail": "invalid host"}, status_code=400)
+    async def security(request: Request, call_next):
+        host = request.headers.get("host", "").split(":", 1)[0]
+        if host not in {"127.0.0.1", "localhost", "testserver"}: return JSONResponse({"detail": "invalid host"}, status_code=400)
         response = await call_next(request)
-        if "Content-Security-Policy" not in response.headers:
-            response.headers["Content-Security-Policy"] = "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers.setdefault("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+        response.headers["X-Content-Type-Options"] = "nosniff"; response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
-    def require_mutation(request: Request) -> dict[str, str]:
-        origin = request.headers.get("origin")
-        expected_origin = f"{request.url.scheme}://{request.headers.get('host')}"
-        if origin != expected_origin:
-            raise HTTPException(status_code=403, detail="origin validation failed")
-        return {"user": "local"}
-
-    def _validate_manifest_updates(project: dict[str, Any], updates: dict[str, dict[str, Any]]) -> None:
-        allowed = {"project": {"product", "baseline_version", "target_version", "next_vendor_version", "description"}, "paths": {"vendor_baseline", "target_cf", "target_cfe", "next_vendor", "compare_repo"}, "policy": {"static_sources_first", "allow_live_infobase_evidence", "mark_runtime_data_dependencies", "default_confidence_for_inference"}}
-        for section, values in updates.items():
-            if section not in allowed or set(values) - allowed[section]:
-                raise HTTPException(status_code=422, detail=f"unsupported project.toml update: {section}")
-        approved = [Path(item) for item in project.get("approved_roots") or roots]
-        for value in updates.get("paths", {}).values():
-            if str(value).strip():
-                candidate = Path(str(value)); canonical_under(candidate if candidate.is_absolute() else Path(project["root"]) / candidate, approved)
+    @app.exception_handler(ValueError)
+    async def invalid(_request: Request, exc: ValueError):
+        from .events import redact
+        return JSONResponse({"detail": redact(str(exc)), "code": "validation_error"}, status_code=422)
+    @app.exception_handler(RuntimeError)
+    async def conflict(_request: Request, exc: RuntimeError):
+        from .events import redact
+        return JSONResponse({"detail": redact(str(exc)), "code": "conflict"}, status_code=409)
 
     @app.get("/api/v1/health")
-    def health():
-        from .workspace import SCHEMA_VERSION
-        return {"status": "ok", "schema_version": SCHEMA_VERSION}
+    def health(): return {"status": "ok", "schema_version": "1"}
 
     @app.get("/api/v1/projects")
-    def list_projects(request: Request):
-        return store.projects()
-
-    @app.get("/api/v1/infobases/discover")
-    def discover_infobases(request: Request):
-        path = Path.home() / ".1C" / "1cestart" / "ibases.v8i"
-        return {"source": str(path), "infobases": discover_1c_infobases(path)}
-
-    @app.get("/api/v1/filesystem/directories")
-    def list_directories(request: Request, path: str = ""):
-        current = canonical_under(Path(path).expanduser() if path else roots[0], roots)
-        if not current.is_dir():
-            raise HTTPException(status_code=404, detail="directory not found")
-        directories = []
-        try:
-            for child in sorted(current.iterdir(), key=lambda item: item.name.casefold()):
-                if child.is_dir():
-                    try:
-                        directories.append({"name": child.name, "path": str(canonical_under(child, roots))})
-                    except ValueError:
-                        pass
-        except PermissionError:
-            raise HTTPException(status_code=403, detail="directory is not readable") from None
-        parent = None
-        try:
-            candidate = canonical_under(current.parent, roots)
-            if candidate != current:
-                parent = str(candidate)
-        except ValueError:
-            pass
-        return {"current": str(current), "parent": parent, "directories": directories}
+    def projects(): return bookmarks()
 
     @app.post("/api/v1/projects", status_code=201)
-    def create_project(body: ProjectCreate, request: Request):
-        require_mutation(request)
-        root = Path(body.root).expanduser()
-        if not (root / "project.toml").is_file():
-            canonical_under(root.parent, roots)
-            from argparse import Namespace
-            from .bootstrap import create_research_repo
-            template_root = Path(__file__).resolve().parents[2]
-            if not (template_root / "templates" / "research-repo").is_dir():
-                archive = Path(__file__).with_name("workspace_assets") / "research-template.zip"
-                template_root = workspace_paths.root / "template"
-                if not archive.is_file():
-                    raise HTTPException(status_code=409, detail="project does not exist and packaged research template is unavailable")
-                if not (template_root / "templates" / "research-repo").is_dir():
-                    with zipfile.ZipFile(archive) as source:
-                        for member in source.infolist():
-                            canonical_under(template_root / member.filename, [template_root])
-                        source.extractall(template_root)
-            slug = re.sub(r"[^a-z0-9-]+", "-", body.name.lower()).strip("-") or secrets.token_hex(4)
-            create_research_repo(Namespace(template_root=str(template_root), target_path=str(root), force=False, project_id=slug, product=body.product or body.name, baseline_version=body.baseline_version, target_version=body.target_version, next_vendor_version="", vendor_baseline="", target_cf="", target_cfe="", next_vendor="", rlm_vendor_baseline="", rlm_target_cf="", rlm_target_cfe="", rlm_next_vendor="", init_git=True))
-        return store.register_project(body.name, root, roots)
-
-    @app.get("/api/v1/projects/{project_id}")
-    def get_project(project_id: str, request: Request):
-        try:
-            return store.project(project_id)
-        except KeyError:
-            raise HTTPException(status_code=404) from None
-
-    @app.put("/api/v1/projects/{project_id}/setup")
-    async def save_setup(project_id: str, request: Request):
-        require_mutation(request)
-        setup = await request.json()
-        errors: dict[str, str] = {}
-        step = int(setup.get("step") or 0)
-        if step >= 2:
-            setup["source_roles"] = json.dumps(SOURCE_PATHS)
-            if not setup.get("vendor_connection"):
-                errors["vendor_connection"] = "select the vendor infobase"
-            if not setup.get("customer_connection"):
-                errors["customer_connection"] = "select the customer infobase"
-            try:
-                infobases = json.loads(str(setup.get("infobases") or "[]"))
-                ids = list(infobases.values()) if isinstance(infobases, dict) else list(infobases)
-                if not ids:
-                    errors["infobases"] = "select at least one tested infobase connection"
-                for connection_id in ids:
-                    connection = store.resource("connection", str(connection_id))
-                    if not connection.get("last_test_ok"):
-                        errors[f"infobases.{connection_id}"] = "connection has not passed its fixed test"
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                errors["infobases"] = str(exc)
-        if step >= 3:
-            project_root = Path(store.project(project_id)["root"])
-            for relative in SOURCE_PATHS.values():
-                canonical_under(project_root / relative, [project_root]).mkdir(parents=True, exist_ok=True)
-            try:
-                source_roles = json.loads(str(setup.get("source_roles") or "{}"))
-                if not isinstance(source_roles, dict) or not source_roles:
-                    errors["source_roles"] = "specify at least one supported source role"
-                for role, value in source_roles.items():
-                    if role not in {"vendor_baseline", "target_cf", "target_cfe", "next_vendor"}:
-                        errors["source_roles"] = f"unsupported source role: {role}"
-                        continue
-                    candidate = Path(str(value)); target = canonical_under(candidate if candidate.is_absolute() else Path(store.project(project_id)["root"]) / candidate, roots)
-                    if not target.exists():
-                        errors[f"source_roles.{role}"] = f"path does not exist: {target}"
-            except (ValueError, json.JSONDecodeError) as exc:
-                errors["source_roles"] = str(exc)
-        if step >= 5 and not setup.get("checked"):
-            errors["checked"] = "prerequisite checks must be confirmed"
-        if setup.get("complete") and not str(setup.get("enabled_stages") or "").strip():
-            errors["enabled_stages"] = "select at least one stage"
-        if setup.get("complete"):
-            from .workspace import STAGE_BY_ID
-            enabled = {item.strip() for item in str(setup.get("enabled_stages") or "").split(",") if item.strip()}
-            unknown = enabled - set(STAGE_BY_ID)
-            if unknown:
-                errors["enabled_stages"] = f"unsupported stages: {', '.join(sorted(unknown))}"
-            agent_stages = {item for item in enabled if item in STAGE_BY_ID and STAGE_BY_ID[item]["kind"] == "agent"}
-            try:
-                assignments = json.loads(str(setup.get("agent_assignments") or "{}"))
-            except json.JSONDecodeError as exc:
-                assignments = {}; errors["agent_assignments"] = str(exc)
-            for stage_id in agent_stages:
-                profile_id = str(assignments.get(stage_id) or "") if isinstance(assignments, dict) else ""
-                try:
-                    profile = store.resource("agent", profile_id)
-                    if not profile.get("enabled", True) or not profile.get("available", False):
-                        raise KeyError(profile_id)
-                except KeyError:
-                    errors[f"agent_assignments.{stage_id}"] = "select an enabled compatible agent profile"
-        if errors:
-            raise HTTPException(status_code=422, detail={"code": "setup_invalid", "fields": errors})
-        return store.save_setup(project_id, setup)
-
-    @app.get("/api/v1/stages")
-    def stages(request: Request):
-        from .workspace import STAGES
-        return list(STAGES)
-
-    @app.get("/api/v1/projects/{project_id}/preferences")
-    def preferences(project_id: str, request: Request):
-        return store.preferences(project_id)
-
-    @app.put("/api/v1/projects/{project_id}/preferences")
-    async def save_preferences(project_id: str, request: Request):
-        require_mutation(request)
-        return store.save_preferences(project_id, await request.json())
+    def add_project(body: BookmarkBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); root = confined(Path(body.root).resolve(), ".")
+        if not any(root == allowed or allowed in root.parents for allowed in roots): raise ValueError("unsupported repository path")
+        identifier = sha256(str(root).encode())[:16]; values = [item for item in bookmarks() if item["id"] != identifier]; item = {"id": identifier, "name": body.name, "root": str(root)}; values.append(item); save_bookmarks(values); return item
 
     @app.get("/api/v1/projects/{project_id}/workflow")
-    def workflow(project_id: str, request: Request):
-        return workflow_snapshot(store, project_id)
+    def snapshot(project_id: str):
+        from .workflow import attach_dispatcher
+        return attach_dispatcher(ApplicationService(repo(project_id)).snapshot(deep=False), repo(project_id), operational)
 
-    @app.post("/api/v1/projects/{project_id}/inspect")
-    def inspect_project(project_id: str, request: Request):
-        require_mutation(request)
-        from .doctor import run_doctor
-        project = store.project(project_id)
-        result = run_doctor(Path(project["root"]), mode="research", deep=True)
-        selected = json.loads(str(project.get("setup", {}).get("infobases") or "[]"))
-        connections = []
-        for item in selected:
+    @app.get("/api/v1/projects/{project_id}/workflow/next")
+    def next_work(project_id: str): return ApplicationService(repo(project_id)).next()
+
+    @app.get("/api/v1/projects/{project_id}/workflow/configuration")
+    def workflow_configuration(project_id: str): return ApplicationService(repo(project_id)).workflow_configuration()
+
+    @app.post("/api/v1/projects/{project_id}/workflow/patch-preview")
+    def workflow_patch_preview(project_id: str, body: StepPatchBody):
+        return ApplicationService(repo(project_id)).preview_step_patch(body.model_dump(), operational)
+
+    @app.post("/api/v1/projects/{project_id}/workflow/run-next")
+    def run_next_step(project_id: str, body: RunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); project = repo(project_id)
+        from .user_state import load_agent_profiles, load_connections
+        preview_root = operational / "projects" / project_id / "source-routing-previews"
+        service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts", routing_previews=preview_root)
+        from .runner import run_next
+        store = EventStore(operational / "projects", project_id)
+        result_path = store.root / ("idempotency-" + sha256(idempotency_key.encode()) + ".json")
+        lock_path = result_path.with_suffix(".lock")
+        with lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if result_path.is_file():
+                result = json.loads(result_path.read_text(encoding="utf-8")); result["snapshot"] = service.snapshot(); return result
+            if body.expected_fingerprint != service.snapshot()["workflow_fingerprint"]: raise RuntimeError("stale workflow fingerprint")
+            invoke = lambda operation, payload, cancelled: service.apply(operation, payload, service.snapshot()["workflow_fingerprint"], cancelled)
+            if set(body.approved_operations) - {"sources.acquire", "mrq.discover-next", "mrq.decide-next"}: raise ValueError("unsupported run approval")
+            source_preview = {"source_routing_preview_id": body.source_routing_preview_id, "routing_plan_fingerprint": body.routing_plan_fingerprint} if body.source_routing_preview_id and body.routing_plan_fingerprint else None
+            result = run_next(service.repo, invoke, store, select=service.next, approved_operations=set(body.approved_operations), agent_profiles=load_agent_profiles(project, operational), source_routing_preview=source_preview)
+            from .contracts import atomic_json
+            atomic_json(result_path, result)
+            return result
+
+    @app.post("/api/v1/projects/{project_id}/workflow/run-until-blocked")
+    def run_until(project_id: str, body: RunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); project = repo(project_id)
+        from .user_state import load_agent_profiles, load_connections
+        preview_root = operational / "projects" / project_id / "source-routing-previews"
+        service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts", routing_previews=preview_root)
+        if set(body.approved_operations) - {"sources.acquire", "mrq.discover-next", "mrq.decide-next"}: raise ValueError("unsupported run approval")
+        from .runner import run_until_blocked
+        store = EventStore(operational / "projects", project_id)
+        result_path = store.root / ("idempotency-until-" + sha256(idempotency_key.encode()) + ".json")
+        with result_path.with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if result_path.is_file():
+                result = json.loads(result_path.read_text(encoding="utf-8")); result["snapshot"] = service.snapshot(); return result
+            if body.expected_fingerprint != service.snapshot()["workflow_fingerprint"]: raise RuntimeError("stale workflow fingerprint")
+            invoke = lambda operation, payload, cancelled: service.apply(operation, payload, service.snapshot()["workflow_fingerprint"], cancelled)
+            source_preview = {"source_routing_preview_id": body.source_routing_preview_id, "routing_plan_fingerprint": body.routing_plan_fingerprint} if body.source_routing_preview_id and body.routing_plan_fingerprint else None
+            result = run_until_blocked(service.repo, invoke, store, max_units=body.max_units, select=service.next, approved_operations=set(body.approved_operations), agent_profiles=load_agent_profiles(project, operational), source_routing_preview=source_preview)
+            from .contracts import atomic_json
+            atomic_json(result_path, result)
+            return result
+
+    @app.post("/api/v1/projects/{project_id}/runs/{run_id}/cancel")
+    def cancel_run(project_id: str, run_id: str, body: CancelBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); repo(project_id)
+        EventStore(operational / "projects", project_id).cancel(run_id, body.actor)
+        return {"run_id": run_id, "status": "cancellation_requested"}
+
+    @app.get("/api/v1/projects/{project_id}/dispatcher")
+    def dispatcher_projection(project_id: str):
+        from .workflow import attach_dispatcher
+        snapshot = attach_dispatcher(ApplicationService(repo(project_id)).snapshot(deep=False), repo(project_id), operational)
+        return snapshot.get("dispatcher", {"schema_version": "1", "revision": 0, "fresh_at": "", "circuits": [], "jobs": {}})
+
+    def stage_preview(project: Path, body: StagePreviewBody, *, require_source_preview: bool = True) -> dict[str, Any]:
+        if body.boundary not in {"sources", "diffs", "projections"}:
+            raise ValueError("unsupported stage recompute boundary")
+        if require_source_preview and body.boundary == "sources" and not body.source_routing_preview_id:
+            raise ValueError("source_routing_preview_id is required for sources")
+        if body.boundary != "sources" and body.source_routing_preview_id is not None:
+            raise ValueError("source_routing_preview_id is only valid for sources")
+        from .stage_recompute import preview
+        return preview(
+            project,
+            boundary=body.boundary,
+            expected_workflow_fingerprint=body.expected_workflow_fingerprint,
+            source_routing_preview_id=body.source_routing_preview_id,
+            operational_root=operational,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/stage-recompute/preview")
+    def preview_stage_recompute(project_id: str, body: StagePreviewBody, request: Request):
+        same_origin(request)
+        return stage_preview(repo(project_id), body)
+
+    @app.post("/api/v1/projects/{project_id}/stage-recompute/runs", status_code=202)
+    def run_stage_recompute(project_id: str, body: StageRunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key)
+        project = repo(project_id)
+        candidates = [None]
+        if body.boundary == "sources":
+            preview_root = operational / "projects" / project_id / "source-routing-previews"
+            candidates = [path.stem for path in sorted(preview_root.glob("*.json"))]
+        plan = None
+        for preview_id in candidates:
             try:
-                profile = store.resource("connection", str(item))
-                if profile.get("last_test_ok"):
-                    connections.append(profile)
-            except KeyError:
-                pass
-        return {"ok": result["status"] != "fail" and bool(connections), "doctor": result, "tested_connections": len(connections)}
+                candidate = stage_preview(
+                    project,
+                    StagePreviewBody(
+                        boundary=body.boundary,
+                        expected_workflow_fingerprint=body.workflow_fingerprint,
+                        source_routing_preview_id=preview_id,
+                    ),
+                    require_source_preview=False,
+                )
+            except RuntimeError:
+                continue
+            if candidate.get("plan_fingerprint") == body.plan_fingerprint:
+                plan = candidate
+                break
+        if plan is None:
+            raise RuntimeError("stale stage recompute plan fingerprint")
+        if plan.get("plan_fingerprint") != body.plan_fingerprint:
+            raise RuntimeError("stale stage recompute plan fingerprint")
+        required = plan["required_confirmations"]
+        if sorted(body.confirmations) != sorted(required) or len(set(body.confirmations)) != len(body.confirmations):
+            raise ValueError("confirmations must exactly match the stage recompute plan")
+        from .contracts import canonical_json
+        request_value = {
+            "project_id": project_id,
+            "boundary": body.boundary,
+            "workflow_fingerprint": body.workflow_fingerprint,
+            "plan_fingerprint": body.plan_fingerprint,
+            "confirmations": sorted(body.confirmations),
+            "predecessor_run_id": body.predecessor_run_id,
+        }
+        request_fingerprint = "sha256:" + sha256(canonical_json(request_value))
+        from .sqlite_state import DispatcherStore
+        with DispatcherStore(project, operational) as store:
+            record, created = store.start_stage_recompute(
+                str(idempotency_key),
+                request_fingerprint,
+                body.boundary,
+                plan,
+                body.predecessor_run_id,
+            )
+            predecessor = store.stage_run(body.predecessor_run_id) if body.predecessor_run_id else None
+        public = {key: record[key] for key in ("run_id", "status", "boundary", "idempotency_key_fingerprint")}
+        public["plan_fingerprint"] = plan["plan_fingerprint"]
+        if not created:
+            if record.get("result") is not None:
+                public["result"] = record["result"]
+            return public
 
-    @app.post("/api/v1/projects/{project_id}/verify")
-    def verify_project(project_id: str, request: Request):
-        require_mutation(request)
-        from .doctor import run_doctor
-        result = run_doctor(Path(store.project(project_id)["root"]), mode="research", deep=True)
-        return {"ok": result["status"] == "ok", "doctor": result}
+        run_id = record["run_id"]
+        lease_token = record["lease_token"]
+        cancelled = threading.Event()
+        with stage_cancellations_lock:
+            stage_cancellations[run_id] = cancelled
+        event_store = EventStore(operational / "projects", project_id)
+        from .events import process_identity
+        event_store.emit(
+            "run.created",
+            run_id,
+            {
+                "status": "running",
+                "actor": "local-user",
+                "process_identity": process_identity(),
+                "workflow_fingerprint": body.workflow_fingerprint,
+                "operation": "stage-recompute",
+                "boundary": body.boundary,
+                "plan_fingerprint": plan["plan_fingerprint"],
+                "idempotency_key_fingerprint": record["idempotency_key_fingerprint"],
+            },
+        )
 
-    if testing:
-        @app.post("/api/v1/testing/projects/{project_id}/fixture-dashboard")
-        def fixture_dashboard(project_id: str, request: Request):
-            require_mutation(request)
-            root = Path(store.project(project_id)["root"])
-            target = canonical_under(root / "outputs" / "review" / "index.html", [root])
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("<!doctype html><html><body><h1>Проверочный результат</h1></body></html>", encoding="utf-8")
-            return {"artifact": "outputs/review/index.html"}
-
-    @app.put("/api/v1/projects/{project_id}/manifest")
-    def manifest(project_id: str, body: ManifestUpdate, request: Request):
-        require_mutation(request)
-        project = store.project(project_id)
-        _validate_manifest_updates(project, body.updates)
-        new_hash = update_project_manifest(Path(project["root"]), body.updates, body.expected_hash)
-        with store.db:
-            store.db.execute("UPDATE projects SET manifest_hash=? WHERE id=?", (new_hash, project_id))
-        return {"manifest_hash": new_hash}
-
-    @app.post("/api/v1/projects/{project_id}/manifest/preview")
-    def manifest_preview(project_id: str, body: ManifestUpdate, request: Request):
-        project = store.project(project_id); path = Path(project["root"]) / "project.toml"
-        _validate_manifest_updates(project, body.updates)
-        current_hash = file_sha256(path)
-        if current_hash != body.expected_hash:
-            raise HTTPException(status_code=409, detail="stale project.toml fingerprint")
-        proposed = render_project_manifest(path.read_text(encoding="utf-8"), body.updates)
-        import difflib
-        difference = "\n".join(difflib.unified_diff(path.read_text(encoding="utf-8").splitlines(), proposed.splitlines(), fromfile="project.toml", tofile="project.toml (proposed)", lineterm=""))
-        return {"source_hash": current_hash, "proposed": proposed, "diff": difference}
-
-    def resource_routes(kind: str):
-        plural = kind + "s"
-
-        @app.get(f"/api/v1/{plural}", name=f"list_{plural}")
-        def list_items(request: Request, project_id: str | None = None):
-            return store.resources(kind, project_id)
-
-        @app.post(f"/api/v1/{plural}", status_code=201, name=f"create_{kind}")
-        def create_item(body: ResourceBody, request: Request):
-            require_mutation(request)
-            data = dict(body.data)
-            project_id = body.project_id or data.pop("project_id", None)
-            if kind == "connection":
-                channel = data.get("channel")
-                if channel not in ALLOWED_CONNECTIONS:
-                    raise HTTPException(status_code=422, detail="unsupported connection channel")
-                if data.get("role") not in {"customer", "vendor"}:
-                    raise HTTPException(status_code=422, detail="connection role must be customer or vendor")
-                if data.get("access_mode", "read") not in {"read", "write"}:
-                    raise HTTPException(status_code=422, detail="unsupported access mode")
-                parsed_target = urllib.parse.urlsplit(str(data.get("url") or ""))
-                if parsed_target.username or parsed_target.password:
-                    raise HTTPException(status_code=422, detail="credentials must use the write-only secret field")
-            if kind == "agent":
-                try:
-                    validate_agent_profile(store, data, body.id)
-                except ValueError as exc:
-                    raise HTTPException(status_code=422, detail=str(exc)) from None
-                probe = agent_probe(str(data["provider"]))
-                data.update({"available": probe["available"], "adapter_version": probe.get("version", ""), "authentication_ready": probe.get("authentication_ready", False), "capabilities": probe.get("capabilities", {})})
-            item = store.save_resource(kind, ({"id": body.id} if body.id else {}) | data, project_id)
-            if body.secret:
-                secret_id = f"{kind}-{item['id']}"
-                store.write_secret(secret_id, body.secret)
-                data["secret_ref"] = secret_id
-                data["secret_present"] = True
-                item = store.save_resource(kind, {"id": item["id"]} | data, project_id)
-            return item
-
-        @app.get(f"/api/v1/{plural}/{{item_id}}", name=f"get_{kind}")
-        def get_item(item_id: str, request: Request):
+        def worker() -> None:
+            started = time.monotonic()
+            status = "failed"
+            result: dict[str, Any]
             try:
-                return store.resource(kind, item_id)
-            except KeyError:
-                raise HTTPException(status_code=404) from None
+                from .stage_recompute import execute
+                import inspect
+                def emit(event_type: str, value: dict[str, Any]):
+                    step_id = str(value["step_id"])
+                    operation = str(value["operation"])
+                    common = {
+                        "boundary": body.boundary,
+                        "plan_fingerprint": plan["plan_fingerprint"],
+                        "idempotency_key_fingerprint": record["idempotency_key_fingerprint"],
+                    }
+                    hierarchy = {"job_id": "stage-recompute", "step_id": step_id, "attempt": 1}
+                    if event_type == "step.started":
+                        with repository_lock(project), DispatcherStore(project, operational) as progress_store:
+                            if not progress_store.renew_stage_lease(run_id, lease_token, {**common, "current_step": operation, "step_id": step_id}):
+                                raise RuntimeError("stage recompute lease lost")
+                            return event_store.emit(
+                                "step.started",
+                                run_id,
+                                {
+                                    **common,
+                                    "status": "running",
+                                    "actor": "local-user",
+                                    "operation": operation,
+                                    "inputs": {"boundary": body.boundary},
+                                    "input_fingerprint": value["input_fingerprint"],
+                                },
+                                **hierarchy,
+                            )
+                    if lease_is_lost():
+                        raise RuntimeError("stage recompute lease lost")
+                    result = value.get("result", {})
+                    def fenced_emit(kind: str, payload: dict[str, Any]):
+                        with repository_lock(project), DispatcherStore(project, operational) as progress_store:
+                            if not progress_store.renew_stage_lease(run_id, lease_token):
+                                raise RuntimeError("stage recompute lease lost")
+                            return event_store.emit(kind, run_id, payload, **hierarchy)
 
-        @app.put(f"/api/v1/{plural}/{{item_id}}", name=f"update_{kind}")
-        def update_item(item_id: str, body: ResourceBody, request: Request):
-            return create_item(body.model_copy(update={"id": item_id}), request)
+                    fenced_emit(
+                        "step.output",
+                        {**common, "status": "completed", "outputs": result, "output_fingerprint": value["output_fingerprint"]},
+                    )
+                    fenced_emit(
+                        "step.validation",
+                        {**common, "status": "completed", "validation": "passed"},
+                    )
+                    return fenced_emit(
+                        "step.finished",
+                        {**common, "status": "completed", "actor": "local-user", "operation": operation, "duration_seconds": 0},
+                    )
+                def lease_is_lost() -> bool:
+                    if cancelled.is_set():
+                        return True
+                    with DispatcherStore(project, operational) as check_store:
+                        return not check_store.renew_stage_lease(run_id, lease_token)
+                arguments = {
+                    "lease_token": lease_token,
+                    "cancelled": lease_is_lost,
+                    "emit": emit,
+                    "operational_root": operational,
+                }
+                if predecessor is not None:
+                    if "predecessor_run" not in inspect.signature(execute).parameters:
+                        raise RuntimeError("stage recompute core does not support predecessor resume")
+                    arguments["predecessor_run"] = predecessor
+                result = execute(
+                    project,
+                    plan,
+                    **arguments,
+                )
+                if lease_is_lost():
+                    raise RuntimeError("stage recompute lease lost")
+                if result.get("status") == "awaiting_manual_work":
+                    event_store.emit(
+                        "approval.required",
+                        run_id,
+                        {
+                            "status": "blocked",
+                            "boundary": body.boundary,
+                            "plan_fingerprint": plan["plan_fingerprint"],
+                            "idempotency_key_fingerprint": record["idempotency_key_fingerprint"],
+                            "next": result.get("next"),
+                        },
+                        job_id="stage-recompute",
+                        step_id="manual-stop",
+                        attempt=1,
+                    )
+                status = str(result.get("status", "completed"))
+                if status == "awaiting_manual_work":
+                    status = "blocked"
+                if status not in {"completed", "blocked", "failed", "cancelled", "interrupted"}:
+                    status = "completed"
+            except InterruptedError:
+                status, result = "cancelled", {"status": "cancelled"}
+            except Exception as exc:
+                status, result = "failed", {
+                    "status": "failed",
+                    "error_class": type(exc).__name__,
+                    "message": "stage recompute failed",
+                    "boundary": body.boundary,
+                    "steps": getattr(exc, "steps", []),
+                }
+            with DispatcherStore(project, operational) as store:
+                current = store.finish_stage_recompute(run_id, lease_token, status, result)
+            if current:
+                event_store.emit(
+                    "run.finished",
+                    run_id,
+                    {
+                        "status": status,
+                        "duration_seconds": time.monotonic() - started,
+                        "operation": "stage-recompute",
+                        "boundary": body.boundary,
+                        "plan_fingerprint": plan["plan_fingerprint"],
+                        "idempotency_key_fingerprint": record["idempotency_key_fingerprint"],
+                        "result": result,
+                    },
+                )
+            with stage_cancellations_lock:
+                stage_cancellations.pop(run_id, None)
 
-        @app.delete(f"/api/v1/{plural}/{{item_id}}", status_code=204, name=f"delete_{kind}")
-        def delete_item(item_id: str, request: Request):
-            require_mutation(request)
-            store.delete_resource(kind, item_id)
-            return Response(status_code=204)
+        threading.Thread(target=worker, name=f"stage-recompute-{run_id}", daemon=True).start()
+        return public
 
-    for resource_kind in ("connection", "agent"):
-        resource_routes(resource_kind)
+    @app.post("/api/v1/projects/{project_id}/stage-recompute/runs/{run_id}/cancel")
+    def cancel_stage_recompute(project_id: str, run_id: str, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key)
+        project = repo(project_id)
+        from .sqlite_state import DispatcherStore
+        with DispatcherStore(project, operational) as store:
+            record = store.stage_run(run_id)
+            if record is None:
+                raise HTTPException(404, "stage recompute run not found")
+            if record["status"] == "running" and not store.stage_token_current(run_id, record["lease_token"]):
+                raise RuntimeError("stage recompute lease token is no longer current")
+            new_cancellation = store.bind_stage_cancellation(str(idempotency_key), run_id)
+            if not new_cancellation:
+                return {"run_id": run_id, "status": "cancellation_requested"}
+            if record["status"] == "running":
+                with stage_cancellations_lock:
+                    signal = stage_cancellations.get(run_id)
+                    if signal is not None:
+                        signal.set()
+                EventStore(operational / "projects", project_id).cancel(run_id, "local-user")
+                return {"run_id": run_id, "status": "cancellation_requested"}
+        return {"run_id": run_id, "status": record["status"]}
 
-    @app.put("/api/v1/connections/{item_id}/credentials")
-    def save_connection_credentials(item_id: str, body: CredentialBody, request: Request):
-        require_mutation(request)
+    @app.post("/api/v1/projects/{project_id}/dispatcher/{job_id}/{action}")
+    def dispatcher_action(project_id: str, job_id: str, action: str, request: Request, body: DispatcherActionBody | None = Body(default=None), idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        if job_id not in {"discover-mrq", "classify-mrq", "decide-mrq"}:
+            raise ValueError("unsupported dispatcher job")
+        if action not in {"start", "stop", "resume", "cancel", "retry", "approve-noise", "approve-batch", "approve-decision"}:
+            raise ValueError("unsupported dispatcher action")
+        if job_id == "classify-mrq" and action.startswith("approve-"):
+            raise ValueError("classification does not require approval")
+        mutation(request, idempotency_key)
+        request_body = body.model_dump(exclude_none=True, exclude_unset=True) if body is not None else {}
+        allowed_body_fields = {
+            "start": {"actor"},
+            "stop": {"timeout_seconds"},
+            "resume": {"actor"},
+            "cancel": {"actor"},
+            "retry": {"policy_source", "predecessor_run_id", "expected_workflow_fingerprint", "expected_input_fingerprints"},
+            "approve-noise": {"actor", "proposal_key", "expected_fingerprint"},
+            "approve-batch": {"actor", "proposal_key", "expected_fingerprint", "payload"},
+            "approve-decision": {"actor", "proposal_key", "expected_fingerprint", "payload"},
+        }[action]
+        if unknown := set(request_body) - allowed_body_fields:
+            raise ValueError(f"unsupported fields for dispatcher {action}: {sorted(unknown)}")
+        project = repo(project_id)
+        from .dispatcher import DispatcherCoordinator, DispatcherOutcome, load_bindings
+        from .sqlite_state import DispatcherStore
+        from .user_state import load_agent_profiles
+        from .workflow import step_configurations
+        event_store = EventStore(operational / "projects", project_id)
+        if action in {"start", "resume", "retry"}:
+            from .sqlite_state import DispatcherStore
+            with DispatcherStore(project, operational) as gate_store:
+                if gate_store.lease("stage-recompute") is not None:
+                    raise RuntimeError("stage recompute lease blocks dispatcher start and continuation")
+        action_result_path = event_store.root / ("idempotency-dispatcher-" + sha256(idempotency_key.encode()) + ".json")
+        action_lock = None
+        if action not in {"approve-noise", "approve-batch", "approve-decision"}:
+            action_lock = action_result_path.with_suffix(".lock").open("a+b")
+            fcntl.flock(action_lock.fileno(), fcntl.LOCK_EX)
+            if action != "retry" and action_result_path.is_file():
+                cached = json.loads(action_result_path.read_text(encoding="utf-8"))
+                action_lock.close()
+                return cached
+        session_key = (project_id, job_id)
+        with dispatcher_sessions_lock:
+            session = dispatcher_sessions.get(session_key)
+            if session is None:
+                store = DispatcherStore(project, operational); store.open()
+                coordinator = DispatcherCoordinator(project, project_id, store, event_store, actor=str(request_body.get("actor", "local-user")))
+                dispatcher_sessions[session_key] = (coordinator, store)
+            else:
+                coordinator, store = session
         try:
-            profile = store.resource("connection", item_id)
-        except KeyError:
-            raise HTTPException(status_code=404) from None
-        secret_id = f"connection-{item_id}"
-        store.write_secret(secret_id, body.secret)
-        profile.update({"user": body.username, "secret_ref": secret_id, "secret_present": True})
-        return store.save_resource("connection", profile, profile.get("project_id"))
-
-    @app.get("/api/v1/artifacts")
-    def artifacts(request: Request, project_id: str | None = None):
-        return store.artifacts(project_id)
-
-    @app.post("/api/v1/projects/{project_id}/artifacts/discover")
-    def discover_artifacts(project_id: str, request: Request):
-        require_mutation(request)
-        items = store.discover_artifacts(project_id)
-        for item in items:
-            store.append_event(project_id, "artifact.ready", {"artifact_id": item["id"], "path": item["path"]}, item.get("run_id"))
-        return items
-
-    @app.get("/api/v1/prompts")
-    def prompts(request: Request, project_id: str | None = None):
-        return store.prompts(project_id)
-
-    @app.post("/api/v1/prompts", status_code=201)
-    def create_prompt(body: ResourceBody, request: Request):
-        require_mutation(request)
-        stage_id = str(body.data.get("stage_id") or "")
-        from .workspace import STAGE_BY_ID
-        template = str(body.data.get("template") or STAGE_BY_ID.get(stage_id, {}).get("prompt_default") or "")
-        return store.save_prompt(str(body.project_id or ""), stage_id, template, str(body.data.get("supplement") or ""), body.data.get("variables") or {})
-
-    @app.get("/api/v1/prompts/{prompt_id}")
-    def prompt(prompt_id: str, request: Request):
-        try:
-            return store.prompt(prompt_id)
-        except KeyError:
-            raise HTTPException(status_code=404) from None
-
-    @app.post("/api/v1/connections/{item_id}/test")
-    def probe_connection(item_id: str, request: Request, confirm_write: str = Header(default="", alias="X-Confirm-Write")):
-        require_mutation(request)
-        profile = store.resource("connection", item_id)
-        if profile.get("access_mode", "read") != "read" and confirm_write.lower() != "true":
-            raise HTTPException(status_code=409, detail={"code": "write_confirmation_required", "target": profile.get("url"), "impact": "connection probe may write to the infobase"})
-        secret = store.secret(profile["secret_ref"]) if profile.get("secret_ref") else ""
-        result = test_connection(profile, secret)
-        profile["last_test_ok"] = bool(result.get("ok"))
-        profile["tested_capabilities"] = result.get("capabilities") or []
-        profile["tested_target"] = result.get("target")
-        store.save_resource("connection", profile, profile.get("project_id"))
-        if profile.get("access_mode", "read") != "read" and profile.get("project_id"):
-            store.append_event(str(profile["project_id"]), "connection.write_probe", {"connection_id": item_id, "target": result.get("target"), "confirmed": True})
-        return result
-
-    @app.get("/api/v1/agent-providers")
-    def providers(request: Request):
-        return [agent_probe(provider) for provider in sorted(ALLOWED_PROVIDERS)]
-
-    @app.get("/api/v1/runs")
-    def runs(request: Request, project_id: str | None = None):
-        return store.runs(project_id)
-
-    @app.get("/api/v1/runs/{run_id}")
-    def run(run_id: str, request: Request):
-        try:
-            return store.run(run_id)
-        except KeyError:
-            raise HTTPException(status_code=404) from None
-
-    @app.get("/api/v1/runs/{run_id}/logs")
-    def run_logs(run_id: str, request: Request, offset: int = 0, limit: int = 200):
-        return store.log_page(run_id, offset, limit)
-
-    @app.post("/api/v1/runs", status_code=202)
-    def start_run(body: RunBody, request: Request, idempotency_key: str = Header(alias="Idempotency-Key")):
-        require_mutation(request)
-        try:
-            return manager.start(body.project_id, body.stage_id, body.payload, idempotency_key)
-        except (ValueError, RuntimeError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from None
-
-    @app.post("/api/v1/runs/{run_id}/cancel")
-    def cancel_run(run_id: str, request: Request):
-        require_mutation(request)
-        return manager.cancel(run_id)
-
-    @app.post("/api/v1/runs/{run_id}/retry", status_code=202)
-    def retry_run(run_id: str, request: Request, idempotency_key: str = Header(alias="Idempotency-Key")):
-        require_mutation(request)
-        run = store.run(run_id)
-        if run["status"] not in {"failed", "interrupted", "cancelled"}:
-            raise HTTPException(status_code=409, detail="only failed, interrupted, or cancelled runs can be retried")
-        payload = {key: value for key, value in run["snapshot"]["payload"].items() if key in {"paths", "agent_profile_id", "timeout_seconds", "workers"}}
-        return manager.start(run["project_id"], run["stage_id"], payload, idempotency_key)
-
-    @app.get("/api/v1/approvals")
-    def approvals(request: Request, project_id: str | None = None):
-        return store.approvals(project_id)
-
-    @app.post("/api/v1/approvals", status_code=201)
-    async def request_approval(request: Request, idempotency_key: str = Header(alias="Idempotency-Key")):
-        require_mutation(request)
-        body = await request.json()
-        return store.request_approval(body["project_id"], body["stage_id"], body.get("data") or {}, idempotency_key)
-
-    @app.post("/api/v1/approvals/{approval_id}/decision")
-    async def decide(approval_id: str, request: Request):
-        require_mutation(request)
-        body = await request.json()
-        try:
-            return store.decide(approval_id, str(body.get("choice")), "local")
-        except (KeyError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from None
-
-    @app.get("/api/v1/events")
-    async def events(request: Request, project_id: str, run_id: str | None = None, last_event_id: str | None = Header(default=None, alias="Last-Event-ID")):
-        after = int(last_event_id or 0)
-
-        async def stream():
-            cursor = after
-            while not await request.is_disconnected():
-                rows, reset = store.events(project_id, cursor, run_id=run_id)
-                if reset:
-                    yield "event: reset\ndata: {}\n\n"
-                    return
-                if rows:
-                    for row in rows:
-                        cursor = int(row["id"])
-                        data = json.dumps(row["payload"], ensure_ascii=False)
-                        yield f"id: {cursor}\nevent: {row['type']}\ndata: {data}\n\n"
+            should_launch_graph = True
+            agent_profile = None
+            phase_policies: dict[str, dict[str, Any]] = {}
+            profiles_by_role: dict[str, dict[str, Any]] = {}
+            if job_id in {"discover-mrq", "classify-mrq", "decide-mrq"}:
+                profiles = load_agent_profiles(project, operational)
+                step_id = job_id
+                configured = next((item for item in step_configurations(project) if item["step"]["id"] == step_id), None)
+                if configured:
+                    phase_policies = {phase["phase_id"]: phase for phase in configured["step"].get("agent_phases", [])}
+                    primary_role = {"discover-mrq": "analyzer", "classify-mrq": "classifier", "decide-mrq": "researcher"}[job_id]
+                    profile_name = next((role["agent_profile"] for phase in phase_policies.values() for role in phase["roles"] if role["role_id"] == primary_role), None)
+                    agent_profile = profiles.get(profile_name) if profile_name else None
+                    profiles_by_role = {role["role_id"]: profiles[role["agent_profile"]] for phase in phase_policies.values() for role in phase["roles"] if role["agent_profile"] in profiles}
+            supplement = next((role["instruction_supplement"] for phase in phase_policies.values() for role in phase["roles"] if role["role_id"] in {"analyzer", "classifier", "researcher"}), "")
+            from .workflow import next_work
+            current_work = next_work(project) or {}
+            expected_action = {"discover-mrq": "mrq.discover-next", "classify-mrq": "mrq.classify-batches", "decide-mrq": "mrq.decide-next"}[job_id]
+            work_unit = current_work.get("work_unit") if current_work.get("action") == expected_action else None
+            if not isinstance(work_unit, dict):
+                work_unit = {"id": job_id, "kind": "dispatcher-root", "allowed_paths": []}
+            work_unit_id = str(work_unit["id"])
+            bindings = load_bindings(project, project_id, job_id, work_unit_id, agent_profile, supplement)
+            if action == "start" and agent_profile is None:
+                outcome = DispatcherOutcome(
+                    job_id,
+                    "",
+                    "blocked",
+                    "",
+                    store.revision()[0],
+                    {"phase": "executor_unavailable"},
+                    {
+                        "code": "executor.agent_profile_missing",
+                        "message": "configured local agent profile is unavailable",
+                        "action": job_id,
+                    },
+                )
+                response = {"job_id": job_id, "action": action, "outcome": {"status": outcome.status, "run_id": outcome.run_id, "thread_id": outcome.thread_id, "revision": outcome.revision, "summary": outcome.summary, "blocker": outcome.blocker}}
+                from .contracts import atomic_json
+                atomic_json(action_result_path, response)
+                return response
+            candidate_run_id = str(uuid.uuid4())
+            execution_snapshot = None
+            if action in {"start", "retry"} and agent_profile is not None and configured is not None:
+                from .agents import resolve_execution_snapshot
+                execution_snapshot = resolve_execution_snapshot(project, candidate_run_id, configured["step"]["operation"], configured["step"], profiles, work_unit)
+            if action == "start":
+                outcome = coordinator.start(job_id, bindings, run_id=candidate_run_id, execution_snapshot=execution_snapshot)
+            elif action == "stop":
+                outcome = coordinator.soft_stop(job_id, timeout_seconds=int(request_body.get("timeout_seconds", 0)))
+            elif action == "resume":
+                outcome = coordinator.resume(job_id, bindings)
+            elif action == "cancel":
+                outcome = coordinator.cancel(job_id)
+            elif action == "retry":
+                policy_source = request_body.get("policy_source")
+                predecessor_run_id = str(request_body.get("predecessor_run_id", ""))
+                expected_workflow = str(request_body.get("expected_workflow_fingerprint", ""))
+                expected_inputs = request_body.get("expected_input_fingerprints")
+                if policy_source not in {"reuse-snapshot", "current-policy"} or not predecessor_run_id or not isinstance(expected_inputs, dict):
+                    raise ValueError("retry requires policy_source, predecessor_run_id and expected input fingerprints")
+                expected_keys = {"source_generation_id", "diff_generation_id", "canonical_generation_id", "work_unit_id"}
+                if set(expected_inputs) != expected_keys or any(not isinstance(value, str) for value in expected_inputs.values()):
+                    raise ValueError("retry expected input fingerprints have an invalid shape")
+                actual_inputs = {
+                    "source_generation_id": bindings.source_generation_id,
+                    "diff_generation_id": bindings.diff_generation_id,
+                    "canonical_generation_id": bindings.canonical_generation_id,
+                    "work_unit_id": bindings.work_unit_id,
+                }
+                if expected_workflow != bindings.workflow_fingerprint or expected_inputs != actual_inputs:
+                    raise RuntimeError("retry workflow or subject inputs are stale")
+                predecessor = event_store.run_snapshot(predecessor_run_id)
+                if predecessor is None:
+                    raise RuntimeError("retry predecessor execution snapshot is missing or corrupt")
+                predecessor_snapshot = predecessor["execution_snapshot"]
+                predecessor_bindings = predecessor_snapshot.get("subject_bindings", {})
+                if any(predecessor_bindings.get(key) != actual_inputs[key] for key in expected_keys - {"work_unit_id"}) or str(predecessor_snapshot.get("work_unit", {}).get("id", "")) != work_unit_id:
+                    raise RuntimeError("retry predecessor subject inputs are incompatible")
+                if policy_source == "reuse-snapshot":
+                    from .agents import validate_execution_snapshot
+                    validate_execution_snapshot(project, predecessor_snapshot)
+                    execution_snapshot = {
+                        **predecessor_snapshot,
+                        "run_id": candidate_run_id,
+                        "policy_source": policy_source,
+                        "predecessor_run_id": predecessor_run_id,
+                    }
+                elif execution_snapshot is not None:
+                    execution_snapshot = {
+                        **execution_snapshot,
+                        "policy_source": policy_source,
+                        "predecessor_run_id": predecessor_run_id,
+                    }
+                if execution_snapshot is None:
+                    raise RuntimeError("retry execution snapshot cannot be resolved")
+                snapshot_fingerprint = "sha256:" + sha256(canonical_json(execution_snapshot))
+                reservation, created = store.reserve_retry(
+                    str(idempotency_key),
+                    "sha256:" + sha256(canonical_json({
+                        "job_id": job_id,
+                        "policy_source": policy_source,
+                        "predecessor_run_id": predecessor_run_id,
+                        "expected_workflow_fingerprint": expected_workflow,
+                        "expected_input_fingerprints": expected_inputs,
+                    })),
+                    candidate_run_id,
+                    job_id,
+                    predecessor_run_id,
+                    policy_source,
+                    execution_snapshot,
+                    snapshot_fingerprint,
+                )
+                candidate_run_id = reservation["run_id"]
+                execution_snapshot = reservation["execution_snapshot"]
+                if not created and reservation["state"] == "terminal":
+                    return reservation["result"]
+                if created:
+                    try:
+                        predecessor_lease = store.lease(job_id)
+                        matching_lease = (
+                            predecessor_lease
+                            if predecessor_lease and predecessor_lease.get("run_id") == predecessor_run_id
+                            else None
+                        )
+                        if matching_lease:
+                            if matching_lease.get("state") not in {"failed", "resumable", "stale"}:
+                                raise RuntimeError("retry predecessor is still active; stop it before retry")
+                        elif predecessor.get("status") not in RETRYABLE_RUN_STATUSES:
+                            raise RuntimeError("retry predecessor status is not retryable")
+                    except Exception:
+                        store.abandon_retry(candidate_run_id, reservation["owner_token"])
+                        raise
+                event_store.prepare_run(candidate_run_id, execution_snapshot)
+                existing_lease = store.lease(job_id)
+                if (
+                    not created
+                    and existing_lease
+                    and existing_lease.get("run_id") == candidate_run_id
+                ):
+                    from .sqlite_state import is_stale
+                    if is_stale(str(existing_lease["renewed_at"])):
+                        store.interrupt_running_work(job_id, candidate_run_id, str(existing_lease["lease_token"]))
+                        store.release_lease(job_id, str(existing_lease["lease_token"]))
+                        existing_lease = None
+                if not created and existing_lease and existing_lease.get("run_id") == candidate_run_id:
+                    from .events import process_identity_alive
+                    if existing_lease["state"] == "running" and not process_identity_alive(existing_lease.get("process_identity")):
+                        store.interrupt_running_work(job_id, candidate_run_id, str(existing_lease["lease_token"]))
+                        store.release_lease(job_id, str(existing_lease["lease_token"]))
+                        outcome = coordinator.retry(job_id, bindings, run_id=candidate_run_id, execution_snapshot=execution_snapshot)
+                        store.update_retry(candidate_run_id, reservation["owner_token"], "started", {"status": outcome.status, "recovered": True})
+                    else:
+                        should_launch_graph = False
+                        outcome = DispatcherOutcome(
+                            job_id,
+                            candidate_run_id,
+                            existing_lease["state"],
+                            existing_lease["thread_id"],
+                            store.revision()[0],
+                            existing_lease.get("summary", {}),
+                        )
                 else:
-                    yield ": heartbeat\n\n"
-                await asyncio.sleep(0.25)
+                    outcome = coordinator.retry(job_id, bindings, run_id=candidate_run_id, execution_snapshot=execution_snapshot)
+                    store.update_retry(candidate_run_id, reservation["owner_token"], "started", {"status": outcome.status})
+            elif action in {"approve-noise", "approve-batch", "approve-decision"}:
+                proposal_key = str(request_body.get("proposal_key", ""))
+                expected_fingerprint = str(request_body.get("expected_fingerprint", ""))
+                if not proposal_key or not expected_fingerprint:
+                    raise ValueError("proposal_key and expected_fingerprint are required for approval")
+                proposal = store.proposal(proposal_key)
+                if proposal is None or proposal["job_id"] != job_id:
+                    raise RuntimeError("dispatcher proposal is missing, stale, or already consumed")
+                lease = store.lease(job_id)
+                if lease is None or lease["thread_id"] != proposal["thread_id"]:
+                    raise RuntimeError("dispatcher approval lease is missing or belongs to another run")
+                if proposal.get("consumed_at") is not None:
+                    recovered_noise = (
+                        action == "approve-noise"
+                        and lease["state"] == "resumable"
+                        and any(
+                            item["job_id"] == job_id
+                            and item["thread_id"] == proposal["thread_id"]
+                            and item["kind"] == "noise-approval"
+                            and item.get("consumed_at") is None
+                            for item in store.proposals()
+                        )
+                    )
+                    if not recovered_noise:
+                        raise RuntimeError("dispatcher proposal is missing, stale, or already consumed")
+                    summary = lease.get("summary", {})
+                    if summary.get("workflow_fingerprint") != expected_fingerprint:
+                        raise RuntimeError("dispatcher noise approval is stale")
+                    response = {
+                        "job_id": job_id,
+                        "action": action,
+                        "outcome": {
+                            "status": "resumable",
+                            "run_id": str(lease.get("run_id", "")),
+                            "thread_id": proposal["thread_id"],
+                            "revision": store.revision()[0],
+                            "summary": summary,
+                            "blocker": None,
+                        },
+                    }
+                    from .contracts import atomic_json
+                    atomic_json(action_result_path, response)
+                    return response
+                lease_token = str(lease["lease_token"])
+                def approval_fence() -> None:
+                    if not store.owns_lease(job_id, lease_token, proposal["thread_id"]):
+                        raise RuntimeError("dispatcher lease was fenced before the canonical effect")
+                result_path = action_result_path
+                with result_path.with_suffix(".lock").open("a+b") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    if result_path.is_file():
+                        return json.loads(result_path.read_text(encoding="utf-8"))
+                    saved = proposal["payload"]
+                    if action == "approve-noise":
+                        proposals = saved.get("noise_proposals", [])
+                        if saved.get("approval_stage") != "noise" or not proposals:
+                            raise ValueError("dispatcher noise proposal is missing")
+                        if ApplicationService(project).snapshot()["workflow_fingerprint"] != expected_fingerprint:
+                            raise RuntimeError("dispatcher noise approval is stale")
+                        timestamp = datetime.now(timezone.utc).isoformat()
+                        reviewed = {
+                            "items": [
+                                {
+                                    "stable_diff_id": item["stable_diff_id"],
+                                    "actor": str(request_body.get("actor", "local-user")),
+                                    "rationale": item["rationale"],
+                                    "evidence": item["evidence"],
+                                    "timestamp": timestamp,
+                                }
+                                for item in proposals
+                            ]
+                        }
+                        approval_key = sha256(
+                            canonical_json(
+                                {
+                                    "thread_id": proposal["thread_id"],
+                                    "kind": "approved-noise",
+                                }
+                            )
+                        )
+                        summary = {
+                            "approved_noise_ids": [item["stable_diff_id"] for item in reviewed["items"]],
+                            "workflow_fingerprint": expected_fingerprint,
+                            "next_action": "resume",
+                        }
+                        if not store.approve_noise_review(
+                            proposal_key,
+                            approval_key,
+                            job_id,
+                            proposal["thread_id"],
+                            lease_token,
+                            reviewed,
+                            summary,
+                        ):
+                            raise RuntimeError("dispatcher lease was fenced before noise approval persistence")
+                    elif action == "approve-batch":
+                        groups = saved.get("batch_proposals", [])
+                        approved_noise = saved.get("approved_noise", [])
+                        canonical_payload = {
+                            "approved_noise": approved_noise,
+                            "group_proposals": [
+                                {key: group[key] for key in ("semantic_key", "title", "stable_diff_ids", "supporting_diff_ids", "evidence", "business_meaning", "scope", "confidence", "rationale")}
+                                for group in groups
+                            ],
+                        }
+                        from .mrq import active
+                        canonical = active(project)
+                        active_by_key = {item.get("semantic_key"): item for item in canonical["mrq.jsonl"] if item.get("state") != "superseded"}
+                        recovered_ids: list[str] = []
+                        for group in canonical_payload["group_proposals"]:
+                            row = active_by_key.get(group["semantic_key"])
+                            if row is None:
+                                recovered_ids = []
+                                break
+                            source = row.get("source_customization", {})
+                            primary = sorted(item.get("stable_diff_id") for item in canonical["dispositions.jsonl"] if item.get("mrq_id") == row["mrq_id"] and item.get("primary"))
+                            if primary != sorted(group["stable_diff_ids"]) or any(source.get(key) != group[key] for key in ("business_meaning", "scope", "confidence", "rationale")):
+                                recovered_ids = []
+                                break
+                            recovered_ids.append(row["mrq_id"])
+                        if (groups or approved_noise) and len(recovered_ids) == len(groups) and _reviewed_noise_is_active(canonical, approved_noise):
+                            with store.lease_guard(job_id, lease_token, proposal["thread_id"]):
+                                approval_fence()
+                                current = active(project)
+                                if current["pointer"].get("canonical_generation_id") != canonical["pointer"].get("canonical_generation_id"):
+                                    raise RuntimeError("canonical recovery changed before approval completion")
+                                current_ids = {
+                                    item.get("mrq_id")
+                                    for item in current["mrq.jsonl"]
+                                    if item.get("state") != "superseded"
+                                }
+                                if not set(recovered_ids) <= current_ids:
+                                    raise RuntimeError("canonical recovery changed before approval completion")
+                                result = {"mrq_ids": recovered_ids, "recovered": True}
+                        else:
+                            result = ApplicationService(project).apply("mrq.publish-source-batch", canonical_payload, expected_fingerprint, fence=approval_fence)
+                        canonical_snapshot = ApplicationService(project).snapshot()
+                        summary = {"published_mrq_ids": result.get("mrq_ids", []), "workflow_fingerprint": canonical_snapshot["workflow_fingerprint"]}
+                    else:
+                        decision = saved.get("decision_proposal")
+                        if not isinstance(decision, dict):
+                            raise ValueError("dispatcher decision proposal is missing")
+                        from .mrq import active
+                        row = next((item for item in active(project)["mrq.jsonl"] if item.get("mrq_id") == decision.get("mrq_id") and item.get("state") != "superseded"), None)
+                        decision_fields = ("decision", "target_evidence", "target_coverage", "residual_gap", "target_solution", "rationale", "acceptance_criteria", "risk", "open_questions")
+                        if row is not None and all(row.get("migration_decision", {}).get(key) == decision.get(key) for key in decision_fields):
+                            with store.lease_guard(job_id, lease_token, proposal["thread_id"]):
+                                approval_fence()
+                                current = active(project)
+                                current_row = next((item for item in current["mrq.jsonl"] if item.get("mrq_id") == decision.get("mrq_id") and item.get("state") != "superseded"), None)
+                                if current_row is None or any(current_row.get("migration_decision", {}).get(key) != decision.get(key) for key in decision_fields):
+                                    raise RuntimeError("canonical recovery changed before approval completion")
+                                result = {"generation_id": current["pointer"].get("canonical_generation_id"), "recovered": True}
+                        else:
+                            result = ApplicationService(project).apply("mrq.decide", decision, expected_fingerprint, fence=approval_fence)
+                        canonical_snapshot = ApplicationService(project).snapshot()
+                        summary = {"approved_mrq_id": decision.get("mrq_id"), "generation_id": result.get("generation_id"), "workflow_fingerprint": canonical_snapshot["workflow_fingerprint"]}
+                    if action != "approve-noise" and not store.consume_proposal(proposal_key, lease_token):
+                        raise RuntimeError("dispatcher lease was fenced before proposal consumption")
+                    remaining = [item for item in store.proposals() if item["job_id"] == job_id and item["thread_id"] == proposal["thread_id"] and item["kind"] == "approval" and item.get("consumed_at") is None]
+                    if action == "approve-noise":
+                        revision = coordinator.emit_transition(
+                            job_id,
+                            str(lease.get("run_id", "")),
+                            proposal["thread_id"],
+                            "step.progress",
+                            "dispatcher.discover-mrq.noise_approved",
+                            {"status": "running", "progress": {**summary, "resumable": True}},
+                        )
+                        outcome = DispatcherOutcome(
+                            job_id,
+                            str(lease.get("run_id", "")),
+                            "resumable",
+                            proposal["thread_id"],
+                            revision,
+                            summary,
+                        )
+                    elif action == "approve-decision" and remaining:
+                        lease = store.lease(job_id) or {}
+                        run_id = lease.get("summary", {}).get("run_id") or ""
+                        store.renew_lease(job_id, str(lease["lease_token"]), state="blocked", summary={"phase": "approval_required", "run_id": run_id, "remaining_approvals": len(remaining)})
+                        revision = coordinator.emit_transition(job_id, run_id, proposal["thread_id"], "step.progress", "dispatcher.decide-mrq.decision_approved", {"status": "blocked", "progress": {"approved_mrq_id": summary["approved_mrq_id"], "remaining_approvals": len(remaining)}})
+                        outcome = DispatcherOutcome(job_id, run_id, "blocked", proposal["thread_id"], revision, {**summary, "remaining_approvals": len(remaining)})
+                    else:
+                        outcome = coordinator.finish(job_id, "completed", summary)
+                    response = {"job_id": job_id, "action": action, "outcome": {"status": outcome.status, "run_id": outcome.run_id, "thread_id": outcome.thread_id, "revision": outcome.revision, "summary": outcome.summary, "blocker": outcome.blocker}}
+                    from .contracts import atomic_json
+                    atomic_json(result_path, response)
+                    return response
+            if should_launch_graph and action in {"start", "resume", "retry"} and outcome.status == "running":
+                saved_run = event_store.run_snapshot(outcome.run_id)
+                saved_execution = (saved_run or {}).get("execution_snapshot", {})
+                saved_phases = saved_execution.get("agent_phases", [])
+                saved_profiles = saved_execution.get("profiles", {})
+                saved_primary_role = "analyzer" if job_id == "discover-mrq" else "researcher"
+                saved_profile_name = next(
+                    (
+                        role["agent_profile"]
+                        for phase in saved_phases
+                        for role in phase.get("roles", [])
+                        if role.get("role_id") == saved_primary_role
+                    ),
+                    None,
+                )
+                if saved_profile_name in saved_profiles:
+                    agent_profile = saved_profiles[saved_profile_name]
+                if agent_profile is None:
+                    outcome = coordinator.finish(job_id, "blocked", {"phase": "executor_unavailable", "blocker": {"code": "executor.agent_profile_missing", "message": "configured local agent profile is unavailable", "action": job_id}})
+                    outcome.blocker = outcome.summary["blocker"]
+                else:
+                    timeout_seconds = int(configured["step"].get("timeout_seconds", 1800)) if configured else 1800
+                    coordinator.launch_graph(outcome, bindings, agent_profile, phase_policies=phase_policies, profiles_by_role=profiles_by_role, timeout_seconds=timeout_seconds)
+            response = {"job_id": job_id, "action": action, "outcome": {"status": outcome.status, "run_id": outcome.run_id, "thread_id": outcome.thread_id, "revision": outcome.revision, "summary": outcome.summary, "blocker": outcome.blocker}}
+            if action == "retry":
+                store.update_retry(
+                    outcome.run_id,
+                    reservation["owner_token"],
+                    "terminal" if outcome.status in {"completed", "failed", "cancelled", "stale", "blocked"} else "started",
+                    response,
+                )
+            from .contracts import atomic_json
+            atomic_json(action_result_path, response)
+            return response
+        except Exception:
+            # Активная сессия остаётся доступной для явной остановки/повтора.
+            raise
+        finally:
+            if action_lock is not None:
+                action_lock.close()
 
-        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    @app.get("/api/v1/projects/{project_id}/source-setup")
+    def source_setup(project_id: str):
+        from .sources import PROFILES, current_profile_test, draft_fingerprint, load_contract
+        from .contracts import external_id
+        infobases, artifacts = load_contract(repo(project_id))
+        from .user_state import load_connections
+        available = load_connections(repo(project_id), operational)
+        summaries = {name: {"available": True, "kind": value.get("kind"), "tested": current_profile_test(value, infobases["acquisition_profile"]), "profile_id": value.get("profile_id"), "platform_path": value.get("platform_path", ""), "extensions": value.get("extensions", []), "extension_count": len(value.get("extensions", [])), "tool_versions": value.get("tool_versions", {})} for name, value in available.items()}
+        drafts = operational / "projects" / project_id / "upload-drafts"
+        declared = [{**item, "external_artifact_id": external_id(item["kind"], item["semantic_key"]), "uploaded": (drafts / item["role"] / external_id(item["kind"], item["semantic_key"]) / item["filename"]).is_file()} for item in artifacts.get("artifacts", [])]
+        project = repo(project_id)
+        pointer = lambda name: json.loads((project / "research" / name).read_text(encoding="utf-8")) if (project / "research" / name).is_file() else {}
+        return {"profiles": sorted(PROFILES), "infobases": infobases, "infobases_fingerprint": "sha256:" + sha256((project / "research/infobases.toml").read_bytes()), "external_artifacts": {"schema_version": artifacts.get("schema_version"), "artifacts": declared}, "upload_draft_fingerprint": draft_fingerprint(drafts), "connection_profiles": summaries, "active_source": pointer("active-source-generation.json"), "active_diff": pointer("active-diff-generation.json")}
 
-    @app.get("/api/v1/artifacts/{project_id}/{artifact_path:path}")
-    def artifact(project_id: str, artifact_path: str, request: Request, download: bool = False, embed: bool = False):
-        project = store.project(project_id)
-        root = Path(project["root"])
+    @app.get("/api/v1/projects/{project_id}/source-tools")
+    def source_tools(project_id: str):
+        project = repo(project_id)
+        from .source_tools import discover_tools
+        from .user_state import load_connections
+        roots = [str(item.get("platform_path", "")) for item in load_connections(project, operational).values()]
+        return discover_tools(roots)
+
+    @app.post("/api/v1/projects/{project_id}/source-routing-previews", status_code=202)
+    def create_source_routing_preview(project_id: str, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key)
+        project = repo(project_id)
+        from .contracts import atomic_json
+        from .user_state import load_connections, workspace_id
+        connections = load_connections(project, operational)
+        roots = {str(item.get("platform_path", "")) for item in connections.values()}
+        if len(roots) != 1 or not next(iter(roots)):
+            raise ValueError("one generation-wide platform path is required")
+        preview_root = operational / "projects" / project_id / "source-routing-previews"
+        preview_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        store = EventStore(operational / "projects", project_id)
+        with (preview_root / ".lock").open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            for old_path in preview_root.glob("*.json"):
+                previous = json.loads(old_path.read_text(encoding="utf-8"))
+                if previous.get("status") in {"pending", "running"}:
+                    store.cancel(previous["preview_id"], "replacement")
+                    previous.update({"status": "cancelled", "bindings": {}, "probe_results": [], "routing_manifest": {}, "required_tools": []}); atomic_json(old_path, previous)
+                    store.emit("run.finished", previous["preview_id"], {"status": "cancelled", "duration_seconds": 0, "operation": "sources.routing-preview"})
+            import uuid
+            preview_id = str(uuid.uuid4())
+            path = preview_root / f"{preview_id}.json"
+            atomic_json(path, {"schema_version": "1", "preview_id": preview_id, "project_id": workspace_id(project), "status": "pending", "routing_plan_fingerprint": "", "bindings": {}, "probe_results": [], "routing_manifest": {}, "required_tools": []})
+            from .events import process_identity
+            from .workflow import state_fingerprint
+            preview_started = time.monotonic()
+            store.emit("run.created", preview_id, {"status": "running", "actor": "local-user", "process_identity": process_identity(), "workflow_fingerprint": state_fingerprint(project), "operation": "sources.routing-preview"})
+
+        def worker():
+            with (preview_root / ".lock").open("a+b") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if record["status"] == "cancelled" or store.cancellation(preview_id):
+                    return
+                record["status"] = "running"; atomic_json(path, record)
+            cancelled = lambda: bool(store.cancellation(preview_id)) or json.loads(path.read_text(encoding="utf-8")).get("status") == "cancelled"
+            def finish(value):
+                with (preview_root / ".lock").open("a+b") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    current = json.loads(path.read_text(encoding="utf-8"))
+                    if current.get("status") == "cancelled":
+                        return
+                    if value["status"] == "ready":
+                        decisions = [{"routing_group_id": group["routing_group_id"], "form_counts": group["form_counts"], "representation_schema": group["representation_schema"], "routing_reason": group["routing_reason"]} for group in value["routing_manifest"]["groups"][:1000]]
+                        outputs = {"group_count": len(value["routing_manifest"]["groups"]), "required_tools": value["required_tools"], "decisions": decisions}
+                        store.emit("step.output", preview_id, {"status": "completed", "outputs": outputs, "output_fingerprint": value["routing_plan_fingerprint"]}, job_id="acquire-sources", step_id="routing-preview", attempt=1)
+                    store.emit("run.finished", preview_id, {"status": "completed" if value["status"] == "ready" else value["status"], "duration_seconds": time.monotonic() - preview_started, "operation": "sources.routing-preview"})
+                    atomic_json(path, value)
+            try:
+                from .sources import build_routing_preview
+                value = build_routing_preview(project, Path(next(iter(roots))), connections, upload_drafts=operational / "projects" / project_id / "upload-drafts", cancelled=cancelled)
+                if cancelled():
+                    return
+                finish({
+                    **record,
+                    **value,
+                    "status": "ready",
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+                })
+            except InterruptedError:
+                current = json.loads(path.read_text(encoding="utf-8"))
+                current["status"] = "cancelled"; atomic_json(path, current)
+            except Exception as exc:
+                finish({**record, "status": "failed", "error_code": "routing_preview_failed", "error": f"routing preview failed ({type(exc).__name__})"})
+
+        threading.Thread(target=worker, name=f"source-routing-preview-{preview_id}", daemon=True).start()
+        return {"preview_id": preview_id, "status": "pending"}
+
+    @app.get("/api/v1/projects/{project_id}/source-routing-previews/{preview_id}")
+    def get_source_routing_preview(project_id: str, preview_id: str):
+        repo(project_id)
+        if not re.fullmatch(r"[0-9a-f-]{36}", preview_id):
+            raise HTTPException(404, "routing preview not found")
+        path = operational / "projects" / project_id / "source-routing-previews" / f"{preview_id}.json"
+        if not path.is_file():
+            raise HTTPException(404, "routing preview not found")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @app.delete("/api/v1/projects/{project_id}/source-routing-previews/{preview_id}")
+    def cancel_source_routing_preview(project_id: str, preview_id: str, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); repo(project_id)
+        path = operational / "projects" / project_id / "source-routing-previews" / f"{preview_id}.json"
+        if not path.is_file():
+            raise HTTPException(404, "routing preview not found")
+        from .contracts import atomic_json
+        with (path.parent / ".lock").open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("status") in {"pending", "running"}:
+                store = EventStore(operational / "projects", project_id)
+                store.cancel(preview_id, "local-user")
+                record["status"] = "cancelled"; atomic_json(path, record)
+                store.emit("run.finished", preview_id, {"status": "cancelled", "duration_seconds": 0, "operation": "sources.routing-preview"})
+        return {"preview_id": preview_id, "status": record["status"]}
+
+    @app.put("/api/v1/projects/{project_id}/connection-profiles/{profile_id}")
+    def put_connection(project_id: str, profile_id: str, body: ConnectionBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); project = repo(project_id)
+        from .sources import load_contract, preflight_connection
+        infobases = load_contract(project)[0]
+        declared = {item["connection_profile"] for item in infobases["roles"].values()}
+        if profile_id not in declared or not profile_id or "/" in profile_id:
+            raise ValueError("connection profile is not declared by this repository")
+        profile = body.profile
+        allowed = {"kind", "server", "reference", "path", "profile_id", "tested", "platform_path", "dbms", "db_server", "db_name", "db_user", "db_password", "infobase_user", "infobase_password", "client_connection", "extensions"}
+        if set(profile) - allowed or profile.get("kind") not in {"server", "file"}:
+            raise ValueError("invalid current connection profile")
+        from .sources import normalize_connection_identity
+        normalize_connection_identity(profile)
+        tester = connection_tester or preflight_connection
+        tested = tester(infobases["acquisition_profile"], Path(str(profile.get("platform_path", ""))), profile)
+        profile = {**profile, **tested}
+        from .user_state import load_connections, save_connections
+        values = load_connections(project, operational); values[profile_id] = profile; save_connections(project, values, operational)
+        return {"profile_id": profile_id, "available": True, "kind": profile["kind"], "tested": True, "acquisition_profile": profile.get("profile_id"), "extension_count": len(profile.get("extensions", []))}
+
+    @app.get("/api/v1/projects/{project_id}/agent-profiles")
+    def agent_profiles(project_id: str):
+        from .user_state import load_agent_profiles
+        return {"items": load_agent_profiles(repo(project_id), operational)}
+
+    @app.put("/api/v1/projects/{project_id}/agent-profiles/{profile_id}")
+    def put_agent_profile(project_id: str, profile_id: str, body: AgentProfileBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); project = repo(project_id)
+        if not profile_id or len(profile_id) > 100 or not profile_id.replace("-", "").replace("_", "").isalnum():
+            raise ValueError("invalid agent profile ID")
+        from .user_state import replace_agent_profile
+        values = replace_agent_profile(project, profile_id, body.profile, operational)
+        return {"profile_id": profile_id, "profile": values[profile_id]}
+
+    @app.put("/api/v1/projects/{project_id}/external-uploads/{role}/{external_id}")
+    async def put_external_upload(project_id: str, role: str, external_id: str, request: Request, filename: str, declared_length: int, declared_sha256: str, expected_draft_fingerprint: str, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); project = repo(project_id)
+        from .sources import draft_fingerprint, load_contract
+        from .contracts import external_id as make_external_id, normalize_relative
+        declaration = next((item for item in load_contract(project)[1].get("artifacts", []) if item.get("role") == role and make_external_id(item.get("kind", ""), item.get("semantic_key", "")) == external_id), None)
+        if not declaration or normalize_relative(filename) != normalize_relative(str(declaration.get("filename", ""))) or declared_length != int(declaration.get("declared_size_bytes", -1)):
+            raise ValueError("upload does not match a tracked external artifact declaration")
+        expected_hash = str(declaration.get("sha256") or declared_sha256).removeprefix("sha256:").lower()
+        if declared_sha256.removeprefix("sha256:").lower() != expected_hash:
+            raise ValueError("upload hash does not match declaration")
+        root = operational / "projects" / project_id / "upload-drafts"
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if draft_fingerprint(root) != expected_draft_fingerprint:
+            raise RuntimeError("stale upload draft fingerprint")
+        import shutil, hashlib
+        if shutil.disk_usage(root).free < declared_length + 1024**3:
+            raise OSError("external upload requires declared bytes plus 1 GiB free space")
+        target = confined(root, f"{role}/{external_id}/{normalize_relative(filename)}"); target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.partial"); checksum = hashlib.sha256(); written = 0
         try:
-            target = canonical_under(root / artifact_path, [root])
-        except ValueError:
-            raise HTTPException(status_code=404) from None
-        if not target.is_file():
-            raise HTTPException(status_code=404)
-        media = "text/html" if target.suffix.lower() == ".html" else "application/octet-stream"
-        safe_dashboard = artifact_path in {"outputs/clean-comparison-dashboard/index.html", "outputs/review/index.html", "outputs/functional-gap-dashboard/index.html"}
-        disposition = "inline" if embed and safe_dashboard else "attachment" if download or target.suffix.lower() == ".html" else "inline"
-        headers = {"Content-Disposition": f'{disposition}; filename="{target.name}"'}
-        if embed and safe_dashboard:
-            headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'unsafe-inline'; connect-src 'none'; frame-ancestors 'self'; form-action 'none'; base-uri 'none'"
-        return FileResponse(target, media_type=media, filename=target.name if disposition == "attachment" else None, headers=headers)
+            with temporary.open("xb") as output:
+                async for chunk in request.stream():
+                    written += len(chunk)
+                    if written > declared_length: raise ValueError("upload exceeds declared length")
+                    checksum.update(chunk); output.write(chunk)
+                output.flush(); os.fsync(output.fileno())
+            if written != declared_length or checksum.hexdigest() != expected_hash:
+                raise ValueError("external upload length or SHA-256 mismatch")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {"role": role, "external_id": external_id, "filename": filename, "size_bytes": written, "sha256": checksum.hexdigest(), "draft_fingerprint": draft_fingerprint(root)}
 
-    static_dir = Path(__file__).with_name("workspace_static")
+    def folder_store(project_id: str):
+        from .external_folder import PreviewStore
+        project_root = operational / "projects" / project_id
+        return PreviewStore(repo(project_id), project_root / "external-folder-previews", project_root / "upload-drafts")
 
-    @app.get("/{path:path}")
-    def frontend(path: str):
-        if path == "api" or path.startswith("api/"):
-            raise HTTPException(status_code=404)
-        target = static_dir / path if path else static_dir / "index.html"
-        if target.is_file():
-            headers = {"Cache-Control": "no-store"} if target.name == "index.html" else None
-            return FileResponse(target, headers=headers)
-        index = static_dir / "index.html"
-        if index.is_file():
-            return FileResponse(index, headers={"Cache-Control": "no-store"})
-        return web["HTMLResponse"]("<h1>Workspace frontend is not built</h1>", status_code=503)
+    def folder_event(project_id: str, preview_id: str, operation: str, value: dict[str, Any]) -> None:
+        from .events import process_identity
+        digest = sha256(preview_id.encode()); run_id = f"external-folder-{digest[:16]}"; store = EventStore(operational / "projects", project_id)
+        store.emit("run.created", run_id, {"status": "running", "actor": "local-user", "process_identity": process_identity(), "workflow_fingerprint": str(value.get("workflow_fingerprint", "")), "operation": operation, "preview_digest": "sha256:" + digest})
+        store.emit("run.finished", run_id, {"status": "completed", "duration_seconds": 0.0, "operation": operation, "entry_count": len(value.get("entries", [])), "ignored_unsupported_count": int(value.get("ignored_unsupported_count", 0)), "status_counts": value.get("status_counts", {}), "total_bytes": int(value.get("total_bytes", 0)), "candidate_declaration_fingerprint": value.get("candidate_declaration_sha256"), "draft_result": value.get("status"), "validation": "passed"})
 
+    def folder_idempotent(project_id: str, key: str, operation: str, invoke) -> dict[str, Any]:
+        from .contracts import atomic_json
+        path = operational / "projects" / project_id / "folder-idempotency" / f"{sha256((operation + ':' + key).encode())}.json"; path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with path.with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if path.is_file(): return json.loads(path.read_text(encoding="utf-8"))
+            value = invoke(); atomic_json(path, value); return value
+
+    @app.post("/api/v1/projects/{project_id}/external-folder-previews", status_code=201)
+    def create_external_folder_preview(project_id: str, request: Request, body: dict[str, Any] = Body(), idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key)
+        from .contracts import canonical_json
+        if len(canonical_json(body)) > 16 * 1024**2 or set(body) != {"entries", "expected_fingerprint", "role"}: raise ValueError("invalid folder preview request")
+        entries = body["entries"]
+        if not isinstance(entries, list) or any(not isinstance(item, dict) or set(item) != {"relative_path", "size_bytes"} for item in entries): raise ValueError("invalid folder preview entries")
+        if body["expected_fingerprint"] != ApplicationService(repo(project_id)).snapshot()["workflow_fingerprint"]: raise RuntimeError("stale workflow fingerprint")
+        def invoke():
+            value = folder_store(project_id).create_browser([item["relative_path"] for item in entries], [item["size_bytes"] for item in entries], body["expected_fingerprint"], body["role"]); folder_event(project_id, value["preview_id"], "external-artifacts.folder-preview.create/v1", value); return value
+        return folder_idempotent(project_id, idempotency_key, "create", invoke)
+
+    @app.put("/api/v1/projects/{project_id}/external-folder-previews/{preview_id}/entries/{entry_id}")
+    async def put_external_folder_entry(project_id: str, preview_id: str, entry_id: str, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key)
+        from .contracts import atomic_json
+        cached = operational / "projects" / project_id / "folder-idempotency" / f"{sha256(('upload:' + str(idempotency_key)).encode())}.json"; cached.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cache_lock = cached.with_suffix(".lock").open("a+b"); fcntl.flock(cache_lock.fileno(), fcntl.LOCK_EX)
+        if cached.is_file():
+            value = json.loads(cached.read_text(encoding="utf-8")); cache_lock.close(); return value
+        store = folder_store(project_id); preview = store.load(preview_id)
+        entry = next((item for item in preview.get("entries", []) if item.get("entry_id") == entry_id), None)
+        if entry is None: cache_lock.close(); raise ValueError("unknown preview entry")
+        semaphore = folder_streams.setdefault(project_id, threading.BoundedSemaphore(2))
+        if not semaphore.acquire(blocking=False): cache_lock.close(); raise RuntimeError("folder upload stream limit reached")
+        target = store._path(preview_id) / "bytes" / entry["stored_name"]; target.parent.mkdir(mode=0o700, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.partial"); written = 0
+        import hashlib
+        digest = hashlib.sha256()
+        try:
+            with temporary.open("xb") as output:
+                async for chunk in request.stream():
+                    written += len(chunk)
+                    if written > entry["size_bytes"]: raise ValueError("upload exceeds declared length")
+                    digest.update(chunk); output.write(chunk)
+                output.flush(); os.fsync(output.fileno())
+            if written != entry["size_bytes"]: raise ValueError("upload length mismatch")
+            os.replace(temporary, target)
+            value = store.uploaded(preview_id, entry_id, written, digest.hexdigest()); atomic_json(cached, value); return value
+        finally:
+            temporary.unlink(missing_ok=True); semaphore.release(); cache_lock.close()
+
+    @app.post("/api/v1/projects/{project_id}/external-folder-previews/{preview_id}/finalize")
+    def finalize_external_folder_preview(project_id: str, preview_id: str, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key)
+        def invoke():
+            value = folder_store(project_id).finalize_browser(preview_id); folder_event(project_id, preview_id, "external-artifacts.folder-preview.finalize/v1", value); return value
+        return folder_idempotent(project_id, idempotency_key, "finalize", invoke)
+
+    @app.get("/api/v1/projects/{project_id}/external-folder-previews/{preview_id}/entries")
+    def external_folder_entries(project_id: str, preview_id: str, cursor: int = 0, limit: int = 100):
+        if cursor < 0 or limit < 1 or limit > 200: raise ValueError("preview page limit must be 1..200")
+        entries = folder_store(project_id).load(preview_id).get("entries", []); page = entries[cursor:cursor + limit]
+        return {"items": page, "next_cursor": cursor + len(page) if cursor + len(page) < len(entries) else None}
+
+    @app.get("/api/v1/projects/{project_id}/external-folder-previews/{preview_id}/declaration-diff")
+    def external_folder_diff(project_id: str, preview_id: str):
+        preview = folder_store(project_id).load(preview_id); return {"candidate_declaration_sha256": preview.get("candidate_declaration_sha256"), "diff": preview.get("declaration_diff", "")}
+
+    @app.post("/api/v1/projects/{project_id}/external-folder-previews/{preview_id}/declaration-diff-preview")
+    def preview_external_folder_diff(project_id: str, preview_id: str, request: Request, body: dict[str, Any] = Body(), idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key)
+        from .contracts import canonical_json
+        if len(canonical_json(body)) > 16 * 1024**2 or set(body) != {"selected_entries", "expected_declaration_fingerprint"}: raise ValueError("invalid declaration diff preview request")
+        return folder_idempotent(project_id, idempotency_key, "declaration-diff-preview", lambda: folder_store(project_id).declaration_diff(preview_id, body["selected_entries"], body["expected_declaration_fingerprint"]))
+
+    @app.post("/api/v1/projects/{project_id}/external-folder-previews/{preview_id}/confirm")
+    def confirm_external_folder_preview(project_id: str, preview_id: str, request: Request, body: dict[str, Any] = Body(), idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key)
+        from .contracts import canonical_json
+        if len(canonical_json(body)) > 16 * 1024**2 or set(body) != {"selected_entries", "expected_fingerprint", "expected_declaration_fingerprint", "expected_draft_fingerprint", "confirm"}: raise ValueError("invalid folder confirmation request")
+        project = repo(project_id); service = ApplicationService(project, upload_drafts=operational / "projects" / project_id / "upload-drafts")
+        def invoke():
+            value = service.apply("sources.configure", {"external_artifact_preview_id": preview_id, "selected_entries": body["selected_entries"], "expected_declaration_fingerprint": body["expected_declaration_fingerprint"], "expected_draft_fingerprint": body["expected_draft_fingerprint"], "confirm": body["confirm"]}, body["expected_fingerprint"]); folder_event(project_id, preview_id, "sources.configure.external-artifacts/v1", value); return value
+        return folder_idempotent(project_id, idempotency_key, "confirm", invoke)
+
+    @app.delete("/api/v1/projects/{project_id}/external-folder-previews/{preview_id}")
+    def cancel_external_folder_preview(project_id: str, preview_id: str, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); return folder_idempotent(project_id, idempotency_key, "cancel", lambda: folder_store(project_id).cancel(preview_id))
+
+    @app.get("/api/v1/projects/{project_id}/indexes")
+    def index_status(project_id: str): return {"items": ApplicationService(repo(project_id)).index_statuses(), "disposable": True}
+
+    @app.post("/api/v1/projects/{project_id}/actions")
+    def action(project_id: str, body: ActionBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); store = EventStore(operational / "projects", project_id); started = time.monotonic()
+        result_path = store.root / ("idempotency-action-" + sha256(idempotency_key.encode()) + ".json")
+        lock_path = result_path.with_suffix(".lock")
+        with lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if result_path.is_file():
+                prior = json.loads(result_path.read_text(encoding="utf-8"))
+                if prior["status"] == "completed": return prior["result"]
+                raise HTTPException(409, "idempotency key belongs to a failed action")
+            project = repo(project_id); workflow_fingerprint = ApplicationService(project).snapshot()["workflow_fingerprint"]
+            from .events import process_identity
+            event_context = {"actor": "local-user", "operation": body.operation}
+            store.emit("run.created", idempotency_key, {**event_context, "status": "running", "process_identity": process_identity(), "workflow_fingerprint": workflow_fingerprint, "idempotency_key": idempotency_key})
+            try:
+                from .user_state import load_connections
+                result = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts").apply(body.operation, body.payload, body.expected_fingerprint)
+            except Exception as exc:
+                from .contracts import atomic_json
+                atomic_json(result_path, {"schema_version": "1", "status": "failed"})
+                store.emit("run.finished", idempotency_key, {**event_context, "status": "failed", "error_class": type(exc).__name__, "message": str(exc), "idempotency_key": idempotency_key, "duration_seconds": time.monotonic() - started}); raise
+            from .contracts import atomic_json
+            atomic_json(result_path, {"schema_version": "1", "status": "completed", "result": result})
+            store.emit("run.finished", idempotency_key, {**event_context, "status": "completed", "result": result, "idempotency_key": idempotency_key, "duration_seconds": time.monotonic() - started}); return result
+
+    @app.get("/api/v1/projects/{project_id}/events")
+    def events(project_id: str, cursor: int = 0, limit: int = 500): return EventStore(operational / "projects", project_id).replay(cursor, limit)
+
+    @app.get("/api/v1/projects/{project_id}/events/stream")
+    async def event_stream(project_id: str, request: Request, cursor: int = 0):
+        repo(project_id); store = EventStore(operational / "projects", project_id)
+        async def delivery():
+            nonlocal cursor
+            import asyncio
+            while not await request.is_disconnected():
+                page = store.replay(cursor, 500)
+                if page.get("resync_required"):
+                    yield "event: resync\ndata: " + json.dumps(page, ensure_ascii=False) + "\n\n"; cursor = page["next_cursor"]
+                for event in page.get("events", []):
+                    cursor = event["sequence"]; yield "id: " + str(cursor) + "\nevent: workflow\ndata: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                yield ": keepalive\n\n"; await asyncio.sleep(1)
+        return StreamingResponse(delivery(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+    @app.get("/api/v1/projects/{project_id}/runs")
+    def runs(project_id: str, offset: int = 0, limit: int = 100):
+        if offset < 0 or not 1 <= limit <= 500: raise ValueError("invalid run page")
+        store = EventStore(operational / "projects", project_id); repo(project_id)
+        store.reconcile()
+        root = store.root / "runs"; items = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(root.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)] if root.is_dir() else []
+        return {"offset": offset, "limit": limit, "items": items[offset:offset + limit], "has_more": offset + limit < len(items)}
+
+    @app.get("/api/v1/projects/{project_id}/runs/{run_id}/attempts/{attempt}/log")
+    def attempt_log(project_id: str, run_id: str, attempt: int, offset: int = 0, limit: int = 500):
+        repo(project_id)
+        return EventStore(operational / "projects", project_id).read_log(run_id, attempt, offset, limit)
+
+    @app.get("/api/v1/projects/{project_id}/operational-artifacts/{artifact_path:path}")
+    def operational_artifact(project_id: str, artifact_path: str):
+        repo(project_id); root = EventStore(operational / "projects", project_id).root
+        path = confined(root, artifact_path); relative = path.relative_to(root).as_posix()
+        if not relative.startswith("artifacts/") or not path.is_file() or path.suffix.lower() not in {".json", ".txt", ".log"}:
+            raise HTTPException(404, "artifact not found")
+        return FileResponse(path, media_type="application/octet-stream", headers={"Content-Disposition": "attachment", "Content-Security-Policy": "sandbox"})
+
+    @app.get("/api/v1/projects/{project_id}/registries/{name}")
+    def registry(
+        project_id: str,
+        name: str,
+        offset: int = 0,
+        limit: int = 100,
+        expected_generation: str = "",
+    ):
+        return ApplicationService(repo(project_id)).registry(
+            name,
+            offset,
+            limit,
+            expected_generation,
+        )
+
+    @app.get("/api/v1/projects/{project_id}/artifacts/{artifact_path:path}")
+    def artifact(project_id: str, artifact_path: str):
+        project = repo(project_id); path = confined(project, artifact_path)
+        relative = path.relative_to(project).as_posix()
+        if not any(relative == prefix.rstrip("/") or relative.startswith(prefix) for prefix in ("outputs/", "analysis/indexes/generations/", "analysis/migration-requirements/generations/")):
+            raise HTTPException(404, "artifact not found")
+        if not path.is_file() or path.suffix.lower() not in {".json", ".csv", ".txt", ".log", ".md"}: raise HTTPException(404, "artifact not found")
+        return FileResponse(path, media_type="text/plain", headers={"Content-Disposition": "attachment", "Content-Security-Policy": "sandbox"})
+    static = Path(__file__).with_name("workspace_static")
+    if static.is_dir(): app.mount("/", StaticFiles(directory=static, html=True), name="workspace")
     return app
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the managed autoresearch workspace")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--workspace-root", action="append", default=[])
-    parser.add_argument("--no-browser", action="store_true")
-    args = parser.parse_args(argv)
-    if args.host not in {"127.0.0.1", "localhost", "::1"}:
-        raise SystemExit("non-loopback binding is not supported")
-    try:
-        import uvicorn
-    except ImportError as exc:
-        raise SystemExit("Install optional workspace dependencies") from exc
-    url = f"http://127.0.0.1:{args.port}/"
-    print(f"Workspace: {url}", flush=True)
-    if not args.no_browser:
-        threading = __import__("threading")
-        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
-    roots = [Path(value).resolve() for value in args.workspace_root] or [Path.cwd()]
-    uvicorn.run(create_app(approved_roots=roots), host=args.host, port=args.port, workers=1)
+def main() -> int:
+    import uvicorn
+    uvicorn.run(create_app(), host="127.0.0.1", port=8765)
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

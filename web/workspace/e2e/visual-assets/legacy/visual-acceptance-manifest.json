@@ -1,0 +1,58 @@
+{
+  "source_commit": "f23d171b",
+  "environment": {
+    "chromium": "Google Chrome for Testing 149.0.7827.55",
+    "device_scale_factor": 1,
+    "page_scale": "100%",
+    "locale": "ru-RU",
+    "timezone": "Europe/Moscow",
+    "fixed_time": "2026-07-21T12:00:00.000Z",
+    "reduced_motion": "reduce"
+  },
+  "update_mode": "CAPTURE_DISPATCHER_NEW_CANDIDATES=1",
+  "images": [
+    {
+      "file": "enriched-reference-baseline-1920x1080.png",
+      "fixture": "historical partial enriched reference",
+      "viewport": "1920x1080",
+      "selector": "[data-testid=\"enriched-subflow-reference\"]",
+      "sha256": "9dc6417f8d53746f1c1340d82e506e5eb0f3c182ea30d9a9290894cc0917bc8f",
+      "approved": true
+    },
+    {
+      "file": "enriched-reference-complete-1920x1080.png",
+      "fixture": "STATIC_COMPLETE_DISPATCHER_PROJECTION",
+      "viewport": "1920x1080",
+      "selector": "page",
+      "sha256": "599f1920ad5781ad7a68622f9c835b1f223548619216488be7942f1eda679023",
+      "approved": true
+    },
+    {
+      "file": "dispatcher-new-empty-1920x1080.png",
+      "candidate": "dispatcher-new-empty-candidate-1920x1080.png",
+      "fixture": "empty dispatcher projection",
+      "viewport": "1920x1080",
+      "selector": "page",
+      "sha256": "84f47b235078765777fa6d24cca6d5330f682f9ff1363ccb5dd1f6198bed5f5d",
+      "approved": true
+    },
+    {
+      "file": "dispatcher-new-saturated-1920x1080.png",
+      "candidate": "dispatcher-new-saturated-candidate-1920x1080.png",
+      "fixture": "saturated dispatcher projection",
+      "viewport": "1920x1080",
+      "selector": "page",
+      "sha256": "2a852e33613037646190bc9e3755b319f025a54b643a55aa9b1c09c3165c7ace",
+      "approved": true
+    },
+    {
+      "file": "dispatcher-new-saturated-1280x720.png",
+      "candidate": "dispatcher-new-saturated-candidate-1280x720.png",
+      "fixture": "saturated dispatcher projection, target stage in view",
+      "viewport": "1280x720",
+      "selector": "page",
+      "sha256": "d29b5c244c0f23f288331afe3044bc98db2b833a55bf365e1129ea01a3849111",
+      "approved": true
+    }
+  ]
+}

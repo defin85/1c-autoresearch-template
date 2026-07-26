@@ -1,0 +1,78 @@
+{
+  "source_commit": "340800cc",
+  "environment": {
+    "chromium": "Google Chrome for Testing 149.0.7827.55",
+    "device_scale_factor": 1,
+    "page_scale": "100%",
+    "locale": "ru-RU",
+    "timezone": "Europe/Moscow",
+    "fixed_time": "2026-07-21T12:00:00.000Z",
+    "reduced_motion": "reduce"
+  },
+  "update_mode": "UPDATE_FIVE_STAGE_VISUALS=1",
+  "images": [
+    {
+      "file": "dispatcher-current-five-stage-empty-1920x1080.png",
+      "candidate": "dispatcher-current-five-stage-empty-1920x1080-candidate.png",
+      "fixture": "empty five-stage dispatcher projection",
+      "viewport": "1920x1080",
+      "selector": "page",
+      "sha256": "cb383be9ee5f18f4f56e8692bd7397d4d78e02bcefb5bb33b8c37f2f28b77c62",
+      "approved": true
+    },
+    {
+      "file": "dispatcher-current-five-stage-saturated-1920x1080.png",
+      "candidate": "dispatcher-current-five-stage-saturated-1920x1080-candidate.png",
+      "fixture": "saturated five-stage dispatcher projection",
+      "viewport": "1920x1080",
+      "selector": "page",
+      "sha256": "28690f83e606f266919adac9bc9d1eebc7ad0af5d0889afdde0aa6c72f358948",
+      "approved": true
+    },
+    {
+      "file": "dispatcher-current-five-stage-saturated-1280x720.png",
+      "candidate": "dispatcher-current-five-stage-saturated-1280x720-candidate.png",
+      "fixture": "saturated five-stage dispatcher projection, local horizontal scroll",
+      "viewport": "1280x720",
+      "selector": "page",
+      "sha256": "d805a588ca310bc30c373198ebc090d3b2b5109d52c9ecd18031323e478ae22f",
+      "approved": true
+    },
+    {
+      "file": "dispatcher-new-five-stage-empty-1920x1080.png",
+      "candidate": "dispatcher-new-five-stage-empty-1920x1080-candidate.png",
+      "fixture": "empty five-stage dispatcher new projection",
+      "viewport": "1920x1080",
+      "selector": "page",
+      "sha256": "41c69630d69f58728451cd1ea22eeb711c7e62bc761aaf254fe596dc5d3f5f3e",
+      "approved": true
+    },
+    {
+      "file": "dispatcher-new-five-stage-saturated-1920x1080.png",
+      "candidate": "dispatcher-new-five-stage-saturated-1920x1080-candidate.png",
+      "fixture": "saturated five-stage dispatcher new projection",
+      "viewport": "1920x1080",
+      "selector": "page",
+      "sha256": "73a48a5df530f0d7b8fdc0eeb6f85f60d20340d08bc28f1d4899c002ba5eacef",
+      "approved": true
+    },
+    {
+      "file": "dispatcher-new-five-stage-saturated-1280x720.png",
+      "candidate": "dispatcher-new-five-stage-saturated-1280x720-candidate.png",
+      "fixture": "saturated five-stage dispatcher new projection, local horizontal scroll",
+      "viewport": "1280x720",
+      "selector": "page",
+      "sha256": "272e9e8c4f3052928347486edf5d206c0ce1bc091a50a635a0f3ff697d0fa1b4",
+      "approved": true
+    },
+    {
+      "file": "dispatcher-five-stage-reference-saturated-1920x1080.png",
+      "candidate": "dispatcher-five-stage-reference-saturated-1920x1080-candidate.png",
+      "fixture": "static complete five-stage reference",
+      "viewport": "1920x1080",
+      "selector": "page",
+      "sha256": "04a93e0844e7f092a633267324beba96480e9d1b08917604ef9fbf468cfa2175",
+      "approved": true
+    }
+  ]
+}

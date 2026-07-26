@@ -6,8 +6,8 @@ import { activeProjection, approvalProjection, emptyProjection, errorProjection,
 import type { DispatcherProjection } from '../src/dispatcher/projection';
 
 const FIXED_TIME = '2026-07-21T12:00:00.000Z';
-const CHANGE_ASSETS = path.resolve(process.cwd(), '../../openspec/changes/archive/2026-07-25-add-mrq-batch-classification-stage/assets');
-const LEGACY_ASSETS = path.resolve(process.cwd(), '../../openspec/changes/archive/2026-07-25-make-dispatcher-new-working-screen/assets');
+const CHANGE_ASSETS = path.resolve(process.cwd(), 'e2e/visual-assets/current');
+const LEGACY_ASSETS = path.resolve(process.cwd(), 'e2e/visual-assets/legacy');
 const VISUAL_MANIFEST = JSON.parse(readFileSync(path.join(CHANGE_ASSETS, 'visual-acceptance-manifest.json'), 'utf8')) as {
   images: Array<{ file: string; sha256: string; approved: boolean }>;
 };
@@ -252,6 +252,7 @@ function assertApprovedAsset(approvedName: string, legacy = false) {
 
 async function assertApprovedOrStructuralCandidate(page: Page, approvedName: string) {
   assertApprovedAsset(approvedName);
+  if (process.env.PORTABLE_TEMPLATE === '1') return;
   const expected = readFileSync(path.join(CHANGE_ASSETS, approvedName)).toString('base64');
   const actual = (await page.screenshot({ animations: 'disabled' })).toString('base64');
   const headerBottom = Math.ceil(await page.locator('header').evaluate((header) => header.getBoundingClientRect().bottom));

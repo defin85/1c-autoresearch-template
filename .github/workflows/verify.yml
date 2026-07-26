@@ -33,8 +33,10 @@ jobs:
       - name: Run doctor
         run: python -m one_c_autoresearch doctor --json --deep --strict
 
-      - name: Test managed workspace API
-        run: pip install '.[workspace]' httpx pytest && pytest -q tests/test_workspace.py tests/test_workspace_api.py
+      - name: Test managed workspace runtime
+        if: runner.os != 'Windows'
+        working-directory: templates/research-repo
+        run: pip install '.[workspace]' httpx pytest && pytest -q tests/test_dispatcher.py tests/test_dispatcher_api.py tests/test_dispatcher_smoke.py tests/test_mrq_batches.py tests/test_pipeline_graphs.py tests/test_workflow.py
 
   workspace-frontend:
     runs-on: ubuntu-latest

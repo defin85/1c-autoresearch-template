@@ -73,7 +73,7 @@ def test_template_portability(root: Path, errors: list[str]) -> None:
         "BP " + "2.0": "fixed source-product label",
         "BP " + "3.0": "fixed target-product label",
     }
-    generated_parts = {"__pycache__", ".pytest_cache", "runs", "workspaces", "traces"}
+    generated_parts = {"__pycache__", ".pytest_cache", ".venv", "node_modules", "runs", "workspaces", "traces"}
     for base in roots:
         folder = repo_path(root, base)
         if not folder.exists():

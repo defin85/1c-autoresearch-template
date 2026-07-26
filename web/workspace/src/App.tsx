@@ -1,155 +1,2351 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Admin, CustomRoutes, Layout, Menu, type DataProvider, type RaRecord } from 'react-admin';
-import { Route, Link, useNavigate, useParams } from 'react-router-dom';
 import {
-  Alert, AppBar, Box, Button, Card, CardActions, CardContent, Chip, CircularProgress,
-  Dialog, DialogActions, DialogContent, DialogTitle, Divider, FormControl, InputLabel,
-  LinearProgress, MenuItem, Select, Stack, Step, StepLabel, Stepper, Tab, Tabs, GlobalStyles,
-  TextField, Toolbar, Typography,
-} from '@mui/material';
-import DashboardIcon from '@mui/icons-material/Dashboard';
-import SettingsIcon from '@mui/icons-material/Settings';
-import { api, mutationHeaders, streamProject, type Stage, type Workflow } from './api';
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
+  Alert,
+  AppBar,
+  Box,
+  Button,
+  Card,
+  CardContent,
+  Checkbox,
+  Chip,
+  CircularProgress,
+  CssBaseline,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  FormControl,
+  FormControlLabel,
+  InputLabel,
+  MenuItem,
+  Select,
+  Stack,
+  Tab,
+  Tabs,
+  TextField,
+  Toolbar,
+  Typography,
+} from "@mui/material";
+import { api, mutationHeaders } from "./api";
+import { PipelineDispatcher } from "./dispatcher/PipelineDispatcher";
+import { OfficialSubFlowReference } from "./dispatcher/OfficialSubFlowReference";
+import { EnrichedSubFlowReference } from "./dispatcher/EnrichedSubFlowReference";
+import { ExternalFolderImport } from "./ExternalFolderImport";
+import type { DispatcherProjection } from "./dispatcher/projection";
 
-const i18nProvider = {
-  translate: (key: string, options?: { _: string }) => (({ 'ra.navigation.skip_nav': 'К содержимому', 'ra.page.dashboard': 'Главная', 'ra.action.refresh': 'Обновить' } as Record<string, string>)[key] || options?._ || key),
-  changeLocale: async (locale: string) => { localStorage.setItem('workspace-locale', locale); },
-  getLocale: () => localStorage.getItem('workspace-locale') || 'ru',
+type Blocker = { code: string; message: string; action: string };
+type Gate = {
+  id: string;
+  state: "blocked" | "ready" | "complete";
+  blockers: Blocker[];
+};
+type Snapshot = {
+  schema_version: string;
+  state: string;
+  workflow_fingerprint: string;
+  gates: Gate[];
+  dispatcher?: DispatcherProjection;
+};
+type Project = { id: string; name: string; root: string };
+type Event = {
+  sequence: number;
+  timestamp: string;
+  type: string;
+  run_id: string;
+  job_id?: string;
+  step_id?: string;
+  attempt?: number;
+  payload: Record<string, unknown>;
+};
+type AgentProfile = {
+  provider: "codex-cli";
+  model: string;
+  reasoning_effort: "low" | "medium" | "high" | "xhigh";
+  instructions_version: string;
+  environment_preset: "local-read-only";
+};
+type AgentRole = {
+  role_id: string;
+  agent_profile: string;
+  count: number;
+  instruction_supplement: string;
+};
+type AgentPhase = {
+  phase_id: string;
+  mode: "sequential" | "parallel-pool" | "coordinated-pool";
+  max_concurrency: number;
+  roles: AgentRole[];
+};
+type ExternalArtifact = {
+  role: string;
+  kind: string;
+  semantic_key: string;
+  filename: string;
+  declared_size_bytes: number;
+  sha256?: string;
+  external_artifact_id: string;
+  uploaded: boolean;
+};
+type SourceSetup = {
+  profiles: string[];
+  infobases: {
+    acquisition_profile: string;
+    roles: Record<
+      string,
+      {
+        connection_profile: string;
+        configuration_name: string;
+        root_uuid: string;
+        version: string;
+      }
+    >;
+  };
+  infobases_fingerprint: string;
+  external_artifacts: { artifacts: ExternalArtifact[] };
+  upload_draft_fingerprint: string;
+  connection_profiles: Record<
+    string,
+    {
+      available: boolean;
+      tested: boolean;
+      profile_id: string;
+      platform_path: string;
+      extension_count: number;
+      extensions: {
+        uuid: string;
+        name: string;
+        version: string;
+        active: boolean;
+      }[];
+      tool_versions: Record<string, string>;
+    }
+  >;
+  active_source: Record<string, unknown>;
+  active_diff: { generation_id?: string; row_counts?: Record<string, number> };
+};
+type SourceIndex = {
+  component_id: string;
+  source_generation_id: string;
+  fingerprint: string;
+  index_key: string;
+  engine: string;
+  engine_version: string;
+  bsl_file_count: number;
+  status: string;
+  last_validation?: string;
+};
+type StepConfiguration = {
+  job_id: string;
+  step: {
+    id: string;
+    operation: string;
+    timeout_seconds: number;
+    max_retries?: number;
+    agent_phases?: AgentPhase[];
+  };
+  catalog: { executor: string; effect: string; approval_required: boolean };
+};
+type WorkflowConfiguration = {
+  manifest_fingerprint: string;
+  jobs: { id: string; needs: string[] }[];
+  steps: StepConfiguration[];
+};
+type RoutingGroup = {
+  routing_group_id: string;
+  form_counts: { managed: number; ordinary: number; inconclusive: number };
+  routing_reason: string;
+  exporter: string;
+  representation_schema: string;
+  absent_roles: string[];
+};
+type RoutingPreview = {
+  preview_id: string;
+  status: "pending" | "running" | "ready" | "failed" | "cancelled";
+  routing_plan_fingerprint: string;
+  routing_manifest?: { groups: RoutingGroup[] };
+  required_tools?: string[];
+  error?: string;
+};
+type SourceToolInventory = {
+  complete: boolean;
+  tools: {
+    tool_id: string;
+    status: string;
+    purpose: string;
+    instances: { version: string; status: string; path: string }[];
+  }[];
 };
 
-const dataProvider = {
-  getList: async resource => {
-    const data = await api<RaRecord[]>(`/${resource}`);
-    return { data, total: data.length };
-  },
-  getOne: async (resource, params) => ({ data: await api<RaRecord>(`/${resource}/${params.id}`) }),
-  create: async (resource, params) => ({ data: await api<RaRecord>(`/${resource}`, { method: 'POST', body: JSON.stringify({ data: params.data }) }) }),
-  update: async (resource, params) => ({ data: await api<RaRecord>(`/${resource}/${params.id}`, { method: 'PUT', body: JSON.stringify({ data: params.data }) }) }),
-  delete: async (resource, params) => ({ data: await api<RaRecord>(`/${resource}/${params.id}`, { method: 'DELETE' }) }),
-  getMany: async (resource, params) => ({ data: await Promise.all(params.ids.map(id => api<RaRecord>(`/${resource}/${id}`))) }),
-  getManyReference: async () => ({ data: [], total: 0 }), updateMany: async () => ({ data: [] }), deleteMany: async () => ({ data: [] }),
-} as DataProvider;
-
-function ProjectMenu() {
-  return <Menu><Menu.DashboardItem /><Menu.Item to="/projects" primaryText="Проекты" leftIcon={<DashboardIcon />} /><Menu.Item to="/connections" primaryText="Подключения" leftIcon={<SettingsIcon />} /><Menu.Item to="/agents" primaryText="Агенты" leftIcon={<SettingsIcon />} /><Menu.Item to="/approvals" primaryText="Решения" leftIcon={<SettingsIcon />} /><Menu.Item to="/runs" primaryText="Запуски" leftIcon={<SettingsIcon />} /></Menu>;
+function SourceSection({
+  step,
+  title,
+  summary,
+  defaultExpanded = false,
+  children,
+}: {
+  step: number;
+  title: string;
+  summary: string;
+  defaultExpanded?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <Accordion
+      defaultExpanded={defaultExpanded}
+      disableGutters
+      sx={{ border: 1, borderColor: "divider", boxShadow: "none" }}
+    >
+      <AccordionSummary
+        expandIcon={<Typography aria-hidden="true">⌄</Typography>}
+      >
+        <Stack direction="row" spacing={1.5} alignItems="center">
+          <Chip label={step} size="small" color="primary" />
+          <Box>
+            <Typography fontWeight={700}>{title}</Typography>
+            <Typography variant="body2" color="text.secondary">
+              {summary}
+            </Typography>
+          </Box>
+        </Stack>
+      </AccordionSummary>
+      <AccordionDetails sx={{ pt: 0 }}>{children}</AccordionDetails>
+    </Accordion>
+  );
 }
 
-function WorkspaceLayout(props: any) { return <Layout {...props} menu={ProjectMenu} />; }
-
-type DirectoryListing = { current: string; parent: string | null; directories: { name: string; path: string }[] };
-
-export function Home() {
-  const [projects, setProjects] = useState<RaRecord[]>([]);
-  const [error, setError] = useState(''); const [open, setOpen] = useState(false); const [pickerOpen, setPickerOpen] = useState(false); const [listing, setListing] = useState<DirectoryListing>(); const [name, setName] = useState(''); const [root, setRoot] = useState(''); const navigate = useNavigate();
-  useEffect(() => { api<RaRecord[]>('/projects').then(setProjects).catch(e => setError(String(e.message))); }, []);
-  const browse = async (path = root) => { try { setListing(await api<DirectoryListing>(`/filesystem/directories${path ? `?path=${encodeURIComponent(path)}` : ''}`)); setPickerOpen(true); } catch (e) { setError((e as Error).message); } };
-  return <Box p={3}><Typography variant="h4" gutterBottom>Управляемое исследование 1С</Typography>
-    <Typography color="text.secondary" mb={3}>Настройка, выполнение, контроль и результаты — без командной строки.</Typography>
-    <Button variant="contained" onClick={() => setOpen(true)} sx={{ mb: 3 }}>Создать или открыть проект</Button>
-    {error && <Alert severity="error">{error}</Alert>}
-    <Stack spacing={2}>{projects.map(project => <Card key={project.id}><CardContent><Typography variant="h6">{String(project.name)}</Typography><Typography component="code">{String(project.root)}</Typography></CardContent><CardActions><Button component={Link} to={`/projects/${project.id}/workflow`}>Открыть процесс</Button><Button component={Link} to={`/projects/${project.id}/setup`}>Настройка</Button></CardActions></Card>)}</Stack>
-    <Dialog open={open} onClose={() => setOpen(false)}><DialogTitle>Создать или открыть проект</DialogTitle><DialogContent><Stack spacing={2} sx={{ mt: 1, minWidth: { sm: 480 } }}><TextField label="Название" required value={name} onChange={e => setName(e.target.value)} /><Stack direction="row" spacing={1} alignItems="flex-start"><TextField fullWidth label="Папка проекта" required value={root} onChange={e => setRoot(e.target.value)} helperText="В папке должен находиться project.toml; новые репозитории создаются штатным шаблоном сервера." /><Button variant="outlined" onClick={() => browse()} sx={{ mt: 1 }}>Выбрать</Button></Stack></Stack></DialogContent><DialogActions><Button onClick={() => setOpen(false)}>Отмена</Button><Button variant="contained" onClick={async () => { try { const item = await api<RaRecord>('/projects', { method: 'POST', body: JSON.stringify({ name, root }) }); navigate(`/projects/${item.id}/setup`); } catch (e) { setError((e as Error).message); setOpen(false); } }}>Продолжить</Button></DialogActions></Dialog>
-    <Dialog open={pickerOpen} onClose={() => setPickerOpen(false)} fullWidth maxWidth="sm"><DialogTitle>Выберите папку проекта</DialogTitle><DialogContent><Typography variant="caption">Текущая папка</Typography><Typography component="code" sx={{ display: 'block', mb: 1, overflowWrap: 'anywhere' }}>{listing?.current}</Typography><Typography color="text.secondary" variant="body2" mb={1}>{listing?.parent ? 'Нажмите на папку, чтобы открыть её.' : 'Это граница разрешённой области. Выше перейти нельзя.'}</Typography><Button disabled={!listing?.parent} onClick={() => listing?.parent && browse(listing.parent)} sx={{ justifyContent: 'flex-start' }}>← Назад</Button><Divider /><Stack>{listing?.directories.map(directory => <Button key={directory.path} onClick={() => browse(directory.path)} sx={{ justifyContent: 'flex-start' }}>📁 {directory.name}</Button>)}</Stack></DialogContent><DialogActions><Button onClick={() => setPickerOpen(false)}>Отмена</Button><Button variant="contained" onClick={() => { if (listing) setRoot(listing.current); setPickerOpen(false); }}>Выбрать эту папку</Button></DialogActions></Dialog>
-  </Box>;
+export function RoutingPreviewSummary({
+  preview,
+}: {
+  preview: RoutingPreview;
+}) {
+  return (
+    <>
+      <Alert severity={preview.status === "ready" ? "success" : "info"}>
+        Состояние: {preview.status}. Требуемые инструменты:{" "}
+        {preview.required_tools?.join(", ") || "не определены"}.
+      </Alert>
+      {preview.status === "failed" && (
+        <Alert severity="error">
+          {preview.error || "Не удалось построить маршрут."}
+        </Alert>
+      )}
+      {preview.routing_manifest?.groups.map((group) => (
+        <Card key={group.routing_group_id} variant="outlined">
+          <CardContent>
+            <Typography variant="subtitle2">
+              {group.routing_group_id}
+            </Typography>
+            <Typography>
+              Управляемые: {group.form_counts.managed}; обычные:{" "}
+              {group.form_counts.ordinary}; неопределённые:{" "}
+              {group.form_counts.inconclusive}
+            </Typography>
+            <Typography>
+              {group.exporter} · {group.representation_schema} ·{" "}
+              {group.routing_reason}
+            </Typography>
+            {group.absent_roles.length > 0 && (
+              <Typography color="text.secondary">
+                Отсутствуют роли: {group.absent_roles.join(", ")}
+              </Typography>
+            )}
+          </CardContent>
+        </Card>
+      ))}
+    </>
+  );
 }
 
-const wizardSteps = ['Проект', 'Информационные базы', 'Исходники', 'Политика доступа', 'Проверки', 'Этапы и агенты'];
-type Setup = { step?: number; product?: string; version?: string; source_roles?: string; infobases?: string; vendor_connection?: string; customer_connection?: string; next_vendor_connection?: string; read_only?: boolean; checked?: boolean; enabled_stages?: string; agent_assignments?: string; complete?: boolean };
+export function ToolInventory({
+  project,
+  selectedProfile,
+  routingPreview,
+}: {
+  project: Project;
+  selectedProfile: string;
+  routingPreview?: RoutingPreview;
+}) {
+  const [inventory, setInventory] = useState<SourceToolInventory>();
+  const [error, setError] = useState("");
+  const refresh = useCallback(
+    () =>
+      api<SourceToolInventory>(`/projects/${project.id}/source-tools`)
+        .then(setInventory)
+        .catch((error) => setError(error.message)),
+    [project.id],
+  );
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+  const use = (tool: string) =>
+    (tool === "ibcmd" && selectedProfile.startsWith("ibcmd+")) ||
+    (tool === "designer" && selectedProfile.startsWith("designer+")) ||
+    (tool === "v8unpack" &&
+      Boolean(
+        routingPreview?.routing_manifest?.groups.some(
+          (group) => group.representation_schema === "v8unpack/v1",
+        ),
+      ))
+      ? "требуется текущим маршрутом"
+      : tool === "v8unpack"
+        ? "требуется при обычных или неопределённых формах"
+        : tool === "edt"
+          ? "только старые поколения"
+          : "не выбран";
+  return (
+    <Stack spacing={1}>
+      <Stack direction="row" spacing={1} alignItems="center">
+        <Typography fontWeight={700}>Состояние инструментов</Typography>
+        {inventory && (
+          <Chip
+            size="small"
+            color={inventory.complete ? "success" : "warning"}
+            label={
+              inventory.complete
+                ? "проверка завершена"
+                : "проверка завершена частично"
+            }
+          />
+        )}
+        <Button onClick={() => void refresh()}>Обновить</Button>
+      </Stack>
+      {error && <Alert severity="error">{error}</Alert>}
+      {inventory && (
+        <Box component="details">
+          <Typography component="summary" sx={{ cursor: "pointer" }}>
+            Показать установки, версии и пути
+          </Typography>
+          <Box sx={{ overflowX: "auto", mt: 1 }}>
+            <Box
+              component="table"
+              aria-label="Установки инструментов получения исходников"
+              sx={{ width: "100%", textAlign: "left" }}
+            >
+              <caption>
+                Живая проверка установок; пути не входят в канонические
+                отпечатки.
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Инструмент</th>
+                  <th scope="col">Состояние</th>
+                  <th scope="col">Использование</th>
+                  <th scope="col">Версия</th>
+                  <th scope="col">Путь</th>
+                </tr>
+              </thead>
+              <tbody>
+                {inventory.tools.flatMap((tool) =>
+                  tool.instances.length
+                    ? tool.instances.map((item, index) => (
+                        <tr key={`${tool.tool_id}:${item.path}`}>
+                          <th scope="row">{index === 0 ? tool.tool_id : ""}</th>
+                          <td>{item.status}</td>
+                          <td>{index === 0 ? use(tool.tool_id) : ""}</td>
+                          <td>{item.version || "не определена"}</td>
+                          <td>{item.path}</td>
+                        </tr>
+                      ))
+                    : [
+                        <tr key={tool.tool_id}>
+                          <th scope="row">{tool.tool_id}</th>
+                          <td>{tool.status}</td>
+                          <td>{use(tool.tool_id)}</td>
+                          <td>—</td>
+                          <td>не найдено</td>
+                        </tr>,
+                      ],
+                )}
+              </tbody>
+            </Box>
+          </Box>
+        </Box>
+      )}
+      {inventory && !inventory.complete && (
+        <Alert severity="warning">
+          Проверка завершена частично: некоторые кандидаты не проверены в
+          пределах лимита.
+        </Alert>
+      )}
+    </Stack>
+  );
+}
 
-export function SetupWizard() {
-  const { projectId = '' } = useParams(); const navigate = useNavigate();
-  const [project, setProject] = useState<Workflow['project']>(); const [setup, setSetup] = useState<Setup>({ read_only: true });
-  const [connections, setConnections] = useState<RaRecord[]>([]);
-  const [step, setStep] = useState(0); const [error, setError] = useState(''); const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({}); const [manifestPreview, setManifestPreview] = useState<{ diff: string; updates: Record<string, Record<string, unknown>> }>(); const [saving, setSaving] = useState(false);
-  useEffect(() => { Promise.all([api<Workflow['project']>(`/projects/${projectId}`), api<RaRecord[]>('/connections')]).then(([value, available]) => { setProject(value); setConnections(available); const saved = value.setup as Setup; setSetup(saved); setStep(Number(saved.step || 0)); }).catch(e => setError(e.message)); }, [projectId]);
-  const save = async (nextStep: number, complete = false) => {
-    setSaving(true); setError(''); setFieldErrors({}); const ids = [setup.vendor_connection, setup.customer_connection, setup.next_vendor_connection].filter(Boolean); const value = { ...setup, infobases: JSON.stringify(ids), step: nextStep, complete };
-    try { if (complete) { if (!manifestPreview || !project) throw new Error('Сначала проверьте изменения project.toml'); await api(`/projects/${projectId}/manifest`, { method: 'PUT', body: JSON.stringify({ expected_hash: project.manifest_hash, updates: manifestPreview.updates }) }); } const saved = await api<Workflow['project']>(`/projects/${projectId}/setup`, { method: 'PUT', body: JSON.stringify(value) }); setSetup(saved.setup as Setup); setStep(nextStep); if (complete) navigate(`/projects/${projectId}/workflow`); } catch (e) { const message = (e as Error).message; setError(message); try { setFieldErrors(JSON.parse(message).fields || {}); } catch { /* typed server detail is optional */ } } finally { setSaving(false); }
+function ProjectPicker({ onSelect }: { onSelect: (project: Project) => void }) {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [root, setRoot] = useState("");
+  const [error, setError] = useState("");
+  const refresh = () => {
+    void api<Project[]>("/projects")
+      .then(setProjects)
+      .catch((error) => setError(error.message));
   };
-  const previewManifest = async () => { try { if (!project) return; const sources = JSON.parse(String(setup.source_roles || '{}')); const updates = { project: { product: setup.product || '', target_version: setup.version || '' }, paths: sources }; const preview = await api<{ diff: string }>(`/projects/${projectId}/manifest/preview`, { method: 'POST', body: JSON.stringify({ expected_hash: project.manifest_hash, updates }) }); setManifestPreview({ diff: preview.diff, updates }); } catch (e) { setError((e as Error).message); } };
-  const inspect = async () => { setSaving(true); setError(''); try { const result = await api<{ ok: boolean; doctor: { summary: { fail: number; warn: number } }; tested_connections: number }>(`/projects/${projectId}/inspect`, { method: 'POST' }); setSetup({ ...setup, checked: result.ok }); if (!result.ok) setError(`Проверки не пройдены: ошибок ${result.doctor.summary.fail}, проверенных подключений ${result.tested_connections}`); } catch (e) { setSetup({ ...setup, checked: false }); setError((e as Error).message); } finally { setSaving(false); } };
-  const field = (key: keyof Setup, label: string, required = true) => <TextField fullWidth required={required} label={label} value={String(setup[key] ?? '')} error={Boolean(fieldErrors[key])} helperText={fieldErrors[key]} onChange={e => setSetup({ ...setup, [key]: e.target.value })} />;
-  return <Box p={3} maxWidth={960} mx="auto"><Typography variant="h4">Первоначальная настройка</Typography><Typography color="text.secondary" mb={3}>{project?.name}</Typography>
-    <Stepper activeStep={step} alternativeLabel sx={{ mb: 4 }}>{wizardSteps.map(label => <Step key={label}><StepLabel>{label}</StepLabel></Step>)}</Stepper>
-    {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
-    <Card><CardContent><Stack spacing={2}>
-      {step === 0 && <>{field('product', 'Продукт')}{field('version', 'Версия')}</>}
-      {step === 1 && <><TextField select required label="База поставщика" value={setup.vendor_connection || ''} onChange={e => setSetup({ ...setup, vendor_connection: e.target.value })}>{connections.map(item => <MenuItem key={item.id} value={String(item.id)}>{String(item.name)}</MenuItem>)}</TextField><TextField select required label="База заказчика" value={setup.customer_connection || ''} onChange={e => setSetup({ ...setup, customer_connection: e.target.value })}>{connections.map(item => <MenuItem key={item.id} value={String(item.id)}>{String(item.name)}</MenuItem>)}</TextField><TextField select label="Следующая версия поставщика" value={setup.next_vendor_connection || ''} onChange={e => setSetup({ ...setup, next_vendor_connection: e.target.value })}><MenuItem value="">Не использовать</MenuItem>{connections.map(item => <MenuItem key={item.id} value={String(item.id)}>{String(item.name)}</MenuItem>)}</TextField><Button component={Link} to="/connections">Управлять подключениями</Button></>}
-      {step === 2 && <><Alert severity="info">Исходники будут выгружены управляемым этапом процесса в каталоги шаблона.</Alert>{Object.entries(JSON.parse(setup.source_roles || '{}')).map(([role, path]) => <Typography key={role}><code>{role}</code> → <code>{String(path)}</code></Typography>)}</>}
-      {step === 3 && <TextField select label="Доступ" value={setup.read_only ? 'read' : 'write'} onChange={e => setSetup({ ...setup, read_only: e.target.value === 'read' })}><MenuItem value="read">Только чтение</MenuItem><MenuItem value="write">Запись с подтверждением каждого запуска</MenuItem></TextField>}
-      {step === 4 && <><Alert severity={setup.checked ? 'success' : 'info'}>{setup.checked ? 'Пути, проект и подключения проверены сервером' : 'Запустите проверку путей, проекта и подключений перед продолжением.'}</Alert><Button variant="outlined" disabled={saving} onClick={inspect}>{saving ? 'Проверка…' : 'Запустить проверки'}</Button></>}
-      {step === 5 && <>{field('enabled_stages', 'Включенные этапы (через запятую)')}{field('agent_assignments', 'Назначения агентов (JSON)', false)}<Button variant="outlined" onClick={previewManifest}>Предпросмотр project.toml</Button>{manifestPreview && <Box component="pre" aria-label="Изменения project.toml" sx={{ whiteSpace: 'pre-wrap', overflow: 'auto' }}>{manifestPreview.diff || 'Изменений нет'}</Box>}</>}
-    </Stack></CardContent><CardActions sx={{ justifyContent: 'space-between' }}><Button disabled={step === 0 || saving} onClick={() => save(step - 1)}>Назад</Button><Button variant="contained" disabled={saving || (step === 4 && !setup.checked) || (step === wizardSteps.length - 1 && !manifestPreview)} onClick={() => save(Math.min(step + 1, wizardSteps.length - 1), step === wizardSteps.length - 1)}>{saving ? 'Сохранение…' : step === wizardSteps.length - 1 ? 'Применить и завершить' : 'Сохранить и продолжить'}</Button></CardActions></Card>
-  </Box>;
+  useEffect(refresh, []);
+  const save = async () => {
+    try {
+      const project = await api<Project>("/projects", {
+        method: "POST",
+        headers: mutationHeaders(`bookmark-${Date.now()}`),
+        body: JSON.stringify({ name, root }),
+      });
+      setOpen(false);
+      refresh();
+      onSelect(project);
+    } catch (error) {
+      setError((error as Error).message);
+    }
+  };
+  return (
+    <Box p={3}>
+      <Typography variant="h4" mb={1}>
+        Исследование конфигурации 1С
+      </Typography>
+      <Typography color="text.secondary" mb={3}>
+        Репозиторий хранит состояние процесса; браузер только показывает его и
+        отправляет типизированные действия.
+      </Typography>
+      {error && (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {error}
+        </Alert>
+      )}
+      <Button variant="contained" onClick={() => setOpen(true)} sx={{ mb: 3 }}>
+        Открыть репозиторий
+      </Button>
+      <Stack spacing={2}>
+        {projects.map((project) => (
+          <Card key={project.id} variant="outlined">
+            <CardContent>
+              <Typography variant="h6">{project.name}</Typography>
+              <Typography component="code">{project.root}</Typography>
+              <Box mt={2}>
+                <Button onClick={() => onSelect(project)}>
+                  Открыть процесс
+                </Button>
+              </Box>
+            </CardContent>
+          </Card>
+        ))}
+      </Stack>
+      <Dialog open={open} onClose={() => setOpen(false)}>
+        <DialogTitle>Добавить закладку проекта</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} mt={1} minWidth={480}>
+            <TextField
+              label="Название"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+            />
+            <TextField
+              label="Путь к репозиторию"
+              value={root}
+              onChange={(event) => setRoot(event.target.value)}
+              helperText="Закладка не является состоянием исследования."
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpen(false)}>Отмена</Button>
+          <Button variant="contained" onClick={save}>
+            Открыть
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
 }
 
-const statusColor = (status: string): 'default' | 'success' | 'error' | 'warning' | 'info' => ({ completed: 'success', failed: 'error', interrupted: 'warning', running: 'info' }[status] as never || 'default');
-
-export function WorkflowPage() {
-  const { projectId = '' } = useParams(); const [value, setValue] = useState<Workflow>(); const [online, setOnline] = useState(true); const [error, setError] = useState('');
-  const refresh = useCallback(() => api<Workflow>(`/projects/${projectId}/workflow`).then(setValue).catch(e => setError(e.message)), [projectId]);
-  useEffect(() => { refresh(); const stop = streamProject(projectId, refresh, setOnline); const timer = window.setInterval(refresh, online ? 30000 : 5000); return () => { stop(); clearInterval(timer); }; }, [projectId, refresh, online]);
-  if (!value) return <Box p={4}>{error ? <Alert severity="error">{error}</Alert> : <CircularProgress />}</Box>;
-  const done = value.stages.filter(s => s.status === 'completed').length;
-  return <Box p={3}><Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" mb={2}><Box><Typography variant="h4">{value.project.name}</Typography><Typography color="text.secondary">{value.project.root}</Typography></Box><Chip color={online ? 'success' : 'warning'} label={online ? 'Обновления в реальном времени' : 'Режим периодического опроса'} /></Stack>
-    <Typography aria-live="polite" position="absolute" sx={{ width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>Завершено {done} из {value.stages.length}</Typography><LinearProgress variant="determinate" value={100 * done / value.stages.length} aria-label={`Завершено ${done} из ${value.stages.length}`} sx={{ mb: 3 }} />
-    <Box display="grid" gridTemplateColumns="repeat(auto-fit,minmax(300px,1fr))" gap={2}>{value.stages.map(stage => <StageCard key={stage.id} projectId={projectId} stage={stage} onRun={refresh} />)}</Box>
-  </Box>;
+export function AgentProfiles({ project }: { project: Project }) {
+  const [items, setItems] = useState<Record<string, AgentProfile>>({});
+  const [profileId, setProfileId] = useState("local");
+  const [model, setModel] = useState("gpt-5.6-sol");
+  const [reasoning, setReasoning] =
+    useState<AgentProfile["reasoning_effort"]>("low");
+  const [version, setVersion] = useState("1");
+  const [environment, setEnvironment] =
+    useState<AgentProfile["environment_preset"]>("local-read-only");
+  const [error, setError] = useState("");
+  const load = useCallback(
+    () =>
+      api<{ items: Record<string, AgentProfile> }>(
+        `/projects/${project.id}/agent-profiles`,
+      )
+        .then((value) => {
+          setItems(value.items);
+          const profile = value.items[profileId];
+          if (profile) {
+            setModel(profile.model);
+            setReasoning(profile.reasoning_effort);
+            setVersion(profile.instructions_version);
+            setEnvironment(profile.environment_preset);
+          }
+        })
+        .catch((error) =>
+          setError(
+            `${error.message}. Старый профиль недействителен: выберите встроенную среду и пересохраните его.`,
+          ),
+        ),
+    [project.id],
+  );
+  useEffect(() => {
+    void load();
+  }, [load]);
+  const selectProfile = (id: string, profile: AgentProfile) => {
+    setProfileId(id);
+    setModel(profile.model);
+    setReasoning(profile.reasoning_effort);
+    setVersion(profile.instructions_version);
+    setEnvironment(profile.environment_preset);
+  };
+  const save = async () => {
+    try {
+      setError("");
+      await api(`/projects/${project.id}/agent-profiles/${profileId}`, {
+        method: "PUT",
+        headers: mutationHeaders(),
+        body: JSON.stringify({
+          profile: {
+            provider: "codex-cli",
+            model,
+            reasoning_effort: reasoning,
+            instructions_version: version,
+            environment_preset: environment,
+          },
+        }),
+      });
+      await load();
+    } catch (error) {
+      setError((error as Error).message);
+    }
+  };
+  return (
+    <Card variant="outlined">
+      <CardContent>
+        <Typography variant="h6" mb={2}>
+          Профили агентов
+        </Typography>
+        {error && (
+          <Alert severity="error" sx={{ mb: 2 }}>
+            {error}
+          </Alert>
+        )}
+        <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "220px minmax(0, 1fr)" }, gap: 2 }}>
+          <Stack spacing={1} aria-label="Профили агентов">
+            {Object.entries(items).map(([id, profile]) => (
+              <Button
+                key={id}
+                variant={id === profileId ? "contained" : "outlined"}
+                onClick={() => selectProfile(id, profile)}
+                sx={{ justifyContent: "flex-start" }}
+              >
+                {id}
+              </Button>
+            ))}
+            <Button variant="text" onClick={() => setProfileId("")}>Новый профиль</Button>
+          </Stack>
+          <Stack spacing={2}>
+            <TextField label="Идентификатор профиля" value={profileId} onChange={(event) => setProfileId(event.target.value)} />
+            <TextField label="Модель" value={model} onChange={(event) => setModel(event.target.value)} />
+            <FormControl>
+              <InputLabel>Уровень рассуждения</InputLabel>
+              <Select label="Уровень рассуждения" value={reasoning} onChange={(event) => setReasoning(event.target.value as AgentProfile["reasoning_effort"])}>
+                {["low", "medium", "high", "xhigh"].map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+              </Select>
+            </FormControl>
+            <Accordion disableGutters sx={{ boxShadow: "none", border: 1, borderColor: "divider" }}>
+              <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
+                <Typography fontWeight={700}>Дополнительные параметры</Typography>
+              </AccordionSummary>
+              <AccordionDetails>
+                <Stack spacing={2}>
+                  <Typography variant="caption">
+                    Профили хранятся только в пользовательском каталоге. Среда local-read-only запрещает запись, но может читать репозиторий; предметные allowed_paths ограничивают контекст инструкции, а не файловый доступ.
+                  </Typography>
+                  <FormControl>
+                    <InputLabel>Версия инструкций</InputLabel>
+                    <Select label="Версия инструкций" value={version} onChange={(event) => setVersion(event.target.value)}>
+                      <MenuItem value="1">1</MenuItem>
+                    </Select>
+                  </FormControl>
+                  <FormControl>
+                    <InputLabel>Среда исполнения</InputLabel>
+                    <Select label="Среда исполнения" value={environment} onChange={(event) => setEnvironment(event.target.value as AgentProfile["environment_preset"])}>
+                      <MenuItem value="local-read-only">local-read-only · только чтение</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Stack>
+              </AccordionDetails>
+            </Accordion>
+            <Button variant="contained" disabled={!profileId.trim()} onClick={() => void save()}>
+              Проверить и сохранить профиль
+            </Button>
+          </Stack>
+        </Box>
+      </CardContent>
+    </Card>
+  );
 }
 
-function StageCard({ projectId, stage, onRun }: { projectId: string; stage: Stage; onRun: () => void }) {
-  const [busy, setBusy] = useState(false); const [error, setError] = useState('');
-  const run = async () => { setBusy(true); setError(''); try { await api('/runs', { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ project_id: projectId, stage_id: stage.id, payload: {} }) }); onRun(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } };
-  return <Card id={`stage-${stage.id}`} variant="outlined"><CardContent><Stack direction="row" justifyContent="space-between"><Typography variant="h6">{stage.title}</Typography><Chip size="small" color={statusColor(stage.status)} label={stage.status} /></Stack><Typography variant="caption">{stage.kind === 'agent' ? 'Агентский этап' : 'Детерминированный этап'}</Typography>{stage.blockers.length > 0 && <Alert severity="warning" sx={{ mt: 2 }}>Требуются: {stage.blockers.join(', ')}</Alert>}{error && <Alert severity="error" sx={{ mt: 2 }}>{error}</Alert>}</CardContent><CardActions><Button component={Link} to={`/projects/${projectId}/stages/${stage.id}`}>Подробнее</Button>{stage.kind === 'agent' ? <Button component={Link} to={`/projects/${projectId}/stages/${stage.id}`} disabled={!stage.ready}>Настроить и запустить</Button> : <Button onClick={run} disabled={!stage.ready || busy || ['queued', 'running'].includes(stage.status)}>Запустить</Button>}{stage.artifact && <Button component="a" href={`/api/v1/artifacts/${projectId}/${stage.artifact}?embed=true`} target="_blank">Результат</Button>}</CardActions></Card>;
+type WorkflowPatchPreview = {
+  before?: StepConfiguration["step"];
+  after?: StepConfiguration["step"];
+  agent_phase_preview?: Array<{
+    phase_id: string;
+    mode: AgentPhase["mode"];
+    effective_max_concurrency: number;
+    maximum_calls_in_current_window: number;
+    roles: Array<{
+      role_id: string;
+      agent_profile: string;
+      profile: Partial<AgentProfile>;
+    }>;
+    sandbox: string;
+    allowed_paths: string;
+  }>;
+};
+
+const STEP_NAMES: Record<string, string> = {
+  "validate-project": "Проверка проекта",
+  "acquire-sources": "Получение исходников",
+  "build-diffs": "Построение различий",
+  "index-sources": "Индексация",
+  "discover-mrq": "Анализ DIF и формирование MRQ",
+  "classify-mrq": "Формирование пакетов",
+  "decide-mrq": "Исследование цели",
+  "build-projections": "Построение проекций",
+  "verify-workflow": "Проверка процесса",
+};
+
+const PHASE_NAMES: Record<string, string> = {
+  "analyze-dif": "Анализ DIF",
+  "form-mrq": "Формирование MRQ",
+  "classify-batches": "Формирование пакетов",
+  "research-target": "Исследование цели",
+};
+
+const ROLE_NAMES: Record<string, string> = {
+  analyzer: "Анализатор",
+  coordinator: "Координатор",
+  grouper: "Группировщик",
+  classifier: "Классификатор",
+  researcher: "Исследователь",
+};
+
+export function WorkflowEditor({
+  project,
+  snapshot,
+  refresh,
+  initialStepId,
+}: {
+  project: Project;
+  snapshot: Snapshot;
+  refresh: () => void;
+  initialStepId?: string;
+}) {
+  const [configuration, setConfiguration] = useState<WorkflowConfiguration>();
+  const [selected, setSelected] = useState("");
+  const [timeout, setTimeoutValue] = useState(1800);
+  const [retries, setRetries] = useState(0);
+  const [phases, setPhases] = useState<AgentPhase[]>([]);
+  const [preview, setPreview] = useState<{
+    response: WorkflowPatchPreview;
+    parameters: Record<string, unknown>;
+  }>();
+  const [error, setError] = useState("");
+  const [agentProfiles, setAgentProfiles] = useState<
+    Record<string, AgentProfile>
+  >({});
+  const load = useCallback(
+    () =>
+      api<WorkflowConfiguration>(
+        `/projects/${project.id}/workflow/configuration`,
+        )
+        .then((value) => {
+          setConfiguration(value);
+          setSelected((previous) =>
+            previous ||
+            value.steps.find((item) => item.step.id === initialStepId)?.step.id ||
+            value.steps[0]?.step.id ||
+            "",
+          );
+        })
+        .catch((error) => setError(error.message)),
+    [initialStepId, project.id],
+  );
+  useEffect(() => {
+    void load();
+  }, [load]);
+  useEffect(() => {
+    void api<{ items: Record<string, AgentProfile> }>(
+      `/projects/${project.id}/agent-profiles`,
+    )
+      .then((value) => setAgentProfiles(value.items))
+      .catch((caught) => setError((caught as Error).message));
+  }, [project.id]);
+  const current = configuration?.steps.find(
+    (item) => item.step.id === selected,
+  );
+  const hasMissingProfiles = phases.some((phase) =>
+    phase.roles.some((role) => !agentProfiles[role.agent_profile]),
+  );
+  useEffect(() => {
+    if (current) {
+      setTimeoutValue(current.step.timeout_seconds);
+      setRetries(current.step.max_retries || 0);
+      setPhases(current.step.agent_phases || []);
+      setPreview(undefined);
+    }
+  }, [current]);
+  const parameters = () => ({
+    timeout_seconds: timeout,
+    ...(["diff.build", "projections.build"].includes(
+      current?.step.operation || "",
+    )
+      ? { max_retries: retries }
+      : {}),
+    ...(current?.step.agent_phases
+      ? { agent_phases: phases }
+      : {}),
+  });
+  const invalidatePreview = () => setPreview(undefined);
+  const updatePhase = (phaseId: string, patch: Partial<AgentPhase>) => {
+    invalidatePreview();
+    setPhases((items) =>
+      items.map((phase) =>
+        phase.phase_id === phaseId ? { ...phase, ...patch } : phase,
+      ),
+    );
+  };
+  const updateRole = (
+    phaseId: string,
+    roleId: string,
+    patch: Partial<AgentRole>,
+  ) => {
+    invalidatePreview();
+    setPhases((items) =>
+      items.map((phase) =>
+        phase.phase_id === phaseId
+          ? {
+              ...phase,
+              roles: phase.roles.map((role) =>
+                role.role_id === roleId ? { ...role, ...patch } : role,
+              ),
+            }
+          : phase,
+      ),
+    );
+  };
+  const showPreview = async () => {
+    try {
+      setError("");
+      const selectedParameters = parameters();
+      const response = await api<WorkflowPatchPreview>(
+        `/projects/${project.id}/workflow/patch-preview`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            step_id: selected,
+            parameters: selectedParameters,
+            expected_manifest_fingerprint: configuration?.manifest_fingerprint,
+          }),
+        },
+      );
+      setPreview({ response, parameters: selectedParameters });
+    } catch (error) {
+      setError((error as Error).message);
+    }
+  };
+  const apply = async () => {
+    try {
+      setError("");
+      await api(`/projects/${project.id}/actions`, {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify({
+          operation: "workflow.patch-step",
+          payload: {
+            step_id: selected,
+            parameters: preview?.parameters,
+            expected_manifest_fingerprint: configuration?.manifest_fingerprint,
+          },
+          expected_fingerprint: snapshot.workflow_fingerprint,
+        }),
+      });
+      setPreview(undefined);
+      await load();
+      refresh();
+    } catch (error) {
+      setError((error as Error).message);
+    }
+  };
+  if (!configuration || !current) return <CircularProgress />;
+  return (
+    <Card variant="outlined">
+      <CardContent>
+        <Typography variant="h6" mb={2}>
+          Этапы процесса
+        </Typography>
+        {error && (
+          <Alert severity="error" sx={{ mb: 2 }}>
+            {error}
+          </Alert>
+        )}
+        <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "260px minmax(0, 1fr)" }, gap: 2 }}>
+          <Stack spacing={0.75} component="nav" aria-label="Этапы процесса">
+            {configuration.steps.map((item) => (
+              <Button
+                key={item.step.id}
+                variant={selected === item.step.id ? "contained" : "text"}
+                onClick={() => setSelected(item.step.id)}
+                sx={{ justifyContent: "flex-start", textAlign: "left", py: 1 }}
+              >
+                <Box>
+                  <Typography component="span" display="block" fontWeight={700}>
+                    {STEP_NAMES[item.step.id] || item.step.id}
+                  </Typography>
+                  <Typography component="span" display="block" variant="caption" sx={{ opacity: 0.75 }}>
+                    {item.step.id}
+                  </Typography>
+                </Box>
+              </Button>
+            ))}
+          </Stack>
+          <Stack spacing={2} minWidth={0}>
+            <Box>
+              <Typography variant="h6">{STEP_NAMES[current.step.id] || current.step.id}</Typography>
+              <Typography variant="caption" color="text.secondary">{current.step.id} · {current.step.operation}</Typography>
+            </Box>
+          {phases.map((phase) => (
+            <Card key={phase.phase_id} variant="outlined">
+              <CardContent>
+                <Typography id={`phase-${phase.phase_id}`} fontWeight={700}>
+                  {PHASE_NAMES[phase.phase_id] || phase.phase_id}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">{phase.phase_id}</Typography>
+                <Stack spacing={2} mt={1}>
+                  {phase.phase_id !== "form-mrq" && (
+                    <FormControl>
+                      <InputLabel id={`mode-${phase.phase_id}`}>Режим</InputLabel>
+                      <Select
+                        aria-label={`Режим ${phase.phase_id}`}
+                        label="Режим"
+                        labelId={`mode-${phase.phase_id}`}
+                        value={phase.mode}
+                        onChange={(event) => {
+                          const mode = event.target.value as AgentPhase["mode"];
+                          updatePhase(phase.phase_id, {
+                            mode,
+                            max_concurrency: mode === "sequential" ? 1 : phase.max_concurrency,
+                            roles: phase.roles.map((role) => ({ ...role, count: mode === "sequential" ? 1 : role.count })),
+                          });
+                        }}
+                      >
+                        <MenuItem value="sequential">Последовательно</MenuItem>
+                        <MenuItem value="parallel-pool">Параллельный пул</MenuItem>
+                      </Select>
+                    </FormControl>
+                  )}
+                  <TextField
+                    type="number"
+                    label="Предел одновременности"
+                    inputProps={{ min: 1, "aria-label": `Предел одновременности ${phase.phase_id}` }}
+                    value={phase.max_concurrency}
+                    onChange={(event) => updatePhase(phase.phase_id, { max_concurrency: Number(event.target.value) })}
+                    disabled={phase.mode === "sequential"}
+                  />
+                  {phase.roles.map((role) => (
+                    <Stack key={role.role_id} spacing={1}>
+                      <Typography id={`role-${phase.phase_id}-${role.role_id}`} variant="subtitle2">{ROLE_NAMES[role.role_id] || role.role_id}</Typography>
+                      <FormControl error={!agentProfiles[role.agent_profile]}>
+                        <InputLabel id={`profile-${phase.phase_id}-${role.role_id}`}>Профиль</InputLabel>
+                        <Select aria-label={`Профиль ${phase.phase_id} ${role.role_id}`} label="Профиль" labelId={`profile-${phase.phase_id}-${role.role_id}`} value={role.agent_profile} onChange={(event) => updateRole(phase.phase_id, role.role_id, { agent_profile: event.target.value })}>
+                          {Object.keys(agentProfiles).map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+                          {!agentProfiles[role.agent_profile] && <MenuItem value={role.agent_profile}>{role.agent_profile} — отсутствует</MenuItem>}
+                        </Select>
+                      </FormControl>
+                      {!agentProfiles[role.agent_profile] && (
+                        <Alert severity="error">
+                          Профиль {role.agent_profile} отсутствует. Создайте или
+                          пересохраните его перед просмотром.
+                        </Alert>
+                      )}
+                      <TextField
+                        type="number"
+                        label="Количество агентов"
+                        value={role.count}
+                        disabled={role.role_id === "coordinator" || phase.mode === "sequential"}
+                        onChange={(event) => updateRole(phase.phase_id, role.role_id, { count: Number(event.target.value) })}
+                        inputProps={{ min: 1, "aria-label": `Количество агентов ${phase.phase_id} ${role.role_id}` }}
+                      />
+                    </Stack>
+                  ))}
+                </Stack>
+              </CardContent>
+            </Card>
+          ))}
+          {phases.length > 0 && (
+            <Alert severity="info">
+              Пределы независимы для каждой фазы; общего предела компьютера нет.
+            </Alert>
+          )}
+          <Accordion disableGutters sx={{ boxShadow: "none", border: 1, borderColor: "divider" }}>
+            <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
+              <Typography fontWeight={700}>Дополнительные параметры</Typography>
+            </AccordionSummary>
+            <AccordionDetails>
+              <Stack spacing={2}>
+                <TextField
+                  type="number"
+                  label="Предельное время, секунд"
+                  value={timeout}
+                  onChange={(event) => {
+                    invalidatePreview();
+                    setTimeoutValue(Number(event.target.value));
+                  }}
+                  inputProps={{ min: 30, max: 86400 }}
+                />
+                {["diff.build", "projections.build"].includes(current.step.operation) && (
+                  <TextField
+                    type="number"
+                    label="Повторные попытки"
+                    value={retries}
+                    onChange={(event) => {
+                      invalidatePreview();
+                      setRetries(Number(event.target.value));
+                    }}
+                    inputProps={{ min: 0, max: 1 }}
+                  />
+                )}
+                {phases.flatMap((phase) => phase.roles.map((role) => (
+                  <TextField
+                    key={`${phase.phase_id}-${role.role_id}`}
+                    multiline
+                    minRows={2}
+                    label={`Дополнительная инструкция · ${ROLE_NAMES[role.role_id] || role.role_id}`}
+                    value={role.instruction_supplement}
+                    onChange={(event) => updateRole(phase.phase_id, role.role_id, { instruction_supplement: event.target.value })}
+                    inputProps={{ maxLength: 4000 }}
+                  />
+                )))}
+              </Stack>
+            </AccordionDetails>
+          </Accordion>
+          <Stack direction="row" spacing={1}>
+            <Button
+              disabled={hasMissingProfiles}
+              onClick={() => void showPreview()}
+            >
+              Предварительный просмотр
+            </Button>
+            <Button
+              disabled={!preview}
+              variant="contained"
+              onClick={() => void apply()}
+            >
+              Применить просмотренное изменение
+            </Button>
+          </Stack>
+          {preview && (
+            <Card variant="outlined" aria-label="Просмотр политики фаз">
+              <CardContent>
+                <Typography fontWeight={700}>Итоговая политика</Typography>
+                {(preview.response.agent_phase_preview || []).map((phase) => (
+                  <Stack key={phase.phase_id} spacing={0.25}>
+                    <Typography variant="body2">
+                      {phase.phase_id}: {phase.mode}; эффективный предел{" "}
+                      {phase.effective_max_concurrency}; максимум вызовов текущего
+                      окна {phase.maximum_calls_in_current_window}
+                    </Typography>
+                    <Typography variant="caption">
+                      {phase.roles
+                        .map(
+                          (role) =>
+                            `${role.role_id}=${role.agent_profile} (${role.profile.model || "профиль недоступен"}, ${role.profile.reasoning_effort || "уровень не задан"}, ${role.profile.environment_preset || "среда недоступна"})`,
+                        )
+                        .join("; ")}
+                    </Typography>
+                    <Typography variant="caption">
+                      Песочница: {phase.sandbox}. Предметные разрешённые пути
+                      выбирают контекст, но не сужают доступ песочницы к файлам.
+                    </Typography>
+                  </Stack>
+                ))}
+                <Typography variant="caption">
+                  Стоимость и точная серверная ревизия модели не вычисляются.
+                </Typography>
+              </CardContent>
+            </Card>
+          )}
+          </Stack>
+        </Box>
+      </CardContent>
+    </Card>
+  );
 }
 
-type DiscoveredInfobase = { name: string; connection_string: string; connection_kind: string; server: string; reference: string; file: string; folder: string; platform_version: string; credentials_ignored: boolean };
+function Sources({
+  project,
+  snapshot,
+  refreshWorkflow,
+}: {
+  project: Project;
+  snapshot: Snapshot;
+  refreshWorkflow: () => void;
+}) {
+  const [setup, setSetup] = useState<SourceSetup>();
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [profiles, setProfiles] = useState<
+    Record<string, Record<string, string>>
+  >({});
+  const [artifactHashes, setArtifactHashes] = useState<Record<string, string>>(
+    {},
+  );
+  const [sourceProfile, setSourceProfile] = useState("");
+  const [roleProfiles, setRoleProfiles] = useState<Record<string, string>>({});
+  const [sourcePreview, setSourcePreview] = useState<Record<string, unknown>>();
+  const [routingPreview, setRoutingPreview] = useState<RoutingPreview>();
+  const [acquisitionResult, setAcquisitionResult] =
+    useState<Record<string, unknown>>();
+  const refresh = useCallback(
+    () =>
+      api<SourceSetup>(`/projects/${project.id}/source-setup`)
+        .then((value) => {
+          setSetup(value);
+          setSourceProfile(
+            (current) => current || value.infobases.acquisition_profile,
+          );
+          setRoleProfiles((current) =>
+            Object.keys(current).length
+              ? current
+              : Object.fromEntries(
+                  Object.entries(value.infobases.roles).map(([role, item]) => [
+                    role,
+                    item.connection_profile,
+                  ]),
+                ),
+          );
+        })
+        .catch((error) => setError(error.message)),
+    [project.id],
+  );
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+  const field = (id: string, name: string, fallback = "") =>
+    profiles[id]?.[name] ?? fallback;
+  const setField = (id: string, name: string, next: string) =>
+    setProfiles((value) => ({
+      ...value,
+      [id]: { ...(value[id] || {}), [name]: next },
+    }));
+  const save = async (id: string) => {
+    const value = profiles[id] || {};
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/projects/${project.id}/connection-profiles/${id}`, {
+        method: "PUT",
+        headers: mutationHeaders(),
+        body: JSON.stringify({
+          profile: {
+            kind: "server",
+            server: value.server || "localhost",
+            reference: value.reference,
+            profile_id: setup?.infobases.acquisition_profile,
+            platform_path:
+              value.platform_path || "/opt/1cv8/x86_64/8.3.27.1989",
+            dbms: "PostgreSQL",
+            db_server: value.db_server || "localhost port=5432",
+            db_name: value.db_name,
+            db_user: value.db_user || "postgres",
+            db_password: value.db_password,
+            infobase_user: value.infobase_user,
+            infobase_password: value.infobase_password,
+            client_connection:
+              value.client_connection ||
+              `/S${value.server || "localhost"}/${value.reference}`,
+          },
+        }),
+      });
+      await refresh();
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const upload = async (artifact: ExternalArtifact, file: File) => {
+    const digest = (
+      artifact.sha256 ||
+      artifactHashes[artifact.external_artifact_id] ||
+      ""
+    ).replace("sha256:", "");
+    if (
+      !/^[0-9a-f]{64}$/.test(digest) ||
+      file.size !== artifact.declared_size_bytes
+    ) {
+      setError("Файл должен иметь объявленный размер и SHA-256.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const query = new URLSearchParams({
+        filename: artifact.filename,
+        declared_length: String(artifact.declared_size_bytes),
+        declared_sha256: digest,
+        expected_draft_fingerprint: setup?.upload_draft_fingerprint || "",
+      });
+      await api(
+        `/projects/${project.id}/external-uploads/${artifact.role}/${artifact.external_artifact_id}?${query}`,
+        {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Idempotency-Key": crypto.randomUUID(),
+          },
+          body: file,
+        },
+      );
+      await refresh();
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const configure = async () => {
+    if (
+      !sourcePreview ||
+      !window.confirm(
+        "Применить просмотренные назначения и начать новую эпоху сравнения?",
+      )
+    )
+      return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/projects/${project.id}/actions`, {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify({
+          operation: "sources.configure",
+          payload: {
+            acquisition_profile: sourceProfile,
+            connection_profiles: roleProfiles,
+            expected_manifest_fingerprint: setup?.infobases_fingerprint,
+            confirm_new_epoch: true,
+          },
+          expected_fingerprint: snapshot.workflow_fingerprint,
+        }),
+      });
+      setSetup(undefined);
+      setSourceProfile("");
+      setRoleProfiles({});
+      setSourcePreview(undefined);
+      await refresh();
+      refreshWorkflow();
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const previewRouting = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const created = await api<RoutingPreview>(
+        `/projects/${project.id}/source-routing-previews`,
+        { method: "POST", headers: mutationHeaders() },
+      );
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        const current = await api<RoutingPreview>(
+          `/projects/${project.id}/source-routing-previews/${created.preview_id}`,
+        );
+        setRoutingPreview(current);
+        if (!["pending", "running"].includes(current.status)) return;
+        await new Promise((resolve) => window.setTimeout(resolve, 250));
+      }
+      setError("Предварительный просмотр не завершился в установленное время.");
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const cancelRouting = async () => {
+    if (!routingPreview) return;
+    await api(
+      `/projects/${project.id}/source-routing-previews/${routingPreview.preview_id}`,
+      { method: "DELETE", headers: mutationHeaders() },
+    );
+    setRoutingPreview({ ...routingPreview, status: "cancelled" });
+  };
+  const acquire = async () => {
+    if (
+      routingPreview?.status !== "ready" ||
+      !window.confirm(
+        "Получить и атомарно опубликовать полное поколение трёх баз по просмотренному маршруту?",
+      )
+    )
+      return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api<Record<string, unknown>>(
+        `/projects/${project.id}/workflow/run-next`,
+        {
+          method: "POST",
+          headers: mutationHeaders(),
+          body: JSON.stringify({
+            expected_fingerprint: snapshot.workflow_fingerprint,
+            approved_operations: ["sources.acquire"],
+            source_routing_preview_id: routingPreview.preview_id,
+            routing_plan_fingerprint: routingPreview.routing_plan_fingerprint,
+          }),
+        },
+      );
+      setAcquisitionResult(result);
+      await refresh();
+      refreshWorkflow();
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (!setup) return <CircularProgress />;
+  const ready = Object.values(setup.infobases.roles).every(
+    (item) => setup.connection_profiles[item.connection_profile]?.tested,
+  );
+  const platformRoots = new Set(
+    Object.values(setup.infobases.roles)
+      .map(
+        (item) =>
+          setup.connection_profiles[item.connection_profile]?.platform_path,
+      )
+      .filter(Boolean),
+  );
+  const roleEntries = Object.entries(setup.infobases.roles);
+  const testedCount = roleEntries.filter(
+    ([, item]) => setup.connection_profiles[item.connection_profile]?.tested,
+  ).length;
+  const artifacts = setup.external_artifacts.artifacts;
+  const uploadedCount = artifacts.filter((item) => item.uploaded).length;
+  const roleLabels: Record<string, string> = {
+    vendor_baseline: "Исходная версия поставщика",
+    target_cf: "Рабочая конфигурация",
+    next_vendor: "Новая версия поставщика",
+  };
+  const legacyProfile =
+    sourceProfile !== "" && !setup.profiles.includes(sourceProfile);
+  const routeStatus =
+    routingPreview?.status === "ready"
+      ? "маршрут проверен"
+      : routingPreview
+        ? "проверка не завершена"
+        : "маршрут ещё не проверен";
+  return (
+    <Stack spacing={2}>
+      {error && <Alert severity="error">{error}</Alert>}
+      <Box>
+        <Typography variant="h5" fontWeight={750}>
+          Источники
+        </Typography>
+        <Typography color="text.secondary">
+          Подготовьте подключения и внешние файлы, затем проверьте маршрут и
+          получите новое поколение.
+        </Typography>
+      </Box>
+      <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+        <Chip
+          color={ready ? "success" : "warning"}
+          label={`Подключения: ${testedCount}/${roleEntries.length}`}
+        />
+        <Chip
+          color={uploadedCount === artifacts.length ? "success" : "warning"}
+          label={
+            artifacts.length
+              ? `Внешние файлы: ${uploadedCount}/${artifacts.length}`
+              : "Внешние файлы не объявлены"
+          }
+        />
+        <Chip
+          color={routingPreview?.status === "ready" ? "success" : "default"}
+          label={routeStatus}
+        />
+      </Stack>
+      {platformRoots.size > 1 && (
+        <Alert severity="error">
+          Для одного поколения выбраны разные каталоги платформы 1С. Повторно
+          проверьте профили на одном каталоге.
+        </Alert>
+      )}
+      <SourceSection
+        step={1}
+        title="Способ получения"
+        summary={`Экспортёр: ${sourceProfile || "не выбран"}`}
+        defaultExpanded
+      >
+        <Stack spacing={2}>
+          <Alert severity="info">
+            Один экспортёр применяется ко всем трём базам. Представление
+            выбирается автоматически для каждой группы компонентов.
+          </Alert>
+          <FormControl fullWidth>
+            <InputLabel>Экспортёр получения исходников</InputLabel>
+            <Select
+              label="Экспортёр получения исходников"
+              value={sourceProfile}
+              onChange={(event) => {
+                setSourceProfile(event.target.value);
+                setSourcePreview(undefined);
+                setRoutingPreview(undefined);
+              }}
+            >
+              {legacyProfile && (
+                <MenuItem value={sourceProfile} disabled>
+                  {sourceProfile} — устаревший профиль
+                </MenuItem>
+              )}
+              {setup.profiles.map((value) => (
+                <MenuItem key={value} value={value}>
+                  {value}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          {legacyProfile && (
+            <Alert severity="warning">
+              Для нового получения выберите профиль с пометкой `form-aware` и
+              примените назначения подключений.
+            </Alert>
+          )}
+          <ToolInventory
+            project={project}
+            selectedProfile={sourceProfile}
+            routingPreview={routingPreview}
+          />
+        </Stack>
+      </SourceSection>
 
-function ConnectionCredentials({ item, onSaved, onError }: { item: RaRecord; onSaved: () => void; onError: (message: string) => void }) {
-  const [open, setOpen] = useState(false); const [username, setUsername] = useState(String(item.user || '')); const [secret, setSecret] = useState(''); const channel = String(item.channel);
-  const passwordLabel = channel === 'onec' ? 'Пароль пользователя 1С' : channel === 'postgresql' ? 'Пароль PostgreSQL' : 'Токен доступа';
-  const save = async () => { try { await api(`/connections/${item.id}/credentials`, { method: 'PUT', body: JSON.stringify({ username, secret }) }); setSecret(''); onSaved(); } catch (e) { onError((e as Error).message); } };
-  return <Stack spacing={1}><Button onClick={() => setOpen(value => !value)}>{open ? 'Скрыть настройки доступа' : 'Настроить доступ'}</Button>{open && <>{['onec', 'postgresql'].includes(channel) && <TextField label={channel === 'onec' ? 'Пользователь 1С' : 'Пользователь PostgreSQL'} value={username} onChange={e => setUsername(e.target.value)} />}{item.secret_present && <Alert severity="success">Секрет сохранён</Alert>}<TextField label={passwordLabel} type="password" value={secret} onChange={e => setSecret(e.target.value)} autoComplete="new-password" /><Button variant="outlined" disabled={!secret} onClick={save}>Сохранить доступ</Button></>}</Stack>;
+      <SourceSection
+        step={2}
+        title="Подключения к базам"
+        summary={`${testedCount} из ${roleEntries.length} соединений проверено`}
+        defaultExpanded={!ready}
+      >
+        <Stack spacing={2}>
+          <Box
+            sx={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
+              gap: 2,
+            }}
+          >
+            {roleEntries.map(([role, item]) => {
+              const id = item.connection_profile;
+              const current = setup.connection_profiles[id];
+              return (
+                <Card key={role} variant="outlined">
+                  <CardContent>
+                    <Typography variant="overline">
+                      {roleLabels[role] || role}
+                    </Typography>
+                    <Typography fontWeight={700}>
+                      {item.configuration_name} · {item.version}
+                    </Typography>
+                    <TextField
+                      fullWidth
+                      size="small"
+                      sx={{ my: 1.5 }}
+                      label="Профиль соединения"
+                      value={roleProfiles[role] || ""}
+                      onChange={(event) => {
+                        setRoleProfiles((value) => ({
+                          ...value,
+                          [role]: event.target.value,
+                        }));
+                        setSourcePreview(undefined);
+                        setRoutingPreview(undefined);
+                      }}
+                    />
+                    <Typography
+                      variant="caption"
+                      component="div"
+                      color="text.secondary"
+                      sx={{ overflowWrap: "anywhere" }}
+                    >
+                      UUID: {item.root_uuid}
+                    </Typography>
+                    {current?.tested ? (
+                      <Stack spacing={1} mt={1.5}>
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          useFlexGap
+                          flexWrap="wrap"
+                        >
+                          <Chip
+                            size="small"
+                            color="success"
+                            label="Соединение проверено"
+                          />
+                          <Chip
+                            size="small"
+                            label={`Расширения: ${current.extension_count}`}
+                          />
+                        </Stack>
+                        {current.extensions.length > 0 && (
+                          <Box component="details">
+                            <Typography
+                              component="summary"
+                              variant="caption"
+                              sx={{ cursor: "pointer" }}
+                            >
+                              Показать расширения
+                            </Typography>
+                            {current.extensions.map((extension) => (
+                              <Typography
+                                key={extension.uuid}
+                                variant="caption"
+                                component="div"
+                              >
+                                {extension.active ? "●" : "○"} {extension.name}{" "}
+                                {extension.version}
+                              </Typography>
+                            ))}
+                          </Box>
+                        )}
+                      </Stack>
+                    ) : (
+                      <Stack spacing={1.5} mt={2}>
+                        <TextField
+                          label="Каталог платформы 1С"
+                          value={field(
+                            id,
+                            "platform_path",
+                            "/opt/1cv8/x86_64/8.3.27.1989",
+                          )}
+                          onChange={(event) =>
+                            setField(id, "platform_path", event.target.value)
+                          }
+                        />
+                        <TextField
+                          label="Сервер 1С"
+                          value={field(id, "server", "localhost")}
+                          onChange={(event) =>
+                            setField(id, "server", event.target.value)
+                          }
+                        />
+                        <TextField
+                          label="Имя базы 1С"
+                          value={field(id, "reference")}
+                          onChange={(event) =>
+                            setField(id, "reference", event.target.value)
+                          }
+                        />
+                        <TextField
+                          label="Имя базы PostgreSQL"
+                          value={field(id, "db_name")}
+                          onChange={(event) =>
+                            setField(id, "db_name", event.target.value)
+                          }
+                        />
+                        <TextField
+                          label="Пользователь PostgreSQL"
+                          value={field(id, "db_user", "postgres")}
+                          onChange={(event) =>
+                            setField(id, "db_user", event.target.value)
+                          }
+                        />
+                        <TextField
+                          type="password"
+                          label="Пароль PostgreSQL"
+                          value={field(id, "db_password")}
+                          onChange={(event) =>
+                            setField(id, "db_password", event.target.value)
+                          }
+                        />
+                        <TextField
+                          label="Пользователь 1С"
+                          value={field(id, "infobase_user")}
+                          onChange={(event) =>
+                            setField(id, "infobase_user", event.target.value)
+                          }
+                        />
+                        <TextField
+                          type="password"
+                          label="Пароль 1С"
+                          value={field(id, "infobase_password")}
+                          onChange={(event) =>
+                            setField(
+                              id,
+                              "infobase_password",
+                              event.target.value,
+                            )
+                          }
+                        />
+                        <Button disabled={busy} onClick={() => void save(id)}>
+                          Проверить и сохранить профиль
+                        </Button>
+                      </Stack>
+                    )}
+                  </CardContent>
+                </Card>
+              );
+            })}
+          </Box>
+          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+            <Button
+              disabled={
+                busy ||
+                (sourceProfile === setup.infobases.acquisition_profile &&
+                  roleEntries.every(
+                    ([role, item]) =>
+                      roleProfiles[role] === item.connection_profile,
+                  ))
+              }
+              onClick={() =>
+                setSourcePreview({
+                  acquisition_profile: sourceProfile,
+                  connection_profiles: roleProfiles,
+                  comparison_epoch_changed: true,
+                })
+              }
+            >
+              Просмотреть изменения назначений
+            </Button>
+            <Button
+              variant="contained"
+              disabled={busy || !sourcePreview}
+              onClick={() => void configure()}
+            >
+              Применить назначения
+            </Button>
+          </Stack>
+          {sourcePreview && (
+            <Alert severity="warning">
+              <Typography>
+                Будет начата новая эпоха сравнения; прежние DIF и MRQ станут
+                устаревшими.
+              </Typography>
+              <Box component="pre" sx={{ whiteSpace: "pre-wrap" }}>
+                {JSON.stringify(sourcePreview, null, 2)}
+              </Box>
+            </Alert>
+          )}
+        </Stack>
+      </SourceSection>
+
+      <SourceSection
+        step={3}
+        title="Внешние артефакты"
+        summary={
+          artifacts.length
+            ? `${uploadedCount} из ${artifacts.length} файлов загружено`
+            : "В контракте нет внешних файлов"
+        }
+        defaultExpanded={uploadedCount < artifacts.length}
+      >
+        <Stack spacing={2}>
+          <ExternalFolderImport
+            projectId={project.id}
+            workflowFingerprint={snapshot.workflow_fingerprint}
+            onComplete={() => {
+              void refresh();
+              refreshWorkflow();
+              setRoutingPreview(undefined);
+            }}
+          />
+          {artifacts.length === 0 && (
+            <Alert severity="info">
+              В отслеживаемом контракте внешние артефакты не объявлены.
+            </Alert>
+          )}
+          {artifacts.map((artifact) => (
+            <Card
+              key={`${artifact.role}:${artifact.external_artifact_id}`}
+              variant="outlined"
+            >
+              <CardContent>
+                <Typography>
+                  {artifact.role} · {artifact.kind} · {artifact.semantic_key}
+                </Typography>
+                <Typography variant="caption">
+                  {artifact.filename}, {artifact.declared_size_bytes} байт,{" "}
+                  {artifact.external_artifact_id}
+                </Typography>
+                {!artifact.sha256 && (
+                  <TextField
+                    fullWidth
+                    sx={{ mt: 1 }}
+                    label="Объявленный SHA-256"
+                    value={artifactHashes[artifact.external_artifact_id] || ""}
+                    onChange={(event) =>
+                      setArtifactHashes((value) => ({
+                        ...value,
+                        [artifact.external_artifact_id]: event.target.value,
+                      }))
+                    }
+                  />
+                )}
+                {artifact.uploaded ? (
+                  <Chip
+                    size="small"
+                    color="success"
+                    sx={{ mt: 1 }}
+                    label="Файл проверен и загружен"
+                  />
+                ) : (
+                  <Button component="label" disabled={busy} sx={{ mt: 1 }}>
+                    Выбрать и проверить файл
+                    <input
+                      hidden
+                      type="file"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (file) void upload(artifact, file);
+                      }}
+                    />
+                  </Button>
+                )}
+              </CardContent>
+            </Card>
+          ))}
+        </Stack>
+      </SourceSection>
+
+      <SourceSection
+        step={4}
+        title="Проверка и получение"
+        summary={routeStatus}
+        defaultExpanded
+      >
+        <Stack spacing={2}>
+          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+            <Button
+              disabled={
+                busy ||
+                !ready ||
+                platformRoots.size > 1 ||
+                artifacts.some((item) => !item.uploaded)
+              }
+              onClick={() => void previewRouting()}
+            >
+              Проверить маршрут
+            </Button>
+            {routingPreview &&
+              ["pending", "running"].includes(routingPreview.status) && (
+                <Button onClick={() => void cancelRouting()}>Отменить</Button>
+              )}
+            <Button
+              variant="contained"
+              disabled={busy || routingPreview?.status !== "ready"}
+              onClick={() => void acquire()}
+            >
+              Получить новое поколение
+            </Button>
+          </Stack>
+          {routingPreview && <RoutingPreviewSummary preview={routingPreview} />}
+          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+            <Chip
+              title={String(setup.active_source.generation_id || "")}
+              label={`Активное поколение: ${
+                String(setup.active_source.generation_id || "нет").slice(
+                  0,
+                  12,
+                ) || "нет"
+              }`}
+            />
+            <Chip
+              label={`Физические строки: ${
+                setup.active_diff.row_counts?.["diff-inventory.csv"] ?? 0
+              }`}
+            />
+            <Chip
+              label={`Покрытие: ${
+                setup.active_diff.row_counts?.["target-coverage.csv"] ?? 0
+              }`}
+            />
+          </Stack>
+          {acquisitionResult && (
+            <Alert severity="success">
+              <Box component="pre" sx={{ whiteSpace: "pre-wrap" }}>
+                {JSON.stringify(acquisitionResult, null, 2)}
+              </Box>
+            </Alert>
+          )}
+        </Stack>
+      </SourceSection>
+    </Stack>
+  );
 }
 
-function ConnectionsPage() {
-  const [items, setItems] = useState<RaRecord[]>([]); const [error, setError] = useState(''); const [createOpen, setCreateOpen] = useState(false); const [discovered, setDiscovered] = useState<DiscoveredInfobase[]>([]); const [discoveryOpen, setDiscoveryOpen] = useState(false); const [discoverySource, setDiscoverySource] = useState('');
-  const [form, setForm] = useState({ name: '', role: 'customer', channel: 'mcp', url: '', connection_string: '', platform_version: '8.3.27.1989' });
-  const refresh = useCallback(() => api<RaRecord[]>('/connections').then(setItems).catch(e => setError(e.message)), []); useEffect(() => { refresh(); }, [refresh]);
-  const discover = async () => { try { const result = await api<{ source: string; infobases: DiscoveredInfobase[] }>('/infobases/discover'); setDiscovered(result.infobases); setDiscoverySource(result.source); setDiscoveryOpen(true); } catch (e) { setError((e as Error).message); } };
-  const importInfobase = async (item: DiscoveredInfobase) => { try { await api('/connections', { method: 'POST', body: JSON.stringify({ data: { ...item, role: 'customer', channel: 'onec', access_mode: 'read' } }) }); setDiscoveryOpen(false); refresh(); } catch (e) { setError((e as Error).message); } };
-  const create = async () => { try { await api('/connections', { method: 'POST', body: JSON.stringify({ data: { ...form, access_mode: 'read' } }) }); setCreateOpen(false); refresh(); } catch (e) { setError((e as Error).message); } };
-  const remove = async (item: RaRecord) => { if (!window.confirm(`Удалить подключение «${String(item.name)}»?`)) return; try { await api(`/connections/${item.id}`, { method: 'DELETE' }); refresh(); } catch (e) { setError((e as Error).message); } };
-  const target = (item: RaRecord) => item.channel === 'onec' ? (item.connection_kind === 'server' ? `${String(item.server)} / ${String(item.reference)}` : String(item.file || item.connection_string)) : String(item.url || 'Адрес не указан');
-  return <Box p={3}><Typography variant="h4" mb={2}>Подключения к ИБ</Typography>{error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}<Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} mb={3}><Button variant="contained" onClick={discover}>Найти базы 1С</Button><Button variant="outlined" onClick={() => setCreateOpen(true)}>Добавить вручную</Button></Stack><Box display="grid" gridTemplateColumns="repeat(auto-fit,minmax(340px,1fr))" gap={2}>{items.map(item => <Card key={item.id} variant="outlined"><CardContent><Stack direction="row" justifyContent="space-between" alignItems="flex-start"><Box><Typography variant="h6">{String(item.name)}</Typography><Typography color="text.secondary">{target(item)}</Typography></Box><Chip size="small" color={item.last_test_ok ? 'success' : 'default'} label={item.last_test_ok ? 'Проверено' : 'Не проверено'} /></Stack><Stack direction="row" spacing={1} mt={2} flexWrap="wrap"><Chip size="small" label={item.channel === 'onec' ? 'Платформа 1С' : String(item.channel).toUpperCase()} /><Chip size="small" label={item.role === 'vendor' ? 'Поставщик' : 'Заказчик'} />{item.platform_version && <Chip size="small" label={String(item.platform_version)} />}</Stack>{item.user && <Typography variant="body2" mt={2}>Пользователь: {String(item.user)}</Typography>}</CardContent><CardActions sx={{ flexWrap: 'wrap' }}><Button onClick={() => api(`/connections/${item.id}/test`, { method: 'POST' }).then(refresh).catch(e => setError(e.message))}>Проверить</Button><ConnectionCredentials item={item} onSaved={refresh} onError={setError} /><Button color="error" onClick={() => remove(item)}>Удалить</Button></CardActions></Card>)}</Box>{items.length === 0 && <Alert severity="info">Подключений пока нет. Найдите базы из списка запуска 1С или добавьте подключение вручную.</Alert>}
-    <Dialog open={createOpen} onClose={() => setCreateOpen(false)} fullWidth maxWidth="sm"><DialogTitle>Новое подключение</DialogTitle><DialogContent><Stack spacing={2} mt={1}><TextField label="Название" required value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /><TextField select label="Роль" value={form.role} onChange={e => setForm({ ...form, role: e.target.value })}><MenuItem value="customer">Заказчик</MenuItem><MenuItem value="vendor">Поставщик</MenuItem></TextField><TextField select label="Канал" value={form.channel} onChange={e => setForm({ ...form, channel: e.target.value })}><MenuItem value="mcp">MCP</MenuItem><MenuItem value="web">Веб-публикация</MenuItem><MenuItem value="postgresql">PostgreSQL</MenuItem><MenuItem value="onec">Платформа 1С</MenuItem></TextField>{form.channel === 'onec' ? <><TextField label="Строка соединения 1С" value={form.connection_string} onChange={e => setForm({ ...form, connection_string: e.target.value })} helperText={'Например: Srvr="server";Ref="base";'} /><TextField label="Версия платформы" value={form.platform_version} onChange={e => setForm({ ...form, platform_version: e.target.value })} /></> : <TextField label="Адрес" value={form.url} onChange={e => setForm({ ...form, url: e.target.value })} />}</Stack></DialogContent><DialogActions><Button onClick={() => setCreateOpen(false)}>Отмена</Button><Button variant="contained" disabled={!form.name || (form.channel === 'onec' ? !form.connection_string : !form.url)} onClick={create}>Добавить</Button></DialogActions></Dialog>
-    <Dialog open={discoveryOpen} onClose={() => setDiscoveryOpen(false)} fullWidth maxWidth="md"><DialogTitle>Найденные базы 1С</DialogTitle><DialogContent><Typography color="text.secondary" mb={2}>{discoverySource}</Typography><Stack spacing={1}>{discovered.map(item => <Card variant="outlined" key={`${item.folder}/${item.name}`}><CardContent><Typography variant="h6">{item.name}</Typography><Typography>{item.connection_kind === 'server' ? `${item.server} / ${item.reference}` : item.file}</Typography><Typography variant="caption">{item.folder} · платформа {item.platform_version || 'не указана'}</Typography>{item.credentials_ignored && <Alert severity="warning" sx={{ mt: 1 }}>Сохранённые параметры входа не импортируются. Введите пароль после добавления.</Alert>}</CardContent><CardActions><Button onClick={() => importInfobase(item)}>Добавить</Button></CardActions></Card>)}</Stack>{discovered.length === 0 && <Alert severity="info">Базы не найдены.</Alert>}</DialogContent><DialogActions><Button onClick={() => setDiscoveryOpen(false)}>Закрыть</Button></DialogActions></Dialog>
-  </Box>;
+function Indexes({
+  project,
+  snapshot,
+}: {
+  project: Project;
+  snapshot: Snapshot;
+}) {
+  const [items, setItems] = useState<SourceIndex[]>([]);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const refresh = useCallback(
+    () =>
+      api<{ items: SourceIndex[] }>(`/projects/${project.id}/indexes`)
+        .then((value) => setItems(value.items))
+        .catch((error) => setError(error.message)),
+    [project.id],
+  );
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+  const run = async (mode: "ensure" | "rebuild") => {
+    if (
+      mode === "rebuild" &&
+      !window.confirm(
+        `Перестроить ${selected.length || items.length} одноразовых индексов?`,
+      )
+    )
+      return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/projects/${project.id}/actions`, {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify({
+          operation: "indexes.build",
+          payload: {
+            mode,
+            component_ids: selected.length ? selected : undefined,
+            confirmed: mode === "rebuild",
+          },
+          expected_fingerprint: snapshot.workflow_fingerprint,
+        }),
+      });
+      await refresh();
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Stack spacing={2}>
+      {error && <Alert severity="error">{error}</Alert>}
+      <Alert severity="info">
+        Индексы — одноразовое ускорение в пользовательском каталоге;
+        канонические доказательства остаются в репозитории.
+      </Alert>
+      <Stack direction="row" spacing={1}>
+        <Button
+          disabled={busy}
+          variant="contained"
+          onClick={() => void run("ensure")}
+        >
+          Обеспечить индексы
+        </Button>
+        <Button
+          disabled={busy}
+          color="warning"
+          onClick={() => void run("rebuild")}
+        >
+          Перестроить с подтверждением
+        </Button>
+      </Stack>
+      {items.map((item) => (
+        <Card key={item.component_id} variant="outlined">
+          <CardContent>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={selected.includes(item.component_id)}
+                  onChange={(event) =>
+                    setSelected(
+                      event.target.checked
+                        ? [...selected, item.component_id]
+                        : selected.filter((id) => id !== item.component_id),
+                    )
+                  }
+                />
+              }
+              label={item.component_id}
+            />
+            <Stack direction="row" spacing={1}>
+              <Chip
+                size="small"
+                label={item.status}
+                color={item.status === "ready" ? "success" : "default"}
+              />
+              <Chip size="small" label={`${item.bsl_file_count} BSL`} />
+            </Stack>
+            <Typography display="block" variant="caption">
+              {item.engine} {item.engine_version} · поколение{" "}
+              {item.source_generation_id}
+            </Typography>
+            <Typography display="block" variant="caption">
+              Ключ {item.index_key} · проверка{" "}
+              {item.last_validation || "ещё не выполнялась"} · исходник{" "}
+              {item.fingerprint}
+            </Typography>
+          </CardContent>
+        </Card>
+      ))}
+    </Stack>
+  );
 }
 
-function ResourcePage({ kind }: { kind: 'agents' | 'approvals' | 'runs' }) {
-  const [items, setItems] = useState<RaRecord[]>([]); const [json, setJson] = useState('{\n  "name": "Codex",\n  "provider": "codex",\n  "model": "gpt-5",\n  "workers": 1,\n  "timeout_seconds": 3600,\n  "tools": ["read", "search"],\n  "enabled": true\n}'); const [secret, setSecret] = useState(''); const [error, setError] = useState('');
-  const refresh = useCallback(() => api<RaRecord[]>(`/${kind}`).then(setItems).catch(e => setError(e.message)), [kind]); useEffect(() => { refresh(); }, [refresh]);
-  const save = async () => { try { await api(`/${kind}`, { method: 'POST', body: JSON.stringify({ data: JSON.parse(json), secret: secret || undefined }) }); setSecret(''); refresh(); } catch (e) { setError((e as Error).message); } };
-  const readonly = kind === 'approvals' || kind === 'runs';
-  return <Box p={3}><Typography variant="h4" mb={2}>{({ agents: 'Профили агентов', approvals: 'Решения', runs: 'Запуски' } as const)[kind]}</Typography>{error && <Alert severity="error">{error}</Alert>}{!readonly && <Card sx={{ mb: 3 }}><CardContent><Stack spacing={2}><TextField label="Настройки JSON" multiline minRows={8} value={json} onChange={e => setJson(e.target.value)} /><TextField label="Секрет (только запись)" type="password" value={secret} onChange={e => setSecret(e.target.value)} autoComplete="new-password" /><Button variant="contained" onClick={save}>Сохранить</Button></Stack></CardContent></Card>}<Stack spacing={2}>{items.map(item => <Card key={item.id}><CardContent><Box component="pre" sx={{ whiteSpace: 'pre-wrap', overflow: 'auto', m: 0 }}>{JSON.stringify(item, (key, value) => key === 'secret_ref' ? undefined : value, 2)}</Box></CardContent><CardActions>{kind === 'approvals' && item.status === 'pending' && <><Button onClick={() => api(`/approvals/${item.id}/decision`, { method: 'POST', body: JSON.stringify({ choice: 'accept' }) }).then(refresh)}>Принять</Button><Button color="error" onClick={() => api(`/approvals/${item.id}/decision`, { method: 'POST', body: JSON.stringify({ choice: 'reject' }) }).then(refresh)}>Отклонить</Button></>}</CardActions></Card>)}</Stack></Box>;
+export function groupEvents(events: Event[]) {
+  const runs: Record<
+    string,
+    Record<string, Record<string, Record<number, Event[]>>>
+  > = {};
+  for (const event of events) {
+    const job = event.job_id || "run";
+    const step = event.step_id || "run";
+    const attempt = event.attempt || 0;
+    const run = (runs[event.run_id] ||= {});
+    const jobEvents = (run[job] ||= {});
+    const stepEvents = (jobEvents[step] ||= {});
+    (stepEvents[attempt] ||= []).push(event);
+  }
+  return runs;
 }
 
-export function StagePage() {
-  const { projectId = '', stageId = '' } = useParams(); const [workflow, setWorkflow] = useState<Workflow>(); const [runs, setRuns] = useState<RaRecord[]>([]); const [agents, setAgents] = useState<RaRecord[]>([]); const [agentId, setAgentId] = useState(''); const [paths, setPaths] = useState('[]'); const [supplement, setSupplement] = useState(''); const [promptPreview, setPromptPreview] = useState<RaRecord>(); const [tab, setTab] = useState(0); const [error, setError] = useState('');
-  const inputRef = useRef<HTMLTextAreaElement>(null);
-  const refresh = useCallback(() => Promise.all([api<Workflow>(`/projects/${projectId}/workflow`), api<RaRecord[]>(`/runs?project_id=${projectId}`), api<RaRecord[]>('/agents')]).then(([w, r, a]) => { setWorkflow(w); setRuns(r.filter(x => x.stage_id === stageId)); setAgents(a); const resolved = w.stages.find(item => item.id === stageId)?.agent_profile?.id; if (resolved) setAgentId(current => current || resolved); }), [projectId, stageId]);
-  useEffect(() => { refresh().catch(e => setError(e.message)); const stop = streamProject(projectId, () => refresh(), () => {}); return stop; }, [projectId, refresh]);
-  const stage = workflow?.stages.find(item => item.id === stageId); const savePrompt = async () => { try { setPromptPreview(await api<RaRecord>('/prompts', { method: 'POST', body: JSON.stringify({ project_id: projectId, data: { stage_id: stageId, supplement } }) })); } catch (e) { setError((e as Error).message); } }; const run = async () => { try { await api('/runs', { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ project_id: projectId, stage_id: stageId, payload: { agent_profile_id: agentId || undefined, paths: JSON.parse(paths) } }) }); refresh(); } catch (e) { setError((e as Error).message); } };
-  return <Box p={3}>{error && <Alert severity="error">{error}</Alert>}<Button component={Link} to={`/projects/${projectId}/workflow`}>← К процессу</Button><Typography variant="h4" mt={2}>{stage?.title || stageId}</Typography><Tabs value={tab} onChange={(_, value) => setTab(value)}><Tab label="Настройки" /><Tab label="Запуски и журналы" /><Tab label="Результаты" /></Tabs><Divider sx={{ mb: 3 }} />
-    {tab === 0 && <Stack spacing={2} maxWidth={800}>{stage?.kind === 'agent' && <><FormControl fullWidth><InputLabel>Профиль агента</InputLabel><Select label="Профиль агента" value={agentId} onChange={e => setAgentId(e.target.value)}>{agents.filter(item => item.enabled !== false).map(item => <MenuItem key={item.id} value={String(item.id)}>{String(item.name || item.provider)} · {String(item.model)}</MenuItem>)}</Select></FormControl><TextField label="Точные входные пути (JSON)" value={paths} onChange={e => setPaths(e.target.value)} helperText="Сервер повторно проверяет разрешенные корни и отпечатки перед запуском." /><TextField label="Дополнение пользователя" multiline minRows={8} inputRef={inputRef} value={supplement} onChange={e => setSupplement(e.target.value)} helperText="Обязательные инструкции проекта и метода добавляются сервером и не изменяются." /><Button variant="outlined" onClick={savePrompt}>Сохранить новую версию промта</Button>{promptPreview && <Card variant="outlined"><CardContent><Typography variant="subtitle2">Собранный промт, версия {String(promptPreview.version)}</Typography><Box component="pre" sx={{ whiteSpace: 'pre-wrap' }}>{String(promptPreview.assembled)}</Box><Typography variant="subtitle2">Изменения</Typography><Box component="pre" sx={{ whiteSpace: 'pre-wrap' }}>{String(promptPreview.diff)}</Box></CardContent></Card>}</>}<Alert severity={stage?.ready ? 'success' : 'warning'}>{stage?.ready ? 'Этап готов к запуску' : `Блокировки: ${stage?.blockers.join(', ')}`}</Alert><Button variant="contained" disabled={!stage?.ready || (stage?.kind === 'agent' && !agentId)} onClick={run}>Запустить этап</Button></Stack>}
-    {tab === 1 && <Stack spacing={2}>{runs.map(run => <Card key={run.id}><CardContent><Typography>{String(run.status)} · {String(run.started_at || 'ожидает')}</Typography><Box component="pre" sx={{ whiteSpace: 'pre-wrap', overflow: 'auto' }}>{Array.isArray(run.log_tail) ? run.log_tail.join('\n') : ''}</Box></CardContent><CardActions>{['queued', 'running'].includes(String(run.status)) && <Button color="warning" onClick={() => api(`/runs/${run.id}/cancel`, { method: 'POST' }).then(refresh)}>Отменить</Button>}{['failed', 'interrupted', 'cancelled'].includes(String(run.status)) && <Button onClick={() => api(`/runs/${run.id}/retry`, { method: 'POST', headers: mutationHeaders() }).then(refresh)}>Повторить или продолжить</Button>}</CardActions></Card>)}</Stack>}
-    {tab === 2 && stage?.artifact && <iframe title={`Результат ${stage.title}`} src={`/api/v1/artifacts/${projectId}/${stage.artifact}?embed=true`} sandbox="allow-scripts" style={{ width: '100%', minHeight: 700, border: 0 }} />}
-  </Box>;
+function Events({ project }: { project: Project }) {
+  const [events, setEvents] = useState<Event[]>([]);
+  const [filter, setFilter] = useState("");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [logs, setLogs] = useState<Record<string, string[]>>({});
+  const cursor = useRef(0);
+  const refresh = useCallback(
+    () =>
+      api<{
+        events: Event[];
+        next_cursor: number;
+        resync_required: boolean;
+        earliest_sequence: number;
+        snapshot?: { events: Event[] }[];
+      }>(
+        `/projects/${project.id}/events?cursor=${cursor.current}&limit=500`,
+      ).then((value) => {
+        const incoming = value.resync_required
+          ? (value.snapshot || []).flatMap((item) => item.events || [])
+          : value.events;
+        setEvents((current) =>
+          [
+            ...new Map(
+              [...current, ...incoming].map((item) => [item.sequence, item]),
+            ).values(),
+          ]
+            .sort((a, b) => a.sequence - b.sequence)
+            .slice(-500),
+        );
+        cursor.current = value.next_cursor;
+      }),
+    [project.id],
+  );
+  useEffect(() => {
+    cursor.current = 0;
+    setEvents([]);
+    refresh();
+    const timer = window.setInterval(refresh, 2000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+  const term = filter.toLowerCase();
+  const visible = events.filter(
+    (event) =>
+      JSON.stringify(event).toLowerCase().includes(term) ||
+      (logs[`${event.run_id}:${event.attempt || 0}`] || [])
+        .join("")
+        .toLowerCase()
+        .includes(term),
+  );
+  const grouped = groupEvents(visible);
+  const terminalRuns = new Set(
+    events
+      .filter((event) => event.type === "run.finished")
+      .map((event) => event.run_id),
+  );
+  const toggle = (key: string) =>
+    setExpanded((value) => {
+      const next = new Set(value);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  const loadLog = async (runId: string, attempt: number) => {
+    const key = `${runId}:${attempt}`;
+    const value = await api<{ lines: string[] }>(
+      `/projects/${project.id}/runs/${encodeURIComponent(runId)}/attempts/${attempt}/log?offset=0&limit=500`,
+    );
+    setLogs((current) => ({ ...current, [key]: value.lines }));
+  };
+  const cancel = async (runId: string) => {
+    await api(
+      `/projects/${project.id}/runs/${encodeURIComponent(runId)}/cancel`,
+      {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify({ actor: "local-user" }),
+      },
+    );
+  };
+  return (
+    <Stack spacing={2}>
+      <TextField
+        label="Поиск в событиях и журналах"
+        value={filter}
+        onChange={(event) => setFilter(event.target.value)}
+      />
+      <Typography variant="caption">
+        Показано не более 500 последних событий и 500 строк журнала за запрос;
+        фильтр и раскрытые узлы сохраняются при обновлении. Показываются
+        наблюдаемые действия агентов; приватные рассуждения модели недоступны.
+      </Typography>
+      {Object.entries(grouped).map(([runId, run]) => {
+        const runKey = `run:${runId}`;
+        const running = !terminalRuns.has(runId);
+        return (
+          <Card variant="outlined" key={runId}>
+            <CardContent>
+              <Stack direction="row" justifyContent="space-between">
+                <Box
+                  component="button"
+                  onClick={() => toggle(runKey)}
+                  aria-expanded={expanded.has(runKey)}
+                  sx={{
+                    border: 0,
+                    background: "none",
+                    p: 0,
+                    cursor: "pointer",
+                    textAlign: "left",
+                  }}
+                >
+                  <Typography variant="h6">
+                    {expanded.has(runKey) ? "▼" : "▶"} Запуск {runId}
+                  </Typography>
+                </Box>
+                {running && (
+                  <Button color="warning" onClick={() => void cancel(runId)}>
+                    Отменить запуск
+                  </Button>
+                )}
+              </Stack>
+              {expanded.has(runKey) && (
+                <Stack spacing={1} mt={1}>
+                  {Object.entries(run).map(([jobId, job]) => {
+                    const jobKey = `${runKey}:${jobId}`;
+                    return (
+                      <Box key={jobId} ml={2}>
+                        <Button
+                          size="small"
+                          onClick={() => toggle(jobKey)}
+                          aria-expanded={expanded.has(jobKey)}
+                        >
+                          {expanded.has(jobKey) ? "▼" : "▶"} Задание {jobId}
+                        </Button>
+                        {expanded.has(jobKey) &&
+                          Object.entries(job).map(([stepId, step]) => {
+                            const stepKey = `${jobKey}:${stepId}`;
+                            return (
+                              <Box key={stepId} ml={2}>
+                                <Button
+                                  size="small"
+                                  onClick={() => toggle(stepKey)}
+                                  aria-expanded={expanded.has(stepKey)}
+                                >
+                                  {expanded.has(stepKey) ? "▼" : "▶"} Шаг{" "}
+                                  {stepId}
+                                </Button>
+                                {expanded.has(stepKey) &&
+                                  Object.entries(step).map(
+                                    ([attemptText, attemptEvents]) => {
+                                      const attempt = Number(attemptText);
+                                      const logKey = `${runId}:${attempt}`;
+                                      const last =
+                                        attemptEvents[attemptEvents.length - 1];
+                                      const diffGeneration = String(
+                                        last.payload.diff_generation_id || "",
+                                      );
+                                      return (
+                                        <Card
+                                          key={attemptText}
+                                          variant="outlined"
+                                          sx={{ ml: 2, mb: 1 }}
+                                        >
+                                          <CardContent>
+                                            <Stack
+                                              direction="row"
+                                              justifyContent="space-between"
+                                            >
+                                              <Typography variant="subtitle2">
+                                                Попытка {attempt || "—"} ·{" "}
+                                                {String(
+                                                  last.payload.status ||
+                                                    "running",
+                                                )}
+                                              </Typography>
+                                              <Typography variant="caption">
+                                                {last.timestamp}
+                                              </Typography>
+                                            </Stack>
+                                            <Typography variant="caption">
+                                              Исполнитель:{" "}
+                                              {String(
+                                                last.payload.actor ||
+                                                  last.payload.agent_profile ||
+                                                  "—",
+                                              )}{" "}
+                                              · единица:{" "}
+                                              {String(
+                                                last.payload.work_unit_id ||
+                                                  "—",
+                                              )}{" "}
+                                              · длительность:{" "}
+                                              {String(
+                                                last.payload.duration_seconds ??
+                                                  "—",
+                                              )}
+                                            </Typography>
+                                            <Stack direction="row" spacing={1}>
+                                              {attempt > 0 && (
+                                                <Button
+                                                  size="small"
+                                                  onClick={() =>
+                                                    void loadLog(runId, attempt)
+                                                  }
+                                                >
+                                                  Загрузить журнал
+                                                </Button>
+                                              )}
+                                              {/^[0-9a-f]{64}$/.test(
+                                                diffGeneration,
+                                              ) && (
+                                                <Button
+                                                  size="small"
+                                                  component="a"
+                                                  href={`/api/v1/projects/${project.id}/artifacts/analysis/indexes/generations/${diffGeneration}/diff-inventory.csv`}
+                                                >
+                                                  Различия репозитория
+                                                </Button>
+                                              )}
+                                            </Stack>
+                                            {logs[logKey] && (
+                                              <Box
+                                                component="pre"
+                                                sx={{
+                                                  maxHeight: 320,
+                                                  overflow: "auto",
+                                                  whiteSpace: "pre-wrap",
+                                                }}
+                                              >
+                                                {logs[logKey].join("")}
+                                              </Box>
+                                            )}
+                                            {attemptEvents.map((event) => (
+                                              <Box key={event.sequence} mt={1}>
+                                                <Typography variant="caption">
+                                                  #{event.sequence} ·{" "}
+                                                  {event.type}
+                                                </Typography>
+                                                <Box
+                                                  component="pre"
+                                                  sx={{
+                                                    whiteSpace: "pre-wrap",
+                                                    overflowWrap: "anywhere",
+                                                  }}
+                                                >
+                                                  {JSON.stringify(
+                                                    event.payload,
+                                                    null,
+                                                    2,
+                                                  )}
+                                                </Box>
+                                              </Box>
+                                            ))}
+                                          </CardContent>
+                                        </Card>
+                                      );
+                                    },
+                                  )}
+                              </Box>
+                            );
+                          })}
+                      </Box>
+                    );
+                  })}
+                </Stack>
+              )}
+            </CardContent>
+          </Card>
+        );
+      })}
+    </Stack>
+  );
+}
+
+export function Registry({ project }: { project: Project }) {
+  const [name, setName] = useState("diff-inventory");
+  const [offset, setOffset] = useState(0);
+  const [page, setPage] = useState<{
+    diff_generation_id?: string;
+    items: Record<string, unknown>[];
+    has_more: boolean;
+  }>({ items: [], has_more: false });
+  const generation = useRef("");
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const expected =
+      offset > 0 && generation.current
+        ? `&expected_generation=${generation.current}`
+        : "";
+    api<typeof page>(
+      `/projects/${project.id}/registries/${name}?offset=${offset}&limit=100${expected}`,
+    )
+      .then((value) => {
+        generation.current = value.diff_generation_id || "";
+        setPage(value);
+        setError("");
+      })
+      .catch((error) => {
+        setPage({ items: [], has_more: false });
+        setError(error.message);
+      });
+  }, [project.id, name, offset]);
+  return (
+    <Stack spacing={2}>
+      {error && <Alert severity="warning">{error}</Alert>}
+      <FormControl>
+        <InputLabel id="registry-label">Реестр</InputLabel>
+        <Select
+          labelId="registry-label"
+          label="Реестр"
+          value={name}
+          onChange={(event) => {
+            setName(event.target.value);
+            setOffset(0);
+            generation.current = "";
+          }}
+        >
+          {[
+            "diff-inventory",
+            "target-coverage",
+            "extension-diff",
+            "extension-dependencies",
+            "extension-path-coverage",
+            "extension-physical-diff",
+            "mrq",
+          ].map((item) => (
+            <MenuItem key={item} value={item}>
+              {item}
+            </MenuItem>
+          ))}
+        </Select>
+      </FormControl>
+      <Typography variant="caption">
+        Строки {offset + 1}–{offset + page.items.length}; размер страницы 100.
+        {page.diff_generation_id &&
+          ` Поколение различий: ${page.diff_generation_id}.`}
+      </Typography>
+      {page.items.length === 0 && (
+        <Alert severity="info">В выбранном реестре нет записей.</Alert>
+      )}
+      {page.items.map((item, index) => (
+        <Card
+          variant="outlined"
+          key={String(item.stable_diff_id || item.mrq_id || index)}
+        >
+          <CardContent>
+            <Box
+              component="pre"
+              aria-label={`Запись реестра ${String(item.stable_diff_id || item.mrq_id || index + 1)}`}
+              sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+            >
+              {JSON.stringify(item, null, 2)}
+            </Box>
+          </CardContent>
+        </Card>
+      ))}
+      <Stack direction="row" spacing={1}>
+        <Button
+          disabled={offset === 0}
+          onClick={() => setOffset(Math.max(0, offset - 100))}
+        >
+          Назад
+        </Button>
+        <Button
+          disabled={!page.has_more}
+          onClick={() => setOffset(offset + 100)}
+        >
+          Далее
+        </Button>
+      </Stack>
+    </Stack>
+  );
+}
+
+function Workspace({
+  project,
+  close,
+}: {
+  project: Project;
+  close: () => void;
+}) {
+  const [snapshot, setSnapshot] = useState<Snapshot>();
+  const [view, setView] = useState<
+    "dispatcher" | "react-flow-example" | "enriched-reference" | "sources" | "indexes" | "settings" | "journal" | "registries"
+  >("dispatcher");
+  const [settingsTab, setSettingsTab] = useState<"stages" | "profiles">("stages");
+  const [settingsStep, setSettingsStep] = useState<string>();
+  const [error, setError] = useState("");
+  const [retryWorkingView, setRetryWorkingView] = useState(false);
+  const fetchSnapshot = useCallback(
+    () => api<Snapshot>(`/projects/${project.id}/workflow`),
+    [project.id],
+  );
+  const refresh = useCallback(
+    () =>
+      fetchSnapshot()
+        .then(setSnapshot)
+        .catch((error) => setError(error.message)),
+    [fetchSnapshot],
+  );
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+  const working = view === "dispatcher";
+  const openWorking = async () => {
+    if (working) {
+      return;
+    }
+    try {
+      const next = await fetchSnapshot();
+      setSnapshot(next);
+      setError("");
+      setRetryWorkingView(false);
+      setView("dispatcher");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось обновить рабочий снимок");
+      setRetryWorkingView(true);
+    }
+  };
+  return (
+    <>
+      <AppBar position="static" color="inherit" elevation={1}>
+        <Toolbar variant="dense" sx={{ minHeight: 56 }}>
+          <Box sx={{ flexGrow: 1 }}>
+            <Typography variant="h6" fontWeight={750}>
+              Диспетчер исследования
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              {project.name}
+            </Typography>
+          </Box>
+          <Button
+            variant={view === "dispatcher" ? "contained" : "text"}
+            onClick={() => void openWorking()}
+          >
+            Диспетчер
+          </Button>
+          <Button onClick={() => setView("sources")}>Источники</Button>
+          <Button onClick={() => setView("journal")}>Журнал</Button>
+          <Button onClick={() => setView("registries")}>Реестры</Button>
+          <Button onClick={() => { setSettingsStep(undefined); setSettingsTab("stages"); setView("settings"); }}>
+            Профили и параметры
+          </Button>
+          <Button color="inherit" onClick={close}>
+            Другой проект
+          </Button>
+        </Toolbar>
+      </AppBar>
+      <Box sx={{ px: working ? 1.5 : 3, py: 1.5 }}>
+        {error && <Alert severity="error" action={retryWorkingView
+          ? <Button color="inherit" onClick={() => void openWorking()}>Повторить снимок</Button>
+          : undefined}>{error}</Alert>}
+        {view === "react-flow-example" ? (
+          <OfficialSubFlowReference />
+        ) : view === "enriched-reference" ? (
+          <EnrichedSubFlowReference />
+        ) : !snapshot ? (
+          <CircularProgress />
+        ) : (
+          <>
+            {working && (
+              <PipelineDispatcher
+                projectId={project.id}
+                initialProjection={snapshot.dispatcher}
+                initialFingerprint={snapshot.workflow_fingerprint}
+                onOpenSources={() => setView("sources")}
+                onOpenIndexes={() => setView("indexes")}
+                onOpenSettings={(stepId) => { setSettingsStep(stepId); setSettingsTab("stages"); setView("settings"); }}
+                onOpenJournal={() => setView("journal")}
+                onOpenRegistries={() => setView("registries")}
+              />
+            )}
+            {view === "sources" && (
+              <Sources
+                project={project}
+                snapshot={snapshot}
+                refreshWorkflow={refresh}
+              />
+            )}
+            {view === "indexes" && (
+              <Indexes project={project} snapshot={snapshot} />
+            )}
+            {view === "settings" && (
+              <Stack spacing={2}>
+                <Box>
+                  <Typography variant="h5" fontWeight={750}>Профили и параметры</Typography>
+                  <Typography color="text.secondary">Настройка этапов процесса и профилей агентов</Typography>
+                </Box>
+                <Tabs value={settingsTab} onChange={(_event, value) => setSettingsTab(value)} aria-label="Разделы настроек">
+                  <Tab value="stages" label="Этапы" />
+                  <Tab value="profiles" label="Профили" />
+                </Tabs>
+                {settingsTab === "stages" ? (
+                  <WorkflowEditor project={project} snapshot={snapshot} refresh={refresh} initialStepId={settingsStep} />
+                ) : (
+                  <AgentProfiles project={project} />
+                )}
+              </Stack>
+            )}
+            {view === "journal" && <Events project={project} />}
+            {view === "registries" && <Registry project={project} />}
+          </>
+        )}
+      </Box>
+    </>
+  );
 }
 
 export function App() {
-  return <><GlobalStyles styles={{ '@media (prefers-reduced-motion: reduce)': { '*, *::before, *::after': { animationDuration: '0.01ms !important', animationIterationCount: '1 !important', transitionDuration: '0.01ms !important' } } }} /><Admin dataProvider={dataProvider} i18nProvider={i18nProvider} layout={WorkspaceLayout} dashboard={Home} title="1C Autoresearch" requireAuth={false} disableTelemetry>
-    <CustomRoutes><Route path="/projects" element={<Home />} /><Route path="/projects/:projectId/setup" element={<SetupWizard />} /><Route path="/projects/:projectId/workflow" element={<WorkflowPage />} /><Route path="/projects/:projectId/stages/:stageId" element={<StagePage />} /><Route path="/connections" element={<ConnectionsPage />} /><Route path="/agents" element={<ResourcePage kind="agents" />} /><Route path="/approvals" element={<ResourcePage kind="approvals" />} /><Route path="/runs" element={<ResourcePage kind="runs" />} /></CustomRoutes>
-  </Admin></>;
+  const [project, setProject] = useState<Project>();
+  return (
+    <>
+      <CssBaseline />
+      {project ? (
+        <Workspace project={project} close={() => setProject(undefined)} />
+      ) : (
+        <ProjectPicker onSelect={setProject} />
+      )}
+    </>
+  );
 }

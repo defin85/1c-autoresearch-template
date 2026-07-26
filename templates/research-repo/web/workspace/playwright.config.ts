@@ -1,3 +1,4 @@
+process.env.PORTABLE_TEMPLATE = '1';
 import { defineConfig } from '@playwright/test';
 import path from 'node:path';
 

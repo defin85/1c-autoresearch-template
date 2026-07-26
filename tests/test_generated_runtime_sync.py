@@ -35,7 +35,11 @@ def test_sync_is_repeatable_and_refuses_non_empty_destination(tmp_path: Path):
 def test_packaged_template_matches_scaffold_and_starts_fresh_repo(tmp_path: Path):
     scaffold = ROOT / "templates/research-repo"
     archive = ROOT / "src/one_c_autoresearch/workspace_assets/research-template.zip"
-    expected = {path.relative_to(scaffold).as_posix(): path.read_bytes() for path in scaffold.rglob("*") if path.is_file()}
+    expected = {
+        path.relative_to(scaffold).as_posix(): path.read_bytes()
+        for path in scaffold.rglob("*")
+        if path.is_file() and not {".venv", "node_modules", "__pycache__", ".pytest_cache", "test-results"}.intersection(path.parts)
+    }
     with zipfile.ZipFile(archive) as source:
         prefix = "templates/research-repo/"
         actual = {name.removeprefix(prefix): source.read(name) for name in source.namelist() if name.startswith(prefix) and not name.endswith("/")}
