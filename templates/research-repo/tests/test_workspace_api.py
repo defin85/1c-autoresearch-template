@@ -13,6 +13,39 @@ from one_c_autoresearch.sources import draft_fingerprint
 REPO = Path(__file__).parents[1]
 
 
+def test_legacy_agent_profile_can_be_explicitly_resaved(tmp_path: Path) -> None:
+    app = create_app(tmp_path / "state", [REPO], testing=True)
+    headers = {"Origin": "http://testserver", "Idempotency-Key": "bookmark"}
+    with TestClient(app) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"name": "test", "root": str(REPO)},
+            headers=headers,
+        ).json()
+        path = tmp_path / "state/projects" / project["id"] / "agent-profiles.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"local":{"provider":"codex-cli","model":"gpt-5","reasoning_effort":"high","instructions_version":"1"}}',
+            encoding="utf-8",
+        )
+        assert client.get(f"/api/v1/projects/{project['id']}/agent-profiles").status_code == 422
+        profile = {
+            "provider": "codex-cli",
+            "model": "gpt-5",
+            "reasoning_effort": "high",
+            "instructions_version": "1",
+            "environment_preset": "local-read-only",
+        }
+        response = client.put(
+            f"/api/v1/projects/{project['id']}/agent-profiles/local",
+            json={"profile": profile},
+            headers=headers | {"Idempotency-Key": "resave"},
+        )
+        assert response.status_code == 200
+        assert response.json()["profile"] == profile
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
 def test_extension_registries_are_paged_and_bound_to_active_diff(tmp_path: Path):
     import csv
     import json
@@ -181,8 +214,8 @@ def test_api_uses_repository_snapshot_and_typed_actions(tmp_path: Path, monkeypa
         snapshot = client.get(f"/api/v1/projects/{project['id']}/workflow").json()
         assert len(snapshot["gates"]) == 7
         configuration = client.get(f"/api/v1/projects/{project['id']}/workflow/configuration").json()
-        assert [job["id"] for job in configuration["jobs"]] == ["configure", "acquire-sources", "build-diffs", "index-sources", "discover-mrq", "decide-mrq", "publish"]
-        assert len(configuration["steps"]) == 8
+        assert [job["id"] for job in configuration["jobs"]] == ["configure", "acquire-sources", "build-diffs", "index-sources", "discover-mrq", "classify-mrq", "decide-mrq", "publish"]
+        assert len(configuration["steps"]) == 9
         registry = client.get(f"/api/v1/projects/{project['id']}/registries/diff-inventory?offset=0&limit=1").json()
         assert len(registry["items"]) <= 1 and registry["limit"] == 1
         rejected = client.post(f"/api/v1/projects/{project['id']}/actions", json={"operation": "shell", "payload": {"command": "rm"}, "expected_fingerprint": snapshot["workflow_fingerprint"]}, headers=headers | {"Idempotency-Key": "run-1"})
@@ -219,10 +252,21 @@ def test_api_uses_repository_snapshot_and_typed_actions(tmp_path: Path, monkeypa
         assert "private-db" not in str(setup) and "private-ib" not in str(setup)
         stored = tmp_path / "state/projects" / project["id"] / "connections.json"
         assert stored.stat().st_mode & 0o777 == 0o600
-        agent = {"provider": "codex-cli", "model": "gpt-5", "reasoning_effort": "high", "instructions_version": "1"}
+        agent = {"provider": "codex-cli", "model": "gpt-5", "reasoning_effort": "high", "instructions_version": "1", "environment_preset": "local-read-only"}
         configured = client.put(f"/api/v1/projects/{project['id']}/agent-profiles/local", json={"profile": agent}, headers=headers | {"Idempotency-Key": "agent-profile-1"})
         assert configured.status_code == 200 and client.get(f"/api/v1/projects/{project['id']}/agent-profiles").json()["items"] == {"local": agent}
         assert (tmp_path / "state/projects" / project["id"] / "agent-profiles.json").stat().st_mode & 0o777 == 0o600
+        discover = next(item for item in configuration["steps"] if item["step"]["id"] == "discover-mrq")
+        preview = client.post(
+            f"/api/v1/projects/{project['id']}/workflow/patch-preview",
+            json={
+                "step_id": "discover-mrq",
+                "parameters": {"agent_phases": discover["step"]["agent_phases"]},
+                "expected_manifest_fingerprint": configuration["manifest_fingerprint"],
+            },
+        )
+        assert preview.status_code == 200
+        assert preview.json()["agent_phase_preview"][0]["roles"][0]["profile"]["model"] == "gpt-5"
 
 
 def test_external_upload_uses_declared_size_bytes(tmp_path: Path):

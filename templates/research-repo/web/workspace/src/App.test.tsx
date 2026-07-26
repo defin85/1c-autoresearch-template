@@ -1,10 +1,12 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, expect, test, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   App,
+  AgentProfiles,
   Registry,
   RoutingPreviewSummary,
   ToolInventory,
+  WorkflowEditor,
   groupEvents,
 } from "./App";
 
@@ -14,6 +16,7 @@ beforeEach(() => {
     vi.fn().mockResolvedValue({ ok: true, json: async () => [] }),
   );
 });
+afterEach(cleanup);
 
 test("shows repository-owned workspace entry", async () => {
   render(<App />);
@@ -89,6 +92,158 @@ test("shows accessible source tool installations and current use", async () => {
     }),
   ).toBeInTheDocument();
   expect(screen.getByText("требуется текущим маршрутом")).toBeInTheDocument();
+});
+
+test("agent profile explains the read-only environment and persists it", async () => {
+  const fetchMock = vi.fn().mockImplementation((_url: string, init?: RequestInit) =>
+    Promise.resolve({
+      ok: true,
+      json: async () => init?.method === "PUT" ? {} : ({ items: {} }),
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  render(<AgentProfiles project={{ id: "p", name: "p", root: "/repo" }} />);
+  expect(await screen.findByText(/local-read-only запрещает запись/)).toBeInTheDocument();
+  expect(screen.getByText(/allowed_paths ограничивают контекст инструкции/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Проверить и сохранить профиль" }));
+  await waitFor(() => {
+    const put = fetchMock.mock.calls.find(([, init]) => init?.method === "PUT");
+    expect(JSON.parse(String(put?.[1]?.body))).toMatchObject({
+      profile: { environment_preset: "local-read-only" },
+    });
+  });
+});
+
+test("workflow preview is invalidated by edits and apply uses the reviewed parameters", async () => {
+  const phase = {
+    phase_id: "analyze-dif",
+    mode: "parallel-pool",
+    max_concurrency: 2,
+    roles: [{
+      role_id: "analyzer",
+      agent_profile: "local",
+      count: 2,
+      instruction_supplement: "",
+    }],
+  };
+  const configuration = {
+    manifest_fingerprint: "sha256:manifest",
+    jobs: [],
+    steps: [{
+      job_id: "discover-mrq",
+      step: {
+        id: "step-1",
+        operation: "mrq.discover-next",
+        timeout_seconds: 1800,
+        agent_phases: [phase],
+      },
+      catalog: { executor: "agent", effect: "user-state", approval_required: false },
+    }],
+  };
+  const fetchMock = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+    if (url.endsWith("/workflow/configuration"))
+      return Promise.resolve({ ok: true, json: async () => configuration });
+    if (url.endsWith("/agent-profiles"))
+      return Promise.resolve({ ok: true, json: async () => ({
+        items: { local: { model: "gpt-5.6-sol", reasoning_effort: "low", instructions_version: "1", environment_preset: "local-read-only" } },
+      }) });
+    if (url.endsWith("/workflow/patch-preview")) {
+      const body = JSON.parse(String(init?.body));
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({
+          after: { ...configuration.steps[0].step, ...body.parameters },
+          agent_phase_preview: [{
+            phase_id: "analyze-dif",
+            mode: "parallel-pool",
+            effective_max_concurrency: 2,
+            maximum_calls_in_current_window: 32,
+            roles: [{
+              role_id: "analyzer",
+              agent_profile: "local",
+              profile: { model: "gpt-5.6-sol", reasoning_effort: "low", instructions_version: "1", environment_preset: "local-read-only" },
+            }],
+            sandbox: "read-only",
+            allowed_paths: "subject paths select context",
+          }],
+        }),
+      });
+    }
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(
+    <WorkflowEditor
+      project={{ id: "p", name: "p", root: "/repo" }}
+      snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
+      refresh={() => {}}
+    />,
+  );
+  await screen.findByLabelText("Режим analyze-dif");
+  expect(screen.getByLabelText("Профиль analyze-dif analyzer")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Предварительный просмотр" }));
+  expect(await screen.findByLabelText("Просмотр политики фаз")).toHaveTextContent("максимум вызовов текущего окна 32");
+  expect(screen.getByLabelText("Просмотр политики фаз")).toHaveTextContent("эффективный предел 2");
+  expect(screen.getByLabelText("Просмотр политики фаз")).toHaveTextContent("Песочница: read-only");
+  const apply = screen.getByRole("button", { name: "Применить просмотренное изменение" });
+  expect(apply).toBeEnabled();
+  fireEvent.change(screen.getByLabelText("Предельное время, секунд"), { target: { value: "1900" } });
+  expect(apply).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Предварительный просмотр" }));
+  await waitFor(() => expect(apply).toBeEnabled());
+  fireEvent.click(apply);
+  await waitFor(() => {
+    const action = fetchMock.mock.calls.find(([url]) => url.endsWith("/actions"));
+    expect(JSON.parse(String(action?.[1]?.body)).payload.parameters.timeout_seconds).toBe(1900);
+  });
+});
+
+test("workflow editor shows a server topology error", async () => {
+  const configuration = {
+    manifest_fingerprint: "sha256:manifest",
+    jobs: [],
+    steps: [{
+      job_id: "discover-mrq",
+      step: {
+        id: "step-1",
+        operation: "mrq.discover-next",
+        timeout_seconds: 1800,
+        agent_phases: [{
+          phase_id: "analyze-dif",
+          mode: "parallel-pool",
+          max_concurrency: 2,
+          roles: [{
+            role_id: "analyzer",
+            agent_profile: "local",
+            count: 2,
+            instruction_supplement: "",
+          }],
+        }],
+      },
+      catalog: { executor: "agent", effect: "user-state", approval_required: false },
+    }],
+  };
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string) => {
+    if (url.endsWith("/workflow/configuration"))
+      return Promise.resolve({ ok: true, json: async () => configuration });
+    if (url.endsWith("/agent-profiles"))
+      return Promise.resolve({ ok: true, json: async () => ({ items: {
+        local: { model: "gpt-5.6-sol", reasoning_effort: "low", instructions_version: "1", environment_preset: "local-read-only" },
+      } }) });
+    if (url.endsWith("/workflow/patch-preview"))
+      return Promise.resolve({ ok: false, json: async () => ({ detail: "Недопустимая топология: требуется ровно один analyzer" }) });
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  }));
+  render(
+    <WorkflowEditor
+      project={{ id: "p", name: "p", root: "/repo" }}
+      snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
+      refresh={() => {}}
+    />,
+  );
+  await screen.findByLabelText("Режим analyze-dif");
+  fireEvent.click(screen.getByRole("button", { name: "Предварительный просмотр" }));
+  expect(await screen.findByText(/Недопустимая топология/)).toBeInTheDocument();
 });
 
 test("shows semantic and raw extension registries with an accessible empty state", async () => {

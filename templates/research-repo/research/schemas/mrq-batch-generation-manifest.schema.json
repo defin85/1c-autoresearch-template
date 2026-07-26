@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "generation_id", "origin_canonical_generation_id", "source_mrq_fingerprint", "result_fingerprint", "batches_sha256", "batch_count", "mrq_count"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "origin_canonical_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_mrq_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "result_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "batches_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "batch_count": {"type": "integer", "minimum": 0},
+    "mrq_count": {"type": "integer", "minimum": 0}
+  },
+  "additionalProperties": false
+}

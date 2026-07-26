@@ -6,7 +6,18 @@
     "schema_version": {"const": "1"},
     "canonical_generation_id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
     "source_generation_id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
-    "diff_generation_id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+    "diff_generation_id": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "batch_generation": {
+      "type": "object",
+      "required": ["generation_id", "result_fingerprint", "source_mrq_fingerprint", "origin_canonical_generation_id"],
+      "properties": {
+        "generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "result_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "source_mrq_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "origin_canonical_generation_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
   },
   "additionalProperties": false
 }

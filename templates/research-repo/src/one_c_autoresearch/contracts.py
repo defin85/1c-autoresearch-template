@@ -8,6 +8,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import threading
 import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,6 +20,9 @@ ROLES = ("vendor_baseline", "target_cf", "next_vendor")
 DECISIONS = ("adopt_vendor", "adapt", "retain_custom", "out_of_scope")
 MRQ_STATES = ("draft", "ready_for_review", "approved", "superseded")
 SECRET_KEYS = re.compile(r"(?:password|passwd|pwd|token|secret|private[_-]?key)", re.I)
+_PROCESS_REPOSITORY_LOCKS: dict[str, threading.RLock] = {}
+_PROCESS_REPOSITORY_LOCKS_GUARD = threading.Lock()
+_HELD_REPOSITORY_LOCKS = threading.local()
 
 
 def canonical_json(value: Any) -> bytes:
@@ -156,19 +160,29 @@ def validate_unique_ids(items: list[dict[str, Any]], id_key: str, preimage_key: 
 @contextmanager
 def repository_lock(repo: Path, timeout_seconds: float = 0) -> Iterator[None]:
     identity = sha256(str(repo.resolve()).encode())
-    lock_dir = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir())) / "one-c-autoresearch-locks"
-    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(lock_dir / f"{identity}.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if timeout_seconds == 0 else 0)
+    with _PROCESS_REPOSITORY_LOCKS_GUARD:
+        process_lock = _PROCESS_REPOSITORY_LOCKS.setdefault(identity, threading.RLock())
+    with process_lock:
+        held = getattr(_HELD_REPOSITORY_LOCKS, "identities", set())
+        if identity in held:
+            raise RuntimeError("repository writer is busy")
+        lock_dir = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir())) / "one-c-autoresearch-locks"
+        lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(lock_dir / f"{identity}.lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(fd, flags)
-        except BlockingIOError as exc:
-            raise RuntimeError("repository writer is busy") from exc
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+            flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if timeout_seconds == 0 else 0)
+            try:
+                fcntl.flock(fd, flags)
+            except BlockingIOError as exc:
+                raise RuntimeError("repository writer is busy") from exc
+            _HELD_REPOSITORY_LOCKS.identities = {*held, identity}
+            try:
+                yield
+            finally:
+                _HELD_REPOSITORY_LOCKS.identities = held
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 def atomic_json(path: Path, value: Any) -> None:

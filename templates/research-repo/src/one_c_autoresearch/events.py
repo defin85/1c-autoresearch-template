@@ -17,6 +17,7 @@ PAYLOAD_LIMIT = 64 * 1024
 LOG_LIMIT = 50 * 1024 * 1024
 EVENT_TYPES = {"run.created", "run.finished", "job.started", "job.finished", "step.started", "step.progress", "step.action", "step.output", "step.validation", "step.finished", "log.append", "approval.required"}
 TERMINAL_STATUSES = {"completed", "blocked", "failed", "cancelled", "interrupted"}
+RETRYABLE_RUN_STATUSES = frozenset((TERMINAL_STATUSES - {"blocked"}) | {"stale"})
 REQUIRED_PAYLOAD = {
     "run.created": {"status", "actor", "process_identity", "workflow_fingerprint", "operation"},
     "run.finished": {"status", "duration_seconds"},
@@ -43,6 +44,15 @@ def process_identity(pid: int | None = None) -> dict[str, Any] | None:
         return None
 
 
+def process_identity_alive(identity: dict[str, Any] | None) -> bool:
+    if not isinstance(identity, dict) or set(identity) != {"pid", "start_time", "boot_id"}:
+        return False
+    try:
+        return process_identity(int(identity["pid"])) == identity
+    except (TypeError, ValueError):
+        return False
+
+
 def redact(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: ("[not retained]" if key.lower() in {"reasoning", "private_reasoning", "chain_of_thought"} else "***" if any(word in key.lower() for word in ("password", "token", "secret", "private_key")) else redact(child)) for key, child in value.items()}
@@ -63,6 +73,50 @@ class EventStore:
         self.events_path = self.root / "events.jsonl"
         self.lock_path = self.root / ".events.lock"
 
+    def prepare_run(self, run_id: str, execution_snapshot: dict[str, Any]) -> str:
+        """Атомарно создаёт неизменяемую безопасную часть файла запуска."""
+
+        reject_secrets(execution_snapshot, "execution snapshot")
+        encoded = canonical_json(execution_snapshot)
+        fingerprint = "sha256:" + sha256(encoded)
+        path = self.root / "runs" / f"{sha256(run_id.encode())}.json"
+        with self.lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if path.is_file():
+                prior = json.loads(path.read_text(encoding="utf-8"))
+                if prior.get("run_id") != run_id or prior.get("execution_snapshot_fingerprint") != fingerprint or canonical_json(prior.get("execution_snapshot")) != encoded:
+                    raise RuntimeError("run execution snapshot is immutable")
+                return fingerprint
+            atomic_json(path, {"schema_version": "2", "run_id": run_id, "last_sequence": 0, "status": "preparing", "process_identity": None, "execution_snapshot": execution_snapshot, "execution_snapshot_fingerprint": fingerprint, "events": []})
+            path.chmod(0o600)
+        return fingerprint
+
+    def remove_prepared_run(self, run_id: str) -> bool:
+        path = self.root / "runs" / f"{sha256(run_id.encode())}.json"
+        with self.lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if not path.is_file():
+                return False
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if value.get("events"):
+                return False
+            path.unlink()
+            return True
+
+    def run_snapshot(self, run_id: str) -> dict[str, Any] | None:
+        """Читает файл запуска и проверяет неизменяемый снимок."""
+
+        path = self.root / "runs" / f"{sha256(run_id.encode())}.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            snapshot = value["execution_snapshot"]
+            fingerprint = "sha256:" + sha256(canonical_json(snapshot))
+        except (FileNotFoundError, OSError, KeyError, json.JSONDecodeError, TypeError):
+            return None
+        if value.get("run_id") != run_id or value.get("execution_snapshot_fingerprint") != fingerprint:
+            return None
+        return value
+
     def emit(self, event_type: str, run_id: str, payload: dict[str, Any], **hierarchy: Any) -> dict[str, Any]:
         if event_type not in EVENT_TYPES:
             raise ValueError(f"unsupported workflow event type: {event_type}")
@@ -74,6 +128,19 @@ class EventStore:
             raise ValueError("step event requires job, step, and positive attempt")
         if event_type in {"run.finished", "job.finished", "step.finished"} and payload.get("status") not in TERMINAL_STATUSES:
             raise ValueError("terminal workflow event requires a terminal status")
+        if event_type in {"run.created", "run.finished"}:
+            prepared = self.run_snapshot(run_id)
+            if prepared is not None and prepared.get("schema_version") == "2":
+                required_snapshot_fields = {
+                    "execution_snapshot_fingerprint",
+                    "policy_source",
+                    "tool_versions",
+                }
+                if missing_snapshot_fields := required_snapshot_fields - set(payload):
+                    raise ValueError(
+                        "dispatcher run event is missing execution metadata: "
+                        f"{sorted(missing_snapshot_fields)}"
+                    )
         missing = REQUIRED_PAYLOAD[event_type] - set(payload)
         if missing:
             raise ValueError(f"workflow event {event_type} is missing payload fields: {sorted(missing)}")
@@ -120,7 +187,12 @@ class EventStore:
             prior_snapshot = {}; history = []
         history = [*history, event][-1000:]
         identity = cleaned.get("process_identity") if event_type == "run.created" else prior_snapshot.get("process_identity")
-        atomic_json(snapshot_path, {"schema_version": "1", "run_id": run_id, "last_sequence": sequence, "status": cleaned.get("status", "running"), "process_identity": identity, "events": history})
+        snapshot = {"schema_version": "2" if "execution_snapshot" in prior_snapshot else "1", "run_id": run_id, "last_sequence": sequence, "status": cleaned.get("status", "running"), "process_identity": identity, "events": history}
+        if "execution_snapshot" in prior_snapshot:
+            snapshot["execution_snapshot"] = prior_snapshot["execution_snapshot"]
+            snapshot["execution_snapshot_fingerprint"] = prior_snapshot["execution_snapshot_fingerprint"]
+        atomic_json(snapshot_path, snapshot)
+        snapshot_path.chmod(0o600)
         return event
 
     def events(self) -> list[dict[str, Any]]:
@@ -163,7 +235,21 @@ class EventStore:
             if identity and process_identity(identity.get("pid")) == identity:
                 continue
             run_id = snapshot["run_id"]
-            self.emit("run.finished", run_id, {"status": "interrupted", "error_class": "process_identity_lost", "message": "run owner is no longer active", "duration_seconds": 0.0})
+            payload = {
+                "status": "interrupted",
+                "error_class": "process_identity_lost",
+                "message": "run owner is no longer active",
+                "duration_seconds": 0.0,
+            }
+            if execution := snapshot.get("execution_snapshot"):
+                payload.update(
+                    {
+                        "execution_snapshot_fingerprint": snapshot.get("execution_snapshot_fingerprint", ""),
+                        "policy_source": execution.get("policy_source", "current-policy"),
+                        "tool_versions": {"codex": execution.get("codex_version", "")},
+                    }
+                )
+            self.emit("run.finished", run_id, payload)
             interrupted.append(run_id)
         return interrupted
 

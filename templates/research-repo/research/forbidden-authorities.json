@@ -17,6 +17,7 @@
     "analysis/indexes/feature-map.csv",
     "analysis/indexes/final-diff-inventory.csv",
     "analysis/indexes/final-feature-map.csv",
+    "research/active-batch-generation.json",
     "analysis/migration-requirements/README.md",
     "analysis/migration-requirements/schemas/migration-requirement.schema.json",
     "docs/method/1c-autoresearch-process.md",

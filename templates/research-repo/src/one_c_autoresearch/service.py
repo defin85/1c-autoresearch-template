@@ -98,12 +98,12 @@ class ApplicationService:
         manifest = workflow.validate_workflow(self.repo)
         return {"manifest_fingerprint": workflow.workflow_fingerprint(self.repo), "jobs": [{"id": job["id"], "needs": job["needs"]} for job in manifest["jobs"]], "steps": workflow.step_configurations(self.repo)}
 
-    def preview_step_patch(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def preview_step_patch(self, payload: dict[str, Any], state_base: Path | None = None) -> dict[str, Any]:
         if set(payload) != {"step_id", "parameters", "expected_manifest_fingerprint"}:
             raise ValueError("invalid workflow step patch")
-        return workflow.preview_step_patch(self.repo, payload["step_id"], payload["parameters"], payload["expected_manifest_fingerprint"])
+        return workflow.preview_step_patch(self.repo, payload["step_id"], payload["parameters"], payload["expected_manifest_fingerprint"], state_base)
 
-    def apply(self, operation: str, payload: dict[str, Any], expected_fingerprint: str, cancelled: callable | None = None, *, staged: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+    def apply(self, operation: str, payload: dict[str, Any], expected_fingerprint: str, cancelled: callable | None = None, *, staged: dict[str, dict[str, Any]] | None = None, fence: callable | None = None) -> dict[str, Any]:
         reject_secrets(payload, "operation payload")
         current = workflow.state_fingerprint(self.repo)
         if expected_fingerprint != current:
@@ -111,6 +111,7 @@ class ApplicationService:
         self._expected_fingerprint = expected_fingerprint
         self._cancelled = cancelled
         self._staged = staged
+        self._fence = fence
         handlers = {
             "project.configure": self._configure,
             "sources.configure": lambda value: self._locked(self._configure_sources, value),
@@ -283,7 +284,15 @@ class ApplicationService:
     def _publish_mrq(self, pointer: dict[str, Any], rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
         source = json.loads((self.repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
         diff = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
-        return mrq.publish(self.repo, rows, source["generation_id"], diff["generation_id"], source, pointer.get("canonical_generation_id"))
+        return mrq.publish(
+            self.repo,
+            rows,
+            source["generation_id"],
+            diff["generation_id"],
+            source,
+            pointer.get("canonical_generation_id"),
+            fence=getattr(self, "_fence", None),
+        )
 
     def _mrq_propose(self, payload: dict[str, Any]) -> dict[str, Any]:
         required = {"semantic_key", "title", "stable_diff_ids", "supporting_diff_ids", "evidence", "business_meaning", "scope", "confidence", "rationale"}
@@ -311,8 +320,12 @@ class ApplicationService:
             raise ValueError("invalid MRQ source batch payload")
         noise_entries = payload["approved_noise"]
         group_proposals = payload["group_proposals"]
-        if not isinstance(noise_entries, list) or not isinstance(group_proposals, list) or not group_proposals:
-            raise ValueError("MRQ source batch requires at least one group proposal")
+        if (
+            not isinstance(noise_entries, list)
+            or not isinstance(group_proposals, list)
+            or not (noise_entries or group_proposals)
+        ):
+            raise ValueError("MRQ source batch requires at least one reviewed item")
         for proposal in group_proposals:
             required_fields = {"semantic_key", "title", "stable_diff_ids", "supporting_diff_ids", "evidence", "business_meaning", "scope", "confidence", "rationale"}
             if set(proposal) != required_fields:
@@ -421,27 +434,45 @@ class ApplicationService:
     def _patch_step(self, payload: dict[str, Any]) -> dict[str, Any]:
         if set(payload) != {"step_id", "parameters", "expected_manifest_fingerprint"}:
             raise ValueError("invalid workflow step patch")
-        workflow.preview_step_patch(self.repo, payload["step_id"], payload["parameters"], payload["expected_manifest_fingerprint"])
         path = self.repo / "research/workflow.toml"
-        # TOML has no stdlib writer; keep the patch closed to scalar values on the matched inline step.
+        # TOML has no stdlib writer; serialize only the already validated fixed step.
         text = path.read_text(encoding="utf-8")
-        import re
-        match = re.search(rf"\{{[^\n]*id = {re.escape(json.dumps(payload['step_id']))}[^\n]*\}}", text)
-        if not match:
+        preview = workflow.preview_step_patch(self.repo, payload["step_id"], payload["parameters"], payload["expected_manifest_fingerprint"])
+        marker_at = text.find(f'{{ id = {json.dumps(payload["step_id"])}, operation =')
+        if marker_at < 0:
             raise ValueError("workflow step not found")
-        current = match.group(0)
-        operation_match = re.search(r'operation = "([^"]+)"', current)
-        operation = operation_match.group(1) if operation_match else ""
+        start = marker_at
+        depth = 0
+        end = -1
+        for index in range(start, len(text)):
+            if text[index] in "[{":
+                depth += 1
+            elif text[index] in "]}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        if start < 0 or end < 0:
+            raise ValueError("workflow step is malformed")
+        operation = preview["operation"]
         if set(payload["parameters"]) - workflow.PARAMETERS.get(operation, set()):
             raise ValueError("unsupported workflow step parameter")
-        updated = current
-        for key, value in payload["parameters"].items():
-            literal = json.dumps(value, ensure_ascii=False)
-            if re.search(rf"\b{re.escape(key)}\s*=", updated):
-                updated = re.sub(rf"\b{re.escape(key)}\s*=\s*(?:\"[^\"]*\"|[^,}}]+)", f"{key} = {literal}", updated)
-            else:
-                updated = updated[:-1].rstrip() + f", {key} = {literal} }}"
-        candidate = text[:match.start()] + updated + text[match.end():]
+
+        def toml_value(value: Any) -> str:
+            if isinstance(value, str):
+                return json.dumps(value, ensure_ascii=False)
+            if isinstance(value, bool):
+                return "true" if value else "false"
+            if isinstance(value, int):
+                return str(value)
+            if isinstance(value, list):
+                return "[" + ", ".join(toml_value(item) for item in value) + "]"
+            if isinstance(value, dict):
+                return "{ " + ", ".join(f"{key} = {toml_value(item)}" for key, item in value.items()) + " }"
+            raise ValueError("unsupported workflow step value")
+
+        updated = "{ " + ", ".join(f"{key} = {toml_value(value)}" for key, value in preview["after"].items()) + " }"
+        candidate = text[:start] + updated + text[end:]
         workflow.validate_workflow_manifest(tomllib.loads(candidate))
         atomic_bytes(path, candidate.encode())
         return {"workflow_fingerprint": workflow.workflow_fingerprint(self.repo)}

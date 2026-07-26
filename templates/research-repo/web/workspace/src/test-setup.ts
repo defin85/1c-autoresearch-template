@@ -36,3 +36,7 @@ if (typeof window !== 'undefined' && typeof window.DOMMatrix === 'undefined') {
     }
   } as unknown as typeof DOMMatrix;
 }
+
+if (typeof window !== 'undefined' && typeof window.DOMMatrixReadOnly === 'undefined') {
+  window.DOMMatrixReadOnly = window.DOMMatrix as unknown as typeof DOMMatrixReadOnly;
+}

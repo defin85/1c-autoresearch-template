@@ -11,13 +11,15 @@ from .events import EventStore, process_identity
 from .workflow import OPERATION_CATALOG, next_work, status, step_configurations
 
 
-AGENT_OPERATIONS = {"mrq.discover-next", "mrq.decide-next"}
+AGENT_OPERATIONS = {"mrq.discover-next", "mrq.classify-batches", "mrq.decide-next"}
 AUTOMATABLE = {"sources.acquire", "diff.build", "indexes.build", "projections.build", "workflow.verify", *AGENT_OPERATIONS}
 APPROVAL_REQUIRED = {"sources.acquire"}
 LOCATION = {
     "project.validate": ("configure", "validate-project"), "sources.acquire": ("acquire-sources", "acquire-sources"),
     "diff.build": ("build-diffs", "build-diffs"), "indexes.build": ("index-sources", "index-sources"),
-    "mrq.discover-next": ("discover-mrq", "discover-mrq"), "mrq.decide-next": ("decide-mrq", "decide-mrq"),
+    "mrq.discover-next": ("discover-mrq", "discover-mrq"),
+    "mrq.classify-batches": ("classify-mrq", "classify-mrq"),
+    "mrq.decide-next": ("decide-mrq", "decide-mrq"),
     "projections.build": ("publish", "build-projections"), "workflow.verify": ("publish", "verify-workflow"),
 }
 
@@ -26,7 +28,19 @@ def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], boo
     run_started = time.monotonic()
     elapsed = lambda: time.monotonic() - run_started
     store.reconcile()
-    before = status(repo); work = (select or (lambda: next_work(repo)))(); run_id = str(uuid.uuid4())
+    before = status(repo); work = (select or (lambda: next_work(repo)))()
+    if work is not None and work.get("action") in AGENT_OPERATIONS:
+        return {
+            "run_id": "",
+            "result": "blocked",
+            "work": work,
+            "blocker": {
+                "code": "dispatcher.required",
+                "message": "agent operations require the snapshot-backed dispatcher",
+                "action": work["action"],
+            },
+        }
+    run_id = str(uuid.uuid4())
     store.emit("run.created", run_id, {"status": "running", "actor": actor, "process_identity": process_identity(), "workflow_fingerprint": before["workflow_fingerprint"], "operation": work.get("action") if work else "none", "work_unit": work})
     if work is None:
         store.emit("run.finished", run_id, {"status": "completed", "result": "already_complete", "duration_seconds": elapsed()})
@@ -35,14 +49,16 @@ def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], boo
     job_id, step_id = LOCATION.get(operation, (str(work.get("job_id", "unknown")), operation.replace(".", "-")))
     configured = next(item for item in step_configurations(repo) if item["step"]["id"] == step_id)
     catalog = OPERATION_CATALOG[operation]
-    profile_name = configured["step"].get("agent_profile") if operation in AGENT_OPERATIONS else None
+    primary_role = {"mrq.discover-next": "analyzer", "mrq.classify-batches": "classifier", "mrq.decide-next": "researcher"}.get(operation, "")
+    role_policy = next((role for phase in configured["step"].get("agent_phases", []) for role in phase["roles"] if role["role_id"] == primary_role), None) if operation in AGENT_OPERATIONS else None
+    profile_name = role_policy.get("agent_profile") if role_policy else None
     profile = (agent_profiles or {}).get(profile_name) if profile_name else None
     try:
         pointers = {name: json.loads((repo / "research" / name).read_text(encoding="utf-8")) for name in ("active-source-generation.json", "active-diff-generation.json", "active-generation.json")}
     except (OSError, json.JSONDecodeError):
         pointers = {}
     context = {"actor": actor, "executor": catalog["executor"], "operation": operation, "operation_version": catalog["version"], "gate_id": work.get("gate_id"), "work_unit": work.get("work_unit"), "work_unit_id": (work.get("work_unit") or {}).get("id"), "source_generation_id": pointers.get("active-source-generation.json", {}).get("generation_id"), "diff_generation_id": pointers.get("active-diff-generation.json", {}).get("generation_id"), "canonical_generation_id": pointers.get("active-generation.json", {}).get("canonical_generation_id"), "index_key": (work.get("work_unit") or {}).get("index_key"), "index_keys": (work.get("work_unit") or {}).get("index_keys")}
-    runtime_payload = {"mode": "ensure"} if operation == "indexes.build" else ({"agent_profile": profile_name, "agent_profile_fingerprint": sha256(canonical_json(profile)) if profile else None, "model": profile.get("model") if profile else None, "instructions_version": profile.get("instructions_version") if profile else None, "instruction_supplement": configured["step"].get("instruction_supplement", ""), "allowed_paths": (work.get("work_unit") or {}).get("allowed_paths", []), "tool_calls": [{"tool": "codex-cli", "sandbox": "read-only"}], "private_reasoning": "unavailable"} if operation in AGENT_OPERATIONS else ({**(source_routing_preview or {})} if operation == "sources.acquire" else {}))
+    runtime_payload = {"mode": "ensure"} if operation == "indexes.build" else ({"agent_profile": profile_name, "agent_profile_fingerprint": sha256(canonical_json(profile)) if profile else None, "model": profile.get("model") if profile else None, "instructions_version": profile.get("instructions_version") if profile else None, "environment_preset": profile.get("environment_preset") if profile else None, "instruction_supplement": role_policy.get("instruction_supplement", "") if role_policy else "", "agent_phases": configured["step"].get("agent_phases", []), "allowed_paths": (work.get("work_unit") or {}).get("allowed_paths", []), "tool_calls": [{"tool": "codex-cli", "sandbox": "read-only"}], "private_reasoning": "unavailable"} if operation in AGENT_OPERATIONS else ({**(source_routing_preview or {})} if operation == "sources.acquire" else {}))
     idempotency_key = sha256(canonical_json({"manifest_fingerprint": before["manifest_fingerprint"], "job_id": job_id, "step_id": step_id, "work_unit_id": (work.get("work_unit") or {}).get("id"), "source_generation_id": context["source_generation_id"], "diff_generation_id": context["diff_generation_id"], "canonical_generation_id": context["canonical_generation_id"], "parameters": configured["step"], "runtime_payload": runtime_payload}))
     accepted = store.accepted(idempotency_key)
     if accepted:
@@ -79,14 +95,36 @@ def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], boo
       store.emit("step.started", run_id, {**context, "status": "running", "inputs": runtime_payload, "input_fingerprint": idempotency_key}, job_id=job_id, step_id=step_id, attempt=attempt)
       try:
         store.emit("step.action", run_id, {**context, "status": "running", "effective_action": runtime_payload}, job_id=job_id, step_id=step_id, attempt=attempt)
-        if operation in AGENT_OPERATIONS:
+        if operation == "mrq.classify-batches":
+            from .mrq_batches import load_active, publish as publish_batches, source_mrq_payload, stable_windows
+            from .pipeline_graphs import _validated_window_batches
+            try:
+                batches = load_active(repo)
+                output = {"status": "completed", "result": "reused", "batch_ids": [batch.batch_id for batch in batches]}
+            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                executor = agent_executor
+                if executor is None:
+                    from .agents import execute as executor
+                _generation_id, fingerprint, records = source_mrq_payload(repo)
+                batches = []
+                for index, window in enumerate(stable_windows(records)):
+                    if source_mrq_payload(repo)[1] != fingerprint:
+                        raise RuntimeError("source_mrq_fingerprint_stale")
+                    unit = {"id": f"window:{index}", "kind": "mrq-batch-window", "source_mrq_fingerprint": fingerprint, "mrqs": window, "allowed_paths": sorted({evidence["path"] for record in window for evidence in record["source_evidence"]})}
+                    proposal_payload = executor(repo, store.root / "proposal-work" / sha256(f"{run_id}:{index}".encode()), (agent_profiles or {})[profile_name], operation, unit, role_policy.get("instruction_supplement", "") if role_policy else "", int(configured["step"].get("timeout_seconds", 1800)), lambda: bool(store.cancellation(run_id)))
+                    batches.extend(_validated_window_batches(window, proposal_payload))
+                if source_mrq_payload(repo)[1] != fingerprint:
+                    raise RuntimeError("source_mrq_fingerprint_stale")
+                binding = publish_batches(repo, batches, fingerprint)
+                output = {"status": "completed", "batch_generation": binding, "batch_ids": [batch.batch_id for batch in batches]}
+        elif operation in AGENT_OPERATIONS:
             proposal = store.proposal(idempotency_key)
             new_proposal = proposal is None
             if proposal is None:
                 executor = agent_executor
                 if executor is None:
                     from .agents import execute as executor
-                payload = executor(repo, store.root / "proposal-work" / sha256(run_id.encode()), (agent_profiles or {})[profile_name], operation, work.get("work_unit") or {}, configured["step"].get("instruction_supplement", ""), int(configured["step"].get("timeout_seconds", 1800)), lambda: bool(store.cancellation(run_id)))
+                payload = executor(repo, store.root / "proposal-work" / sha256(run_id.encode()), (agent_profiles or {})[profile_name], operation, work.get("work_unit") or {}, role_policy.get("instruction_supplement", "") if role_policy else "", int(configured["step"].get("timeout_seconds", 1800)), lambda: bool(store.cancellation(run_id)))
                 from .agents import validate_proposal
                 validate_proposal(operation, payload, work.get("work_unit") or {})
                 proposal = store.save_proposal(idempotency_key, operation, profile_name, payload)

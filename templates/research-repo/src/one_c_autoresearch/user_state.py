@@ -39,8 +39,12 @@ def agent_profiles_path(repo: Path, base: Path | None = None) -> Path:
 
 
 def _validate_agent_profiles(values: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    from .agents import INSTRUCTION_CATALOG
+
     for name, profile in values.items():
-        if not name or set(profile) != {"provider", "model", "reasoning_effort", "instructions_version"} or profile["provider"] != "codex-cli" or profile["reasoning_effort"] not in {"low", "medium", "high", "xhigh"} or not all(str(profile[key]).strip() for key in ("model", "instructions_version")):
+        if "environment_preset" not in profile:
+            raise ValueError(f"invalid user-scope agent profile: {name}; environment_preset is required, resave the profile")
+        if not name or set(profile) != {"provider", "model", "reasoning_effort", "instructions_version", "environment_preset"} or profile["provider"] != "codex-cli" or profile["reasoning_effort"] not in {"low", "medium", "high", "xhigh"} or profile["instructions_version"] not in INSTRUCTION_CATALOG or profile["environment_preset"] != "local-read-only" or not str(profile["model"]).strip():
             raise ValueError(f"invalid user-scope agent profile: {name}")
     return values
 
@@ -55,3 +59,23 @@ def save_agent_profiles(repo: Path, values: dict[str, dict[str, Any]], base: Pat
     path = agent_profiles_path(repo, base)
     atomic_bytes(path, json.dumps(values, ensure_ascii=False, sort_keys=True).encode())
     path.chmod(0o600)
+
+
+def replace_agent_profile(
+    repo: Path,
+    name: str,
+    profile: dict[str, Any],
+    base: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Перезаписывает один профиль, в том числе единственный старый профиль."""
+
+    path = agent_profiles_path(repo, base)
+    try:
+        values = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid user-scope agent profile file; recreate it") from exc
+    if not isinstance(values, dict):
+        raise ValueError("invalid user-scope agent profile file; recreate it")
+    values[name] = profile
+    save_agent_profiles(repo, values, base)
+    return values

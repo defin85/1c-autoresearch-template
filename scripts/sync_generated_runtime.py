@@ -16,13 +16,15 @@ FILES = (
     "tests/test_external_folder.py", "tests/test_source_routing.py", "tests/test_source_tools.py",
     "tests/test_sources.py", "tests/test_diffs.py", "tests/test_extension_analyzer.py", "tests/test_indexes.py",
     "tests/test_runner.py", "tests/test_workspace_api.py", "tests/test_stage_recompute.py",
-    "tests/test_stage_recompute_api.py",
+    "tests/test_stage_recompute_api.py", "tests/test_dispatcher.py", "tests/test_dispatcher_api.py",
+    "tests/test_dispatcher_smoke.py", "tests/test_doctor.py", "tests/test_mrq.py",
+    "tests/test_mrq_batches.py", "tests/test_pipeline_graphs.py", "tests/test_workflow.py",
 )
 TREES = (
     "src/one_c_autoresearch", "one_c_autoresearch", "research/schemas", "web/workspace",
     "tests/fixtures/source-routing", "tests/fixtures/extension-semantic",
 )
-IGNORED_PARTS = {"__pycache__", ".pytest_cache", ".venv", "node_modules", "test-results", ".git"}
+IGNORED_PARTS = {"__pycache__", ".pytest_cache", ".venv", "node_modules", "test-results", ".artifacts", ".playwright-cli", ".git"}
 FORBIDDEN_SUFFIXES = {".cf", ".cfe", ".epf", ".erf", ".dt", ".pyc", ".pyo"}
 FORBIDDEN_TEXT = (re.compile(r"/run/" + r"media/"), re.compile(r"/home/[A-Za-z0-9._-]+/"), re.compile(r"sppr", re.I))
 

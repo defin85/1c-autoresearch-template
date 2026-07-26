@@ -1,6 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { EMPTY_PROJECTION, buildEdges, buildNodes, circuitById, freshnessLabel, isFresh, projectionStateColor } from './projection';
-import { FIXED_EDGES, FIXED_NODES, type CircuitId } from './nodes';
+import { EMPTY_PROJECTION, VISIBLE_DECISION_LIMIT, VISIBLE_INVOCATION_LIMIT, VISIBLE_QUEUE_LIMIT, circuitById, freshnessLabel, isFresh, roleProgress, visibleWindow, type AgentRoleProjection, type CircuitId } from './projection';
 
 describe('dispatcher projection', () => {
   test('empty projection yields neutral freshness', () => {
@@ -13,8 +12,8 @@ describe('dispatcher projection', () => {
   });
 
   test('completed projection shows confirmation time regardless of age', () => {
-    const fresh = new Date(Date.now() - 1_000).toISOString();
-    expect(freshnessLabel({ ...EMPTY_PROJECTION, fresh_at: fresh })).toMatch(/^подтверждено /);
+    const confirmed = new Date(Date.now() - 30_000).toISOString();
+    expect(freshnessLabel({ ...EMPTY_PROJECTION, fresh_at: confirmed })).toMatch(/^подтверждено /);
   });
 
   test('active projection (>10s) is reported as stale', () => {
@@ -24,48 +23,9 @@ describe('dispatcher projection', () => {
 
   test('isFresh respects 10-second threshold', () => {
     const now = Date.parse('2026-07-21T12:00:00Z');
-    expect(isFresh(new Date(now - 5_000).toISOString(), now)).toBe(true);
-    expect(isFresh(new Date(now - 11_000).toISOString(), now)).toBe(false);
+    expect(isFresh(new Date(now - 9_999).toISOString(), now)).toBe(true);
+    expect(isFresh(new Date(now - 10_000).toISOString(), now)).toBe(false);
     expect(isFresh('', now)).toBe(false);
-  });
-
-  test('projectionStateColor maps each state', () => {
-    expect(projectionStateColor('complete')).toBe('#2e7d32');
-    expect(projectionStateColor('ready')).toBe('#ed6c02');
-    expect(projectionStateColor('blocked')).toBe('#d32f2f');
-    expect(projectionStateColor('unknown')).toBe('#9e9e9e');
-  });
-
-  test('buildNodes returns fixed nodes with disabled drag/connect', () => {
-    const nodes = buildNodes(EMPTY_PROJECTION, null, false);
-    expect(nodes).toHaveLength(FIXED_NODES.length);
-    for (const node of nodes) {
-      expect(node.draggable).toBe(false);
-      expect(node.connectable).toBe(false);
-      expect(node.selectable).toBe(true);
-      expect(node.type).toBe('dispatcherNode');
-    }
-  });
-
-  test('buildNodes marks selected node', () => {
-    const nodes = buildNodes(EMPTY_PROJECTION, 'prepare-diffs', false);
-    const selected = nodes.find((node) => node.id === 'prepare-diffs');
-    expect(selected).toBeDefined();
-    expect((selected!.data as { isSelected: boolean }).isSelected).toBe(true);
-  });
-
-  test('buildEdges returns fixed edges with smoothstep type', () => {
-    const edges = buildEdges(false);
-    expect(edges).toHaveLength(FIXED_EDGES.length);
-    for (const edge of edges) {
-      expect(edge.type).toBe('smoothstep');
-      expect(edge.animated).toBe(false);
-    }
-  });
-
-  test('buildEdges respects animate flag for reduced-motion off', () => {
-    const edges = buildEdges(true);
-    expect(edges.every((edge) => edge.animated)).toBe(true);
   });
 
   test('circuitById finds existing circuit', () => {
@@ -76,24 +36,21 @@ describe('dispatcher projection', () => {
     expect(circuitById(projection, 'decide-target')).toBeUndefined();
   });
 
-  test('fixed nodes cover exactly four circuits', () => {
-    const circuits = new Set(FIXED_NODES.map((node) => node.circuit));
-    expect(circuits).toEqual(new Set(['prepare-diffs', 'analyze-dif', 'form-mrq', 'decide-target']));
+  test('visible windows preserve server order at the fixed limits', () => {
+    const values = Array.from({ length: 20 }, (_, index) => index);
+    expect(visibleWindow(values, VISIBLE_QUEUE_LIMIT)).toEqual([0, 1, 2, 3]);
+    expect(visibleWindow(values, VISIBLE_DECISION_LIMIT)).toEqual([0, 1, 2]);
+    expect(visibleWindow(values, VISIBLE_INVOCATION_LIMIT)).toEqual(values.slice(0, 16));
   });
 
-  test('fixed edges reference only known nodes', () => {
-    const known = new Set(FIXED_NODES.map((node) => node.id));
-    for (const edge of FIXED_EDGES) {
-      expect(known.has(edge.source)).toBe(true);
-      expect(known.has(edge.target)).toBe(true);
-    }
-  });
-
-  test('projection with error does not break node rendering', () => {
-    const nodes = buildNodes({ ...EMPTY_PROJECTION, error: 'store gone' }, null, false);
-    expect(nodes).toHaveLength(FIXED_NODES.length);
-    for (const node of nodes) {
-      expect((node.data as { circuitState: string }).circuitState).toBe('unknown');
-    }
+  test('role progress requires an exhaustive partition and separates capacity', () => {
+    const role: AgentRoleProjection = {
+      role_id: 'analyzer', agent_profile: 'local', configured_slots: 4, requested: 10,
+      running: 2, queued: 1, completed: 4, failed: 1, cancelled: 1, interrupted: 1,
+      invocations: [],
+    };
+    expect(roleProgress(role)).toEqual({ valid: true, percent: 70, processed: 7, freeCapacity: 2 });
+    expect(roleProgress({ ...role, requested: 11 })).toEqual({ valid: false, percent: undefined, processed: 7, freeCapacity: 2 });
+    expect(roleProgress({ ...role, requested: 0, running: 0, queued: 0, completed: 0, failed: 0, cancelled: 0, interrupted: 0 })).toEqual({ valid: true, percent: undefined, processed: 0, freeCapacity: 4 });
   });
 });

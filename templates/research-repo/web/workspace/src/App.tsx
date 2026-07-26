@@ -35,6 +35,8 @@ import {
 } from "@mui/material";
 import { api, mutationHeaders } from "./api";
 import { PipelineDispatcher } from "./dispatcher/PipelineDispatcher";
+import { OfficialSubFlowReference } from "./dispatcher/OfficialSubFlowReference";
+import { EnrichedSubFlowReference } from "./dispatcher/EnrichedSubFlowReference";
 import { ExternalFolderImport } from "./ExternalFolderImport";
 import type { DispatcherProjection } from "./dispatcher/projection";
 
@@ -66,7 +68,20 @@ type AgentProfile = {
   provider: "codex-cli";
   model: string;
   reasoning_effort: "low" | "medium" | "high" | "xhigh";
-  instructions_version: number;
+  instructions_version: string;
+  environment_preset: "local-read-only";
+};
+type AgentRole = {
+  role_id: string;
+  agent_profile: string;
+  count: number;
+  instruction_supplement: string;
+};
+type AgentPhase = {
+  phase_id: string;
+  mode: "sequential" | "parallel-pool" | "coordinated-pool";
+  max_concurrency: number;
+  roles: AgentRole[];
 };
 type RunResult = {
   run_id: string;
@@ -139,8 +154,7 @@ type StepConfiguration = {
     operation: string;
     timeout_seconds: number;
     max_retries?: number;
-    agent_profile?: string;
-    instruction_supplement?: string;
+    agent_phases?: AgentPhase[];
   };
   catalog: { executor: string; effect: string; approval_required: boolean };
 };
@@ -583,13 +597,15 @@ function ActionPanel({
   );
 }
 
-function AgentProfiles({ project }: { project: Project }) {
+export function AgentProfiles({ project }: { project: Project }) {
   const [items, setItems] = useState<Record<string, AgentProfile>>({});
   const [profileId, setProfileId] = useState("local");
   const [model, setModel] = useState("gpt-5.6-sol");
   const [reasoning, setReasoning] =
     useState<AgentProfile["reasoning_effort"]>("low");
-  const [version, setVersion] = useState(1);
+  const [version, setVersion] = useState("1");
+  const [environment, setEnvironment] =
+    useState<AgentProfile["environment_preset"]>("local-read-only");
   const [error, setError] = useState("");
   const load = useCallback(
     () =>
@@ -597,7 +613,11 @@ function AgentProfiles({ project }: { project: Project }) {
         `/projects/${project.id}/agent-profiles`,
       )
         .then((value) => setItems(value.items))
-        .catch((error) => setError(error.message)),
+        .catch((error) =>
+          setError(
+            `${error.message}. Старый профиль недействителен: выберите встроенную среду и пересохраните его.`,
+          ),
+        ),
     [project.id],
   );
   useEffect(() => {
@@ -615,6 +635,7 @@ function AgentProfiles({ project }: { project: Project }) {
             model,
             reasoning_effort: reasoning,
             instructions_version: version,
+            environment_preset: environment,
           },
         }),
       });
@@ -636,13 +657,16 @@ function AgentProfiles({ project }: { project: Project }) {
         )}
         <Stack spacing={2}>
           <Typography variant="caption">
-            Профили хранятся только в пользовательском каталоге и не являются
-            исследовательскими решениями.
+            Профили хранятся только в пользовательском каталоге. Среда
+            local-read-only запрещает запись, но может читать репозиторий;
+            предметные allowed_paths ограничивают контекст инструкции, а не
+            файловый доступ.
           </Typography>
           {Object.entries(items).map(([id, profile]) => (
             <Alert key={id} severity="success">
               {id}: {profile.model}, рассуждение {profile.reasoning_effort},
-              версия инструкций {profile.instructions_version}
+              версия инструкций {profile.instructions_version}, среда{" "}
+              {profile.environment_preset}
             </Alert>
           ))}
           <TextField
@@ -673,13 +697,26 @@ function AgentProfiles({ project }: { project: Project }) {
               ))}
             </Select>
           </FormControl>
-          <TextField
-            type="number"
-            label="Версия инструкций"
-            value={version}
-            onChange={(event) => setVersion(Number(event.target.value))}
-            inputProps={{ min: 1 }}
-          />
+          <FormControl>
+            <InputLabel>Версия инструкций</InputLabel>
+            <Select label="Версия инструкций" value={version} onChange={(event) => setVersion(event.target.value)}>
+              <MenuItem value="1">1</MenuItem>
+            </Select>
+          </FormControl>
+          <FormControl>
+            <InputLabel>Среда исполнения</InputLabel>
+            <Select
+              label="Среда исполнения"
+              value={environment}
+              onChange={(event) =>
+                setEnvironment(
+                  event.target.value as AgentProfile["environment_preset"],
+                )
+              }
+            >
+              <MenuItem value="local-read-only">local-read-only · только чтение</MenuItem>
+            </Select>
+          </FormControl>
           <Button variant="contained" onClick={() => void save()}>
             Проверить и сохранить профиль
           </Button>
@@ -689,7 +726,25 @@ function AgentProfiles({ project }: { project: Project }) {
   );
 }
 
-function WorkflowEditor({
+type WorkflowPatchPreview = {
+  before?: StepConfiguration["step"];
+  after?: StepConfiguration["step"];
+  agent_phase_preview?: Array<{
+    phase_id: string;
+    mode: AgentPhase["mode"];
+    effective_max_concurrency: number;
+    maximum_calls_in_current_window: number;
+    roles: Array<{
+      role_id: string;
+      agent_profile: string;
+      profile: Partial<AgentProfile>;
+    }>;
+    sandbox: string;
+    allowed_paths: string;
+  }>;
+};
+
+export function WorkflowEditor({
   project,
   snapshot,
   refresh,
@@ -702,9 +757,11 @@ function WorkflowEditor({
   const [selected, setSelected] = useState("");
   const [timeout, setTimeoutValue] = useState(1800);
   const [retries, setRetries] = useState(0);
-  const [profile, setProfile] = useState("local");
-  const [supplement, setSupplement] = useState("");
-  const [preview, setPreview] = useState<Record<string, unknown>>();
+  const [phases, setPhases] = useState<AgentPhase[]>([]);
+  const [preview, setPreview] = useState<{
+    response: WorkflowPatchPreview;
+    parameters: Record<string, unknown>;
+  }>();
   const [error, setError] = useState("");
   const [agentProfiles, setAgentProfiles] = useState<
     Record<string, AgentProfile>
@@ -732,12 +789,14 @@ function WorkflowEditor({
   const current = configuration?.steps.find(
     (item) => item.step.id === selected,
   );
+  const hasMissingProfiles = phases.some((phase) =>
+    phase.roles.some((role) => !agentProfiles[role.agent_profile]),
+  );
   useEffect(() => {
     if (current) {
       setTimeoutValue(current.step.timeout_seconds);
       setRetries(current.step.max_retries || 0);
-      setProfile(current.step.agent_profile || "local");
-      setSupplement(current.step.instruction_supplement || "");
+      setPhases(current.step.agent_phases || []);
       setPreview(undefined);
     }
   }, [current]);
@@ -748,24 +807,55 @@ function WorkflowEditor({
     )
       ? { max_retries: retries }
       : {}),
-    ...(current?.step.operation.startsWith("mrq.")
-      ? { agent_profile: profile, instruction_supplement: supplement }
+    ...(current?.step.agent_phases
+      ? { agent_phases: phases }
       : {}),
   });
+  const invalidatePreview = () => setPreview(undefined);
+  const updatePhase = (phaseId: string, patch: Partial<AgentPhase>) => {
+    invalidatePreview();
+    setPhases((items) =>
+      items.map((phase) =>
+        phase.phase_id === phaseId ? { ...phase, ...patch } : phase,
+      ),
+    );
+  };
+  const updateRole = (
+    phaseId: string,
+    roleId: string,
+    patch: Partial<AgentRole>,
+  ) => {
+    invalidatePreview();
+    setPhases((items) =>
+      items.map((phase) =>
+        phase.phase_id === phaseId
+          ? {
+              ...phase,
+              roles: phase.roles.map((role) =>
+                role.role_id === roleId ? { ...role, ...patch } : role,
+              ),
+            }
+          : phase,
+      ),
+    );
+  };
   const showPreview = async () => {
     try {
       setError("");
-      setPreview(
-        await api(`/projects/${project.id}/workflow/patch-preview`, {
+      const selectedParameters = parameters();
+      const response = await api<WorkflowPatchPreview>(
+        `/projects/${project.id}/workflow/patch-preview`,
+        {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             step_id: selected,
-            parameters: parameters(),
+            parameters: selectedParameters,
             expected_manifest_fingerprint: configuration?.manifest_fingerprint,
           }),
-        }),
+        },
       );
+      setPreview({ response, parameters: selectedParameters });
     } catch (error) {
       setError((error as Error).message);
     }
@@ -780,7 +870,7 @@ function WorkflowEditor({
           operation: "workflow.patch-step",
           payload: {
             step_id: selected,
-            parameters: parameters(),
+            parameters: preview?.parameters,
             expected_manifest_fingerprint: configuration?.manifest_fingerprint,
           },
           expected_fingerprint: snapshot.workflow_fingerprint,
@@ -832,7 +922,10 @@ function WorkflowEditor({
             type="number"
             label="Предельное время, секунд"
             value={timeout}
-            onChange={(event) => setTimeoutValue(Number(event.target.value))}
+            onChange={(event) => {
+              invalidatePreview();
+              setTimeoutValue(Number(event.target.value));
+            }}
             inputProps={{ min: 30, max: 86400 }}
           />
           {["diff.build", "projections.build"].includes(
@@ -842,46 +935,90 @@ function WorkflowEditor({
               type="number"
               label="Повторные попытки"
               value={retries}
-              onChange={(event) => setRetries(Number(event.target.value))}
+              onChange={(event) => {
+                invalidatePreview();
+                setRetries(Number(event.target.value));
+              }}
               inputProps={{ min: 0, max: 1 }}
             />
           )}
-          {current.step.operation.startsWith("mrq.") && (
-            <>
-              <FormControl error={!agentProfiles[profile]}>
-                <InputLabel>Профиль агента</InputLabel>
-                <Select
-                  label="Профиль агента"
-                  value={profile}
-                  onChange={(event) => setProfile(event.target.value)}
-                >
-                  {Object.keys(agentProfiles).map((value) => (
-                    <MenuItem key={value} value={value}>
-                      {value}
-                    </MenuItem>
-                  ))}
-                  {!agentProfiles[profile] && (
-                    <MenuItem value={profile}>{profile} — отсутствует</MenuItem>
+          {phases.map((phase) => (
+            <Card key={phase.phase_id} variant="outlined">
+              <CardContent>
+                <Typography id={`phase-${phase.phase_id}`} fontWeight={700}>
+                  {phase.phase_id}
+                </Typography>
+                <Stack spacing={2} mt={1}>
+                  {phase.phase_id !== "form-mrq" && (
+                    <FormControl>
+                      <InputLabel id={`mode-${phase.phase_id}`}>Режим {phase.phase_id}</InputLabel>
+                      <Select
+                        label={`Режим ${phase.phase_id}`}
+                        labelId={`mode-${phase.phase_id}`}
+                        value={phase.mode}
+                        onChange={(event) => {
+                          const mode = event.target.value as AgentPhase["mode"];
+                          updatePhase(phase.phase_id, {
+                            mode,
+                            max_concurrency: mode === "sequential" ? 1 : phase.max_concurrency,
+                            roles: phase.roles.map((role) => ({ ...role, count: mode === "sequential" ? 1 : role.count })),
+                          });
+                        }}
+                      >
+                        <MenuItem value="sequential">Последовательно</MenuItem>
+                        <MenuItem value="parallel-pool">Параллельный пул</MenuItem>
+                      </Select>
+                    </FormControl>
                   )}
-                </Select>
-              </FormControl>
-              {!agentProfiles[profile] && (
-                <Alert severity="warning">
-                  Создайте профиль агента перед запуском шага.
-                </Alert>
-              )}
-              <TextField
-                multiline
-                minRows={3}
-                label="Дополнительная инструкция"
-                value={supplement}
-                onChange={(event) => setSupplement(event.target.value)}
-                inputProps={{ maxLength: 4000 }}
-              />
-            </>
+                  <TextField
+                    type="number"
+                    label={`Предел одновременности ${phase.phase_id}`}
+                    value={phase.max_concurrency}
+                    onChange={(event) => updatePhase(phase.phase_id, { max_concurrency: Number(event.target.value) })}
+                    disabled={phase.mode === "sequential"}
+                    inputProps={{ min: 1 }}
+                  />
+                  {phase.roles.map((role) => (
+                    <Stack key={role.role_id} spacing={1}>
+                      <Typography id={`role-${phase.phase_id}-${role.role_id}`} variant="subtitle2">Роль: {role.role_id}</Typography>
+                      <FormControl error={!agentProfiles[role.agent_profile]}>
+                        <InputLabel id={`profile-${phase.phase_id}-${role.role_id}`}>Профиль {phase.phase_id} {role.role_id}</InputLabel>
+                        <Select label={`Профиль ${phase.phase_id} ${role.role_id}`} labelId={`profile-${phase.phase_id}-${role.role_id}`} value={role.agent_profile} onChange={(event) => updateRole(phase.phase_id, role.role_id, { agent_profile: event.target.value })}>
+                          {Object.keys(agentProfiles).map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+                          {!agentProfiles[role.agent_profile] && <MenuItem value={role.agent_profile}>{role.agent_profile} — отсутствует</MenuItem>}
+                        </Select>
+                      </FormControl>
+                      {!agentProfiles[role.agent_profile] && (
+                        <Alert severity="error">
+                          Профиль {role.agent_profile} отсутствует. Создайте или
+                          пересохраните его перед просмотром.
+                        </Alert>
+                      )}
+                      <TextField
+                        type="number"
+                        label={`Логические слоты ${phase.phase_id} ${role.role_id}`}
+                        value={role.count}
+                        disabled={role.role_id === "coordinator" || phase.mode === "sequential"}
+                        onChange={(event) => updateRole(phase.phase_id, role.role_id, { count: Number(event.target.value) })}
+                        inputProps={{ min: 1 }}
+                      />
+                      <TextField multiline minRows={2} label={`Дополнительная инструкция ${phase.phase_id} ${role.role_id}`} value={role.instruction_supplement} onChange={(event) => updateRole(phase.phase_id, role.role_id, { instruction_supplement: event.target.value })} inputProps={{ maxLength: 4000 }} />
+                    </Stack>
+                  ))}
+                </Stack>
+              </CardContent>
+            </Card>
+          ))}
+          {phases.length > 0 && (
+            <Alert severity="info">
+              Пределы независимы для каждой фазы; общего предела компьютера нет.
+            </Alert>
           )}
           <Stack direction="row" spacing={1}>
-            <Button onClick={() => void showPreview()}>
+            <Button
+              disabled={hasMissingProfiles}
+              onClick={() => void showPreview()}
+            >
               Предварительный просмотр
             </Button>
             <Button
@@ -893,12 +1030,35 @@ function WorkflowEditor({
             </Button>
           </Stack>
           {preview && (
-            <Box
-              component="pre"
-              sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-            >
-              {JSON.stringify(preview, null, 2)}
-            </Box>
+            <Card variant="outlined" aria-label="Просмотр политики фаз">
+              <CardContent>
+                <Typography fontWeight={700}>Итоговая политика</Typography>
+                {(preview.response.agent_phase_preview || []).map((phase) => (
+                  <Stack key={phase.phase_id} spacing={0.25}>
+                    <Typography variant="body2">
+                      {phase.phase_id}: {phase.mode}; эффективный предел{" "}
+                      {phase.effective_max_concurrency}; максимум вызовов текущего
+                      окна {phase.maximum_calls_in_current_window}
+                    </Typography>
+                    <Typography variant="caption">
+                      {phase.roles
+                        .map(
+                          (role) =>
+                            `${role.role_id}=${role.agent_profile} (${role.profile.model || "профиль недоступен"}, ${role.profile.reasoning_effort || "уровень не задан"}, ${role.profile.environment_preset || "среда недоступна"})`,
+                        )
+                        .join("; ")}
+                    </Typography>
+                    <Typography variant="caption">
+                      Песочница: {phase.sandbox}. Предметные разрешённые пути
+                      выбирают контекст, но не сужают доступ песочницы к файлам.
+                    </Typography>
+                  </Stack>
+                ))}
+                <Typography variant="caption">
+                  Стоимость и точная серверная ревизия модели не вычисляются.
+                </Typography>
+              </CardContent>
+            </Card>
           )}
         </Stack>
       </CardContent>
@@ -2122,20 +2282,41 @@ function Workspace({
 }) {
   const [snapshot, setSnapshot] = useState<Snapshot>();
   const [view, setView] = useState<
-    "dispatcher" | "sources" | "indexes" | "settings" | "journal" | "registries"
+    "dispatcher" | "dispatcher-new" | "react-flow-example" | "enriched-reference" | "sources" | "indexes" | "settings" | "journal" | "registries"
   >("dispatcher");
   const [error, setError] = useState("");
+  const [retryWorkingView, setRetryWorkingView] = useState<"dispatcher" | "dispatcher-new">();
+  const fetchSnapshot = useCallback(
+    () => api<Snapshot>(`/projects/${project.id}/workflow`),
+    [project.id],
+  );
   const refresh = useCallback(
     () =>
-      api<Snapshot>(`/projects/${project.id}/workflow`)
+      fetchSnapshot()
         .then(setSnapshot)
         .catch((error) => setError(error.message)),
-    [project.id],
+    [fetchSnapshot],
   );
   useEffect(() => {
     refresh();
   }, [refresh]);
-  const dispatcher = () => setView("dispatcher");
+  const working = view === "dispatcher" || view === "dispatcher-new";
+  const openWorking = async (target: "dispatcher" | "dispatcher-new") => {
+    if (working) {
+      setView(target);
+      return;
+    }
+    try {
+      const next = await fetchSnapshot();
+      setSnapshot(next);
+      setError("");
+      setRetryWorkingView(undefined);
+      setView(target);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось обновить рабочий снимок");
+      setRetryWorkingView(target);
+    }
+  };
   return (
     <>
       <AppBar position="static" color="inherit" elevation={1}>
@@ -2148,9 +2329,20 @@ function Workspace({
               {project.name}
             </Typography>
           </Box>
-          {view !== "dispatcher" && (
-            <Button onClick={dispatcher}>Диспетчер</Button>
-          )}
+          <Button
+            variant={view === "dispatcher" ? "contained" : "text"}
+            onClick={() => void openWorking("dispatcher")}
+          >
+            Диспетчер
+          </Button>
+          <Button onClick={() => setView("react-flow-example")}>Пример React Flow</Button>
+          <Button onClick={() => setView("enriched-reference")}>Обогащённая схема</Button>
+          <Button
+            variant={view === "dispatcher-new" ? "contained" : "text"}
+            onClick={() => void openWorking("dispatcher-new")}
+          >
+            Диспетчер new
+          </Button>
           <Button onClick={() => setView("sources")}>Источники</Button>
           <Button onClick={() => setView("journal")}>Журнал</Button>
           <Button onClick={() => setView("registries")}>Реестры</Button>
@@ -2159,15 +2351,22 @@ function Workspace({
           </Button>
         </Toolbar>
       </AppBar>
-      <Box sx={{ px: view === "dispatcher" ? 1.5 : 3, py: 1.5 }}>
-        {error && <Alert severity="error">{error}</Alert>}
-        {!snapshot ? (
+      <Box sx={{ px: working ? 1.5 : 3, py: 1.5 }}>
+        {error && <Alert severity="error" action={retryWorkingView
+          ? <Button color="inherit" onClick={() => void openWorking(retryWorkingView)}>Повторить снимок</Button>
+          : undefined}>{error}</Alert>}
+        {view === "react-flow-example" ? (
+          <OfficialSubFlowReference />
+        ) : view === "enriched-reference" ? (
+          <EnrichedSubFlowReference />
+        ) : !snapshot ? (
           <CircularProgress />
         ) : (
           <>
-            {view === "dispatcher" && (
+            {working && (
               <PipelineDispatcher
                 projectId={project.id}
+                canvasVariant={view === "dispatcher-new" ? "new" : "current"}
                 initialProjection={snapshot.dispatcher}
                 initialFingerprint={snapshot.workflow_fingerprint}
                 onOpenSources={() => setView("sources")}

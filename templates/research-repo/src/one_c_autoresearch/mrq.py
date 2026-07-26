@@ -237,7 +237,7 @@ def validate_graph(rows: dict[str, list[dict[str, Any]]], source_id: str, diff_i
         raise ValueError("a customer DIF has conflicting primary dispositions")
 
 
-def publish(repo: Path, rows: dict[str, list[dict[str, Any]]], source_id: str, diff_id: str, epoch: dict[str, str], expected_generation: str | None, *, activate: bool = True, diff_candidate: dict[str, Any] | None = None, preserve_approval_prefix: bool = True) -> dict[str, Any]:
+def publish(repo: Path, rows: dict[str, list[dict[str, Any]]], source_id: str, diff_id: str, epoch: dict[str, str], expected_generation: str | None, *, activate: bool = True, diff_candidate: dict[str, Any] | None = None, preserve_approval_prefix: bool = True, fence: callable | None = None) -> dict[str, Any]:
     with repository_lock(repo):
         current = json.loads((repo / "research/active-generation.json").read_text(encoding="utf-8"))
         if current.get("canonical_generation_id") != expected_generation:
@@ -266,6 +266,8 @@ def publish(repo: Path, rows: dict[str, list[dict[str, Any]]], source_id: str, d
             hashes = {name: sha256((staging / name).read_bytes()) for name in FILES}
             preimage = {"schema_version": "1", "source_generation_id": source_id, "diff_generation_id": diff_id, "comparison_epoch_fingerprint": epoch_fingerprint, "files": hashes}
             generation = sha256(canonical_json(preimage))
+            if fence is not None:
+                fence()
             destination = repo / "analysis/migration-requirements/generations" / generation
             destination.parent.mkdir(parents=True, exist_ok=True)
             manifest_path = repo / "research/generations" / generation / "manifest.json"
@@ -285,6 +287,17 @@ def publish(repo: Path, rows: dict[str, list[dict[str, Any]]], source_id: str, d
             if any(sha256((destination / name).read_bytes()) != digest for name, digest in hashes.items()):
                 raise ValueError("existing canonical generation payload is inconsistent")
             pointer = {"schema_version": "1", "canonical_generation_id": generation, "source_generation_id": source_id, "diff_generation_id": diff_id}
+            prior_batch = current.get("batch_generation")
+            if prior_batch:
+                from .mrq_batches import load_active as load_active_batches, source_mrq_payload
+                _, fingerprint, _ = source_mrq_payload(repo, generation)
+                if fingerprint == prior_batch.get("source_mrq_fingerprint"):
+                    try:
+                        load_active_batches(repo)
+                    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                        pass
+                    else:
+                        pointer["batch_generation"] = prior_batch
             if activate:
                 atomic_json(repo / "research/active-generation.json", pointer)
             return pointer

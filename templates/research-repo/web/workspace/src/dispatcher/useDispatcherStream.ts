@@ -35,23 +35,85 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
   const [error, setError] = useState('');
   const cursorRef = useRef(0);
   const closedRef = useRef(false);
+  const revisionRef = useRef(initialProjection?.revision ?? 0);
+  const hasBootstrapProjectionRef = useRef(Boolean(initialProjection));
+  const activeRef = useRef<Promise<void> | null>(null);
+  const pendingRef = useRef(false);
+  const lastStartRef = useRef(Number.NEGATIVE_INFINITY);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestedRef = useRef(0);
+  const completedRef = useRef(0);
+  const waitersRef = useRef<Array<{ target: number; resolve: () => void }>>([]);
+  const lastLoadSucceededRef = useRef(true);
+  const resyncingRef = useRef(!initialProjection);
 
   const loadSnapshot = useCallback(async () => {
     try {
       const snapshot = await api<SnapshotWithDispatcher>(`/projects/${projectId}/workflow`);
+      const next = snapshot.dispatcher ?? EMPTY_PROJECTION;
+      if (next.revision < revisionRef.current) {
+        setError(`snapshot revision ${next.revision} is older than current revision ${revisionRef.current}`);
+        lastLoadSucceededRef.current = false;
+        return;
+      }
+      revisionRef.current = next.revision;
       setFingerprint(snapshot.workflow_fingerprint);
-      setProjection(snapshot.dispatcher ?? EMPTY_PROJECTION);
+      setProjection(next);
       setError('');
+      lastLoadSucceededRef.current = true;
     } catch (fetchError) {
       setError(fetchError instanceof Error ? fetchError.message : 'snapshot fetch failed');
-    } finally {
-      setResyncing(false);
+      lastLoadSucceededRef.current = false;
     }
   }, [projectId]);
 
-  const refresh = useCallback(async () => {
-    await loadSnapshot();
+  const pump = useCallback(() => {
+    if (closedRef.current || activeRef.current || !pendingRef.current) return;
+    const delay = Math.max(0, 1000 - (Date.now() - lastStartRef.current));
+    if (delay > 0) {
+      if (!timerRef.current) timerRef.current = setTimeout(() => {
+        timerRef.current = null;
+        pump();
+      }, delay);
+      return;
+    }
+    pendingRef.current = false;
+    lastStartRef.current = Date.now();
+    const target = requestedRef.current;
+    const request = loadSnapshot();
+    activeRef.current = request;
+    void request.finally(() => {
+      activeRef.current = null;
+      completedRef.current = Math.max(completedRef.current, target);
+      const ready = waitersRef.current.filter((waiter) => waiter.target <= completedRef.current);
+      waitersRef.current = waitersRef.current.filter((waiter) => waiter.target > completedRef.current);
+      ready.forEach((waiter) => waiter.resolve());
+      pump();
+    });
   }, [loadSnapshot]);
+
+  const queueRefresh = useCallback((waitForCompletion = true) => {
+    const target = ++requestedRef.current;
+    pendingRef.current = true;
+    const complete = waitForCompletion
+      ? new Promise<void>((resolve) => waitersRef.current.push({ target, resolve }))
+      : Promise.resolve();
+    pump();
+    return complete;
+  }, [pump]);
+
+  const resync = useCallback(async () => {
+    resyncingRef.current = true;
+    setResyncing(true);
+    await queueRefresh();
+    if (lastLoadSucceededRef.current) {
+      resyncingRef.current = false;
+      setResyncing(false);
+      return true;
+    }
+    return false;
+  }, [queueRefresh]);
+  const refresh = useCallback(async () => { await resync(); }, [resync]);
 
   useEffect(() => {
     closedRef.current = false;
@@ -66,27 +128,22 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
           const payload = JSON.parse((event as MessageEvent).data) as { sequence: number; job_id?: string; payload?: { revision?: number; kind?: string; operation?: string } };
           if (typeof payload.sequence !== 'number' || payload.sequence <= cursorRef.current) return;
           if (cursorRef.current > 0 && payload.sequence !== cursorRef.current + 1) {
-            setResyncing(true);
             cursorRef.current = 0;
-            void loadSnapshot().finally(() => setResyncing(false));
+            void resync();
             return;
           }
           cursorRef.current = payload.sequence;
-          // при любом событии диспетчера перечитываем снимок, чтобы получить консистентную проекцию с тем же revision
-          if (payload.payload?.kind?.startsWith('dispatcher.') || payload.job_id === 'stage-recompute' || payload.payload?.operation === 'stage-recompute') {
-            void loadSnapshot();
-          }
+          void queueRefresh(false);
         } catch {
           // игнорируем мусорные события; снимок останется прежним
         }
       });
       eventSource.addEventListener('resync', () => {
-        setResyncing(true);
         cursorRef.current = 0;
-        void loadSnapshot().finally(() => setResyncing(false));
+        void resync();
       });
       eventSource.addEventListener('open', () => {
-        setError('');
+        if (!resyncingRef.current) setError('');
       });
       eventSource.addEventListener('error', () => {
         // EventSource переподключается сам с Last-Event-ID; параллельный опрос запрещён.
@@ -98,12 +155,17 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
       }
     };
     // Родитель уже получил общий снимок; без него загружаем его перед SSE.
-    if (initialProjection) connect(); else void loadSnapshot().then(connect);
+    if (hasBootstrapProjectionRef.current) connect(); else void resync().then((loaded) => {
+      if (loaded) connect();
+    });
     return () => {
       closedRef.current = true;
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = null;
+      waitersRef.current.splice(0).forEach((waiter) => waiter.resolve());
       if (eventSource) eventSource.close();
     };
-  }, [projectId, loadSnapshot, initialProjection]);
+  }, [projectId, queueRefresh, resync]);
 
   return { projection, fingerprint, resyncing, error, refresh };
 }

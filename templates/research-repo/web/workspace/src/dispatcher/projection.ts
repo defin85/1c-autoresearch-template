@@ -1,12 +1,9 @@
-// Типы серверной операционной проекции диспетчера и маппинг в React Flow.
+// Типы серверной операционной проекции диспетчера.
 //
 // Проекция присоединяется к снимку под ключём ``dispatcher`` и НЕ входит в
-// канонические отпечатки. Узлы и рёбра вычисляются из фиксированных констант
-// ``FIXED_NODES``/``FIXED_EDGES``; серверная проекция только уточняет
-// состояние, агрегаты и свежесть каждого контура.
+// канонические отпечатки.
 
-import { MarkerType, type Edge, type Node } from '@xyflow/react';
-import { FIXED_EDGES, FIXED_NODES, NODE_BY_ID, type CircuitId, type FixedNode } from './nodes';
+export type CircuitId = 'prepare-diffs' | 'analyze-dif' | 'form-mrq' | 'classify-mrq' | 'decide-target';
 
 export interface CircuitLease {
   job_id: string;
@@ -24,6 +21,15 @@ export interface CircuitProjection {
   state: 'complete' | 'ready' | 'blocked' | 'unknown';
   leases?: CircuitLease[];
   aggregates?: Record<string, number | string>;
+  zones?: DispatcherZoneProjection[];
+  publication?: DispatcherZoneProjection;
+}
+
+export interface DispatcherZoneProjection {
+  id: string;
+  state: 'unknown' | 'waiting' | 'active' | 'error' | 'complete';
+  count?: number;
+  updated_at?: string;
 }
 
 export interface DispatcherProjection {
@@ -34,7 +40,30 @@ export interface DispatcherProjection {
   jobs: Record<string, CircuitLease>;
   stage_recompute_run?: { run_id: string; status: string; result?: Record<string, unknown> | null; plan?: { plan_fingerprint?: string } };
   items: DispatcherItems;
+  agent_phases?: AgentPhaseProjection[];
+  retry_candidates?: Array<{
+    run_id: string;
+    job_id: 'discover-mrq' | 'classify-mrq' | 'decide-mrq';
+    status: string;
+    execution_snapshot_fingerprint: string;
+    policy_source: 'reuse-snapshot' | 'current-policy';
+    workflow_fingerprint: string;
+    input_fingerprints: Record<string, string>;
+  }>;
   error?: string;
+}
+export interface AgentInvocationProjection {
+  invocation_id: string; slot_id: string; work_unit_id: string; status: string; created_at?: string; updated_at?: string;
+}
+export interface AgentRoleProjection {
+  role_id: string; agent_profile: string; configured_slots: number; requested: number;
+  running: number; queued: number; completed: number; failed: number; cancelled: number; interrupted: number;
+  invocations: AgentInvocationProjection[];
+  invocation_total?: number; invocation_omitted?: number;
+  model?: string; reasoning_effort?: string; environment_preset?: string; environment_status?: string;
+}
+export interface AgentPhaseProjection {
+  job_id: string; phase_id: string; mode: string; max_concurrency: number; roles: AgentRoleProjection[];
 }
 
 export interface DispatcherItems {
@@ -64,7 +93,7 @@ export interface DifCard {
   compatibility_summary?: Record<string, number>;
   blocker_codes?: string[];
 }
-export interface ProposalCard { id: string; job_id: string; kind: string; semantic_key: string; dif_ids: string[]; evidence_count: number; noise_count: number; mrq_id: string; created_at: string }
+export interface ProposalCard { id: string; job_id: string; kind: string; approval_stage?: 'noise' | 'batch' | ''; semantic_key: string; dif_ids: string[]; evidence_count: number; noise_count: number; mrq_id: string; created_at: string }
 export interface MrqCard { id: string; title: string; semantic_key: string; state: string; dif_ids: string[]; evidence_count: number }
 export interface BatchCard { id: string; mrq_ids: string[]; reason: string }
 export interface DecisionCard { id: string; title: string; decision: string; target_solution: string; evidence_count: number; gap: boolean }
@@ -72,72 +101,37 @@ export interface DecisionCard { id: string; title: string; decision: string; tar
 export const EMPTY_ITEMS: DispatcherItems = { dif_queue: [], meaning_diffs: [], noise_diffs: [], proposals: [], mrqs: [], batches: [], decisions: [], approval_count: 0 };
 
 export const EMPTY_PROJECTION: DispatcherProjection = {
-  schema_version: '1',
+  schema_version: '2',
   revision: 0,
   fresh_at: '',
   circuits: [],
   jobs: {},
   items: EMPTY_ITEMS,
+  agent_phases: [],
 };
+
+export const VISIBLE_QUEUE_LIMIT = 4;
+export const VISIBLE_DECISION_LIMIT = 3;
+export const VISIBLE_INVOCATION_LIMIT = 16;
+
+export function visibleWindow<T>(items: readonly T[], limit: number): T[] {
+  return items.slice(0, limit);
+}
+
+export function roleProgress(role: AgentRoleProjection): { valid: boolean; percent?: number; processed: number; freeCapacity: number } {
+  const processed = role.completed + role.failed + role.cancelled + role.interrupted;
+  const partition = role.running + role.queued + processed;
+  return {
+    valid: partition === role.requested,
+    percent: role.requested > 0 && partition === role.requested ? Math.floor(100 * processed / role.requested) : undefined,
+    processed,
+    freeCapacity: Math.max(role.configured_slots - role.running, 0),
+  };
+}
 
 export function circuitById(projection: DispatcherProjection | undefined | null, id: CircuitId): CircuitProjection | undefined {
   if (!projection) return undefined;
   return projection.circuits.find((circuit) => circuit.id === id);
-}
-
-export function projectionStateColor(state: CircuitProjection['state'] | undefined): string {
-  switch (state) {
-    case 'complete':
-      return '#2e7d32';
-    case 'ready':
-      return '#ed6c02';
-    case 'blocked':
-      return '#d32f2f';
-    default:
-      return '#9e9e9e';
-  }
-}
-
-export function buildNodes(projection: DispatcherProjection | undefined | null, selectedId: string | null, animate: boolean): Node[] {
-  const now = Date.now();
-  return FIXED_NODES.map((fixed) => {
-    const circuit = circuitById(projection, fixed.circuit);
-    const lease = circuit?.leases?.[0];
-    const fresh = lease ? isFresh(lease.renewed_at, now) : true;
-    const isSelected = selectedId === fixed.id;
-    return {
-      id: fixed.id,
-      type: 'dispatcherNode',
-      position: fixed.position,
-      data: {
-        title: fixed.title,
-        circuit: fixed.circuit,
-        circuitState: circuit?.state ?? 'unknown',
-        aggregates: circuit?.aggregates ?? {},
-        lease,
-        fresh,
-        animate: animate && circuit?.state === 'ready',
-        isSelected,
-        items: projection?.items ?? EMPTY_ITEMS,
-      },
-      style: { width: fixed.width, height: 590, background: fixed.tint, border: `2px solid ${isSelected ? fixed.color : `${fixed.color}44`}`, borderRadius: 12 },
-      draggable: false,
-      connectable: false,
-      selectable: true,
-    } satisfies Node;
-  });
-}
-
-export function buildEdges(animate: boolean): Edge[] {
-  return FIXED_EDGES.map((edge) => ({
-    id: edge.id,
-    source: edge.source,
-    target: edge.target,
-    type: 'smoothstep',
-    animated: animate,
-    markerEnd: { type: MarkerType.ArrowClosed, color: '#607d8b', width: 18, height: 18 },
-    style: { stroke: '#607d8b', strokeWidth: 2.2 },
-  }));
 }
 
 export function isFresh(renewedAt: string, now: number): boolean {
@@ -155,12 +149,4 @@ export function freshnessLabel(projection: DispatcherProjection | undefined | nu
   const activeLeases = Object.values(projection.jobs);
   if (activeLeases.length === 0) return `подтверждено ${new Date(projection.fresh_at).toLocaleTimeString('ru-RU')}`;
   return activeLeases.every((lease) => isFresh(lease.renewed_at, Date.now())) ? 'данные актуальны' : 'данные несвежие';
-}
-
-export function fixedNodeById(id: string): FixedNode | undefined {
-  return NODE_BY_ID[id];
-}
-
-export function allFixedNodes(): readonly FixedNode[] {
-  return FIXED_NODES;
 }

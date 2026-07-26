@@ -1,5 +1,5 @@
-schema_version = "1"
-tool_version = "0.1.0"
+schema_version = "3"
+tool_version = "0.2.0"
 
 [[gates]]
 id = "project-configured"
@@ -52,12 +52,27 @@ steps = [{ id = "index-sources", operation = "indexes.build", operation_version 
 [[jobs]]
 id = "discover-mrq"
 needs = ["index-sources"]
-steps = [{ id = "discover-mrq", operation = "mrq.discover-next", operation_version = "1", timeout_seconds = 1800, agent_profile = "local", instruction_supplement = "" }]
+steps = [{ id = "discover-mrq", operation = "mrq.discover-next", operation_version = "2", timeout_seconds = 1800, agent_phases = [
+  { phase_id = "analyze-dif", mode = "parallel-pool", max_concurrency = 4, roles = [{ role_id = "analyzer", agent_profile = "local", count = 4, instruction_supplement = "" }] },
+  { phase_id = "form-mrq", mode = "coordinated-pool", max_concurrency = 4, roles = [
+    { role_id = "coordinator", agent_profile = "local", count = 1, instruction_supplement = "" },
+    { role_id = "grouper", agent_profile = "local", count = 4, instruction_supplement = "" },
+  ] },
+] }]
+
+[[jobs]]
+id = "classify-mrq"
+needs = ["discover-mrq"]
+steps = [{ id = "classify-mrq", operation = "mrq.classify-batches", operation_version = "1", timeout_seconds = 1800, agent_phases = [
+  { phase_id = "classify-batches", mode = "sequential", max_concurrency = 1, roles = [{ role_id = "classifier", agent_profile = "local", count = 1, instruction_supplement = "" }] },
+] }]
 
 [[jobs]]
 id = "decide-mrq"
-needs = ["discover-mrq"]
-steps = [{ id = "decide-mrq", operation = "mrq.decide-next", operation_version = "1", timeout_seconds = 1800, agent_profile = "local", instruction_supplement = "" }]
+needs = ["classify-mrq"]
+steps = [{ id = "decide-mrq", operation = "mrq.decide-next", operation_version = "2", timeout_seconds = 1800, agent_phases = [
+  { phase_id = "research-target", mode = "parallel-pool", max_concurrency = 4, roles = [{ role_id = "researcher", agent_profile = "local", count = 4, instruction_supplement = "" }] },
+] }]
 
 [[jobs]]
 id = "publish"
