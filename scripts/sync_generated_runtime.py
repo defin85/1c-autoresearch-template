@@ -81,6 +81,30 @@ def sanitize(root: Path, reference: Path) -> None:
             )
         if path.relative_to(root).as_posix() == "web/workspace/playwright.config.ts":
             text = "process.env.PORTABLE_TEMPLATE = '1';\n" + text
+        if path.relative_to(root).as_posix() == "tests/test_dispatcher_api.py":
+            text = text.replace(
+                "REPO = Path(__file__).resolve().parents[1]\n",
+                """REPO = Path(__file__).resolve().parents[1]
+
+
+def _test_execution_snapshot(_repo, run_id, operation, step, profiles, work_unit):
+    return {
+        "schema_version": "1", "run_id": run_id, "operation": operation,
+        "operation_version": step["operation_version"], "workflow_fingerprint": "sha256:" + "0" * 64,
+        "timeout_seconds": step["timeout_seconds"], "agent_phases": step.get("agent_phases", []),
+        "profiles": profiles, "instructions": {}, "environment": {}, "codex_version": "test",
+        "application_version": "one-c-autoresearch/0.2", "subject_bindings": {
+            "source_generation_id": "", "diff_generation_id": "", "canonical_generation_id": "",
+        }, "policy_source": "current-policy", "work_unit": work_unit, "context_manifest": {
+            "schema_version": "1", "work_unit_id": work_unit["id"],
+            "work_unit_fingerprint": "sha256:" + "0" * 64, "paths": [],
+        },
+    }
+""",
+            ).replace(
+                '    state = tmp_path / "state"\n    monkeypatch.setattr(\n',
+                '    state = tmp_path / "state"\n    monkeypatch.setattr("one_c_autoresearch.agents.resolve_execution_snapshot", _test_execution_snapshot)\n    monkeypatch.setattr(\n',
+            )
         if "tests" in path.parts and path.suffix == ".py":
             text = text.replace('"gpt-5.6-' + 'sol"', '"test-model"')
         if path.suffix == ".py":

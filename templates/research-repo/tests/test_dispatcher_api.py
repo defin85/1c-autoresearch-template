@@ -23,6 +23,21 @@ from one_c_autoresearch.workspace_api import create_app
 REPO = Path(__file__).resolve().parents[1]
 
 
+def _test_execution_snapshot(_repo, run_id, operation, step, profiles, work_unit):
+    return {
+        "schema_version": "1", "run_id": run_id, "operation": operation,
+        "operation_version": step["operation_version"], "workflow_fingerprint": "sha256:" + "0" * 64,
+        "timeout_seconds": step["timeout_seconds"], "agent_phases": step.get("agent_phases", []),
+        "profiles": profiles, "instructions": {}, "environment": {}, "codex_version": "test",
+        "application_version": "one-c-autoresearch/0.2", "subject_bindings": {
+            "source_generation_id": "", "diff_generation_id": "", "canonical_generation_id": "",
+        }, "policy_source": "current-policy", "work_unit": work_unit, "context_manifest": {
+            "schema_version": "1", "work_unit_id": work_unit["id"],
+            "work_unit_fingerprint": "sha256:" + "0" * 64, "paths": [],
+        },
+    }
+
+
 def _client(tmp_path: Path) -> TestClient:
     app = create_app(tmp_path / "state", [REPO], testing=True)
     return TestClient(app)
@@ -363,6 +378,7 @@ def test_dispatcher_section_is_not_part_of_canonical_fingerprint(tmp_path: Path)
 
 def test_retry_recovers_same_run_after_owner_dies_post_lease(tmp_path: Path, monkeypatch) -> None:
     state = tmp_path / "state"
+    monkeypatch.setattr("one_c_autoresearch.agents.resolve_execution_snapshot", _test_execution_snapshot)
     monkeypatch.setattr(
         "one_c_autoresearch.agents.build_context_manifest",
         lambda _repo, work_unit: {
@@ -454,6 +470,7 @@ def test_retry_recovers_same_run_after_owner_dies_post_lease(tmp_path: Path, mon
 
 def test_noise_approval_resumes_same_run_and_thread(tmp_path: Path, monkeypatch) -> None:
     state = tmp_path / "state"
+    monkeypatch.setattr("one_c_autoresearch.agents.resolve_execution_snapshot", _test_execution_snapshot)
     monkeypatch.setattr(
         "one_c_autoresearch.agents.build_context_manifest",
         lambda _repo, work_unit: {
