@@ -158,7 +158,7 @@ def test_dispatcher_projection_probes_codex_once_for_all_roles(tmp_path: Path, m
     state = tmp_path / "state"
     save_agent_profiles(
         REPO,
-        {"local": {"provider": "codex-cli", "model": "gpt-5.6-sol", "reasoning_effort": "low", "instructions_version": "1", "environment_preset": "local-read-only"}},
+        {"local": {"provider": "codex-cli", "model": "test-model", "reasoning_effort": "low", "instructions_version": "1", "environment_preset": "local-read-only"}},
         state,
     )
     calls = 0
@@ -374,7 +374,7 @@ def test_retry_recovers_same_run_after_owner_dies_post_lease(tmp_path: Path, mon
     )
     save_agent_profiles(
         REPO,
-        {"local": {"provider": "codex-cli", "model": "gpt-5.6-sol", "reasoning_effort": "low", "instructions_version": "1", "environment_preset": "local-read-only"}},
+        {"local": {"provider": "codex-cli", "model": "test-model", "reasoning_effort": "low", "instructions_version": "1", "environment_preset": "local-read-only"}},
         state,
     )
     monkeypatch.setattr(DispatcherCoordinator, "_validate_new_run_snapshot", lambda *_args: None)
@@ -473,7 +473,7 @@ def test_noise_approval_resumes_same_run_and_thread(tmp_path: Path, monkeypatch)
     )
     save_agent_profiles(
         REPO,
-        {"local": {"provider": "codex-cli", "model": "gpt-5.6-sol", "reasoning_effort": "low", "instructions_version": "1", "environment_preset": "local-read-only"}},
+        {"local": {"provider": "codex-cli", "model": "test-model", "reasoning_effort": "low", "instructions_version": "1", "environment_preset": "local-read-only"}},
         state,
     )
     with TestClient(create_app(state, [REPO], testing=True)) as client:

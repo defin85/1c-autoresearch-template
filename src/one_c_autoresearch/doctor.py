@@ -1627,8 +1627,8 @@ class Doctor:
             operations = [step.get("operation") for job in workflow.get("jobs", []) for step in job.get("steps", [])]
             for name, actual, expected in (
                 ("gates", len(workflow.get("gates", [])), 7),
-                ("jobs", len(workflow.get("jobs", [])), 7),
-                ("operations", len(operations), 8),
+                ("jobs", len(workflow.get("jobs", [])), 8),
+                ("operations", len(operations), 9),
             ):
                 self.checks.add(f"template.workflow.{name}", "ok" if actual == expected else "fail", f"Canonical workflow {name}: {actual}; expected {expected}")
             return

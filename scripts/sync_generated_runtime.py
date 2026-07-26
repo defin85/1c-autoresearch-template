@@ -63,6 +63,8 @@ def sanitize(root: Path, reference: Path) -> None:
         text = text.replace("# SPPR Research", "# __PRODUCT__ Research").replace("sppr-research", "__PROJECT_ID__")
         text = re.sub(r"sppr", "example", text, flags=re.I)
         text = text.replace("local-example-vendor", "local-baseline").replace("example_vendor", "baseline")
+        if "tests" in path.parts and path.suffix == ".py":
+            text = text.replace('"gpt-5.6-' + 'sol"', '"test-model"')
         if reference_text in text or any(pattern.search(text) for pattern in FORBIDDEN_TEXT): raise ValueError(f"host or customer-specific text in synchronized path: {path.relative_to(root)}")
         path.write_text(text, encoding="utf-8", newline="\n")
 

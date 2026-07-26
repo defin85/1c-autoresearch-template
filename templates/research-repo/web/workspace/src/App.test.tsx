@@ -180,6 +180,9 @@ test("workflow preview is invalidated by edits and apply uses the reviewed param
     />,
   );
   await screen.findByLabelText("Режим analyze-dif");
+  expect(screen.getByText("Анализ DIF")).toBeInTheDocument();
+  expect(screen.getByLabelText("Количество агентов analyze-dif analyzer")).toHaveValue(2);
+  expect(screen.queryByText(/Логические слоты/)).not.toBeInTheDocument();
   expect(screen.getByLabelText("Профиль analyze-dif analyzer")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Предварительный просмотр" }));
   expect(await screen.findByLabelText("Просмотр политики фаз")).toHaveTextContent("максимум вызовов текущего окна 32");
@@ -187,6 +190,7 @@ test("workflow preview is invalidated by edits and apply uses the reviewed param
   expect(screen.getByLabelText("Просмотр политики фаз")).toHaveTextContent("Песочница: read-only");
   const apply = screen.getByRole("button", { name: "Применить просмотренное изменение" });
   expect(apply).toBeEnabled();
+  fireEvent.click(screen.getByText("Дополнительные параметры"));
   fireEvent.change(screen.getByLabelText("Предельное время, секунд"), { target: { value: "1900" } });
   expect(apply).toBeDisabled();
   fireEvent.click(screen.getByRole("button", { name: "Предварительный просмотр" }));
@@ -244,6 +248,33 @@ test("workflow editor shows a server topology error", async () => {
   await screen.findByLabelText("Режим analyze-dif");
   fireEvent.click(screen.getByRole("button", { name: "Предварительный просмотр" }));
   expect(await screen.findByText(/Недопустимая топология/)).toBeInTheDocument();
+});
+
+test("workflow editor opens the requested step", async () => {
+  const configuration = {
+    manifest_fingerprint: "sha256:manifest",
+    jobs: [],
+    steps: [
+      { job_id: "configure", step: { id: "validate-project", operation: "project.validate", timeout_seconds: 1800 }, catalog: { executor: "local", effect: "read", approval_required: false } },
+      { job_id: "classify-mrq", step: { id: "classify-mrq", operation: "mrq.classify-batches", timeout_seconds: 1800 }, catalog: { executor: "agent", effect: "user-state", approval_required: false } },
+    ],
+  };
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string) => {
+    if (url.endsWith("/workflow/configuration"))
+      return Promise.resolve({ ok: true, json: async () => configuration });
+    if (url.endsWith("/agent-profiles"))
+      return Promise.resolve({ ok: true, json: async () => ({ items: {} }) });
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  }));
+  render(
+    <WorkflowEditor
+      project={{ id: "p", name: "p", root: "/repo" }}
+      snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
+      refresh={() => {}}
+      initialStepId="classify-mrq"
+    />,
+  );
+  expect(await screen.findByRole("heading", { name: "Формирование пакетов" })).toBeInTheDocument();
 });
 
 test("shows semantic and raw extension registries with an accessible empty state", async () => {

@@ -64,6 +64,7 @@ describe('dispatcherNewGraphModel', () => {
     expect(byId.get('grouper-1')).toMatchObject({ zoneId: 'form-groupers', state: 'В работе', active: true });
     expect(byId.get('researcher-1')).toMatchObject({ zoneId: 'decide-researchers', state: 'В работе', active: true });
     expect(byId.get('semantic-dif')?.detail).toContain('DIF-00021');
+    expect(graph.nodes.find((node) => node.id === 'semantic-dif')?.style?.width).toBeGreaterThanOrEqual(96);
     expect(byId.get('publication')).toMatchObject({ zoneId: 'form-publication', detail: expect.stringContaining('MRQ-00001 · DIF 1 · доказательств 2') });
     expect(byId.get('results')?.detail).toContain('типовых: 1');
     expect(graph.nodes.flatMap((node) => node.data.invocations ?? [])).toHaveLength(24);

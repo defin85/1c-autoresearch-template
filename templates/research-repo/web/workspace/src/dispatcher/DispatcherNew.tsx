@@ -17,15 +17,13 @@ export function DispatcherNew({
   onActivate: (circuitId: CircuitId, initiatorKey: string) => void;
 }) {
   const model = useMemo(() => buildDispatcherNewGraph(projection), [projection]);
-  return <Box data-testid="dispatcher-new-scroll" sx={{ height: 720, overflowX: 'auto', overflowY: 'hidden' }}>
-    <Box sx={{ height: '100%', minWidth: { xs: 1955, xl: '100%' } }}>
-      <EnrichedDispatcherGraph
-        model={model}
-        viewport={viewport}
-        onMoveEnd={onMoveEnd}
-        onActivate={onActivate}
-        testId="dispatcher-new-canvas"
-      />
-    </Box>
+  return <Box data-testid="dispatcher-new-scroll" sx={{ height: 720, overflow: 'hidden' }}>
+    <EnrichedDispatcherGraph
+      model={model}
+      viewport={viewport}
+      onMoveEnd={onMoveEnd}
+      onActivate={onActivate}
+      testId="dispatcher-new-canvas"
+    />
   </Box>;
 }

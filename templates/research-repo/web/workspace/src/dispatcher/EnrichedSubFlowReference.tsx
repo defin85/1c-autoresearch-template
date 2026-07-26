@@ -52,7 +52,7 @@ export const ENRICHED_SUBFLOW_NODES: Node<EnrichedNodeData>[] = [
   item('analyzer-1', 'analysis', 'Анализатор-1', 138, 105, 165, 112, '#1976d2', 'Текущий: DIF-002 · прогресс 65%', 'Анализирует', true),
   item('analyzer-2', 'analysis', 'Анализатор-2', 138, 270, 165, 96, '#757575', 'Работа не назначена', 'Свободен'),
   item('analyzer-3', 'analysis', 'Анализатор-3', 138, 420, 165, 112, '#ed6c02', 'Текущий: DIF-008 · повтор через 15 с', 'Ошибка'),
-  item('semantic-dif', 'analysis', 'Смысловые DIF', 325, 120, 88, 410, '#1976d2', 'DIF-002 · DIF-005 · DIF-017', '23'),
+  item('semantic-dif', 'analysis', 'Смысловые DIF', 325, 120, 96, 410, '#1976d2', 'DIF-002 · DIF-005 · DIF-017', '23'),
 
   item('semantic-queue', 'mrq', 'Смысловые DIF', 18, 110, 92, 430, '#6d3be7', '23 DIF', 'Ожидает'),
   item('coordinator', 'mrq', 'Координатор MRQ', 140, 190, 150, 190, '#6d3be7', 'Опорный DIF: 002 · кандидатов: 4', 'Работает', true),

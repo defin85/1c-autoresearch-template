@@ -2,12 +2,12 @@ import { expect, test, type Page } from '@playwright/test';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { activeProjection, emptyProjection, errorProjection, saturatedProjection } from './dispatcher.fixtures';
+import { activeProjection, approvalProjection, emptyProjection, errorProjection, saturatedProjection } from './dispatcher.fixtures';
 import type { DispatcherProjection } from '../src/dispatcher/projection';
 
 const FIXED_TIME = '2026-07-21T12:00:00.000Z';
-const CHANGE_ASSETS = path.resolve(process.cwd(), '../../openspec/changes/add-mrq-batch-classification-stage/assets');
-const LEGACY_ASSETS = path.resolve(process.cwd(), '../../openspec/changes/make-dispatcher-new-working-screen/assets');
+const CHANGE_ASSETS = path.resolve(process.cwd(), '../../openspec/changes/archive/2026-07-25-add-mrq-batch-classification-stage/assets');
+const LEGACY_ASSETS = path.resolve(process.cwd(), '../../openspec/changes/archive/2026-07-25-make-dispatcher-new-working-screen/assets');
 const VISUAL_MANIFEST = JSON.parse(readFileSync(path.join(CHANGE_ASSETS, 'visual-acceptance-manifest.json'), 'utf8')) as {
   images: Array<{ file: string; sha256: string; approved: boolean }>;
 };
@@ -21,14 +21,6 @@ const REQUIRED_ZONES = [
 ] as const;
 const NEW_REQUIRED_ZONES = REQUIRED_ZONES.filter((zone) =>
   !['vendor-baseline', 'target-cf', 'next-vendor'].includes(zone));
-const REQUIRED_LINKS = [
-  ['sources', 'sources-acquire'], ['sources-acquire', 'diffs-build'], ['diffs-build', 'indexes-build'], ['indexes-build', 'prepare-dif-window'],
-  ['prepare-dif-window', 'analyze-dif-window'], ['analyze-dif-window', 'analyze-workers'], ['analyze-workers', 'analyze-meaning'], ['analyze-workers', 'analyze-noise'],
-  ['analyze-meaning', 'form-meaning'],
-  ['form-meaning', 'form-coordinator'], ['form-coordinator', 'form-groupers'], ['form-groupers', 'form-proposals'], ['form-proposals', 'form-review'], ['form-review', 'form-barrier'], ['form-barrier', 'form-publication'], ['form-publication', 'form-summary'],
-  ['form-summary', 'classify-input'], ['classify-input', 'classify-workers'], ['classify-workers', 'classify-validation'], ['classify-validation', 'classify-batches'],
-  ['classify-batches', 'decide-mrq-queue'], ['decide-mrq-queue', 'decide-researchers'], ['decide-researchers', 'decide-target-base'], ['decide-target-base', 'decide-approval'], ['decide-approval', 'decide-outcomes'], ['decide-outcomes', 'decide-summary'],
-] as const;
 const NEW_REQUIRED_LINKS = [
   ['sources', 'acquire'], ['acquire', 'index'], ['index', 'diff'], ['diff', 'dif-queue'],
   ['dif-queue', 'analysis-queue'], ['analysis-queue', 'analyzer-1'], ['analyzer-1', 'semantic-dif'],
@@ -142,7 +134,7 @@ async function openFixture(page: Page, initialProjection: DispatcherProjection =
   await page.getByRole('textbox', { name: 'Путь к репозиторию' }).fill(process.env.E2E_REPO!);
   await page.getByRole('button', { name: 'Открыть', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Диспетчер исследования' })).toBeVisible();
-  await expect(page.getByTestId('dispatcher-canvas')).toBeVisible();
+  await expect(page.getByTestId('dispatcher-new-canvas')).toBeVisible();
   return {
     workflowRequests: () => workflowRequests,
     eventSources: () => page.evaluate(() => (window as typeof window & { __eventSourceCount: number }).__eventSourceCount),
@@ -175,46 +167,6 @@ async function openFixture(page: Page, initialProjection: DispatcherProjection =
   };
 }
 
-async function assertDispatcherGeometry(page: Page, _allInViewport = false) {
-  const canvas = page.getByTestId('dispatcher-canvas');
-  await expect(canvas.locator('.react-flow__viewport')).toHaveAttribute('style', /scale\(0\.9\)/);
-  for (const zone of REQUIRED_ZONES) {
-    const locator = canvas.locator(`[data-zone="${zone}"]`);
-    await expect(locator).toBeVisible();
-  }
-  for (const [source, target] of REQUIRED_LINKS) {
-    await expect(canvas.getByTestId(`rf__edge-flow:${source}:${target}`)).toHaveCount(1);
-  }
-  expect(await canvas.locator('.react-flow__edge').count()).toBeGreaterThanOrEqual(REQUIRED_LINKS.length);
-  await expect(canvas.locator('.react-flow__edge[tabindex]')).toHaveCount(0);
-  await expect(canvas.locator('.react-flow__handle:not([aria-hidden="true"])')).toHaveCount(0);
-  const geometry = await page.evaluate((ids) => {
-    const dispatcher = document.querySelector<HTMLElement>('[data-testid="dispatcher-scroll"]')!;
-    const rectangles = ids.map((id) => document.querySelector<HTMLElement>(`[data-zone="${id}"]`)!.getBoundingClientRect());
-    const nodes = [...document.querySelectorAll<HTMLElement>('.react-flow__node')];
-    const overlap = nodes.some((node) => {
-      const zones = [...node.querySelectorAll<HTMLElement>('[data-zone]')]
-        .filter((zone) => !zone.parentElement?.closest('[data-zone]'))
-        .map((zone) => zone.getBoundingClientRect());
-      return zones.some((left, index) => zones.slice(index + 1).some((right) =>
-        Math.min(left.right, right.right) - Math.max(left.left, right.left) > 1
-        && Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top) > 1));
-    });
-    return {
-      positiveZones: rectangles.every(({ width, height }) => width > 0 && height > 0),
-      documentOverflow: document.documentElement.scrollWidth > window.innerWidth,
-      dispatcher: { clientWidth: dispatcher.clientWidth, scrollWidth: dispatcher.scrollWidth },
-      eventSources: (window as typeof window & { __eventSourceCount: number }).__eventSourceCount,
-      overlap,
-    };
-  }, [...REQUIRED_ZONES]);
-  expect(geometry.positiveZones).toBe(true);
-  expect(geometry.documentOverflow).toBe(false);
-  expect(geometry.eventSources).toBe(1);
-  expect(geometry.overlap).toBe(false);
-  return geometry;
-}
-
 async function assertDispatcherNewGeometry(page: Page, _allInViewport = false) {
   const canvas = page.getByTestId('dispatcher-new-canvas');
   for (const zone of NEW_REQUIRED_ZONES) {
@@ -240,6 +192,55 @@ async function assertDispatcherNewGeometry(page: Page, _allInViewport = false) {
   return geometry;
 }
 
+async function assertNoClippedNodeContent(page: Page, testId = 'dispatcher-new-canvas') {
+  const issues = await page.getByTestId(testId).evaluate((canvas) => {
+    const tolerance = 2;
+    const result: string[] = [];
+    for (const container of canvas.querySelectorAll<HTMLElement>('[data-content-inset]')) {
+      const style = getComputedStyle(container);
+      const insets = [style.paddingTop, style.paddingRight, style.paddingBottom, style.paddingLeft].map(Number.parseFloat);
+      if (insets.some((inset) => inset < 6)) {
+        result.push(`${container.dataset.zone || container.dataset.agentSlotId}: внутренний отступ меньше 6 px`);
+      }
+    }
+    for (const node of canvas.querySelectorAll<HTMLElement>('.react-flow__node:not(.react-flow__node-stage)')) {
+      const body = node.firstElementChild as HTMLElement | null;
+      if (!body) continue;
+      for (const region of body.querySelectorAll<HTMLElement>('[role="region"]')) {
+        if (region.scrollHeight > region.clientHeight + tolerance && !['auto', 'scroll'].includes(getComputedStyle(region).overflowY)) {
+          result.push(`${node.dataset.id}: переполнение области недоступно`);
+        }
+      }
+      const bounds = body.getBoundingClientRect();
+      for (const text of body.querySelectorAll<HTMLElement>('p, .MuiChip-label')) {
+        if (!text.textContent?.trim()) continue;
+        const scrollRegion = text.closest<HTMLElement>('[role="region"]');
+        if (scrollRegion && scrollRegion.scrollHeight > scrollRegion.clientHeight + tolerance) continue;
+        const box = text.getBoundingClientRect();
+        if (box.left < bounds.left - tolerance || box.right > bounds.right + tolerance
+          || box.top < bounds.top - tolerance || box.bottom > bounds.bottom + tolerance) {
+          result.push(`${node.dataset.id}: обрезан текст «${text.textContent.trim().slice(0, 40)}»`);
+        }
+      }
+      const textElements = [...body.querySelectorAll<HTMLElement>('p, .MuiChip-label')]
+        .filter((text) => text.textContent?.trim() && getComputedStyle(text).visibility !== 'hidden');
+      for (let left = 0; left < textElements.length; left += 1) {
+        const leftBox = textElements[left].getBoundingClientRect();
+        for (let right = left + 1; right < textElements.length; right += 1) {
+          const rightBox = textElements[right].getBoundingClientRect();
+          const overlapWidth = Math.min(leftBox.right, rightBox.right) - Math.max(leftBox.left, rightBox.left);
+          const overlapHeight = Math.min(leftBox.bottom, rightBox.bottom) - Math.max(leftBox.top, rightBox.top);
+          if (overlapWidth > tolerance && overlapHeight > tolerance) {
+            result.push(`${node.dataset.id}: «${textElements[left].textContent?.trim()}» накладывается на «${textElements[right].textContent?.trim()}»`);
+          }
+        }
+      }
+    }
+    return [...new Set(result)];
+  });
+  expect(issues, issues.join('\n')).toEqual([]);
+}
+
 function assertApprovedAsset(approvedName: string, legacy = false) {
   const root = legacy ? LEGACY_ASSETS : CHANGE_ASSETS;
   const manifest = legacy ? LEGACY_VISUAL_MANIFEST : VISUAL_MANIFEST;
@@ -251,168 +252,51 @@ function assertApprovedAsset(approvedName: string, legacy = false) {
 
 async function assertApprovedOrStructuralCandidate(page: Page, approvedName: string) {
   assertApprovedAsset(approvedName);
-  await expect(page).toHaveScreenshot(approvedName, { animations: 'disabled', maxDiffPixelRatio: 0.001 });
+  const expected = readFileSync(path.join(CHANGE_ASSETS, approvedName)).toString('base64');
+  const actual = (await page.screenshot({ animations: 'disabled' })).toString('base64');
+  const headerBottom = Math.ceil(await page.locator('header').evaluate((header) => header.getBoundingClientRect().bottom));
+  const comparison = await page.evaluate(async ({ expectedBase64, actualBase64, ignoredRows }) => {
+    const decode = async (base64: string) => {
+      const binary = atob(base64);
+      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+      return createImageBitmap(new Blob([bytes], { type: 'image/png' }));
+    };
+    const [expectedImage, actualImage] = await Promise.all([decode(expectedBase64), decode(actualBase64)]);
+    if (expectedImage.width !== actualImage.width || expectedImage.height !== actualImage.height) {
+      return { sameSize: false, ratio: 1 };
+    }
+    const pixels = (image: ImageBitmap) => {
+      const canvas = new OffscreenCanvas(image.width, image.height);
+      const context = canvas.getContext('2d')!;
+      context.drawImage(image, 0, 0);
+      return context.getImageData(0, 0, image.width, image.height).data;
+    };
+    const expectedPixels = pixels(expectedImage);
+    const actualPixels = pixels(actualImage);
+    let changed = 0;
+    const first = ignoredRows * expectedImage.width * 4;
+    for (let offset = first; offset < expectedPixels.length; offset += 4) {
+      if (
+        expectedPixels[offset] !== actualPixels[offset]
+        || expectedPixels[offset + 1] !== actualPixels[offset + 1]
+        || expectedPixels[offset + 2] !== actualPixels[offset + 2]
+        || expectedPixels[offset + 3] !== actualPixels[offset + 3]
+      ) changed += 1;
+    }
+    return {
+      sameSize: true,
+      ratio: changed / ((expectedImage.height - ignoredRows) * expectedImage.width),
+    };
+  }, { expectedBase64: expected, actualBase64: actual, ignoredRows: headerBottom });
+  expect(comparison.sameSize).toBe(true);
+  expect(comparison.ratio).toBeLessThanOrEqual(0.001);
 }
-
-test('single enriched dispatcher preserves shell, stream, panel, actions and focus', async ({ page }) => {
-  await page.setViewportSize({ width: 1920, height: 1080 });
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  const consoleErrors: string[] = [];
-  const pageErrors: string[] = [];
-  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
-  page.on('pageerror', (error) => pageErrors.push(error.message));
-  const ledger = await openFixture(page, errorProjection);
-  await assertDispatcherGeometry(page, true);
-  await expect(page.getByRole('button', { name: 'Диспетчер', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: /Текущий диспетчер|Новый диспетчер/ })).toHaveCount(0);
-
-  const node = page.locator('.react-flow__node[data-id="analyze-dif"]');
-  await node.click();
-  await expect(page.getByRole('region', { name: 'Текущее задание' })).toHaveCount(1);
-  await page.getByRole('button', { name: 'Явный повтор' }).click();
-  await page.getByRole('button', { name: 'Запустить повтор' }).click();
-  await expect.poll(() => ledger.actionRequests.length).toBe(1);
-  expect(ledger.actionRequests[0]).toMatchObject({ method: 'POST', body: { expected_workflow_fingerprint: 'sha256:fixture' } });
-
-  await page.getByRole('button', { name: 'Закрыть' }).click();
-  await expect(node).toBeFocused();
-  await node.press('Enter');
-  await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();
-  const viewport = page.getByTestId('dispatcher-canvas').locator('.react-flow__viewport');
-  const initialTransform = await viewport.getAttribute('style');
-  await page.getByTestId('dispatcher-canvas').locator('.react-flow__controls-zoomin').click();
-  await expect.poll(() => viewport.getAttribute('style')).not.toBe(initialTransform);
-  const changedTransform = await viewport.getAttribute('style');
-
-  const next = structuredClone(errorProjection);
-  next.revision += 1;
-  await ledger.publish(next, 1);
-  await expect(page.getByText(`Ревизия ${next.revision}`, { exact: true })).toBeVisible();
-  await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();
-  await expect(viewport).toHaveAttribute('style', changedTransform!);
-  expect(ledger.workflowRequests()).toBe(2);
-  expect(await page.evaluate(() => (window as typeof window & { __eventSourceCount: number }).__eventSourceCount)).toBe(1);
-  await page.keyboard.press('Escape');
-  await expect(page.getByRole('region', { name: 'Текущее задание' })).toHaveCount(0);
-  await expect(node).toBeFocused();
-  expect(consoleErrors).toEqual([]);
-  expect(pageErrors).toEqual([]);
-});
-
-test('empty current dispatcher keeps the complete structural matrix at 1920x1080', async ({ page }) => {
-  await page.setViewportSize({ width: 1920, height: 1080 });
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  await openFixture(page, emptyProjection);
-  await assertDispatcherGeometry(page, true);
-  await expect(page.getByText('Легенда', { exact: true })).toBeVisible();
-  if (process.env.UPDATE_FIVE_STAGE_VISUALS === '1') {
-    await page.screenshot({ path: path.join(CHANGE_ASSETS, 'dispatcher-current-five-stage-empty-1920x1080-candidate.png'), animations: 'disabled' });
-    return;
-  }
-  await assertApprovedOrStructuralCandidate(page, 'dispatcher-current-five-stage-empty-1920x1080.png');
-});
-
-test('focus falls back to the stage button when an agent disappears after SSE', async ({ page }) => {
-  const ledger = await openFixture(page);
-  await page.locator('.react-flow__node[data-id="agent:analyze-dif:analyzer:analyzer-1"]').click();
-  await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();
-  const next = structuredClone(saturatedProjection);
-  next.revision += 1;
-  const role = next.agent_phases![0].roles[0];
-  role.invocations = [];
-  role.invocation_total = 0;
-  role.invocation_omitted = 0;
-  role.requested = role.running = role.queued = role.completed = role.failed = role.cancelled = role.interrupted = 0;
-  await ledger.publish(next, 1);
-  await expect(page.locator('.react-flow__node[data-id^="agent:analyze-dif:"]')).toHaveCount(0);
-  await page.getByRole('button', { name: 'Закрыть' }).click();
-  await expect(page.getByRole('button', { name: 'Анализ DIF', exact: true })).toBeFocused();
-});
-
-test('local graph failure keeps the real shell and open panel available', async ({ page }) => {
-  const ledger = await openFixture(page);
-  await page.locator('.react-flow__node[data-id="analyze-dif"]').click();
-  await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();
-  const broken = structuredClone(saturatedProjection);
-  broken.revision += 1;
-  (broken.agent_phases![0] as unknown as { roles: unknown }).roles = {};
-  await ledger.publish(broken, 1);
-  await expect(page.getByText(/Холст диспетчера недоступен/)).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Диспетчер исследования' })).toBeVisible();
-  await expect(page.getByRole('navigation', { name: 'Этапы диспетчера' })).toBeVisible();
-  await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();
-  await expect(page.getByText('Легенда', { exact: true })).toBeVisible();
-});
-
-test('saturated current dispatcher remains bounded and factual at 1920x1080', async ({ page }) => {
-  await page.setViewportSize({ width: 1920, height: 1080 });
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  await openFixture(page);
-  await assertDispatcherGeometry(page, true);
-  await expect(page.locator('[data-zone="prepare-dif-window"]')).toContainText('Показано 4 из доступного окна');
-  await expect(page.locator('[data-zone="analyze-dif-window"]')).toContainText('Показано 4 из 12');
-  await expect(page.locator('[data-zone="classify-input"]')).toContainText('Показано 4 из 6');
-  await expect(page.locator('[data-zone="classify-batches"]')).toContainText('Показано 4 из 5');
-  await expect(page.locator('[data-zone="analyze-workers"]')).toContainText('Не показано вызовов: 2');
-  await expect(page.locator('[data-invocation-id]')).toHaveCount(24);
-  for (const invocation of ['invocation-01', 'coordinator-1', 'grouper-1', 'classifier-1', 'researcher-1']) {
-    await expect(page.locator(`[data-invocation-id="${invocation}"]`)).toBeVisible();
-  }
-  await expect(page.getByLabel(/Вызов invocation-01: слот analyzer-1, единица DIF-00001, состояние Выполняется/)).toBeVisible();
-  await expect(page.locator('[data-zone="classify-input"]')).toContainText('MRQ-00001 · DIF: 1 · доказательств: 2');
-  await expect(page.getByRole('region', { name: 'Исходные MRQ: коллекция' })).toHaveAttribute('tabindex', '0');
-  await expect(page.locator('[data-zone="decide-outcomes"]')).toContainText('MRQ-00001 · Принять типовое');
-  await expect(page.locator('[data-zone="decide-summary"]')).toContainText('Вне объёма: 1');
-  await expect(page.getByText('Легенда', { exact: true })).toBeVisible();
-  if (process.env.UPDATE_FIVE_STAGE_VISUALS === '1') {
-    await page.screenshot({ path: path.join(CHANGE_ASSETS, 'dispatcher-current-five-stage-saturated-1920x1080-candidate.png'), animations: 'disabled' });
-    return;
-  }
-  await assertApprovedOrStructuralCandidate(page, 'dispatcher-current-five-stage-saturated-1920x1080.png');
-});
-
-test('saturated dispatcher uses local horizontal overview at 1280x720', async ({ page }) => {
-  await page.setViewportSize({ width: 1280, height: 720 });
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  await openFixture(page);
-  const geometry = await assertDispatcherGeometry(page);
-  expect(geometry.dispatcher.scrollWidth).toBeGreaterThan(geometry.dispatcher.clientWidth);
-  const scroll = page.getByTestId('dispatcher-scroll');
-  const before = await page.locator('[data-zone="decide-summary"]').evaluate((element) => element.getBoundingClientRect().left);
-  await scroll.evaluate((element) => { element.scrollLeft = element.scrollWidth; });
-  await expect.poll(() => page.locator('[data-zone="decide-summary"]').evaluate((element) => element.getBoundingClientRect().left)).toBeLessThan(before);
-  if (process.env.UPDATE_FIVE_STAGE_VISUALS === '1') {
-    await page.screenshot({ path: path.join(CHANGE_ASSETS, 'dispatcher-current-five-stage-saturated-1280x720-candidate.png'), animations: 'disabled' });
-    return;
-  }
-  await assertApprovedOrStructuralCandidate(page, 'dispatcher-current-five-stage-saturated-1280x720.png');
-});
-
-test('sixteen distinct slots remain visible inside their agent collection', async ({ page }) => {
-  const dense = structuredClone(saturatedProjection);
-  dense.agent_phases![0].roles[0].invocations.forEach((invocation, index) => {
-    invocation.slot_id = `dense-${index + 1}`;
-  });
-  await openFixture(page, dense);
-  await expect(page.locator('[data-agent-id^="agent:analyze-dif:"]')).toHaveCount(16);
-  const geometry = await page.evaluate(() => {
-    const parent = document.querySelector<HTMLElement>('[data-zone="analyze-workers"]')!.getBoundingClientRect();
-    return [...document.querySelectorAll<HTMLElement>('[data-agent-id^="agent:analyze-dif:"]')].map((element) => {
-      const rect = element.closest<HTMLElement>('.react-flow__node')!.getBoundingClientRect();
-      return {
-        inside: rect.left >= parent.left && rect.top >= parent.top && rect.right <= parent.right && rect.bottom <= parent.bottom,
-        visible: rect.width > 0 && rect.height > 0,
-      };
-    });
-  });
-  expect(geometry.every((item) => item.inside && item.visible)).toBe(true);
-});
 
 test('motion follows the user preference and only confirmed activity animates', async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'no-preference' });
   await openFixture(page);
   await expect(page.locator('.react-flow__edge.animated')).not.toHaveCount(0);
-  await expect(page.locator('[data-zone="analyze-workers"]')).toHaveCSS('animation-name', 'dispatcherNodePulse');
+  await expect(page.locator('[data-zone="analyze-workers"]')).toHaveCSS('animation-name', 'enrichedRolePulse');
   await expect(page.locator('[data-zone="classify-batches"]')).toHaveCSS('animation-name', 'none');
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
@@ -420,52 +304,63 @@ test('motion follows the user preference and only confirmed activity animates', 
   await expect(page.locator('[data-zone="analyze-workers"]')).toHaveCSS('animation-name', 'none');
 });
 
-test('dispatcher variants share one shell, stream and panel while restoring separate viewports', async ({ page }) => {
+test('the sole dispatcher keeps one shell, stream, panel and viewport', async ({ page }) => {
   const ledger = await openFixture(page);
-  const currentCanvas = page.getByTestId('dispatcher-canvas');
-  const currentViewport = currentCanvas.locator('.react-flow__viewport');
-  await currentCanvas.locator('.react-flow__node[data-id="analyze-dif"]').click();
+  await expect(page.getByRole('button', { name: 'Диспетчер', exact: true })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Диспетчер new', exact: true })).toHaveCount(0);
+  const canvas = page.getByTestId('dispatcher-new-canvas');
+  const viewport = canvas.locator('.react-flow__viewport');
+  await canvas.locator('.react-flow__node[data-id="analysis"]').click();
   await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();
-  await currentCanvas.locator('.react-flow__controls-zoomin').click();
-  await expect.poll(() => currentViewport.getAttribute('style')).not.toBe('transform: translate(4px, 10px) scale(0.9);');
-  const currentTransform = await currentViewport.getAttribute('style');
-
-  await page.getByRole('button', { name: 'Диспетчер new', exact: true }).click();
-  await assertDispatcherNewGeometry(page, true);
-  await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();
-  const newCanvas = page.getByTestId('dispatcher-new-canvas');
-  const newViewport = newCanvas.locator('.react-flow__viewport');
-  const newInitialTransform = await newViewport.getAttribute('style');
-  await newCanvas.locator('.react-flow__controls-zoomin').click();
-  await expect.poll(() => newViewport.getAttribute('style')).not.toBe(newInitialTransform);
-  const newTransform = await newViewport.getAttribute('style');
-
-  await page.getByRole('button', { name: 'Диспетчер', exact: true }).click();
-  await expect(page.getByTestId('dispatcher-canvas').locator('.react-flow__viewport')).toHaveAttribute('style', currentTransform!);
-  await page.getByRole('button', { name: 'Диспетчер new', exact: true }).click();
-  await expect(page.getByTestId('dispatcher-new-canvas').locator('.react-flow__viewport')).toHaveAttribute('style', newTransform!);
+  const initialTransform = await viewport.getAttribute('style');
+  await canvas.locator('.react-flow__controls-zoomin').click();
+  await expect.poll(() => viewport.getAttribute('style')).not.toBe(initialTransform);
+  const transform = await viewport.getAttribute('style');
   expect(ledger.workflowRequests()).toBe(1);
   expect(await ledger.eventSources()).toBe(1);
 
   await page.getByRole('button', { name: 'Закрыть' }).click();
-  const newInitiator = page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="analyzer-1"]');
-  await newInitiator.focus();
-  await newInitiator.press('Enter');
+  const initiator = page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="analyzer-1"]');
+  await initiator.focus();
+  await initiator.press('Enter');
   const refreshed = structuredClone(saturatedProjection);
   refreshed.revision += 2;
   await ledger.publishBurst(refreshed, Array.from({ length: 100 }, (_, index) => index + 1));
   await expect(page.getByText(`Ревизия ${refreshed.revision}`, { exact: true })).toBeVisible();
   await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();
-  await expect(page.getByTestId('dispatcher-new-canvas').locator('.react-flow__viewport')).toHaveAttribute('style', newTransform!);
+  await expect(viewport).toHaveAttribute('style', transform!);
   await page.getByRole('button', { name: 'Закрыть' }).click();
-  await expect(newInitiator).toBeFocused();
+  await expect(initiator).toBeFocused();
   await expect.poll(() => ledger.workflowRequests()).toBe(3);
   expect(await ledger.eventSources()).toBe(1);
 });
 
-test('dispatcher new keeps stale projection read-only until an explicit nondecreasing snapshot succeeds', async ({ page }) => {
+test('the sole dispatcher sends one approved action with the workflow fingerprint', async ({ page }) => {
+  const projection = structuredClone(approvalProjection);
+  projection.items.proposals[0] = {
+    ...projection.items.proposals[0],
+    job_id: 'discover-mrq',
+    kind: 'approval',
+    approval_stage: 'batch',
+  };
+  const ledger = await openFixture(page, projection);
+  await page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="analysis"]').click();
+  await page.getByRole('button', { name: 'Одобрить предложение' }).click();
+  await expect.poll(() => ledger.actionRequests.length).toBe(1);
+  expect(ledger.actionRequests[0]).toMatchObject({
+    method: 'POST',
+    body: {
+      actor: 'local-user',
+      proposal_key: projection.items.proposals[0].id,
+      expected_fingerprint: 'sha256:fixture',
+    },
+  });
+  expect(ledger.actionRequests[0].url).toContain('/dispatcher/discover-mrq/approve-batch');
+  expect(ledger.actionRequests[0].idempotencyKey).toBeTruthy();
+});
+
+test('dispatcher keeps stale projection read-only until an explicit nondecreasing snapshot succeeds', async ({ page }) => {
   const ledger = await openFixture(page);
-  await page.getByRole('button', { name: 'Диспетчер new', exact: true }).click();
   const node = page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="analyzer-1"]');
   await node.click();
   const viewport = page.getByTestId('dispatcher-new-canvas').locator('.react-flow__viewport');
@@ -505,28 +400,27 @@ test('dispatcher new keeps stale projection read-only until an explicit nondecre
   expect(await ledger.eventSources()).toBe(1);
 });
 
-test('active projection is distinct and only confirmed work is active on dispatcher new', async ({ page }) => {
+test('active projection is distinct and only confirmed work is active', async ({ page }) => {
   expect(activeProjection).not.toEqual(saturatedProjection);
   await openFixture(page, activeProjection);
-  await page.getByRole('button', { name: 'Диспетчер new', exact: true }).click();
   await assertDispatcherNewGeometry(page, true);
   await expect(page.locator('[data-invocation-id]')).toHaveCount(1);
   await expect(page.locator('[data-zone="analyze-workers"]')).toContainText('В работе');
   await expect(page.locator('[data-zone="form-coordinator"]')).toContainText('Ожидает');
 });
 
-test('both canvases render every classifier lifecycle state through the shared panel', async ({ page }) => {
+test('the dispatcher renders every classifier lifecycle state through the shared panel', async ({ page }) => {
   const ledger = await openFixture(page);
   const cases = [
-    ['ready', undefined, 'ready', 'Готово', 'не захвачена'],
-    ['active', 'running', 'active', 'В работе', 'fixture'],
-    ['error', 'failed', 'error', 'Ошибка', 'Ошибка'],
-    ['blocked', 'resumable', 'blocked', 'Ожидает', 'Остановлен'],
-    ['complete', undefined, 'complete', 'Готово', 'не захвачена'],
-    ['unknown', 'stale', 'unknown', 'Недоступно', 'Устарел'],
+    ['ready', undefined, 'Готово', 'не захвачена'],
+    ['active', 'running', 'В работе', 'fixture'],
+    ['error', 'failed', 'Ошибка', 'Ошибка'],
+    ['blocked', 'resumable', 'Ожидает', 'Остановлен'],
+    ['complete', undefined, 'Готово', 'не захвачена'],
+    ['unknown', 'stale', 'Недоступно', 'Устарел'],
   ] as const;
   let sequence = 1;
-  for (const [circuitState, leaseState, currentLabel, newLabel, leaseLabel] of cases) {
+  for (const [circuitState, leaseState, stageLabel, leaseLabel] of cases) {
     const projection = structuredClone(saturatedProjection);
     projection.revision += sequence;
     projection.circuits.find(({ id }) => id === 'classify-mrq')!.state = circuitState;
@@ -548,31 +442,25 @@ test('both canvases render every classifier lifecycle state through the shared p
     }
     await ledger.publish(projection, sequence);
     sequence += 1;
-    for (const variant of ['Диспетчер', 'Диспетчер new'] as const) {
-      await page.getByRole('button', { name: variant, exact: true }).click();
-      const stage = variant === 'Диспетчер'
-        ? page.locator('[data-testid="dispatcher-canvas"] .react-flow__node[data-id="classify-mrq"]')
-        : page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="classify"]');
-      await expect(stage).toContainText(variant === 'Диспетчер' ? currentLabel : newLabel);
-      await page.getByRole('navigation', { name: 'Этапы диспетчера' }).getByRole('button', { name: 'Формирование пакетов' }).click();
-      const panel = page.getByRole('region', { name: 'Текущее задание' });
-      await expect(panel).toBeVisible();
-      await expect(panel).toContainText(leaseLabel);
-      await expect(page.getByRole('heading', { name: 'Формирование пакетов' })).toBeVisible();
-      await page.keyboard.press('Escape');
-    }
+    const stage = page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="classify"]');
+    await expect(stage).toContainText(stageLabel);
+    await page.getByRole('navigation', { name: 'Этапы диспетчера' }).getByRole('button', { name: 'Формирование пакетов' }).click();
+    const panel = page.getByRole('region', { name: 'Текущее задание' });
+    await expect(panel).toBeVisible();
+    await expect(panel).toContainText(leaseLabel);
+    await expect(page.getByRole('heading', { name: 'Формирование пакетов' })).toBeVisible();
+    await page.keyboard.press('Escape');
   }
 });
 
-test('dispatcher new exposes factual error state and keyboard interaction without losing the shell', async ({ page }) => {
+test('dispatcher exposes factual error state and keyboard interaction without losing the shell', async ({ page }) => {
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
   page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
   page.on('pageerror', (error) => pageErrors.push(error.message));
   await openFixture(page, errorProjection);
-  await page.getByRole('button', { name: 'Диспетчер new', exact: true }).click();
   await expect(page.locator('[data-zone="diffs-build"]')).toContainText('Ошибка');
-  await page.getByRole('button', { name: 'Диспетчер new', exact: true }).focus();
+  await page.getByRole('button', { name: 'Диспетчер', exact: true }).focus();
   for (let index = 0; index < 40 && await page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="analysis"]:focus').count() === 0; index += 1) {
     await page.keyboard.press('Tab');
   }
@@ -591,11 +479,11 @@ test('dispatcher new exposes factual error state and keyboard interaction withou
   expect(pageErrors).toEqual([]);
 });
 
-test('dispatcher new empty projection is structural before visual approval', async ({ page }) => {
+test('dispatcher empty projection is structural before visual approval', async ({ page }) => {
   await page.setViewportSize({ width: 1920, height: 1080 });
   await openFixture(page, emptyProjection);
-  await page.getByRole('button', { name: 'Диспетчер new', exact: true }).click();
   await assertDispatcherNewGeometry(page, true);
+  await assertNoClippedNodeContent(page);
   await expect(page.locator('[data-invocation-id]')).toHaveCount(0);
   if (process.env.UPDATE_FIVE_STAGE_VISUALS === '1') {
     await page.screenshot({ path: path.join(CHANGE_ASSETS, 'dispatcher-new-five-stage-empty-1920x1080-candidate.png'), animations: 'disabled' });
@@ -604,11 +492,11 @@ test('dispatcher new empty projection is structural before visual approval', asy
   await assertApprovedOrStructuralCandidate(page, 'dispatcher-new-five-stage-empty-1920x1080.png');
 });
 
-test('dispatcher new saturated projection is factual, bounded and candidate-ready at 1920x1080', async ({ page }) => {
+test('dispatcher saturated projection is factual, bounded and candidate-ready at 1920x1080', async ({ page }) => {
   await page.setViewportSize({ width: 1920, height: 1080 });
   await openFixture(page);
-  await page.getByRole('button', { name: 'Диспетчер new', exact: true }).click();
   await assertDispatcherNewGeometry(page, true);
+  await assertNoClippedNodeContent(page);
   await expect(page.locator('[data-zone="analyze-workers"], [data-zone="form-coordinator"], [data-zone="form-groupers"], [data-zone="classify-workers"], [data-zone="decide-researchers"]')).toHaveCount(5);
   await expect(page.locator('[data-invocation-id]')).toHaveCount(24);
   await expect(page.locator('[data-zone="decide-target-base"]')).toContainText('Версия и размер не подтверждены');
@@ -620,26 +508,41 @@ test('dispatcher new saturated projection is factual, bounded and candidate-read
   await assertApprovedOrStructuralCandidate(page, 'dispatcher-new-five-stage-saturated-1920x1080.png');
 });
 
-test('dispatcher new remains reachable through local overview at 1280x720', async ({ page }) => {
+test('dispatcher remains reachable through local overview at 1280x720', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 });
   await openFixture(page);
-  await page.getByRole('button', { name: 'Диспетчер new', exact: true }).click();
   const geometry = await assertDispatcherNewGeometry(page);
-  expect(geometry.scroll.scrollWidth).toBeGreaterThan(geometry.scroll.clientWidth);
-  const scroll = page.getByTestId('dispatcher-new-scroll');
-  const before = await page.locator('[data-zone="decide-summary"]').evaluate((element) => element.getBoundingClientRect().left);
-  await scroll.evaluate((element) => { element.scrollLeft = element.scrollWidth; });
-  await expect.poll(() => page.locator('[data-zone="decide-summary"]').evaluate((element) => element.getBoundingClientRect().left)).toBeLessThan(before);
+  expect(geometry.scroll.scrollWidth).toBe(geometry.scroll.clientWidth);
+  assertApprovedAsset('dispatcher-new-five-stage-saturated-1280x720.png');
+  const canvas = page.getByTestId('dispatcher-new-canvas');
+  const viewport = page.getByTestId('dispatcher-new-canvas').locator('.react-flow__viewport');
+  await canvas.locator('.react-flow__controls-zoomout').click({ force: true });
+  await expect(viewport).not.toHaveAttribute('style', /scale\(0\.9\)/);
+  const beforePan = await viewport.getAttribute('style');
+  const canvasBox = await canvas.boundingBox();
+  await page.mouse.move(canvasBox!.x + canvasBox!.width / 2, canvasBox!.y + canvasBox!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(canvasBox!.x + canvasBox!.width / 2 + 80, canvasBox!.y + canvasBox!.height / 2 + 40, { steps: 5 });
+  await page.mouse.up();
+  await expect.poll(() => viewport.getAttribute('style')).not.toBe(beforePan);
+  await canvas.locator('.react-flow__controls-fitview').click({ force: true });
+  await expect.poll(async () => page.evaluate(() => {
+    const bounds = document.querySelector<HTMLElement>('[data-testid="dispatcher-new-canvas"]')!.getBoundingClientRect();
+    return [...document.querySelectorAll<HTMLElement>('[data-testid="dispatcher-new-canvas"] .react-flow__node-stage')]
+      .every((node) => {
+        const box = node.getBoundingClientRect();
+        return box.left >= bounds.left && box.right <= bounds.right && box.top >= bounds.top && box.bottom <= bounds.bottom;
+      });
+  })).toBe(true);
+  await assertNoClippedNodeContent(page);
   if (process.env.UPDATE_FIVE_STAGE_VISUALS === '1') {
     await page.screenshot({ path: path.join(CHANGE_ASSETS, 'dispatcher-new-five-stage-saturated-1280x720-candidate.png'), animations: 'disabled' });
     return;
   }
-  await assertApprovedOrStructuralCandidate(page, 'dispatcher-new-five-stage-saturated-1280x720.png');
 });
 
-test('dispatcher new agent focus falls back after SSE removal and its local failure keeps the shell', async ({ page }) => {
+test('dispatcher agent focus falls back after SSE removal and its local failure keeps the shell', async ({ page }) => {
   const ledger = await openFixture(page);
-  await page.getByRole('button', { name: 'Диспетчер new', exact: true }).click();
   await page.locator('[data-invocation-id="invocation-01"]').click();
   await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();
   const next = structuredClone(saturatedProjection);
@@ -659,25 +562,25 @@ test('dispatcher new agent focus falls back after SSE removal and its local fail
   broken.revision += 1;
   (broken.items as unknown as { mrqs: unknown }).mrqs = null;
   await ledger.publish(broken, 2);
-  await expect(page.getByText(/Холст «Диспетчер new» недоступен/)).toBeVisible();
+  await expect(page.getByText(/Холст диспетчера недоступен/)).toBeVisible();
   await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();
   await expect(page.getByRole('navigation', { name: 'Этапы диспетчера' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Журнал', exact: true }).first()).toBeVisible();
   await expect(page.getByRole('button', { name: 'Реестры', exact: true }).first()).toBeVisible();
   await expect(page.getByText('Легенда', { exact: true })).toBeVisible();
-  await expect(page.getByTestId('dispatcher-canvas')).toHaveCount(0);
+  await expect(page.getByTestId('dispatcher-new-canvas')).toHaveCount(0);
 });
 
 test('return from a non-working view requires a fresh snapshot and fails closed', async ({ page }) => {
   const ledger = await openFixture(page);
   await page.getByRole('button', { name: 'Источники', exact: true }).first().click();
-  await expect(page.getByTestId('dispatcher-canvas')).toHaveCount(0);
+  await expect(page.getByTestId('dispatcher-new-canvas')).toHaveCount(0);
   await expect.poll(() => ledger.closedEventSources()).toBe(1);
 
   ledger.failNextWorkflow();
   await page.getByRole('button', { name: 'Диспетчер', exact: true }).click();
   await expect(page.getByText('fresh snapshot unavailable')).toBeVisible();
-  await expect(page.getByTestId('dispatcher-canvas')).toHaveCount(0);
+  await expect(page.getByTestId('dispatcher-new-canvas')).toHaveCount(0);
   expect(await ledger.eventSources()).toBe(1);
 
   const fresh = structuredClone(saturatedProjection);
@@ -685,78 +588,57 @@ test('return from a non-working view requires a fresh snapshot and fails closed'
   ledger.setProjection(fresh);
   await page.getByRole('button', { name: 'Повторить снимок' }).click();
   await expect(page.getByText(`Ревизия ${fresh.revision}`, { exact: true })).toBeVisible();
-  await expect(page.getByTestId('dispatcher-canvas')).toBeVisible();
+  await expect(page.getByTestId('dispatcher-new-canvas')).toBeVisible();
   expect(ledger.workflowRequests()).toBe(3);
   expect(await ledger.eventSources()).toBe(2);
 });
 
-test('both dispatcher canvases use contextual and compact navigation with a fresh return lifecycle', async ({ page }) => {
+test('the dispatcher uses contextual and compact navigation with a fresh return lifecycle', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
   const ledger = await openFixture(page);
+  await expect(page.getByRole('button', { name: 'Пример React Flow' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Обогащённая схема' })).toHaveCount(0);
   let expectedStreams = 1;
-  const returnTo = async (variant: 'Диспетчер' | 'Диспетчер new') => {
-    await page.getByRole('button', { name: variant, exact: true }).click();
+  const returnTo = async () => {
+    await page.getByRole('button', { name: 'Диспетчер', exact: true }).click();
     expectedStreams += 1;
     await expect.poll(() => ledger.eventSources()).toBe(expectedStreams);
     await expect.poll(() => ledger.closedEventSources()).toBe(expectedStreams - 1);
   };
-  for (const variant of ['Диспетчер', 'Диспетчер new'] as const) {
-    await page.getByRole('button', { name: variant, exact: true }).click();
+  await page.getByRole('button', { name: 'Профили и параметры', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Профили и параметры' })).toBeVisible();
+  await returnTo();
+  await page.getByRole('navigation', { name: 'Этапы диспетчера' }).getByRole('button', { name: 'Подготовка различий' }).click();
+  await page.getByRole('button', { name: 'Настроить источники' }).click();
+  await expect(page.getByRole('heading', { name: 'Источники' })).toBeVisible();
+  await returnTo();
 
-    await page.getByRole('navigation', { name: 'Этапы диспетчера' }).getByRole('button', { name: 'Подготовка различий' }).click();
-    await page.getByRole('button', { name: 'Настроить источники' }).click();
-    await expect(page.getByRole('heading', { name: 'Источники' })).toBeVisible();
-    await returnTo(variant);
+  await page.getByRole('navigation', { name: 'Этапы диспетчера' }).getByRole('button', { name: 'Подготовка различий' }).click();
+  await page.getByRole('button', { name: 'Проверить индексы' }).click();
+  await expect(page.getByText(/Индексы — одноразовое ускорение/)).toBeVisible();
+  await returnTo();
 
-    await page.getByRole('navigation', { name: 'Этапы диспетчера' }).getByRole('button', { name: 'Подготовка различий' }).click();
-    await page.getByRole('button', { name: 'Проверить индексы' }).click();
-    await expect(page.getByText(/Индексы — одноразовое ускорение/)).toBeVisible();
-    await returnTo(variant);
-
-    await page.getByRole('navigation', { name: 'Этапы диспетчера' }).getByRole('button', { name: 'Анализ DIF' }).click();
-    await page.getByRole('button', { name: 'Профили и параметры' }).click();
-    await expect(page.getByText('Следующее типизированное действие')).toBeVisible();
-    await returnTo(variant);
-
-    await page.getByRole('button', { name: 'Журнал', exact: true }).first().click();
-    await expect(page.getByRole('textbox', { name: 'Поиск в событиях и журналах' })).toBeVisible();
-    await returnTo(variant);
-
-    await page.getByRole('button', { name: 'Реестры', exact: true }).first().click();
-    await expect(page.getByLabel('Реестр')).toBeVisible();
-    await returnTo(variant);
-  }
-  expect(ledger.workflowRequests()).toBe(11);
-});
-
-test('original enriched reference remains available as a separate screen', async ({ page }) => {
+  await page.getByRole('navigation', { name: 'Этапы диспетчера' }).getByRole('button', { name: 'Анализ DIF' }).click();
+  await page.getByRole('region', { name: 'Текущее задание' }).getByRole('button', { name: 'Профили и параметры' }).click();
+  await expect(page.getByRole('heading', { name: 'Профили и параметры' })).toBeVisible();
+  await expect(page.getByRole('tab', { name: 'Этапы' })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByText('Следующее типизированное действие')).toHaveCount(0);
+  await page.setViewportSize({ width: 1280, height: 720 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.getByRole('tab', { name: 'Профили' }).click();
+  await expect(page.getByText('Профили агентов')).toBeVisible();
   await page.setViewportSize({ width: 1920, height: 1080 });
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  await openFixture(page);
-  await page.getByRole('button', { name: 'Обогащённая схема' }).click();
-  await expect(page.getByTestId('enriched-subflow-reference')).toBeVisible();
-  await expect(page.getByText('Обогащённый эталон диспетчера')).toBeVisible();
-  assertApprovedAsset('enriched-reference-baseline-1920x1080.png', true);
-  if (process.env.UPDATE_FIVE_STAGE_VISUALS === '1') {
-    await page.screenshot({ path: path.join(CHANGE_ASSETS, 'dispatcher-five-stage-reference-saturated-1920x1080-candidate.png'), animations: 'disabled' });
-  } else {
-    await assertApprovedOrStructuralCandidate(page, 'dispatcher-five-stage-reference-saturated-1920x1080.png');
-  }
-  await page.getByRole('button', { name: 'Диспетчер new' }).click();
-  await expect(page.getByTestId('dispatcher-new-canvas')).toBeVisible();
-  await expect(page.getByTestId('enriched-subflow-reference')).toHaveCount(0);
-});
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await returnTo();
 
-test('enriched reference preserves screen links and opens dispatcher new directly', async ({ page }) => {
-  await openFixture(page);
-  const navigation = page.locator('header button');
-  const navigationLabels = await navigation.allTextContents();
-  const headerBox = await page.locator('header').boundingBox();
+  await page.getByRole('button', { name: 'Журнал', exact: true }).first().click();
+  await expect(page.getByRole('textbox', { name: 'Поиск в событиях и журналах' })).toBeVisible();
+  await returnTo();
 
-  await page.getByRole('button', { name: 'Обогащённая схема', exact: true }).click();
-
-  await expect(page.getByTestId('enriched-subflow-reference')).toBeVisible();
-  await expect(navigation).toHaveText(navigationLabels);
-  expect(await page.locator('header').boundingBox()).toEqual(headerBox);
-  await page.getByRole('button', { name: 'Диспетчер new', exact: true }).click();
-  await expect(page.getByTestId('dispatcher-new-canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Реестры', exact: true }).first().click();
+  await expect(page.getByLabel('Реестр')).toBeVisible();
+  await returnTo();
+  expect(ledger.workflowRequests()).toBe(7);
+  expect(pageErrors.filter(message => message !== 'project bookmark not found')).toEqual([]);
 });

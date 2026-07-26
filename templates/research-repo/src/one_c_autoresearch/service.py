@@ -16,8 +16,6 @@ class ApplicationService:
     def __init__(self, repo: Path, rlm_executable: str | None = None, connections: dict[str, dict[str, Any]] | None = None, upload_drafts: Path | None = None, routing_previews: Path | None = None):
         self.repo = repo.resolve()
         self.rlm_executable = rlm_executable or indexes.discover_executable(self.repo)
-        if self.rlm_executable:
-            indexes.validate_engine_version(self.repo, self.rlm_executable)
         self.connections = connections
         self.upload_drafts = upload_drafts
         self.routing_previews = routing_previews
@@ -235,6 +233,7 @@ class ApplicationService:
             raise ValueError("invalid index operation mode")
         if not self.rlm_executable:
             raise RuntimeError("rlm-bsl-index is unavailable in PATH")
+        indexes.validate_engine_version(self.repo, self.rlm_executable)
         probe = lambda path: indexes.cli_probe(self.rlm_executable, path)
         builder = lambda path, component_id: indexes.cli_build(self.rlm_executable, path, component_id)
         rows = indexes.ensure(self.repo, builder, selected=payload.get("component_ids"), rebuild=mode == "rebuild", confirmed=bool(payload.get("confirmed")), probe=probe)

@@ -29,6 +29,8 @@ import {
   MenuItem,
   Select,
   Stack,
+  Tab,
+  Tabs,
   TextField,
   Toolbar,
   Typography,
@@ -82,12 +84,6 @@ type AgentPhase = {
   mode: "sequential" | "parallel-pool" | "coordinated-pool";
   max_concurrency: number;
   roles: AgentRole[];
-};
-type RunResult = {
-  run_id: string;
-  result: string;
-  proposal?: { payload: Record<string, unknown> };
-  blocker?: Blocker;
 };
 type ExternalArtifact = {
   role: string;
@@ -470,133 +466,6 @@ function ProjectPicker({ onSelect }: { onSelect: (project: Project) => void }) {
   );
 }
 
-function ActionPanel({
-  project,
-  snapshot,
-  refresh,
-}: {
-  project: Project;
-  snapshot: Snapshot;
-  refresh: () => void;
-}) {
-  const [next, setNext] = useState<{
-    action: string;
-    blocker?: { message: string };
-  } | null>();
-  const [result, setResult] = useState<RunResult>();
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const load = useCallback(
-    () =>
-      api<typeof next>(`/projects/${project.id}/workflow/next`)
-        .then(setNext)
-        .catch((error) => setError(error.message)),
-    [project.id],
-  );
-  useEffect(() => {
-    void load();
-  }, [load]);
-  const run = async () => {
-    const agentApproval = result?.blocker?.code === "approval.agent_proposal";
-    const approvals = agentApproval
-      ? [next?.action]
-      : next?.action === "sources.acquire" &&
-          window.confirm(
-            "Получить и опубликовать полное новое поколение трёх баз?",
-          )
-        ? ["sources.acquire"]
-        : [];
-    setBusy(true);
-    setError("");
-    try {
-      const value = await api<RunResult>(
-        `/projects/${project.id}/workflow/run-next`,
-        {
-          method: "POST",
-          headers: mutationHeaders(),
-          body: JSON.stringify({
-            expected_fingerprint: snapshot.workflow_fingerprint,
-            approved_operations: approvals,
-          }),
-        },
-      );
-      setResult(value);
-      refresh();
-      await load();
-    } catch (error) {
-      setError((error as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <Card variant="outlined">
-      <CardContent>
-        <Typography variant="h6" mb={2}>
-          Следующее типизированное действие
-        </Typography>
-        {error && (
-          <Alert severity="error" sx={{ mb: 2 }}>
-            {error}
-          </Alert>
-        )}
-        <Stack spacing={2}>
-          {next ? (
-            <>
-              <Typography component="code">{next.action}</Typography>
-              {next.blocker && (
-                <Alert severity="info">{next.blocker.message}</Alert>
-              )}
-              {next.action === "sources.acquire" && (
-                <Alert severity="info">
-                  Откройте раздел «Источники», проверьте маршрут и подтвердите
-                  получение там.
-                </Alert>
-              )}
-              {result?.proposal && (
-                <Alert severity="warning">
-                  <Typography mb={1}>
-                    Предложение агента сформировано и ещё не изменило
-                    репозиторий.
-                  </Typography>
-                  <Box
-                    component="pre"
-                    sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-                  >
-                    {JSON.stringify(result.proposal.payload, null, 2)}
-                  </Box>
-                </Alert>
-              )}
-              <Button
-                disabled={busy || next.action === "sources.acquire"}
-                color={
-                  result?.blocker?.code === "approval.agent_proposal"
-                    ? "warning"
-                    : "primary"
-                }
-                variant="contained"
-                onClick={() => void run()}
-              >
-                {result?.blocker?.code === "approval.agent_proposal"
-                  ? "Одобрить сохранённое предложение"
-                  : "Выполнить следующий шаг"}
-              </Button>
-            </>
-          ) : (
-            <Alert severity="success">
-              Готовых действий нет: процесс завершен.
-            </Alert>
-          )}
-          <Typography variant="caption">
-            Новый результат агента всегда требует отдельного подтверждения.
-            Произвольные команды и замена канонического файла не принимаются.
-          </Typography>
-        </Stack>
-      </CardContent>
-    </Card>
-  );
-}
-
 export function AgentProfiles({ project }: { project: Project }) {
   const [items, setItems] = useState<Record<string, AgentProfile>>({});
   const [profileId, setProfileId] = useState("local");
@@ -612,7 +481,16 @@ export function AgentProfiles({ project }: { project: Project }) {
       api<{ items: Record<string, AgentProfile> }>(
         `/projects/${project.id}/agent-profiles`,
       )
-        .then((value) => setItems(value.items))
+        .then((value) => {
+          setItems(value.items);
+          const profile = value.items[profileId];
+          if (profile) {
+            setModel(profile.model);
+            setReasoning(profile.reasoning_effort);
+            setVersion(profile.instructions_version);
+            setEnvironment(profile.environment_preset);
+          }
+        })
         .catch((error) =>
           setError(
             `${error.message}. Старый профиль недействителен: выберите встроенную среду и пересохраните его.`,
@@ -623,6 +501,13 @@ export function AgentProfiles({ project }: { project: Project }) {
   useEffect(() => {
     void load();
   }, [load]);
+  const selectProfile = (id: string, profile: AgentProfile) => {
+    setProfileId(id);
+    setModel(profile.model);
+    setReasoning(profile.reasoning_effort);
+    setVersion(profile.instructions_version);
+    setEnvironment(profile.environment_preset);
+  };
   const save = async () => {
     try {
       setError("");
@@ -655,72 +540,58 @@ export function AgentProfiles({ project }: { project: Project }) {
             {error}
           </Alert>
         )}
-        <Stack spacing={2}>
-          <Typography variant="caption">
-            Профили хранятся только в пользовательском каталоге. Среда
-            local-read-only запрещает запись, но может читать репозиторий;
-            предметные allowed_paths ограничивают контекст инструкции, а не
-            файловый доступ.
-          </Typography>
-          {Object.entries(items).map(([id, profile]) => (
-            <Alert key={id} severity="success">
-              {id}: {profile.model}, рассуждение {profile.reasoning_effort},
-              версия инструкций {profile.instructions_version}, среда{" "}
-              {profile.environment_preset}
-            </Alert>
-          ))}
-          <TextField
-            label="Идентификатор профиля"
-            value={profileId}
-            onChange={(event) => setProfileId(event.target.value)}
-          />
-          <TextField
-            label="Модель"
-            value={model}
-            onChange={(event) => setModel(event.target.value)}
-          />
-          <FormControl>
-            <InputLabel>Уровень рассуждения</InputLabel>
-            <Select
-              label="Уровень рассуждения"
-              value={reasoning}
-              onChange={(event) =>
-                setReasoning(
-                  event.target.value as AgentProfile["reasoning_effort"],
-                )
-              }
-            >
-              {["low", "medium", "high", "xhigh"].map((value) => (
-                <MenuItem key={value} value={value}>
-                  {value}
-                </MenuItem>
-              ))}
-            </Select>
-          </FormControl>
-          <FormControl>
-            <InputLabel>Версия инструкций</InputLabel>
-            <Select label="Версия инструкций" value={version} onChange={(event) => setVersion(event.target.value)}>
-              <MenuItem value="1">1</MenuItem>
-            </Select>
-          </FormControl>
-          <FormControl>
-            <InputLabel>Среда исполнения</InputLabel>
-            <Select
-              label="Среда исполнения"
-              value={environment}
-              onChange={(event) =>
-                setEnvironment(
-                  event.target.value as AgentProfile["environment_preset"],
-                )
-              }
-            >
-              <MenuItem value="local-read-only">local-read-only · только чтение</MenuItem>
-            </Select>
-          </FormControl>
-          <Button variant="contained" onClick={() => void save()}>
-            Проверить и сохранить профиль
-          </Button>
-        </Stack>
+        <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "220px minmax(0, 1fr)" }, gap: 2 }}>
+          <Stack spacing={1} aria-label="Профили агентов">
+            {Object.entries(items).map(([id, profile]) => (
+              <Button
+                key={id}
+                variant={id === profileId ? "contained" : "outlined"}
+                onClick={() => selectProfile(id, profile)}
+                sx={{ justifyContent: "flex-start" }}
+              >
+                {id}
+              </Button>
+            ))}
+            <Button variant="text" onClick={() => setProfileId("")}>Новый профиль</Button>
+          </Stack>
+          <Stack spacing={2}>
+            <TextField label="Идентификатор профиля" value={profileId} onChange={(event) => setProfileId(event.target.value)} />
+            <TextField label="Модель" value={model} onChange={(event) => setModel(event.target.value)} />
+            <FormControl>
+              <InputLabel>Уровень рассуждения</InputLabel>
+              <Select label="Уровень рассуждения" value={reasoning} onChange={(event) => setReasoning(event.target.value as AgentProfile["reasoning_effort"])}>
+                {["low", "medium", "high", "xhigh"].map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+              </Select>
+            </FormControl>
+            <Accordion disableGutters sx={{ boxShadow: "none", border: 1, borderColor: "divider" }}>
+              <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
+                <Typography fontWeight={700}>Дополнительные параметры</Typography>
+              </AccordionSummary>
+              <AccordionDetails>
+                <Stack spacing={2}>
+                  <Typography variant="caption">
+                    Профили хранятся только в пользовательском каталоге. Среда local-read-only запрещает запись, но может читать репозиторий; предметные allowed_paths ограничивают контекст инструкции, а не файловый доступ.
+                  </Typography>
+                  <FormControl>
+                    <InputLabel>Версия инструкций</InputLabel>
+                    <Select label="Версия инструкций" value={version} onChange={(event) => setVersion(event.target.value)}>
+                      <MenuItem value="1">1</MenuItem>
+                    </Select>
+                  </FormControl>
+                  <FormControl>
+                    <InputLabel>Среда исполнения</InputLabel>
+                    <Select label="Среда исполнения" value={environment} onChange={(event) => setEnvironment(event.target.value as AgentProfile["environment_preset"])}>
+                      <MenuItem value="local-read-only">local-read-only · только чтение</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Stack>
+              </AccordionDetails>
+            </Accordion>
+            <Button variant="contained" disabled={!profileId.trim()} onClick={() => void save()}>
+              Проверить и сохранить профиль
+            </Button>
+          </Stack>
+        </Box>
       </CardContent>
     </Card>
   );
@@ -744,14 +615,43 @@ type WorkflowPatchPreview = {
   }>;
 };
 
+const STEP_NAMES: Record<string, string> = {
+  "validate-project": "Проверка проекта",
+  "acquire-sources": "Получение исходников",
+  "build-diffs": "Построение различий",
+  "index-sources": "Индексация",
+  "discover-mrq": "Анализ DIF и формирование MRQ",
+  "classify-mrq": "Формирование пакетов",
+  "decide-mrq": "Исследование цели",
+  "build-projections": "Построение проекций",
+  "verify-workflow": "Проверка процесса",
+};
+
+const PHASE_NAMES: Record<string, string> = {
+  "analyze-dif": "Анализ DIF",
+  "form-mrq": "Формирование MRQ",
+  "classify-batches": "Формирование пакетов",
+  "research-target": "Исследование цели",
+};
+
+const ROLE_NAMES: Record<string, string> = {
+  analyzer: "Анализатор",
+  coordinator: "Координатор",
+  grouper: "Группировщик",
+  classifier: "Классификатор",
+  researcher: "Исследователь",
+};
+
 export function WorkflowEditor({
   project,
   snapshot,
   refresh,
+  initialStepId,
 }: {
   project: Project;
   snapshot: Snapshot;
   refresh: () => void;
+  initialStepId?: string;
 }) {
   const [configuration, setConfiguration] = useState<WorkflowConfiguration>();
   const [selected, setSelected] = useState("");
@@ -770,13 +670,18 @@ export function WorkflowEditor({
     () =>
       api<WorkflowConfiguration>(
         `/projects/${project.id}/workflow/configuration`,
-      )
+        )
         .then((value) => {
           setConfiguration(value);
-          setSelected((previous) => previous || value.steps[0]?.step.id || "");
+          setSelected((previous) =>
+            previous ||
+            value.steps.find((item) => item.step.id === initialStepId)?.step.id ||
+            value.steps[0]?.step.id ||
+            "",
+          );
         })
         .catch((error) => setError(error.message)),
-    [project.id],
+    [initialStepId, project.id],
   );
   useEffect(() => {
     void load();
@@ -784,7 +689,9 @@ export function WorkflowEditor({
   useEffect(() => {
     void api<{ items: Record<string, AgentProfile> }>(
       `/projects/${project.id}/agent-profiles`,
-    ).then((value) => setAgentProfiles(value.items));
+    )
+      .then((value) => setAgentProfiles(value.items))
+      .catch((caught) => setError((caught as Error).message));
   }, [project.id]);
   const current = configuration?.steps.find(
     (item) => item.step.id === selected,
@@ -888,72 +795,52 @@ export function WorkflowEditor({
     <Card variant="outlined">
       <CardContent>
         <Typography variant="h6" mb={2}>
-          Параметры фиксированного шага
+          Этапы процесса
         </Typography>
         {error && (
           <Alert severity="error" sx={{ mb: 2 }}>
             {error}
           </Alert>
         )}
-        <Stack spacing={2}>
-          <FormControl>
-            <InputLabel>Шаг</InputLabel>
-            <Select
-              label="Шаг"
-              value={selected}
-              onChange={(event) => setSelected(event.target.value)}
-            >
-              {configuration.steps.map((item) => (
-                <MenuItem key={item.step.id} value={item.step.id}>
-                  {item.job_id} · {item.step.id}
-                </MenuItem>
-              ))}
-            </Select>
-          </FormControl>
-          <Alert severity="info">
-            Операция {current.step.operation}; исполнитель{" "}
-            {current.catalog.executor}; воздействие {current.catalog.effect}
-            {current.catalog.approval_required
-              ? "; требуется подтверждение"
-              : ""}
-            .
-          </Alert>
-          <TextField
-            type="number"
-            label="Предельное время, секунд"
-            value={timeout}
-            onChange={(event) => {
-              invalidatePreview();
-              setTimeoutValue(Number(event.target.value));
-            }}
-            inputProps={{ min: 30, max: 86400 }}
-          />
-          {["diff.build", "projections.build"].includes(
-            current.step.operation,
-          ) && (
-            <TextField
-              type="number"
-              label="Повторные попытки"
-              value={retries}
-              onChange={(event) => {
-                invalidatePreview();
-                setRetries(Number(event.target.value));
-              }}
-              inputProps={{ min: 0, max: 1 }}
-            />
-          )}
+        <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "260px minmax(0, 1fr)" }, gap: 2 }}>
+          <Stack spacing={0.75} component="nav" aria-label="Этапы процесса">
+            {configuration.steps.map((item) => (
+              <Button
+                key={item.step.id}
+                variant={selected === item.step.id ? "contained" : "text"}
+                onClick={() => setSelected(item.step.id)}
+                sx={{ justifyContent: "flex-start", textAlign: "left", py: 1 }}
+              >
+                <Box>
+                  <Typography component="span" display="block" fontWeight={700}>
+                    {STEP_NAMES[item.step.id] || item.step.id}
+                  </Typography>
+                  <Typography component="span" display="block" variant="caption" sx={{ opacity: 0.75 }}>
+                    {item.step.id}
+                  </Typography>
+                </Box>
+              </Button>
+            ))}
+          </Stack>
+          <Stack spacing={2} minWidth={0}>
+            <Box>
+              <Typography variant="h6">{STEP_NAMES[current.step.id] || current.step.id}</Typography>
+              <Typography variant="caption" color="text.secondary">{current.step.id} · {current.step.operation}</Typography>
+            </Box>
           {phases.map((phase) => (
             <Card key={phase.phase_id} variant="outlined">
               <CardContent>
                 <Typography id={`phase-${phase.phase_id}`} fontWeight={700}>
-                  {phase.phase_id}
+                  {PHASE_NAMES[phase.phase_id] || phase.phase_id}
                 </Typography>
+                <Typography variant="caption" color="text.secondary">{phase.phase_id}</Typography>
                 <Stack spacing={2} mt={1}>
                   {phase.phase_id !== "form-mrq" && (
                     <FormControl>
-                      <InputLabel id={`mode-${phase.phase_id}`}>Режим {phase.phase_id}</InputLabel>
+                      <InputLabel id={`mode-${phase.phase_id}`}>Режим</InputLabel>
                       <Select
-                        label={`Режим ${phase.phase_id}`}
+                        aria-label={`Режим ${phase.phase_id}`}
+                        label="Режим"
                         labelId={`mode-${phase.phase_id}`}
                         value={phase.mode}
                         onChange={(event) => {
@@ -972,18 +859,18 @@ export function WorkflowEditor({
                   )}
                   <TextField
                     type="number"
-                    label={`Предел одновременности ${phase.phase_id}`}
+                    label="Предел одновременности"
+                    inputProps={{ min: 1, "aria-label": `Предел одновременности ${phase.phase_id}` }}
                     value={phase.max_concurrency}
                     onChange={(event) => updatePhase(phase.phase_id, { max_concurrency: Number(event.target.value) })}
                     disabled={phase.mode === "sequential"}
-                    inputProps={{ min: 1 }}
                   />
                   {phase.roles.map((role) => (
                     <Stack key={role.role_id} spacing={1}>
-                      <Typography id={`role-${phase.phase_id}-${role.role_id}`} variant="subtitle2">Роль: {role.role_id}</Typography>
+                      <Typography id={`role-${phase.phase_id}-${role.role_id}`} variant="subtitle2">{ROLE_NAMES[role.role_id] || role.role_id}</Typography>
                       <FormControl error={!agentProfiles[role.agent_profile]}>
-                        <InputLabel id={`profile-${phase.phase_id}-${role.role_id}`}>Профиль {phase.phase_id} {role.role_id}</InputLabel>
-                        <Select label={`Профиль ${phase.phase_id} ${role.role_id}`} labelId={`profile-${phase.phase_id}-${role.role_id}`} value={role.agent_profile} onChange={(event) => updateRole(phase.phase_id, role.role_id, { agent_profile: event.target.value })}>
+                        <InputLabel id={`profile-${phase.phase_id}-${role.role_id}`}>Профиль</InputLabel>
+                        <Select aria-label={`Профиль ${phase.phase_id} ${role.role_id}`} label="Профиль" labelId={`profile-${phase.phase_id}-${role.role_id}`} value={role.agent_profile} onChange={(event) => updateRole(phase.phase_id, role.role_id, { agent_profile: event.target.value })}>
                           {Object.keys(agentProfiles).map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
                           {!agentProfiles[role.agent_profile] && <MenuItem value={role.agent_profile}>{role.agent_profile} — отсутствует</MenuItem>}
                         </Select>
@@ -996,13 +883,12 @@ export function WorkflowEditor({
                       )}
                       <TextField
                         type="number"
-                        label={`Логические слоты ${phase.phase_id} ${role.role_id}`}
+                        label="Количество агентов"
                         value={role.count}
                         disabled={role.role_id === "coordinator" || phase.mode === "sequential"}
                         onChange={(event) => updateRole(phase.phase_id, role.role_id, { count: Number(event.target.value) })}
-                        inputProps={{ min: 1 }}
+                        inputProps={{ min: 1, "aria-label": `Количество агентов ${phase.phase_id} ${role.role_id}` }}
                       />
-                      <TextField multiline minRows={2} label={`Дополнительная инструкция ${phase.phase_id} ${role.role_id}`} value={role.instruction_supplement} onChange={(event) => updateRole(phase.phase_id, role.role_id, { instruction_supplement: event.target.value })} inputProps={{ maxLength: 4000 }} />
                     </Stack>
                   ))}
                 </Stack>
@@ -1014,6 +900,48 @@ export function WorkflowEditor({
               Пределы независимы для каждой фазы; общего предела компьютера нет.
             </Alert>
           )}
+          <Accordion disableGutters sx={{ boxShadow: "none", border: 1, borderColor: "divider" }}>
+            <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
+              <Typography fontWeight={700}>Дополнительные параметры</Typography>
+            </AccordionSummary>
+            <AccordionDetails>
+              <Stack spacing={2}>
+                <TextField
+                  type="number"
+                  label="Предельное время, секунд"
+                  value={timeout}
+                  onChange={(event) => {
+                    invalidatePreview();
+                    setTimeoutValue(Number(event.target.value));
+                  }}
+                  inputProps={{ min: 30, max: 86400 }}
+                />
+                {["diff.build", "projections.build"].includes(current.step.operation) && (
+                  <TextField
+                    type="number"
+                    label="Повторные попытки"
+                    value={retries}
+                    onChange={(event) => {
+                      invalidatePreview();
+                      setRetries(Number(event.target.value));
+                    }}
+                    inputProps={{ min: 0, max: 1 }}
+                  />
+                )}
+                {phases.flatMap((phase) => phase.roles.map((role) => (
+                  <TextField
+                    key={`${phase.phase_id}-${role.role_id}`}
+                    multiline
+                    minRows={2}
+                    label={`Дополнительная инструкция · ${ROLE_NAMES[role.role_id] || role.role_id}`}
+                    value={role.instruction_supplement}
+                    onChange={(event) => updateRole(phase.phase_id, role.role_id, { instruction_supplement: event.target.value })}
+                    inputProps={{ maxLength: 4000 }}
+                  />
+                )))}
+              </Stack>
+            </AccordionDetails>
+          </Accordion>
           <Stack direction="row" spacing={1}>
             <Button
               disabled={hasMissingProfiles}
@@ -1060,7 +988,8 @@ export function WorkflowEditor({
               </CardContent>
             </Card>
           )}
-        </Stack>
+          </Stack>
+        </Box>
       </CardContent>
     </Card>
   );
@@ -2282,10 +2211,12 @@ function Workspace({
 }) {
   const [snapshot, setSnapshot] = useState<Snapshot>();
   const [view, setView] = useState<
-    "dispatcher" | "dispatcher-new" | "react-flow-example" | "enriched-reference" | "sources" | "indexes" | "settings" | "journal" | "registries"
+    "dispatcher" | "react-flow-example" | "enriched-reference" | "sources" | "indexes" | "settings" | "journal" | "registries"
   >("dispatcher");
+  const [settingsTab, setSettingsTab] = useState<"stages" | "profiles">("stages");
+  const [settingsStep, setSettingsStep] = useState<string>();
   const [error, setError] = useState("");
-  const [retryWorkingView, setRetryWorkingView] = useState<"dispatcher" | "dispatcher-new">();
+  const [retryWorkingView, setRetryWorkingView] = useState(false);
   const fetchSnapshot = useCallback(
     () => api<Snapshot>(`/projects/${project.id}/workflow`),
     [project.id],
@@ -2300,21 +2231,20 @@ function Workspace({
   useEffect(() => {
     refresh();
   }, [refresh]);
-  const working = view === "dispatcher" || view === "dispatcher-new";
-  const openWorking = async (target: "dispatcher" | "dispatcher-new") => {
+  const working = view === "dispatcher";
+  const openWorking = async () => {
     if (working) {
-      setView(target);
       return;
     }
     try {
       const next = await fetchSnapshot();
       setSnapshot(next);
       setError("");
-      setRetryWorkingView(undefined);
-      setView(target);
+      setRetryWorkingView(false);
+      setView("dispatcher");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Не удалось обновить рабочий снимок");
-      setRetryWorkingView(target);
+      setRetryWorkingView(true);
     }
   };
   return (
@@ -2331,21 +2261,16 @@ function Workspace({
           </Box>
           <Button
             variant={view === "dispatcher" ? "contained" : "text"}
-            onClick={() => void openWorking("dispatcher")}
+            onClick={() => void openWorking()}
           >
             Диспетчер
-          </Button>
-          <Button onClick={() => setView("react-flow-example")}>Пример React Flow</Button>
-          <Button onClick={() => setView("enriched-reference")}>Обогащённая схема</Button>
-          <Button
-            variant={view === "dispatcher-new" ? "contained" : "text"}
-            onClick={() => void openWorking("dispatcher-new")}
-          >
-            Диспетчер new
           </Button>
           <Button onClick={() => setView("sources")}>Источники</Button>
           <Button onClick={() => setView("journal")}>Журнал</Button>
           <Button onClick={() => setView("registries")}>Реестры</Button>
+          <Button onClick={() => { setSettingsStep(undefined); setSettingsTab("stages"); setView("settings"); }}>
+            Профили и параметры
+          </Button>
           <Button color="inherit" onClick={close}>
             Другой проект
           </Button>
@@ -2353,7 +2278,7 @@ function Workspace({
       </AppBar>
       <Box sx={{ px: working ? 1.5 : 3, py: 1.5 }}>
         {error && <Alert severity="error" action={retryWorkingView
-          ? <Button color="inherit" onClick={() => void openWorking(retryWorkingView)}>Повторить снимок</Button>
+          ? <Button color="inherit" onClick={() => void openWorking()}>Повторить снимок</Button>
           : undefined}>{error}</Alert>}
         {view === "react-flow-example" ? (
           <OfficialSubFlowReference />
@@ -2366,12 +2291,11 @@ function Workspace({
             {working && (
               <PipelineDispatcher
                 projectId={project.id}
-                canvasVariant={view === "dispatcher-new" ? "new" : "current"}
                 initialProjection={snapshot.dispatcher}
                 initialFingerprint={snapshot.workflow_fingerprint}
                 onOpenSources={() => setView("sources")}
                 onOpenIndexes={() => setView("indexes")}
-                onOpenSettings={() => setView("settings")}
+                onOpenSettings={(stepId) => { setSettingsStep(stepId); setSettingsTab("stages"); setView("settings"); }}
                 onOpenJournal={() => setView("journal")}
                 onOpenRegistries={() => setView("registries")}
               />
@@ -2388,17 +2312,19 @@ function Workspace({
             )}
             {view === "settings" && (
               <Stack spacing={2}>
-                <ActionPanel
-                  project={project}
-                  snapshot={snapshot}
-                  refresh={refresh}
-                />
-                <AgentProfiles project={project} />
-                <WorkflowEditor
-                  project={project}
-                  snapshot={snapshot}
-                  refresh={refresh}
-                />
+                <Box>
+                  <Typography variant="h5" fontWeight={750}>Профили и параметры</Typography>
+                  <Typography color="text.secondary">Настройка этапов процесса и профилей агентов</Typography>
+                </Box>
+                <Tabs value={settingsTab} onChange={(_event, value) => setSettingsTab(value)} aria-label="Разделы настроек">
+                  <Tab value="stages" label="Этапы" />
+                  <Tab value="profiles" label="Профили" />
+                </Tabs>
+                {settingsTab === "stages" ? (
+                  <WorkflowEditor project={project} snapshot={snapshot} refresh={refresh} initialStepId={settingsStep} />
+                ) : (
+                  <AgentProfiles project={project} />
+                )}
               </Stack>
             )}
             {view === "journal" && <Events project={project} />}

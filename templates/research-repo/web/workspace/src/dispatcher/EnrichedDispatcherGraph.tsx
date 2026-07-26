@@ -116,9 +116,11 @@ const StageNode = memo(function StageNode({ data }: NodeProps<Node<EnrichedNodeD
 const CardNode = memo(function CardNode({ id, data }: NodeProps<Node<EnrichedNodeData>>) {
   return <Paper
     data-zone={data.zoneId ?? id}
+    data-content-inset
     variant="outlined"
     sx={{
       height: '100%',
+      boxSizing: 'border-box',
       p: 1,
       borderColor: `${data.accent}99`,
       bgcolor: '#fff',
@@ -131,35 +133,42 @@ const CardNode = memo(function CardNode({ id, data }: NodeProps<Node<EnrichedNod
     }}
   >
     <NamedHandles accent={data.accent} ports={data.ports} />
-    <Stack spacing={0.65}>
+    <Stack spacing={0.4} sx={{ height: '100%', minHeight: 0 }}>
       <Typography sx={{ fontSize: 13, fontWeight: 750, lineHeight: 1.15 }}>{data.title}</Typography>
-      {data.state && <Chip label={data.state} size="small" sx={{ alignSelf: 'flex-start', height: 20, color: data.accent, '& .MuiChip-label': { px: 0.8, fontSize: 10 } }} />}
-      {data.detail && <Typography sx={{ fontSize: 10.5, color: 'text.secondary', lineHeight: 1.35 }}>{data.detail}</Typography>}
+      {data.state && <Chip label={data.state} size="small" sx={{ alignSelf: 'flex-start', height: 18, color: data.accent, '& .MuiChip-label': { px: 0.7, fontSize: 9.5 } }} />}
       {data.subzones?.length ? <Stack
         spacing={0.5}
         tabIndex={0}
         role="region"
         aria-label={`${data.title}: вложенные зоны`}
-        sx={{ maxHeight: '100%', overflowY: 'auto' }}
+        sx={{ flex: 1, minHeight: 0, overflowY: 'auto' }}
       >
+        {data.detail && <Typography sx={{ fontSize: 10.5, color: 'text.secondary', lineHeight: 1.3, overflowWrap: 'anywhere' }}>{data.detail}</Typography>}
         {data.subzones.map((zone) => <Box
           key={zone.id}
           data-zone={zone.id}
-          sx={{ p: 0.55, border: 1, borderColor: `${data.accent}44`, borderRadius: 0.7, bgcolor: '#fff' }}
+          data-content-inset
+          sx={{ p: 0.75, border: 1, borderColor: `${data.accent}44`, borderRadius: 0.7, bgcolor: '#fff' }}
         >
-          <Stack direction="row" gap={0.5}>
-            <Typography sx={{ minWidth: 0, flex: 1, fontSize: 9.5, fontWeight: 750 }}>{zone.title}</Typography>
+          <Stack gap={0.1}>
+            <Typography sx={{ fontSize: 9.5, fontWeight: 750, overflowWrap: 'anywhere' }}>{zone.title}</Typography>
             <Typography sx={{ fontSize: 8.5, color: zone.state === 'Ошибка' ? 'error.main' : data.accent }}>{zone.state}</Typography>
           </Stack>
           <Typography sx={{ fontSize: 8.5, color: 'text.secondary' }}>{zone.detail}</Typography>
         </Box>)}
       </Stack> : null}
+      {data.detail && !data.subzones?.length && <Typography
+        tabIndex={0}
+        role="region"
+        aria-label={`${data.title}: содержимое`}
+        sx={{ flex: 1, minHeight: 0, overflowY: 'auto', fontSize: 10.5, color: 'text.secondary', lineHeight: 1.3, overflowWrap: 'anywhere' }}
+      >{data.detail}</Typography>}
       {data.items?.length ? <Stack
         spacing={0.35}
         tabIndex={0}
         role="region"
         aria-label={data.collectionLabel ?? `${data.title}: коллекция`}
-        sx={{ maxHeight: '100%', overflowY: 'auto' }}
+        sx={{ flex: 1, minHeight: 0, overflowY: 'auto' }}
       >
         {data.items.map((item) => <Typography key={item} noWrap title={item} sx={{ fontSize: 9.5, color: 'text.secondary' }}>{item}</Typography>)}
       </Stack> : null}
@@ -175,9 +184,14 @@ const RoleNode = memo(function RoleNode({ id, data }: NodeProps<Node<EnrichedNod
     }));
   return <Box
     data-zone={data.zoneId ?? id}
+    data-content-inset
     sx={{
       height: '100%',
+      boxSizing: 'border-box',
+      p: 1,
       position: 'relative',
+      display: 'flex',
+      flexDirection: 'column',
       border: 1,
       borderColor: `${data.accent}99`,
       borderRadius: 1,
@@ -190,23 +204,24 @@ const RoleNode = memo(function RoleNode({ id, data }: NodeProps<Node<EnrichedNod
     }}
   >
     <NamedHandles accent={data.accent} ports={data.ports} />
-    <Stack direction="row" alignItems="center" gap={0.5} sx={{ px: 0.4, height: 24 }}>
-      <Typography sx={{ fontSize: 11.5, fontWeight: 750, flex: 1 }}>{data.title}</Typography>
-      <Typography sx={{ color: data.accent, fontSize: 9.5 }}>{data.state}</Typography>
+    <Stack direction="row" alignItems="flex-start" gap={0.5} sx={{ minHeight: 24 }}>
+      <Typography sx={{ minWidth: 0, fontSize: 11.5, fontWeight: 750, lineHeight: 1.1, flex: 1, overflowWrap: 'anywhere' }}>{data.title}</Typography>
+      <Typography noWrap sx={{ flexShrink: 0, color: data.accent, fontSize: 9.5 }}>{data.state}</Typography>
     </Stack>
-    {data.detail && <Typography noWrap title={data.detail} sx={{ px: 0.4, fontSize: 8.5, color: 'text.secondary' }}>{data.detail}</Typography>}
+    {data.detail && <Typography noWrap title={data.detail} sx={{ fontSize: 8.5, color: 'text.secondary' }}>{data.detail}</Typography>}
     <Stack
       spacing={0.45}
       mt={0.4}
       tabIndex={0}
       role="region"
       aria-label={data.collectionLabel ?? `${data.title}: вызовы`}
-      sx={{ height: data.detail ? 'calc(100% - 40px)' : 'calc(100% - 28px)', overflowY: 'auto', pr: 0.3 }}
+      sx={{ flex: 1, minHeight: 0, overflowY: 'auto' }}
     >
       {slots.length ? slots.map(({ slotId, invocations }) => <Box
         key={slotId}
         component="button"
         type="button"
+        data-content-inset
         data-agent-slot-id={slotId}
         data-dispatcher-initiator={`new-slot:${id}:${slotId}`}
         data-circuit-id={data.circuitId}
@@ -217,6 +232,7 @@ const RoleNode = memo(function RoleNode({ id, data }: NodeProps<Node<EnrichedNod
           bgcolor: '#fff',
           borderRadius: 1,
           p: 0.8,
+          flexShrink: 0,
           minHeight: data.title === 'Координатор MRQ' ? 'calc(100% - 4px)' : 92,
           cursor: 'pointer',
         }}
@@ -306,7 +322,7 @@ export function EnrichedDispatcherGraph({
       edges={edges}
       nodeTypes={ENRICHED_NODE_TYPES}
       {...(viewport ? { viewport } : fitView ? { fitView: true, fitViewOptions: { padding: 0.02 } } : { defaultViewport: DEFAULT_VIEWPORT })}
-      minZoom={fitView ? 0.45 : 0.65}
+      minZoom={0.45}
       maxZoom={1.4}
       nodesDraggable={false}
       nodesConnectable={false}

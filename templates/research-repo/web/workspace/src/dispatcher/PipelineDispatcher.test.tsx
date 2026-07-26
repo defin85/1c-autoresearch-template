@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { DispatcherCanvasErrorBoundary, DispatcherNewCanvasErrorBoundary, DispatcherPanel, leaseActionMatrix, PipelineDispatcher } from './PipelineDispatcher';
+import { DispatcherCanvasErrorBoundary, DispatcherPanel, leaseActionMatrix, PipelineDispatcher } from './PipelineDispatcher';
 import type { DispatcherProjection } from './projection';
 import { approvalProjection, errorProjection, saturatedProjection, staleProjection, stoppedProjection } from '../../e2e/dispatcher.fixtures';
 
@@ -89,18 +89,16 @@ beforeEach(() => {
 afterEach(cleanup);
 
 test('PipelineDispatcher renders five circuits and freshness label', async () => {
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" />);
+  render(<PipelineDispatcher projectId="proj-1" />);
   expect((await screen.findAllByText('Подготовка')).length).toBeGreaterThan(0);
-  for (const title of ['Подготовка различий', 'Анализ DIF', 'Формирование MRQ', 'Формирование пакетов', 'Исследование целевой базы']) {
+  for (const title of ['Подготовка различий', 'Анализ DIF', 'Формирование MRQ', 'Формирование пакетов', 'Исследование цели']) {
     expect((await screen.findAllByText(title)).length).toBeGreaterThan(0);
   }
   expect((await screen.findAllByText('DIF-002')).length).toBeGreaterThan(0);
   expect((await screen.findAllByText(/MRQ-014/)).length).toBeGreaterThan(0);
-  expect((await screen.findAllByText(/Адаптировать/)).length).toBeGreaterThan(0);
-  expect(screen.getAllByText(/подтверждено/).length).toBeGreaterThan(0);
+  expect(document.querySelector('[data-zone="decide-outcomes"]')).not.toBeNull();
   expect(screen.getByText('Легенда')).toBeInTheDocument();
-  expect(screen.getByTestId('dispatcher-canvas')).toBeInTheDocument();
-  expect(document.querySelectorAll('.react-flow__node-stage')).toHaveLength(5);
+  expect(screen.getByTestId('dispatcher-new-canvas')).toBeInTheDocument();
   expect(document.querySelectorAll('[data-stage-state="active"]')).toHaveLength(1);
   expect(document.querySelectorAll('[data-stage-state="future"]')).toHaveLength(3);
 });
@@ -119,24 +117,8 @@ test('local canvas error keeps the surrounding shell mounted', () => {
   consoleError.mockRestore();
 });
 
-test('dispatcher new React subtree error stays inside its local boundary', () => {
-  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
-  const BrokenSubtree = () => { throw new Error('new subtree failed'); };
-  render(<>
-    <div>Оболочка диспетчера</div>
-    <DispatcherNewCanvasErrorBoundary><BrokenSubtree /></DispatcherNewCanvasErrorBoundary>
-    <button>Журнал</button><button>Реестры</button>
-  </>);
-  expect(screen.getByText('Холст «Диспетчер new» недоступен: new subtree failed')).toBeInTheDocument();
-  expect(screen.getByText('Оболочка диспетчера')).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Журнал' })).toBeEnabled();
-  expect(screen.getByRole('button', { name: 'Реестры' })).toBeEnabled();
-  expect(screen.queryByText('Холст диспетчера недоступен: new subtree failed')).not.toBeInTheDocument();
-  consoleError.mockRestore();
-});
-
 test('dispatcher stages have keyboard-focusable text controls', async () => {
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" />);
+  render(<PipelineDispatcher projectId="proj-1" />);
   await screen.findByRole('button', { name: 'Анализ DIF' });
   expect(within(screen.getByRole('navigation', { name: 'Этапы диспетчера' })).getAllByRole('button').map((button) => button.textContent)).toEqual([
     'Подготовка различий',
@@ -145,14 +127,14 @@ test('dispatcher stages have keyboard-focusable text controls', async () => {
     'Формирование пакетов',
     'Исследование цели',
   ]);
-  const node = document.querySelector<HTMLElement>('.react-flow__node[data-id="analyze-dif"]');
+  const node = document.querySelector<HTMLElement>('.react-flow__node[data-id="analysis"]');
   expect(node).not.toBeNull();
   expect(node).toHaveAttribute('tabindex', '0');
   fireEvent.keyDown(node!, { key: 'Enter' });
   expect(await screen.findByText('Текущее задание')).toBeInTheDocument();
-  fireEvent.keyDown(document.querySelector<HTMLElement>('.react-flow__node[data-id="analyze-dif"]')!, { key: 'Escape' });
+  fireEvent.keyDown(document.querySelector<HTMLElement>('.react-flow__node[data-id="analysis"]')!, { key: 'Escape' });
   await waitFor(() => expect(screen.queryByText('Текущее задание')).not.toBeInTheDocument());
-  const currentNode = document.querySelector<HTMLElement>('.react-flow__node[data-id="analyze-dif"]')!;
+  const currentNode = document.querySelector<HTMLElement>('.react-flow__node[data-id="analysis"]')!;
   fireEvent.keyDown(currentNode, { key: ' ' });
   expect(await screen.findByText('Текущее задание')).toBeInTheDocument();
 });
@@ -166,7 +148,7 @@ test('dispatcher new uses the shared action callback and restores focus', async 
       ? { outcome: { status: 'running', revision: 8, summary: {} } }
       : { events: [], next_cursor: 0, resync_required: false },
   } as Response));
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="new" initialProjection={projection} initialFingerprint="sha256:fixture" />);
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={projection} initialFingerprint="sha256:fixture" />);
   const node = document.querySelector<HTMLElement>('.react-flow__node[data-id="analyzer-1"]');
   expect(node).not.toBeNull();
   expect(node).toHaveAttribute('tabindex', '0');
@@ -182,68 +164,6 @@ test('dispatcher new uses the shared action callback and restores focus', async 
   await waitFor(() => expect(document.querySelector<HTMLElement>('.react-flow__node[data-id="analyzer-1"]')).toHaveFocus());
 });
 
-test('agent initiator with a compound stable id regains focus after closing the shared panel', async () => {
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" initialProjection={saturatedProjection} initialFingerprint="sha256:fixture" />);
-  const agentNode = document.querySelector<HTMLElement>('.react-flow__node[data-id^="agent:analyze-dif:"]');
-  expect(agentNode).not.toBeNull();
-  fireEvent.click(agentNode!);
-  expect(await screen.findByText('Текущее задание')).toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: 'Закрыть' }));
-  await waitFor(() => expect(document.querySelector<HTMLElement>(`.react-flow__node[data-id="${agentNode!.dataset.id}"]`)).toHaveFocus());
-});
-
-test('PipelineDispatcher does not imitate active workers without a lease', async () => {
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" />);
-  await waitFor(() => expect(document.querySelector('[data-zone="analyze-workers"]')).toHaveTextContent('Назначено: 2 · настроено: 4'));
-  const workers = document.querySelector('[data-zone="analyze-workers"]')!;
-  expect(document.querySelectorAll('[data-agent-id^="agent:analyze-dif:"]')).toHaveLength(2);
-  expect(screen.queryByText('Свободен')).not.toBeInTheDocument();
-  expect(workers).toHaveTextContent('gpt-5.6-sol · ready');
-});
-
-test('dispatcher keeps the required structural zones in every circuit', async () => {
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" />);
-  await screen.findByText('Сводка опубликованных MRQ');
-  for (const id of [
-    'sources', 'vendor-baseline', 'target-cf', 'next-vendor', 'sources-acquire', 'diffs-build', 'indexes-build', 'prepare-dif-window',
-    'analyze-dif-window', 'analyze-workers', 'analyze-meaning', 'analyze-noise',
-    'form-meaning', 'form-coordinator', 'form-groupers', 'form-proposals', 'form-review', 'form-barrier', 'form-publication', 'form-summary',
-    'classify-input', 'classify-workers', 'classify-validation', 'classify-batches',
-    'decide-mrq-queue', 'decide-target-base', 'decide-researchers', 'decide-approval', 'decide-outcomes', 'decide-summary',
-  ]) {
-    expect(document.querySelector(`[data-zone="${id}"]`)).not.toBeNull();
-  }
-  expect([...document.querySelectorAll('.react-flow__handle')].every((handle) => handle.getAttribute('aria-hidden') === 'true')).toBe(true);
-  expect(document.querySelectorAll('.react-flow__edge[tabindex]')).toHaveLength(0);
-});
-
-test('contradictory role counters suppress progress', async () => {
-  const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
-  projection.agent_phases![0].roles[0].requested = 9;
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" initialProjection={projection} initialFingerprint="sha256:abc" />);
-  const alert = await screen.findByText('Противоречивая проекция роли');
-  expect(alert.closest('.MuiPaper-root')).not.toHaveTextContent('Обработано: 0%');
-});
-
-test('unknown totals stay unknown and never become local collection totals', async () => {
-  const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
-  delete projection.circuits[0].aggregates!.diff_count;
-  projection.items.dif_queue = Array.from({ length: 5 }, (_, index) => ({ id: `DIF-${index + 1}`, path: '', kind: 'changed', state: 'queued' }));
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" initialProjection={projection} initialFingerprint="sha256:abc" />);
-  expect((await screen.findAllByText('Показано 4 из доступного окна')).length).toBeGreaterThan(0);
-  expect(screen.queryByText('Показано 4 из 5')).not.toBeInTheDocument();
-});
-
-test('contradictory invocation window is explicit and hides an untrusted remainder', async () => {
-  const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
-  const role = projection.agent_phases![0].roles[0];
-  role.invocation_total = 4;
-  role.invocation_omitted = 3;
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" initialProjection={projection} initialFingerprint="sha256:abc" />);
-  expect(await screen.findByText('Противоречивая проекция роли')).toBeInTheDocument();
-  expect(screen.queryByText('Не показано вызовов: 3')).not.toBeInTheDocument();
-});
-
 test.each([
   ['остановленное', stoppedProjection, 'Остановлен'],
   ['ошибочное', errorProjection, 'Ошибка'],
@@ -253,46 +173,11 @@ test.each([
   expect(screen.getByText(new RegExp(`Аренда: fixture-agent \\(${label}\\)`))).toBeInTheDocument();
 });
 
-test('stale, unavailable environment, cancellation, interruption and all outcomes stay textual', async () => {
-  const projection = structuredClone(staleProjection);
-  projection.agent_phases![0].roles[0].environment_status = '';
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" initialProjection={projection} initialFingerprint="sha256:fixture" />);
-  expect(await screen.findByText('Данные диспетчера устарели')).toBeInTheDocument();
-  expect(screen.getByText('gpt-5.6-sol · доступность не подтверждена')).toBeInTheDocument();
-  expect(screen.getByText(/· Отменено ·/)).toBeInTheDocument();
-  expect(screen.getByText(/· Прервано ·/)).toBeInTheDocument();
-  expect(document.querySelector('[data-zone="decide-summary"]')).toHaveTextContent('Типовой механизм: 1 · Адаптировать: 1');
-  expect(document.querySelector('[data-zone="decide-summary"]')).toHaveTextContent('Сохранить доработку: 1 · Вне объёма: 1');
-  expect(screen.queryByText(/GAP-/)).not.toBeInTheDocument();
-});
-
-test('source MRQ cards retain assigned DIF and evidence counts', async () => {
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" initialProjection={saturatedProjection} initialFingerprint="sha256:fixture" />);
-  expect((await screen.findAllByText(/DIF: 1 · доказательств: 2/)).length).toBeGreaterThan(0);
-});
-
-test('configured idle roles are waiting, while approved outcomes are complete', async () => {
-  const projection = structuredClone(saturatedProjection);
-  for (const phase of projection.agent_phases ?? []) {
-    for (const role of phase.roles) {
-      role.requested = 0;
-      role.running = 0;
-      role.queued = 0;
-      role.completed = 0;
-      role.failed = 0;
-      role.cancelled = 0;
-      role.interrupted = 0;
-      role.invocation_total = 0;
-      role.invocation_omitted = 0;
-      role.invocations = [];
-    }
-  }
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" initialProjection={projection} initialFingerprint="sha256:fixture" />);
-  await screen.findByText('Сводка опубликованных MRQ');
-  expect(document.querySelector('[data-zone="analyze-workers"]')).toHaveTextContent('waiting');
-  expect(document.querySelector('[data-zone="analyze-workers"]')).not.toHaveTextContent('active');
-  expect(document.querySelector('[data-zone="decide-outcomes"]')).toHaveTextContent('complete');
-  expect(document.querySelector('[data-zone="decide-summary"]')).toHaveTextContent('Решений в окне');
+test('context settings action passes the selected workflow step', () => {
+  const onOpenSettings = vi.fn();
+  render(<DispatcherPanel projectId="proj-1" projection={snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection} fingerprint="sha256:fixture" selectedCircuit="classify-mrq" onClose={() => {}} onOpenSettings={onOpenSettings} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Профили и параметры' }));
+  expect(onOpenSettings).toHaveBeenCalledWith('classify-mrq');
 });
 
 test('PipelineDispatcher shows real invocation states independently of a soft-stopped lease', async () => {
@@ -300,7 +185,7 @@ test('PipelineDispatcher shows real invocation states independently of a soft-st
   const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
   projection.jobs = { 'discover-mrq': lease };
   projection.circuits[1].leases = [lease];
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="current" initialProjection={projection} initialFingerprint="sha256:abc" />);
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={projection} initialFingerprint="sha256:abc" />);
   expect(await screen.findByText('Выполняется')).toBeInTheDocument();
   expect(screen.queryByText('Анализирует')).not.toBeInTheDocument();
 });
@@ -892,7 +777,7 @@ test.each(newCanvasActionMatrix)('$name доступно из интеракти
     }
     return Promise.resolve({ ok: true, json: async () => ({ events: [], next_cursor: 0, resync_required: false }) } as Response);
   });
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="new" initialProjection={projection} initialFingerprint="sha256:workflow" />);
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={projection} initialFingerprint="sha256:workflow" />);
   await openNewCanvasNode(actionCase.node);
   await actionCase.invoke();
 
@@ -952,7 +837,7 @@ test.each(newCanvasActionMatrix)('$name показывает серверную 
     }
     return Promise.resolve({ ok: true, json: async () => ({ events: [], next_cursor: 0, resync_required: false }) } as Response);
   });
-  render(<PipelineDispatcher projectId="proj-1" canvasVariant="new" initialProjection={projection} initialFingerprint="sha256:workflow" />);
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={projection} initialFingerprint="sha256:workflow" />);
   await openNewCanvasNode(actionCase.node);
   await actionCase.invoke();
 

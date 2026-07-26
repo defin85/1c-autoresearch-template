@@ -325,8 +325,8 @@ def test_canonical_template(root: Path) -> int:
     workflow = tomllib.loads((scaffold / "research/workflow.toml").read_text(encoding="utf-8"))
     operations = [step["operation"] for job in workflow.get("jobs", []) for step in job.get("steps", [])]
     require(len(workflow.get("gates", [])) == 7, "Canonical scaffold must contain seven gates.", errors)
-    require(len(workflow.get("jobs", [])) == 7, "Canonical scaffold must contain seven jobs.", errors)
-    require(len(operations) == 8, "Canonical scaffold must contain eight operations.", errors)
+    require(len(workflow.get("jobs", [])) == 8, "Canonical scaffold must contain eight jobs.", errors)
+    require(len(operations) == 9, "Canonical scaffold must contain nine operations.", errors)
     for forbidden in ("analysis/queue", "preferences.json", "stage.json"):
         require(not (scaffold / forbidden).exists(), f"Legacy authority remains: {forbidden}", errors)
     test_template_portability(root, errors)

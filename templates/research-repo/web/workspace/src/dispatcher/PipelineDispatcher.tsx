@@ -5,16 +5,14 @@
 // панорамирование, масштабирование, ``fitView`` и выбор узла для панели
 // подробностей. ``prefers-reduced-motion`` отключает анимацию без потери данных.
 
-import { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from 'react';
+import { Component, useCallback, useEffect, useRef, useState, type ErrorInfo, type ReactNode } from 'react';
 import { Alert, Box, Button, Checkbox, Chip, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, Divider, FormControl, FormControlLabel, InputLabel, LinearProgress, MenuItem, Paper, Select, Stack, TextField, Typography } from '@mui/material';
 import { Check, CheckCircle, DataObject, Hub, TaskAlt, WarningAmber } from '@mui/icons-material';
 import { ReactFlowProvider, type Viewport } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { api, mutationHeaders } from '../api';
 import { freshnessLabel, type CircuitId, type CircuitLease, type DispatcherProjection } from './projection';
-import { DispatcherGraph } from './DispatcherGraph';
 import { DispatcherNew } from './DispatcherNew';
-import { buildDispatcherGraph } from './dispatcherGraphModel';
 import { useDispatcherStream } from './useDispatcherStream';
 
 const CIRCUIT_LABEL: Record<CircuitId, string> = {
@@ -98,7 +96,7 @@ async function postDispatcherAction(projectId: string, jobId: 'discover-mrq' | '
   return response.outcome;
 }
 
-interface ContextActions { onOpenSources?: () => void; onOpenIndexes?: () => void; onOpenSettings?: () => void }
+interface ContextActions { onOpenSources?: () => void; onOpenIndexes?: () => void; onOpenSettings?: (stepId?: string) => void }
 
 type LeaseAction = 'start' | 'stop' | 'resume' | 'retry' | 'cancel' | 'approve';
 
@@ -295,7 +293,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selectedCi
           <Button color="warning" disabled={readOnly || busy || !actions.retry} onClick={() => { setPredecessorRunId(String(lease?.summary?.run_id || retryCandidates[0]?.run_id || '')); setRetryOpen(true); }}>Явный повтор</Button>
           <Button color="error" disabled={readOnly || busy || !actions.cancel} onClick={() => void run('cancel')}>Отменить задание</Button>
           {pendingApproval && <Button color="success" variant="contained" disabled={readOnly || busy || !actions.approve} onClick={() => void approve()}>{pendingApproval.approval_stage === 'noise' ? `Одобрить шум (${pendingApproval.noise_count})` : 'Одобрить предложение'}</Button>}
-          {onOpenSettings && <Button onClick={onOpenSettings}>Профили и параметры</Button>}
+          {onOpenSettings && <Button onClick={() => onOpenSettings(job || undefined)}>Профили и параметры</Button>}
         </Stack>
         {lease?.state === 'resumable' && (
           <Alert severity="info" sx={{ mt: 1 }}>
@@ -372,28 +370,6 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selectedCi
   );
 }
 
-interface CanvasProps {
-  projection: DispatcherProjection;
-  viewport: Viewport;
-  onMoveEnd: (viewport: Viewport) => void;
-  onActivate: (circuitId: CircuitId, initiatorKey: string) => void;
-}
-
-function DispatcherCanvas({ projection, viewport, onMoveEnd, onActivate }: CanvasProps) {
-  const model = useMemo(() => buildDispatcherGraph(projection), [projection]);
-  return <Box data-testid="dispatcher-scroll" sx={{ height: 790, overflowX: 'auto', overflowY: 'hidden' }}>
-    <Box sx={{ height: '100%', minWidth: { xs: 2070, xl: '100%' } }}>
-      <DispatcherGraph
-        model={model}
-        viewport={viewport}
-        onMoveEnd={onMoveEnd}
-        onActivate={(circuitId, nodeId) => onActivate(circuitId, `graph:${nodeId}`)}
-        testId="dispatcher-canvas"
-      />
-    </Box>
-  </Box>;
-}
-
 export class DispatcherCanvasErrorBoundary extends Component<{ children: ReactNode }, { error: string }> {
   state = { error: '' };
   static getDerivedStateFromError(error: Error) {
@@ -403,19 +379,6 @@ export class DispatcherCanvasErrorBoundary extends Component<{ children: ReactNo
   render() {
     return this.state.error
       ? <Alert severity="error">Холст диспетчера недоступен: {this.state.error}</Alert>
-      : this.props.children;
-  }
-}
-
-export class DispatcherNewCanvasErrorBoundary extends Component<{ children: ReactNode }, { error: string }> {
-  state = { error: '' };
-  static getDerivedStateFromError(error: Error) {
-    return { error: error.message || 'Ошибка нового холста' };
-  }
-  componentDidCatch(_error: Error, _info: ErrorInfo) {}
-  render() {
-    return this.state.error
-      ? <Alert severity="error">Холст «Диспетчер new» недоступен: {this.state.error}</Alert>
       : this.props.children;
   }
 }
@@ -460,23 +423,21 @@ function DispatcherFooter({ projection, events }: { projection: DispatcherProjec
 
 export interface PipelineDispatcherProps {
   projectId: string;
-  canvasVariant: 'current' | 'new';
   initialProjection?: DispatcherProjection;
   initialFingerprint?: string;
   onOpenSources?: () => void;
   onOpenIndexes?: () => void;
-  onOpenSettings?: () => void;
+  onOpenSettings?: (stepId?: string) => void;
   onOpenJournal?: () => void;
   onOpenRegistries?: () => void;
 }
 
-export function PipelineDispatcher({ projectId, canvasVariant, initialProjection, initialFingerprint, onOpenSources, onOpenIndexes, onOpenSettings, onOpenJournal, onOpenRegistries }: PipelineDispatcherProps) {
+export function PipelineDispatcher({ projectId, initialProjection, initialFingerprint, onOpenSources, onOpenIndexes, onOpenSettings, onOpenJournal, onOpenRegistries }: PipelineDispatcherProps) {
   const { projection, fingerprint, resyncing, error, refresh } = useDispatcherStream({ projectId, initialProjection, initialFingerprint });
   const [recentEvents, setRecentEvents] = useState<RecentEvent[]>([]);
   const [selectedCircuit, setSelectedCircuit] = useState<CircuitId | null>(null);
   const [initiatorKey, setInitiatorKey] = useState<string | null>(null);
-  const [currentViewport, setCurrentViewport] = useState<Viewport>({ x: 4, y: 10, zoom: 0.9 });
-  const [newViewport, setNewViewport] = useState<Viewport>({ x: 4, y: 10, zoom: 0.9 });
+  const [viewport, setViewport] = useState<Viewport>({ x: 4, y: 10, zoom: 0.9 });
   const shellRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     void api<{ events: RecentEvent[]; snapshot?: { events: RecentEvent[] }[] }>(`/projects/${projectId}/events?cursor=0&limit=50`).then((value) => {
@@ -498,7 +459,7 @@ export function PipelineDispatcher({ projectId, canvasVariant, initialProjection
       const separator = initiatorKey?.indexOf(':') ?? -1;
       const source = separator < 0 ? '' : initiatorKey!.slice(0, separator);
       const nodeId = separator < 0 ? '' : initiatorKey!.slice(separator + 1);
-      const graphNode = source === 'graph' || source === 'new'
+      const graphNode = source === 'new'
         ? [...(shellRef.current?.querySelectorAll<HTMLElement>('.react-flow__node[data-id]') ?? [])]
           .find((element) => element.dataset.id === nodeId)
         : undefined;
@@ -532,21 +493,14 @@ export function PipelineDispatcher({ projectId, canvasVariant, initialProjection
         <Box sx={{ position: 'relative' }} onKeyDown={(event) => {
           if (event.key === 'Escape' && selectedCircuit) closePanel();
         }}>
-          {canvasVariant === 'current' ? <DispatcherCanvasErrorBoundary>
-            <DispatcherCanvas
-              projection={projection}
-              viewport={currentViewport}
-              onMoveEnd={setCurrentViewport}
-              onActivate={activate}
-            />
-          </DispatcherCanvasErrorBoundary> : <DispatcherNewCanvasErrorBoundary>
+          <DispatcherCanvasErrorBoundary>
             <DispatcherNew
               projection={projection}
-              viewport={newViewport}
-              onMoveEnd={setNewViewport}
+              viewport={viewport}
+              onMoveEnd={setViewport}
               onActivate={activate}
             />
-          </DispatcherNewCanvasErrorBoundary>}
+          </DispatcherCanvasErrorBoundary>
           <DispatcherPanel
             projectId={projectId}
             projection={projection}
