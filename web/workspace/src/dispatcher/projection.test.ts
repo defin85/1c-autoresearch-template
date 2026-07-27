@@ -18,7 +18,7 @@ describe('dispatcher projection', () => {
 
   test('active projection (>10s) is reported as stale', () => {
     const stale = new Date(Date.now() - 30_000).toISOString();
-    expect(freshnessLabel({ ...EMPTY_PROJECTION, fresh_at: stale, jobs: { 'discover-mrq': { job_id: 'discover-mrq', thread_id: 't', work_unit_id: 'DIF-1', owner: 'u', acquired_at: stale, renewed_at: stale, state: 'running', summary: {} } } })).toBe('данные несвежие');
+    expect(freshnessLabel({ ...EMPTY_PROJECTION, fresh_at: stale, jobs: { 'analyze-dif': { job_id: 'analyze-dif', thread_id: 't', work_unit_id: 'DIF-1', owner: 'u', acquired_at: stale, renewed_at: stale, state: 'running', summary: {} } } })).toBe('данные несвежие');
   });
 
   test('isFresh respects 10-second threshold', () => {

@@ -16,7 +16,8 @@ GATES = (
     ("project-configured", "project.validate"),
     ("sources-acquired", "sources.validate"),
     ("diffs-built", "diff.validate"),
-    ("diffs-classified", "mrq.ownership"),
+    ("all-dif-classified", "dif.classification"),
+    ("mrq-consolidated", "mrq.ownership"),
     ("source-evidence-complete", "mrq.source-evidence"),
     ("decisions-approved", "mrq.approvals"),
     ("published", "workflow.verify"),
@@ -26,8 +27,9 @@ JOBS = (
     ("acquire-sources", ("configure",), (("acquire-sources", "sources.acquire", "1"),)),
     ("build-diffs", ("acquire-sources",), (("build-diffs", "diff.build", "1"),)),
     ("index-sources", ("build-diffs",), (("index-sources", "indexes.build", "1"),)),
-    ("discover-mrq", ("index-sources",), (("discover-mrq", "mrq.discover-next", "2"),)),
-    ("classify-mrq", ("discover-mrq",), (("classify-mrq", "mrq.classify-batches", "1"),)),
+    ("analyze-dif", ("index-sources",), (("analyze-dif", "dif.classify-next", "1"),)),
+    ("consolidate-mrq", ("analyze-dif",), (("consolidate-mrq", "mrq.consolidate", "1"),)),
+    ("classify-mrq", ("consolidate-mrq",), (("classify-mrq", "mrq.classify-batches", "1"),)),
     ("decide-mrq", ("classify-mrq",), (("decide-mrq", "mrq.decide-next", "2"),)),
     ("publish", ("decide-mrq",), (("build-projections", "projections.build", "1"), ("verify-workflow", "workflow.verify", "1"))),
 )
@@ -36,15 +38,18 @@ PARAMETERS = {
     "sources.acquire": {"timeout_seconds"},
     "diff.build": {"timeout_seconds", "max_retries"},
     "indexes.build": {"timeout_seconds"},
-    "mrq.discover-next": {"timeout_seconds", "agent_phases"},
+    "dif.classify-next": {"timeout_seconds", "agent_phases"},
+    "mrq.consolidate": {"timeout_seconds", "agent_phases"},
     "mrq.classify-batches": {"timeout_seconds", "agent_phases"},
     "mrq.decide-next": {"timeout_seconds", "agent_phases"},
     "projections.build": {"timeout_seconds", "max_retries"},
     "workflow.verify": {"timeout_seconds"},
 }
 AGENT_PHASE_CATALOG = {
-    "mrq.discover-next": (
+    "dif.classify-next": (
         {"phase_id": "analyze-dif", "modes": ("sequential", "parallel-pool"), "roles": ("analyzer",)},
+    ),
+    "mrq.consolidate": (
         {"phase_id": "form-mrq", "modes": ("coordinated-pool",), "roles": ("coordinator", "grouper")},
     ),
     "mrq.classify-batches": (
@@ -59,9 +64,10 @@ _CATALOG = {
     "sources.acquire": {"executor": "application", "effect": "write", "paths": ["sources/generations/", "research/active-source-generation.json"], "artifacts": ["source-generation"], "validator": "sources.validate", "retryable": [], "approval_required": True},
     "diff.build": {"executor": "application", "effect": "write", "paths": ["analysis/indexes/generations/", "research/active-diff-generation.json"], "artifacts": ["diff-generation"], "validator": "diff.validate", "retryable": ["transient_io"], "approval_required": False},
     "indexes.build": {"executor": "rlm-tools-bsl", "effect": "user-scope-write", "paths": ["sources/generations/"], "artifacts": ["source-index"], "validator": "indexes.validate", "retryable": [], "approval_required": False},
-    "mrq.discover-next": {"executor": "agent", "effect": "proposal", "paths": ["analysis/migration-requirements/generations/", "research/active-generation.json"], "artifacts": ["mrq-generation"], "validator": "mrq.validate", "retryable": [], "approval_required": False},
-    "mrq.classify-batches": {"executor": "agent", "effect": "proposal", "paths": ["analysis/migration-requirements/batch-generations/", "research/active-generation.json"], "artifacts": ["mrq-batch-generation"], "validator": "mrq-batches-ready", "retryable": [], "approval_required": False},
-    "mrq.decide-next": {"executor": "agent", "effect": "proposal", "paths": ["analysis/migration-requirements/generations/", "research/active-generation.json"], "artifacts": ["mrq-generation"], "validator": "mrq.validate", "retryable": [], "approval_required": True},
+    "dif.classify-next": {"executor": "agent", "effect": "proposal", "paths": ["analysis/dif-classifications/generations/", "research/active-dif-classification-generation.json"], "artifacts": ["dif-classification-generation"], "validator": "dif.classification", "retryable": [], "approval_required": False},
+    "mrq.consolidate": {"executor": "agent", "effect": "proposal", "paths": ["analysis/migration-requirements/generations/", "research/active-consolidation-generation.json"], "artifacts": ["consolidation-plan"], "validator": "mrq.validate", "retryable": [], "approval_required": True},
+    "mrq.classify-batches": {"executor": "agent", "effect": "proposal", "paths": ["analysis/migration-requirements/batch-generations/", "research/active-consolidation-generation.json"], "artifacts": ["mrq-batch-generation"], "validator": "mrq-batches-ready", "retryable": [], "approval_required": False},
+    "mrq.decide-next": {"executor": "agent", "effect": "proposal", "paths": ["analysis/migration-requirements/decision-generations/", "research/active-consolidation-generation.json"], "artifacts": ["decision-generation"], "validator": "mrq.validate", "retryable": [], "approval_required": True},
     "projections.build": {"executor": "application", "effect": "write", "paths": ["outputs/"], "artifacts": ["projections"], "validator": "projections.validate", "retryable": ["transient_io"], "approval_required": False},
     "workflow.verify": {"executor": "application", "effect": "read", "paths": ["."], "artifacts": ["workflow-snapshot"], "validator": "doctor.strict", "retryable": [], "approval_required": False},
 }
@@ -75,7 +81,7 @@ OPERATION_CATALOG = {
     for operation, entry in _CATALOG.items()
 }
 for _operation, _phases in AGENT_PHASE_CATALOG.items():
-    OPERATION_CATALOG[_operation]["version"] = "1" if _operation == "mrq.classify-batches" else "2"
+    OPERATION_CATALOG[_operation]["version"] = "2" if _operation == "mrq.decide-next" else "1"
     OPERATION_CATALOG[_operation]["agent_phases"] = [dict(item) for item in _phases]
 PROJECT_SECTIONS = {"project", "mcp", "web", "policy"}
 RESEARCH_OWNED_PROJECT_KEYS = {
@@ -87,6 +93,8 @@ RESEARCH_OWNED_PROJECT_KEYS = {
     "workflow": "research/workflow.toml",
     "active_source_generation": "research/active-source-generation.json",
     "active_diff_generation": "research/active-diff-generation.json",
+    "active_dif_classification_generation": "research/active-dif-classification-generation.json",
+    "active_consolidation_generation": "research/active-consolidation-generation.json",
     "active_generation": "research/active-generation.json",
 }
 
@@ -178,7 +186,7 @@ def validate_project_contract(repo: Path) -> dict[str, Any]:
 
 
 def state_fingerprint(repo: Path) -> str:
-    paths = ("project.toml", "research/workflow.toml", "research/infobases.toml", "research/external-artifacts.toml", "research/indexing.toml", "research/active-source-generation.json", "research/active-diff-generation.json", "research/active-generation.json", "outputs/projections.json")
+    paths = ("project.toml", "research/workflow.toml", "research/infobases.toml", "research/external-artifacts.toml", "research/indexing.toml", "research/active-source-generation.json", "research/active-diff-generation.json", "research/active-dif-classification-generation.json", "research/active-consolidation-generation.json", "outputs/projections.json")
     return "sha256:" + sha256(canonical_json({name: sha256((repo / name).read_bytes()) if (repo / name).is_file() else None for name in paths}))
 
 
@@ -186,7 +194,7 @@ def validate_workflow_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     errors: list[str] = []
     if set(manifest) != {"schema_version", "tool_version", "gates", "jobs"}:
         errors.append(f"workflow top-level fields differ: {sorted(set(manifest) ^ {'schema_version', 'tool_version', 'gates', 'jobs'})}")
-    if manifest.get("schema_version") != "3":
+    if manifest.get("schema_version") != "4":
         errors.append("unsupported workflow schema; use a compatible tool or recreate the repository")
     if manifest.get("tool_version") != __version__:
         errors.append(f"workflow requires tool version {manifest.get('tool_version')}; installed version is {__version__}")
@@ -195,7 +203,7 @@ def validate_workflow_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"gate[{index}] fields differ: {sorted(set(item) ^ {'id', 'validator'})}")
     actual_gates = tuple((item.get("id"), item.get("validator")) for item in manifest.get("gates", []))
     if actual_gates != GATES:
-        errors.append(f"fixed seven-gate contract changed: {actual_gates!r}")
+        errors.append(f"fixed eight-gate contract changed: {actual_gates!r}")
     actual_jobs = []
     for job_index, job in enumerate(manifest.get("jobs", [])):
         if set(job) != {"id", "needs", "steps"}:
@@ -231,7 +239,7 @@ def validate_workflow_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             steps.append((step.get("id"), operation, step.get("operation_version")))
         actual_jobs.append((job.get("id"), tuple(job.get("needs", [])), tuple(steps)))
     if tuple(actual_jobs) != JOBS:
-        errors.append(f"fixed eight-job/nine-operation graph changed: {tuple(actual_jobs)!r}")
+        errors.append(f"fixed nine-job/ten-operation graph changed: {tuple(actual_jobs)!r}")
     if errors:
         raise ValueError("; ".join(errors))
     return manifest
@@ -285,23 +293,18 @@ def preview_step_patch(
         except (OSError, ValueError, KeyError):
             profiles = {}
         try:
-            from .pipeline_graphs import _owned_diff_ids, _read_diff_inventory, select_dif_window
-            discover_ready = len(select_dif_window(repo))
-            discover_remaining = len(
-                {
-                    row["stable_diff_id"]
-                    for row in _read_diff_inventory(repo)
-                }
-                - _owned_diff_ids(repo)
-            )
+            from .dif_classifications import coverage
+            classification = coverage(repo)
+            discover_ready = min(int(classification["remaining"]), 32)
+            discover_remaining = int(classification["remaining"])
         except (OSError, ValueError, KeyError, IndexError):
             discover_ready = discover_remaining = 0
         try:
-            from .mrq import active
             from .mrq_batches import load_active
+            from .pipeline_graphs import _decision_mrqs
             mrq_rows = [
                 row
-                for row in active(repo)["mrq.jsonl"]
+                for row in _decision_mrqs(repo)
                 if row.get("state") != "superseded"
                 and not row.get("migration_decision", {}).get("decision")
             ]
@@ -317,13 +320,13 @@ def preview_step_patch(
             classification_ready = 0
         ready_work = {
             "analyze-dif": discover_ready,
-            "form-mrq": discover_ready,
+            "form-mrq": int(discover_remaining == 0),
             "classify-batches": classification_ready,
             "research-target": target_ready,
         }
         maximum_calls = {
             "analyze-dif": discover_ready,
-            "form-mrq": discover_ready + int(discover_ready > 0 and discover_ready == discover_remaining),
+            "form-mrq": int(discover_remaining == 0),
             "classify-batches": classification_ready,
             "research-target": target_ready,
         }
@@ -395,18 +398,16 @@ def _active_rows(repo: Path) -> tuple[list[dict[str, str]], list[dict[str, Any]]
     diff_root = repo / "analysis/indexes/generations" / str(diff_pointer.get("generation_id"))
     with (diff_root / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
         diffs = [row for row in csv.DictReader(stream) if row.get("comparison_id", "").startswith("CMP-")]
-    pointer = pointers["mrq"] or {}
-    generation = pointer.get("canonical_generation_id")
-    if not generation:
+    from .consolidation import load_active as load_consolidation
+    state = load_consolidation(repo)
+    if state["pointer"]["state"] != "active":
         return diffs, [], [], []
-    from .mrq import active
-    state = active(
-        repo,
-        pointer_candidate=pointer,
-        source_candidate=pointers["source"],
-        diff_candidate=diff_pointer,
-    )
-    return diffs, state["mrq.jsonl"], state["dispositions.jsonl"], state["approvals.jsonl"]
+    dispositions = state["mrq"]["dispositions.jsonl"]
+    decisions = []
+    if state["pointer"].get("decision_generation_id"):
+        from .decision_generations import validate_generation as validate_decisions
+        decisions = validate_decisions(repo, state["pointer"]["decision_generation_id"])["decisions.jsonl"]
+    return diffs, state["mrq"]["mrq.jsonl"], dispositions, decisions
 
 
 def _jsonl(path: Path) -> list[dict[str, Any]]:
@@ -466,22 +467,49 @@ def status(repo: Path, *, deep: bool = True) -> dict[str, Any]:
     validate_workflow(repo)
     checks = [_project_blockers(repo), _source_blockers(repo, deep=deep), _diff_blockers(repo)]
     if not any(checks):
-        diffs, mrqs, dispositions, approvals = _active_rows(repo)
-        customer = {row["stable_diff_id"] for row in diffs if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"}
-        owners: dict[str, int] = {key: 0 for key in customer}
-        mrq_ids = {item.get("mrq_id") for item in mrqs}
-        approved_noise = {(event.get("target_id"), event.get("fingerprint")) for event in approvals if event.get("event") == "approve"}
-        for item in dispositions:
-            noise = item.get("approved_noise")
-            valid_noise = isinstance(noise, dict) and (item.get("stable_diff_id"), sha256(canonical_json(noise))) in approved_noise
-            if item.get("primary") and item.get("stable_diff_id") in owners and (item.get("mrq_id") in mrq_ids or valid_noise):
-                owners[item["stable_diff_id"]] += 1
-        checks.append([] if all(value == 1 for value in owners.values()) else [Blocker("mrq.ownership", "each customer DIF needs exactly one primary MRQ or approved noise", "mrq.discover-next")])
-        active = [item for item in mrqs if item.get("state") != "superseded"]
-        checks.append([] if all(item.get("source_customization", {}).get("evidence") for item in active) else [Blocker("mrq.source_evidence", "active MRQ source evidence is incomplete", "mrq.discover-next")])
-        checks.append([] if all(item.get("state") == "approved" and item.get("migration_decision", {}).get("decision") for item in active) else [Blocker("mrq.approvals", "active MRQ decisions are incomplete or unapproved", "mrq.decide-next")])
-        pointer_path = repo / "research/active-generation.json"
-        checks.append(_publication_blockers(repo, _pointer(repo, pointer_path.name).get("canonical_generation_id") if pointer_path.is_file() else None, deep=deep))
+        from .dif_classifications import coverage as classification_coverage
+        classification = classification_coverage(repo)
+        checks.append(
+            [] if classification["all_dif_classified"] else [
+                Blocker(
+                    "dif.classification",
+                    f"{classification['remaining']} customer DIF remain unclassified",
+                    "dif.classify-next",
+                )
+            ]
+        )
+    if not any(checks):
+        try:
+            from .consolidation import load_active as load_consolidation
+            consolidation = load_consolidation(repo)
+            consolidated = consolidation["pointer"]["state"] == "active"
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            consolidated = False
+        checks.append(
+            [] if consolidated else [
+                Blocker("mrq.ownership", "complete MRQ consolidation is not published", "mrq.consolidate")
+            ]
+        )
+    if not any(checks):
+        from .consolidation import load_active as load_consolidation
+        consolidated = load_consolidation(repo)
+        mrq_ids = {row["mrq_id"] for row in consolidated["mrq"]["mrq.jsonl"]}
+        evidenced = {row["mrq_id"] for row in consolidated["mrq"]["evidence.jsonl"]}
+        checks.append([] if evidenced == mrq_ids else [Blocker("mrq.source_evidence", "active MRQ source evidence is incomplete", "mrq.consolidate")])
+        pointer = consolidated["pointer"]
+        decisions_complete = False
+        try:
+            from .decision_generations import consolidation_input_fingerprint, validate_generation as validate_decisions
+            generation = validate_decisions(repo, pointer["decision_generation_id"])
+            decisions_complete = (
+                pointer["decision_input_fingerprint"] == consolidation_input_fingerprint(pointer)
+                and {row["mrq_id"] for row in generation["decisions.jsonl"]}
+                == {row["mrq_id"] for row in consolidated["mrq"]["mrq.jsonl"]}
+            )
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            decisions_complete = False
+        checks.append([] if decisions_complete else [Blocker("mrq.approvals", "active MRQ decisions are incomplete or unapproved", "mrq.decide-next")])
+        checks.append(_publication_blockers(repo, pointer.get("mrq_generation_id"), deep=deep))
     while len(checks) < len(GATES):
         checks.append([Blocker("predecessor.blocked", "a predecessor gate is incomplete", "")])
     gates: list[Gate] = []
@@ -504,11 +532,30 @@ def _projection_blockers(repo: Path, generation: str | None) -> list[Blocker]:
         value = json.loads(manifest.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         value = {}
-    from .mrq import active
-    return [] if value == projection_value(active(repo)) else [Blocker("projection.stale", "projections are stale or independently edited", "projections.build")]
+    from .consolidation import load_active
+    return [] if value == projection_value(load_active(repo)) else [Blocker("projection.stale", "projections are stale or independently edited", "projections.build")]
 
 
 def projection_value(state: dict[str, Any]) -> dict[str, Any]:
+    if "pointer" in state and state["pointer"].get("schema_version") == "2":
+        pointer = state["pointer"]
+        mrqs = state["mrq"]["mrq.jsonl"]
+        dispositions = state["mrq"]["dispositions.jsonl"]
+        return {
+            "schema_version": "3",
+            "consolidation_transaction_id": pointer["transaction_id"],
+            "decision_generation_id": pointer.get("decision_generation_id"),
+            "input_consolidation_fingerprint": pointer["plan_fingerprint"],
+            "input_decision_fingerprint": pointer.get("decision_input_fingerprint"),
+            "input_fingerprint": sha256(canonical_json({"mrq": mrqs, "dispositions": dispositions})),
+            "views": {
+                "subject_cards": mrqs,
+                "functional_gaps": mrqs,
+                "dashboard": {"active_mrq": len(mrqs), "dif_memberships": len(dispositions)},
+                "customer_register": dispositions,
+                "specifications": [],
+            },
+        }
     generation = state["pointer"].get("canonical_generation_id")
     mrqs = state["mrq.jsonl"]
     dispositions = state["dispositions.jsonl"]
@@ -532,16 +579,15 @@ def _publication_blockers(repo: Path, generation: str | None, *, deep: bool = Tr
         return blockers
     from .sources import validate_active
     from .diffs import validate_active as validate_active_diffs
-    from .mrq import active as active_mrq
+    from .consolidation import load_active as active_consolidation
     from .contracts import require_tracked_clean
     try:
-        pointer = _pointer(repo, "active-generation.json")
-        if pointer.get("batch_generation"):
+        consolidation = active_consolidation(repo)
+        if consolidation["pointer"].get("batch_generation_id"):
             from .mrq_batches import load_active
             load_active(repo)
         validate_active(repo, deep=True, require_tracked_clean=True)
         validate_active_diffs(repo, require_tracked_clean_state=True)
-        active_mrq(repo, require_tracked_clean_state=True)
         require_tracked_clean(repo, [repo / "outputs/projections.json"])
     except (ValueError, OSError, KeyError, json.JSONDecodeError) as exc:
         return [Blocker("publication.strict", str(exc), "workflow.verify")]
@@ -866,12 +912,13 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
     # контуры выводятся из канонического снимка
     gates = {gate["id"]: gate for gate in snapshot.get("gates", [])}
     classify_aggregates = _classify_aggregates(repo)
+    active_jobs = {lease["job_id"] for lease in leases if lease["state"] == "running"}
     circuits = [
         {"id": "prepare-diffs", "state": _circuit_state(gates.get("sources-acquired"), gates.get("diffs-built")), "aggregates": _prepare_aggregates(repo), "zones": _prepare_zones(repo, store.base, gates, store.path.parent / "runs", str(snapshot.get("workflow_fingerprint", "")))},
-        {"id": "analyze-dif", "state": _circuit_state(gates.get("diffs-classified")), "leases": [lease for lease in leases if lease["job_id"] == "discover-mrq"], "aggregates": _analyze_aggregates(repo)},
-        {"id": "form-mrq", "state": _circuit_state(gates.get("source-evidence-complete")), "aggregates": _form_mrq_aggregates(repo), "publication": {"id": "publication", "state": _zone_state(gates.get("source-evidence-complete"))}},
-        {"id": "classify-mrq", "state": classify_aggregates["state"], "leases": [lease for lease in leases if lease["job_id"] == "classify-mrq"], "aggregates": classify_aggregates},
-        {"id": "decide-target", "state": _circuit_state(gates.get("decisions-approved")), "leases": [lease for lease in leases if lease["job_id"] == "decide-mrq"], "aggregates": _decide_aggregates(repo)},
+        {"id": "analyze-dif", "state": _agent_circuit_state("analyze-dif", active_jobs, gates.get("all-dif-classified")), "leases": [lease for lease in leases if lease["job_id"] == "analyze-dif"], "aggregates": _analyze_aggregates(repo, store)},
+        {"id": "form-mrq", "state": _agent_circuit_state("consolidate-mrq", active_jobs, gates.get("mrq-consolidated"), gates.get("source-evidence-complete")), "leases": [lease for lease in leases if lease["job_id"] == "consolidate-mrq"], "aggregates": _form_mrq_aggregates(repo, store), "publication": {"id": "publication", "state": _zone_state(gates.get("source-evidence-complete"))}},
+        {"id": "classify-mrq", "state": "active" if "classify-mrq" in active_jobs else classify_aggregates["state"], "leases": [lease for lease in leases if lease["job_id"] == "classify-mrq"], "aggregates": classify_aggregates},
+        {"id": "decide-target", "state": _agent_circuit_state("decide-mrq", active_jobs, gates.get("decisions-approved")), "leases": [lease for lease in leases if lease["job_id"] == "decide-mrq"], "aggregates": _decide_aggregates(repo)},
     ]
     from datetime import datetime, timezone
     retry_candidates = []
@@ -891,7 +938,8 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
                 continue
             operation = execution.get("operation")
             job_id = {
-                "mrq.discover-next": "discover-mrq",
+                "dif.classify-next": "analyze-dif",
+                "mrq.consolidate": "consolidate-mrq",
                 "mrq.classify-batches": "classify-mrq",
                 "mrq.decide-next": "decide-mrq",
             }.get(operation)
@@ -948,7 +996,7 @@ def _dispatcher_items(
         operational = store.proposals()
         analyze_results = [
             row for row in operational
-            if row.get("job_id") == "discover-mrq"
+            if row.get("job_id") == "analyze-dif"
             and row.get("kind") == "node-result"
             and str(row.get("payload", {}).get("name", "")).startswith("analyze-dif:")
         ]
@@ -965,8 +1013,15 @@ def _dispatcher_items(
             (row for row in diffs if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"),
             key=lambda row: row["stable_diff_id"],
         )
-        owners = {row.get("stable_diff_id") for row in dispositions if row.get("primary")}
-        noise = {row.get("stable_diff_id") for row in dispositions if row.get("approved_noise")}
+        try:
+            from .dif_classifications import load_active as load_classifications
+            classification_rows = load_classifications(repo)["rows"]
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            classification_rows = []
+        classifications = {
+            row["stable_diff_id"]: row["classification"]
+            for row in classification_rows
+        }
         active_mrqs = sorted((row for row in mrqs if row.get("state") != "superseded"), key=lambda row: row["mrq_id"])
         pointer = _pointer(repo, "active-diff-generation.json")
         diff_root = repo / "analysis/indexes/generations" / str(pointer.get("generation_id"))
@@ -986,23 +1041,93 @@ def _dispatcher_items(
             dependencies_by_id.get(row["stable_diff_id"], []),
         )
         from .mrq_batches import load_active
-        canonical_pointer_path = repo / "research/active-generation.json"
-        canonical_pointer = _pointer(repo, canonical_pointer_path.name) if canonical_pointer_path.is_file() else {}
-        batches = load_active(repo) if canonical_pointer.get("batch_generation") else []
+        from .consolidation import load_active as load_consolidation
+        consolidation = load_consolidation(repo)
+        consolidation_pointer = consolidation["pointer"]
+        batches = load_active(repo) if consolidation_pointer.get("batch_generation_id") else []
+        previously_owned = {
+            row["stable_diff_id"] for row in dispositions if row.get("primary")
+        }
         pending_difs = [
             row for row in customer
-            if row["stable_diff_id"] not in owners and row["stable_diff_id"] not in transient
+            if row["stable_diff_id"] not in classifications
+            and row["stable_diff_id"] not in transient
+            and row["stable_diff_id"] not in previously_owned
         ]
         pending_mrqs = active_mrqs
-        meaning_difs = [row for row in customer if (row["stable_diff_id"] in owners and row["stable_diff_id"] not in noise) or transient.get(row["stable_diff_id"]) == "meaning"]
-        noise_difs = [row for row in customer if row["stable_diff_id"] in noise or transient.get(row["stable_diff_id"]) == "noise"]
+        meaning_difs = [row for row in customer if classifications.get(row["stable_diff_id"]) == "meaning" or transient.get(row["stable_diff_id"]) == "meaning"]
+        noise_difs = [row for row in customer if classifications.get(row["stable_diff_id"]) == "noise_candidate" or transient.get(row["stable_diff_id"]) == "noise"]
         proposals = [row for row in operational if row.get("kind") == "approval" and row.get("consumed_at") is None]
-        decisions = [row for row in active_mrqs if row.get("migration_decision", {}).get("decision")]
+        decision_rows: list[dict[str, Any]] = []
+        if consolidation_pointer.get("decision_generation_id"):
+            from .decision_generations import validate_generation as validate_decisions
+            decision_rows = validate_decisions(
+                repo,
+                consolidation_pointer["decision_generation_id"],
+                allowed_mrq_ids={row["mrq_id"] for row in active_mrqs},
+            )["decisions.jsonl"]
+        decision_by_mrq = {row["mrq_id"]: row["decision"] for row in decision_rows}
+        decisions = [
+            {**row, "migration_decision": decision_by_mrq[row["mrq_id"]]}
+            for row in active_mrqs if row["mrq_id"] in decision_by_mrq
+        ]
+        plan: dict[str, Any] = {}
+        proposal = next((
+            row for row in reversed(operational)
+            if row.get("job_id") == "consolidate-mrq"
+            and row.get("kind") == "approval"
+            and row.get("consumed_at") is None
+        ), None)
+        if proposal:
+            relative = proposal.get("payload", {}).get("plan_path")
+            path = store.path.parent / relative if relative else None
+            if path and path.is_file():
+                plan = json.loads(path.read_text(encoding="utf-8"))
+        elif consolidation_pointer.get("plan_fingerprint"):
+            path = (
+                store.path.parent
+                / "consolidation-plans"
+                / f"{consolidation_pointer['plan_fingerprint'].removeprefix('sha256:')}.json"
+            )
+            if path.is_file():
+                plan = json.loads(path.read_text(encoding="utf-8"))
+        outcomes = plan.get("outcomes", {})
+        def outcome_cards() -> list[dict[str, Any]]:
+            lineage = [
+                row for row in plan.get("lineage", [])
+                if row.get("domain") == "mrq"
+            ]
+            return [
+                {
+                    "id": f"mrq:{kind}:{identifier}",
+                    "title": identifier,
+                    "state": kind,
+                    "evidence_count": len([
+                        row for row in lineage
+                        if identifier in row.get("source_ids", [])
+                        or identifier in row.get("target_ids", [])
+                    ]),
+                    "source_ids": next((
+                        row.get("source_ids", []) for row in lineage
+                        if identifier in row.get("source_ids", [])
+                        or identifier in row.get("target_ids", [])
+                    ), [identifier] if kind in {"retained", "revalidated"} else []),
+                    "target_ids": next((
+                        row.get("target_ids", []) for row in lineage
+                        if identifier in row.get("source_ids", [])
+                        or identifier in row.get("target_ids", [])
+                    ), [identifier] if kind in {"retained", "revalidated", "new"} else []),
+                }
+                for kind in ("retained", "new", "merged", "split", "superseded", "revalidated")
+                for identifier in outcomes.get(kind, [])
+            ]
+        mrq_outcomes = outcome_cards()
         return {
             "dif_queue": [card(row, "queued") for row in pending_difs[:32]],
             "meaning_diffs": [card(row, "meaning") for row in meaning_difs[:16]],
             "noise_diffs": [card(row, "noise") for row in noise_difs[:16]],
             "proposals": [_proposal_card(row) for row in proposals[:16]],
+            "mrq_outcomes": mrq_outcomes[:32],
             "mrqs": [_mrq_card(row, dispositions) for row in pending_mrqs[:32]],
             "batches": [{"id": batch.batch_id, "mrq_ids": list(batch.mrq_ids), "reason": batch.basis} for batch in batches[:16]],
             "decisions": [_decision_card(row) for row in decisions[:32]],
@@ -1021,12 +1146,13 @@ def _dispatcher_items(
                 "meaning-diffs": {"total": len(meaning_difs), "visible": min(len(meaning_difs), 16), "omitted": max(len(meaning_difs) - 16, 0)},
                 "noise-diffs": {"total": len(noise_difs), "visible": min(len(noise_difs), 16), "omitted": max(len(noise_difs) - 16, 0)},
                 "proposals": {"total": len(proposals), "visible": min(len(proposals), 16), "omitted": max(len(proposals) - 16, 0)},
+                "mrq-outcomes": {"total": len(mrq_outcomes), "visible": min(len(mrq_outcomes), 32), "omitted": max(len(mrq_outcomes) - 32, 0)},
                 "batches": {"total": len(batches), "visible": min(len(batches), 16), "omitted": max(len(batches) - 16, 0)},
                 "decisions": {"total": len(decisions), "visible": min(len(decisions), 32), "omitted": max(len(decisions) - 32, 0)},
             },
         }
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
-        return {"dif_queue": [], "meaning_diffs": [], "noise_diffs": [], "proposals": [], "mrqs": [], "batches": [], "decisions": [], "approval_count": 0, "_queue_aggregates": {"dif-queue": {"total": 0, "visible": 0, "omitted": 0}, "mrq-queue": {"total": 0, "visible": 0, "omitted": 0}}}
+        return {"dif_queue": [], "meaning_diffs": [], "noise_diffs": [], "proposals": [], "mrq_outcomes": [], "mrqs": [], "batches": [], "decisions": [], "approval_count": 0, "_queue_aggregates": {"dif-queue": {"total": 0, "visible": 0, "omitted": 0}, "mrq-queue": {"total": 0, "visible": 0, "omitted": 0}}}
 
 
 def _dif_card(
@@ -1111,6 +1237,10 @@ def _circuit_state(*gates: dict[str, Any]) -> str:
     return "blocked"
 
 
+def _agent_circuit_state(job_id: str, active_jobs: set[str], *gates: dict[str, Any]) -> str:
+    return "active" if job_id in active_jobs else _circuit_state(*gates)
+
+
 def _prepare_aggregates(repo: Path) -> dict[str, Any]:
     import csv
     pointer_path = repo / "research/active-diff-generation.json"
@@ -1135,28 +1265,130 @@ def _prepare_aggregates(repo: Path) -> dict[str, Any]:
         return {"diff_count": 0, "target_coverage_count": 0, "semantic_extension_diff_count": 0}
 
 
-def _analyze_aggregates(repo: Path) -> dict[str, Any]:
+def _analyze_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]:
     try:
-        from .pipeline_graphs import select_dif_window, _read_diff_inventory
+        from .pipeline_graphs import _read_diff_inventory
+        from .dif_classifications import coverage
         customer = _read_diff_inventory(repo)
-        window = select_dif_window(repo)
+        counts = coverage(repo)
         semantic = sum(row.get("object_kind") == "extension_intervention" for row in customer)
         pointer = _pointer(repo, "active-diff-generation.json")
         root = repo / "analysis/indexes/generations" / str(pointer.get("generation_id"))
         raw_count = len(_csv(root / "extension-physical-diff.csv"))
-        return {"customer_diff_count": len(customer), "semantic_extension_diff_count": semantic, "raw_extension_diff_count": raw_count, "window_size": len(window), "max_window": 32, "max_parallel": 4}
+        window_total = min(int(counts["remaining"]), 32)
+        completed = reusable = failed = 0
+        lease = store.lease("analyze-dif") if store else None
+        if store and lease:
+            node_results = [
+                row for row in store.proposals()
+                if row.get("job_id") == "analyze-dif"
+                and row.get("thread_id") == lease.get("thread_id")
+                and row.get("kind") == "node-result"
+                and str(row.get("payload", {}).get("name", "")).startswith("analyze-dif:")
+            ]
+            completed = len(node_results)
+        return {
+            **counts,
+            "customer_diff_count": len(customer),
+            "semantic_extension_diff_count": semantic,
+            "raw_extension_diff_count": raw_count,
+            "window_size": window_total,
+            "current_window_total": window_total,
+            "current_window_completed": completed,
+            "failed": failed,
+            "reusable_completed": reusable,
+            "window_published": bool(counts["classified"]) and completed == 0,
+            "max_window": 32,
+            "max_parallel": 4,
+        }
     except Exception:
         return {"customer_diff_count": 0, "semantic_extension_diff_count": 0, "window_size": 0, "max_window": 32, "max_parallel": 4}
 
 
-def _form_mrq_aggregates(repo: Path) -> dict[str, Any]:
+def _form_mrq_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]:
     try:
-        from .mrq import active
-        state = active(repo)
-        active_mrqs = [item for item in state["mrq.jsonl"] if item.get("state") != "superseded"]
-        return {"active_mrq_count": len(active_mrqs), "disposition_count": len(state["dispositions.jsonl"])}
+        from .consolidation import load_active
+        state = load_active(repo)
+        pointer = state["pointer"]
+        result = {
+            "active_mrq_count": len(state["mrq"].get("mrq.jsonl", [])),
+            "plan_fingerprint": pointer.get("plan_fingerprint"),
+            "publication_state": pointer["state"],
+            "published": int(pointer["state"] == "active"),
+            "approval_pending": 0,
+            "already_applied": False,
+        }
+        if store:
+            try:
+                from .consolidation import input_snapshot, normalized_records, partition_manifest
+                from .user_state import load_agent_profiles
+                profiles = load_agent_profiles(repo, store.base)
+                configured = next(item for item in step_configurations(repo) if item["step"]["id"] == "consolidate-mrq")
+                coordinator_name = next(
+                    role["agent_profile"]
+                    for phase in configured["step"]["agent_phases"]
+                    for role in phase["roles"]
+                    if role["role_id"] == "coordinator"
+                )
+                profile = profiles[coordinator_name]
+                snapshot = input_snapshot(repo)
+                manifest = partition_manifest(
+                    normalized_records(snapshot),
+                    profile.get("input_context_tokens"),
+                    estimator_version=str(profile.get("context_estimator_version", "utf8-v1")),
+                )
+                result.update({
+                    "input_context_tokens": manifest["input_context_tokens"],
+                    "context_estimator_version": manifest["estimator_version"],
+                    "partition_count": len(manifest["partitions"]),
+                    "pair_count": len(manifest["pairs"]),
+                    "planned_invocation_count": manifest["planned_invocation_count"],
+                    "plan_status": "ready",
+                })
+            except (OSError, ValueError, KeyError, StopIteration, TypeError):
+                result.update({
+                    "plan_status": "blocked",
+                    "blocker_code": "consolidation.context_capacity",
+                    "blocker_message": "verified positive model input context capacity is required",
+                })
+            lease = store.lease("consolidate-mrq")
+            if lease:
+                result.update(lease.get("summary", {}))
+            proposal = next((
+                row for row in reversed(store.proposals())
+                if row.get("job_id") == "consolidate-mrq"
+                and row.get("kind") == "approval"
+                and row.get("consumed_at") is None
+            ), None)
+            if proposal:
+                result.update(proposal["payload"].get("aggregates", {}))
+                result["approval_pending"] = 1
+                relative = proposal["payload"].get("plan_path")
+                plan_path = store.path.parent / relative if relative else None
+                if plan_path and plan_path.is_file():
+                    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                    manifest = plan["partition_manifest"]
+                    result.update({
+                        "input_context_tokens": manifest["input_context_tokens"],
+                        "context_estimator_version": manifest["estimator_version"],
+                        "partition_count": len(manifest["partitions"]),
+                        "pair_count": len(manifest["pairs"]),
+                        "planned_invocation_count": manifest["planned_invocation_count"],
+                    })
+            elif pointer.get("plan_fingerprint"):
+                plan_path = (
+                    store.path.parent
+                    / "consolidation-plans"
+                    / f"{pointer['plan_fingerprint'].removeprefix('sha256:')}.json"
+                )
+                if plan_path.is_file():
+                    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                    result["legacy_decisions_stale"] = len(
+                        plan.get("decision_carryover", {}).get("stale", [])
+                    )
+        return result
     except Exception:
-        return {"active_mrq_count": 0, "disposition_count": 0}
+        return {"active_mrq_count": 0, "publication_state": "unpublished"}
 
 
 def _classify_aggregates(repo: Path) -> dict[str, Any]:
@@ -1187,10 +1419,21 @@ def _classify_aggregates(repo: Path) -> dict[str, Any]:
 
 def _decide_aggregates(repo: Path) -> dict[str, Any]:
     try:
-        from .mrq import active
-        state = active(repo)
-        decisions = [item for item in state["mrq.jsonl"] if item.get("migration_decision", {}).get("decision")]
-        adapt_count = sum(1 for item in decisions if item.get("migration_decision", {}).get("decision") == "adapt")
-        return {"decision_count": len(decisions), "adapt_count": adapt_count, "pending_count": sum(1 for item in state["mrq.jsonl"] if item.get("state") != "superseded" and not item.get("migration_decision", {}).get("decision"))}
+        from .consolidation import load_active
+        state = load_active(repo)
+        pointer = state["pointer"]
+        rows: list[dict[str, Any]] = []
+        if pointer.get("decision_generation_id"):
+            from .decision_generations import validate_generation
+            rows = validate_generation(
+                repo,
+                pointer["decision_generation_id"],
+                allowed_mrq_ids={row["mrq_id"] for row in state["mrq"]["mrq.jsonl"]},
+            )["decisions.jsonl"]
+        return {
+            "decision_count": len(rows),
+            "adapt_count": sum(row["decision"]["decision"] == "adapt" for row in rows),
+            "pending_count": len(state["mrq"]["mrq.jsonl"]) - len(rows),
+        }
     except Exception:
         return {"decision_count": 0, "adapt_count": 0, "pending_count": 0}

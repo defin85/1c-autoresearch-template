@@ -20,9 +20,42 @@ export interface CircuitProjection {
   id: CircuitId;
   state: 'complete' | 'ready' | 'blocked' | 'unknown';
   leases?: CircuitLease[];
-  aggregates?: Record<string, number | string>;
+  aggregates?: DispatcherAggregates;
   zones?: DispatcherZoneProjection[];
   publication?: DispatcherZoneProjection;
+}
+
+export interface DispatcherAggregates extends Record<string, number | string | boolean | undefined> {
+  total?: number;
+  classified?: number;
+  meaning?: number;
+  noise_candidate?: number;
+  remaining?: number;
+  current_window_total?: number;
+  current_window_completed?: number;
+  failed?: number;
+  reusable_completed?: number;
+  window_published?: boolean;
+  retained?: number;
+  new?: number;
+  merged?: number;
+  split?: number;
+  superseded?: number;
+  approval_pending?: number;
+  published?: number;
+  coverage?: number | string;
+  partition_count?: number;
+  pair_count?: number;
+  planned_invocation_count?: number;
+  uncovered_partition_count?: number;
+  plan_status?: string;
+  plan_fingerprint?: string;
+  blocker_code?: string;
+  blocker_message?: string;
+  input_context_tokens?: number;
+  context_estimator_version?: string;
+  already_applied?: boolean;
+  legacy_decisions_stale?: number;
 }
 
 export interface DispatcherZoneProjection {
@@ -48,7 +81,7 @@ export interface DispatcherProjection {
   }>;
   retry_candidates?: Array<{
     run_id: string;
-    job_id: 'discover-mrq' | 'classify-mrq' | 'decide-mrq';
+    job_id: 'analyze-dif' | 'consolidate-mrq' | 'classify-mrq' | 'decide-mrq';
     status: string;
     execution_snapshot_fingerprint: string;
     policy_source: 'reuse-snapshot' | 'current-policy';
@@ -83,7 +116,7 @@ export type DispatcherSelection =
   | { kind: 'slot'; circuitId: CircuitId; phaseId: string; roleId: string; slotId: string; runId?: string }
   | { kind: 'invocation'; circuitId: CircuitId; phaseId: string; roleId: string; slotId: string; invocationId: string; runId?: string }
   | { kind: 'queue'; circuitId: CircuitId; queueId: string }
-  | { kind: 'item'; itemKind: 'dif' | 'mrq' | 'batch' | 'decision' | 'proposal'; circuitId: CircuitId; queueId: string; itemId: string };
+  | { kind: 'item'; itemKind: 'dif' | 'mrq' | 'outcome' | 'batch' | 'decision' | 'proposal'; circuitId: CircuitId; queueId: string; itemId: string };
 export interface AgentPhaseProjection {
   job_id: string; phase_id: string; mode: string; max_concurrency: number; roles: AgentRoleProjection[];
 }
@@ -93,6 +126,7 @@ export interface DispatcherItems {
   meaning_diffs: DifCard[];
   noise_diffs: DifCard[];
   proposals: ProposalCard[];
+  mrq_outcomes: CollectionCard[];
   mrqs: MrqCard[];
   batches: BatchCard[];
   decisions: DecisionCard[];
@@ -115,12 +149,13 @@ export interface DifCard {
   compatibility_summary?: Record<string, number>;
   blocker_codes?: string[];
 }
-export interface ProposalCard { id: string; job_id: string; kind: string; approval_stage?: 'noise' | 'batch' | ''; semantic_key: string; dif_ids: string[]; evidence_count: number; noise_count: number; mrq_id: string; created_at: string }
+export interface ProposalCard { id: string; job_id: string; kind: string; approval_stage?: 'consolidation' | 'decision' | ''; semantic_key: string; dif_ids: string[]; evidence_count: number; noise_count: number; mrq_id: string; created_at: string }
 export interface MrqCard { id: string; title: string; semantic_key: string; state: string; dif_ids: string[]; evidence_count: number }
 export interface BatchCard { id: string; mrq_ids: string[]; reason: string }
 export interface DecisionCard { id: string; title: string; decision: string; target_solution: string; evidence_count: number; gap: boolean }
+export interface CollectionCard { id: string; title: string; state: string; evidence_count: number; source_ids?: string[]; target_ids?: string[] }
 
-export const EMPTY_ITEMS: DispatcherItems = { dif_queue: [], meaning_diffs: [], noise_diffs: [], proposals: [], mrqs: [], batches: [], decisions: [], approval_count: 0 };
+export const EMPTY_ITEMS: DispatcherItems = { dif_queue: [], meaning_diffs: [], noise_diffs: [], proposals: [], mrq_outcomes: [], mrqs: [], batches: [], decisions: [], approval_count: 0 };
 
 export const EMPTY_PROJECTION: DispatcherProjection = {
   schema_version: '2',

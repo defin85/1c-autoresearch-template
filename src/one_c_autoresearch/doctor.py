@@ -195,6 +195,10 @@ TEMPLATE_REQUIRED_PATHS = [
     "src/one_c_autoresearch/bootstrap.py",
     "src/one_c_autoresearch/workspace.py",
     "src/one_c_autoresearch/workspace_api.py",
+    "src/one_c_autoresearch/dif_classifications.py",
+    "src/one_c_autoresearch/consolidation.py",
+    "src/one_c_autoresearch/decision_generations.py",
+    "src/one_c_autoresearch/workflow_migration.py",
     "src/one_c_autoresearch/workspace_runner.py",
     "src/one_c_autoresearch/workspace_static/index.html",
     "src/one_c_autoresearch/workspace_assets/research-template.zip",
@@ -218,6 +222,9 @@ TEMPLATE_REQUIRED_PATHS = [
     "templates/research-repo/AGENTS.md",
     "templates/research-repo/README.md",
     "templates/research-repo/project.toml",
+    "templates/research-repo/research/active-consolidation-generation.json",
+    "templates/research-repo/research/schemas/dif-classification-row.schema.json",
+    "templates/research-repo/research/schemas/consolidation-pointer.schema.json",
     "templates/research-repo/.codex/1c-mcp.example.toml",
     "templates/research-repo/docs/agent/index.md",
     "templates/research-repo/docs/agent/repo-map.md",
@@ -1626,9 +1633,9 @@ class Doctor:
             workflow = read_toml(canonical)
             operations = [step.get("operation") for job in workflow.get("jobs", []) for step in job.get("steps", [])]
             for name, actual, expected in (
-                ("gates", len(workflow.get("gates", [])), 7),
-                ("jobs", len(workflow.get("jobs", [])), 8),
-                ("operations", len(operations), 9),
+                ("gates", len(workflow.get("gates", [])), 8),
+                ("jobs", len(workflow.get("jobs", [])), 9),
+                ("operations", len(operations), 10),
             ):
                 self.checks.add(f"template.workflow.{name}", "ok" if actual == expected else "fail", f"Canonical workflow {name}: {actual}; expected {expected}")
             return

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from one_c_autoresearch.workflow import AGENT_PHASE_CATALOG, OPERATION_CATALOG, next_work, preview_step_patch, projection_value, semantic_diff_context, status, validate_project_contract, validate_workflow, workflow_fingerprint
+from one_c_autoresearch.workflow import AGENT_PHASE_CATALOG, OPERATION_CATALOG, _agent_circuit_state, next_work, preview_step_patch, projection_value, semantic_diff_context, status, validate_project_contract, validate_workflow, workflow_fingerprint
 from one_c_autoresearch.mrq import active
 
 
@@ -11,16 +11,22 @@ REPO = Path(__file__).parents[1]
 HAS_ACTIVE_GENERATION = (REPO / "research/active-generation.json").is_file()
 
 
+def test_active_agent_job_overrides_ready_gate_state():
+    gate = {"state": "ready"}
+    assert _agent_circuit_state("analyze-dif", {"analyze-dif"}, gate) == "active"
+    assert _agent_circuit_state("analyze-dif", set(), gate) == "ready"
+
+
 def test_fixed_graph_and_next_unit_matches_first_ready_gate():
     manifest = validate_workflow(REPO)
-    assert manifest["schema_version"] == "3"
+    assert manifest["schema_version"] == "4"
     assert manifest["tool_version"] == "0.2.0"
-    assert len(manifest["gates"]) == 7
-    assert len(manifest["jobs"]) == 8
-    assert len(OPERATION_CATALOG) == 9
-    assert [job["id"] for job in manifest["jobs"]][-4:] == ["discover-mrq", "classify-mrq", "decide-mrq", "publish"]
+    assert len(manifest["gates"]) == 8
+    assert len(manifest["jobs"]) == 9
+    assert len(OPERATION_CATALOG) == 10
+    assert [job["id"] for job in manifest["jobs"]][-5:] == ["analyze-dif", "consolidate-mrq", "classify-mrq", "decide-mrq", "publish"]
     snapshot = status(REPO)
-    assert len(snapshot["gates"]) == 7
+    assert len(snapshot["gates"]) == 8
     ready = [gate for gate in snapshot["gates"] if gate["state"] == "ready"]
     assert next_work(REPO) is None if not ready else next_work(REPO)["action"] == ready[0]["blockers"][0]["action"]
 
@@ -75,27 +81,27 @@ def test_exact_operation_catalog_and_typed_patch_preview():
     assert preview["catalog"]["effect"] == "write"
     with pytest.raises(ValueError, match="unsupported"):
         preview_step_patch(REPO, "build-diffs", {"shell": "true"}, workflow_fingerprint(REPO))
-    phases = preview_step_patch(REPO, "discover-mrq", {}, workflow_fingerprint(REPO))["after"]["agent_phases"]
-    assert [item["phase_id"] for item in phases] == ["analyze-dif", "form-mrq"]
-    assert AGENT_PHASE_CATALOG["mrq.discover-next"][1]["roles"] == ("coordinator", "grouper")
+    phases = preview_step_patch(REPO, "analyze-dif", {}, workflow_fingerprint(REPO))["after"]["agent_phases"]
+    consolidate = preview_step_patch(REPO, "consolidate-mrq", {}, workflow_fingerprint(REPO))["after"]["agent_phases"]
+    assert [item["phase_id"] for item in phases] == ["analyze-dif"]
+    assert [item["phase_id"] for item in consolidate] == ["form-mrq"]
+    assert AGENT_PHASE_CATALOG["mrq.consolidate"][0]["roles"] == ("coordinator", "grouper")
     classifier = preview_step_patch(REPO, "classify-mrq", {}, workflow_fingerprint(REPO))["after"]["agent_phases"]
     assert classifier == [{"phase_id": "classify-batches", "mode": "sequential", "max_concurrency": 1, "roles": [{"role_id": "classifier", "agent_profile": "local", "count": 1, "instruction_supplement": ""}]}]
     with pytest.raises(ValueError, match="phase"):
-        preview_step_patch(REPO, "discover-mrq", {"agent_phases": list(reversed(phases))}, workflow_fingerprint(REPO))
+        preview_step_patch(REPO, "analyze-dif", {"agent_phases": []}, workflow_fingerprint(REPO))
 
 
-def test_empty_discover_window_has_no_coordinator_call(monkeypatch):
-    monkeypatch.setattr("one_c_autoresearch.pipeline_graphs.select_dif_window", lambda _repo: [])
-    monkeypatch.setattr("one_c_autoresearch.pipeline_graphs._read_diff_inventory", lambda _repo: [])
+def test_empty_analyze_window_has_no_agent_call(monkeypatch):
+    monkeypatch.setattr("one_c_autoresearch.dif_classifications.coverage", lambda _repo: {"remaining": 0})
     preview = preview_step_patch(
         REPO,
-        "discover-mrq",
+        "analyze-dif",
         {},
         workflow_fingerprint(REPO),
     )
     phases = {item["phase_id"]: item for item in preview["agent_phase_preview"]}
     assert phases["analyze-dif"]["effective_max_concurrency"] == 0
-    assert phases["form-mrq"]["maximum_calls_in_current_window"] == 0
 
 
 def test_legacy_agent_step_and_unsafe_phase_values_are_rejected(tmp_path: Path):
@@ -111,7 +117,7 @@ def test_legacy_agent_step_and_unsafe_phase_values_are_rejected(tmp_path: Path):
         validate_workflow(tmp_path)
 
 
-@pytest.mark.skipif(not HAS_ACTIVE_GENERATION, reason="clean template has no active generation")
+@pytest.mark.skipif(not HAS_ACTIVE_GENERATION or not (REPO / "outputs/projections.json").is_file(), reason="clean template has no generated outputs")
 def test_repository_truth_survives_user_state_deletion(tmp_path: Path):
     before = status(REPO), active(REPO), (REPO / "outputs/projections.json").read_bytes()
     operational = tmp_path / "user-state"

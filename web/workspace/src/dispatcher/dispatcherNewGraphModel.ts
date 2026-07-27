@@ -232,7 +232,11 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
   const classifier = roleInvocations(projection, 'classifier');
   const researcher = roleInvocations(projection, 'researcher');
   const stage = CIRCUIT_BY_STAGE[nodeId];
-  if (stage) return { state: circuitState(projection, stage), active: false };
+  if (stage) return {
+    ...(stage === 'form-mrq' ? { title: '3 Формирование и консолидация MRQ' } : {}),
+    state: circuitState(projection, stage),
+    active: false,
+  };
 
   switch (nodeId) {
     case 'sources': {
@@ -253,7 +257,10 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
     case 'dif-queue':
       return difQueuePatch(projection, false);
     case 'analysis-queue':
-      return difQueuePatch(projection, true);
+      return {
+        ...difQueuePatch(projection, true),
+        detail: `В окне: ${projection.circuits.find((item) => item.id === 'analyze-dif')?.aggregates?.current_window_total ?? 'недоступно'} · выполнено: ${projection.circuits.find((item) => item.id === 'analyze-dif')?.aggregates?.current_window_completed ?? 'недоступно'}`,
+      };
     case 'analyzer-1':
       return invocationPatch(analyzer[0], 'Анализатор 1');
     case 'analyzer-2':
@@ -275,15 +282,21 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
     case 'grouper-3':
       return invocationPatch(grouper[2], 'Группировщик 3');
     case 'proposal': {
-      return collectionPatch(projection, 'proposals', projection.items.proposals, 'Предложений');
+      const aggregates = projection.circuits.find((item) => item.id === 'form-mrq')?.aggregates ?? {};
+      return {
+        title: 'Предложения MRQ',
+        state: circuitState(projection, 'form-mrq'),
+        detail: `Сохранено: ${aggregates.retained ?? '—'} · новых: ${aggregates.new ?? '—'} · объединено: ${aggregates.merged ?? '—'} · разделено: ${aggregates.split ?? '—'} · заменено: ${aggregates.superseded ?? '—'}`,
+        active: false,
+      };
     }
     case 'review': {
-      const proposals = projection.items.proposals.length;
-      const evidence = projection.items.proposals.reduce((sum, item) => sum + item.evidence_count, 0);
+      const aggregates = projection.circuits.find((item) => item.id === 'form-mrq')?.aggregates ?? {};
       const coverage = circuitState(projection, 'form-mrq');
       return {
+        title: 'Консолидация MRQ',
         state: coverage,
-        detail: `Предложений: ${proposals} · Доказательств: ${evidence} · Полное покрытие: ${coverage === 'Готово' ? 'подтверждено' : 'не подтверждено'}`,
+        detail: `План: ${aggregates.plan_status ?? 'не построен'} · ожидают одобрения: ${aggregates.approval_pending ?? 0} · покрытие: ${aggregates.coverage ?? 'не подтверждено'}`,
         active: false,
       };
     }

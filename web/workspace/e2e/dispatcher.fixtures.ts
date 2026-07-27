@@ -3,7 +3,7 @@ import type { CircuitLease, DispatcherProjection } from '../src/dispatcher/proje
 const NOW = '2026-07-21T12:00:00.000Z';
 
 const lease = (state: string): CircuitLease => ({
-  job_id: 'discover-mrq',
+  job_id: 'analyze-dif',
   thread_id: 'thread-fixture',
   work_unit_id: 'DIF-00001',
   owner: 'fixture-agent',
@@ -27,11 +27,11 @@ const circuits: DispatcherProjection['circuits'] = [
       { id: 'indexes-build', state: 'complete', updated_at: NOW },
     ],
   },
-  { id: 'analyze-dif', state: 'ready', aggregates: { window_size: 12, raw_extension_diff_count: 2 } },
+  { id: 'analyze-dif', state: 'ready', aggregates: { total: 12, classified: 11, meaning: 6, noise_candidate: 5, remaining: 1, current_window_total: 12, current_window_completed: 11, failed: 1, reusable_completed: 11, window_published: false } },
   {
     id: 'form-mrq',
     state: 'ready',
-    aggregates: { active_mrq_count: 6, disposition_count: 12 },
+    aggregates: { retained: 3, new: 2, merged: 1, split: 0, superseded: 1, evidence: 12, coverage: 'complete', approval_pending: 1, published: 0, partition_count: 2, pair_count: 3, planned_invocation_count: 5, input_context_tokens: 200000, context_estimator_version: 'utf8-v1', plan_status: 'approval_required', plan_fingerprint: 'sha256:plan' },
     publication: { id: 'publication', state: 'waiting', updated_at: NOW },
   },
   { id: 'classify-mrq', state: 'complete', aggregates: { input_mrq_count: 6, window_count: 1, batch_count: 5, validation_state: 'valid' } },
@@ -67,7 +67,7 @@ export const emptyProjection: DispatcherProjection = {
     { id: 'decide-target', state: 'unknown' },
   ],
   jobs: {},
-  items: { dif_queue: [], meaning_diffs: [], noise_diffs: [], proposals: [], mrqs: [], batches: [], decisions: [], approval_count: 0 },
+  items: { dif_queue: [], meaning_diffs: [], noise_diffs: [], proposals: [], mrq_outcomes: [], mrqs: [], batches: [], decisions: [], approval_count: 0 },
   agent_phases: [],
 };
 
@@ -76,7 +76,7 @@ export const saturatedProjection: DispatcherProjection = {
   revision: 42,
   fresh_at: NOW,
   circuits,
-  jobs: { 'discover-mrq': lease('running') },
+  jobs: { 'analyze-dif': lease('running') },
   queue_aggregates: {
     'dif-queue': { total: 12, visible: 12, omitted: 0 },
     'mrq-queue': { total: 6, visible: 6, omitted: 0 },
@@ -87,9 +87,9 @@ export const saturatedProjection: DispatcherProjection = {
     noise_diffs: Array.from({ length: 5 }, (_, index) => dif(index + 31, 'noise')),
     proposals: Array.from({ length: 5 }, (_, index) => ({
       id: `group-${index + 1}`,
-      job_id: index === 0 ? 'decide-mrq' : 'discover-mrq',
-      kind: 'group.ready',
-      approval_stage: index === 0 ? 'batch' as const : '' as const,
+      job_id: index === 0 ? 'decide-mrq' : 'consolidate-mrq',
+      kind: 'approval',
+      approval_stage: index === 0 ? 'decision' as const : '' as const,
       semantic_key: `fixture-${index + 1}`,
       dif_ids: [`DIF-${String(index + 21).padStart(5, '0')}`],
       evidence_count: 2,
@@ -97,6 +97,7 @@ export const saturatedProjection: DispatcherProjection = {
       mrq_id: '',
       created_at: NOW,
     })),
+    mrq_outcomes: [{ id: 'mrq:retained:MRQ-00001', title: 'MRQ-00001', state: 'retained', evidence_count: 2, source_ids: ['MRQ-00001'], target_ids: ['MRQ-00001'] }],
     mrqs: Array.from({ length: 6 }, (_, index) => ({
       id: `MRQ-${String(index + 1).padStart(5, '0')}`,
       title: `Требование ${index + 1}`,
@@ -120,7 +121,7 @@ export const saturatedProjection: DispatcherProjection = {
   },
   agent_phases: [
     {
-      job_id: 'discover-mrq',
+      job_id: 'consolidate-mrq',
       phase_id: 'analyze-dif',
       mode: 'parallel-pool',
       max_concurrency: 4,
@@ -145,7 +146,7 @@ export const saturatedProjection: DispatcherProjection = {
       }],
     },
     {
-      job_id: 'discover-mrq',
+      job_id: 'analyze-dif',
       phase_id: 'form-mrq',
       mode: 'coordinated-pool',
       max_concurrency: 3,
@@ -228,7 +229,7 @@ export const activeProjection = variant((projection) => {
 });
 const setLease = (projection: DispatcherProjection, state: string) => {
   const current = lease(state);
-  projection.jobs['discover-mrq'] = current;
+  projection.jobs['analyze-dif'] = current;
   projection.circuits[1].leases = [current];
 };
 
@@ -240,7 +241,7 @@ export const errorProjection = variant((projection) => {
 });
 export const staleProjection = variant((projection) => {
   const current = { ...lease('running'), renewed_at: '2026-07-21T10:00:00.000Z' };
-  projection.jobs['discover-mrq'] = current;
+  projection.jobs['analyze-dif'] = current;
   projection.circuits[1].leases = [current];
 });
 

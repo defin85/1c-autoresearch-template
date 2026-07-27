@@ -4,6 +4,7 @@ import json
 import threading
 import uuid
 from hashlib import sha256 as hashlib_sha256
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -29,7 +30,7 @@ REPO = Path(__file__).resolve().parents[1]
 def _fake_bindings(work_unit_id: str = "DIF-AAA", *, workflow_fingerprint: str = "sha256:abc") -> DispatcherBindings:
     return DispatcherBindings(
         project_id="proj-1",
-        job_id="discover-mrq",
+        job_id="analyze-dif",
         work_unit_id=work_unit_id,
         source_generation_id="src-1",
         diff_generation_id="diff-1",
@@ -59,7 +60,7 @@ def _start(coordinator: DispatcherCoordinator, job_id: str, bindings: Dispatcher
     snapshot = {
         "schema_version": "1",
         "run_id": run_id,
-        "operation": "mrq.discover-next" if job_id == "discover-mrq" else "mrq.decide-next",
+        "operation": "dif.classify-next" if job_id == "analyze-dif" else "mrq.decide-next",
         "operation_version": "2",
         "workflow_fingerprint": bindings.workflow_fingerprint,
         "timeout_seconds": 60,
@@ -85,7 +86,7 @@ def _start(coordinator: DispatcherCoordinator, job_id: str, bindings: Dispatcher
 
 
 def test_dispatcher_jobs_match_fixed_workflow_contract() -> None:
-    assert DISPATCHER_JOBS == ("discover-mrq", "classify-mrq", "decide-mrq")
+    assert DISPATCHER_JOBS == ("analyze-dif", "consolidate-mrq", "classify-mrq", "decide-mrq")
     assert STALE_AFTER_SECONDS == 10
 
 
@@ -133,10 +134,10 @@ def test_load_bindings_reads_active_pointers(tmp_path: Path) -> None:
     (tmp_path / "research").mkdir()
     (tmp_path / "research/active-source-generation.json").write_text(json.dumps({"generation_id": "src-xyz"}))
     (tmp_path / "research/active-diff-generation.json").write_text(json.dumps({"generation_id": "diff-xyz"}))
-    (tmp_path / "research/active-generation.json").write_text(json.dumps({"canonical_generation_id": "canon-xyz"}))
+    (tmp_path / "research/active-consolidation-generation.json").write_text(json.dumps({"mrq_generation_id": "canon-xyz", "transaction_id": "tx"}))
     (tmp_path / "project.toml").write_text('[project]\nid="x"\n')
     with patch("one_c_autoresearch.dispatcher.sha256", lambda value: value.decode() if isinstance(value, bytes) else value), patch("one_c_autoresearch.stage_recompute.state_fingerprint", lambda _repo: "sha256:wf"):
-        bindings = load_bindings(tmp_path, "proj", "discover-mrq", "DIF-1", {"model": "gpt"}, "sup")
+        bindings = load_bindings(tmp_path, "proj", "analyze-dif", "DIF-1", {"model": "gpt"}, "sup")
     assert bindings.source_generation_id == "src-xyz"
     assert bindings.diff_generation_id == "diff-xyz"
     assert bindings.canonical_generation_id == "canon-xyz"
@@ -146,15 +147,15 @@ def test_load_bindings_reads_active_pointers(tmp_path: Path) -> None:
 def test_start_acquires_lease_and_second_process_is_blocked(tmp_path: Path) -> None:
     coordinator, store, event_store = _coordinator(tmp_path)
     try:
-        first = _start(coordinator, "discover-mrq", _fake_bindings())
-        second = _start(coordinator, "discover-mrq", _fake_bindings())
+        first = _start(coordinator, "analyze-dif", _fake_bindings())
+        second = _start(coordinator, "analyze-dif", _fake_bindings())
         assert first.status == "running"
         assert second.status == "blocked"
         assert second.blocker is not None and second.blocker["code"] == "dispatcher.lease.busy"
         events = event_store.events()
         kinds = [event["payload"].get("kind") for event in events]
-        assert "dispatcher.discover-mrq.started" in kinds
-        started = next(event for event in events if event["payload"].get("kind") == "dispatcher.discover-mrq.started")
+        assert "dispatcher.analyze-dif.started" in kinds
+        started = next(event for event in events if event["payload"].get("kind") == "dispatcher.analyze-dif.started")
         assert started["payload"]["effective_action"]["policy_source"] == "current-policy"
     finally:
         coordinator.close()
@@ -178,11 +179,11 @@ def test_resume_rejects_changed_bindings(tmp_path: Path) -> None:
     coordinator, store, _ = _coordinator(tmp_path)
     try:
         original = _fake_bindings()
-        _start(coordinator, "discover-mrq", original)
-        coordinator.soft_stop("discover-mrq")
+        _start(coordinator, "analyze-dif", original)
+        coordinator.soft_stop("analyze-dif")
         # предметное поколение изменилось — сохранённый запуск больше не валиден
         changed = DispatcherBindings(**{**original.__dict__, "diff_generation_id": "diff-new"})
-        outcome = coordinator.resume("discover-mrq", changed)
+        outcome = coordinator.resume("analyze-dif", changed)
         assert outcome.status == "stale"
         assert outcome.blocker is not None and outcome.blocker["code"] == "dispatcher.bindings.stale"
     finally:
@@ -194,12 +195,12 @@ def test_resume_accepts_matching_bindings(tmp_path: Path) -> None:
     coordinator, store, _ = _coordinator(tmp_path)
     try:
         bindings = _fake_bindings()
-        _start(coordinator, "discover-mrq", bindings)
-        coordinator.soft_stop("discover-mrq")
+        _start(coordinator, "analyze-dif", bindings)
+        coordinator.soft_stop("analyze-dif")
         with patch("one_c_autoresearch.agents.validate_execution_snapshot", lambda *_args: None):
-            outcome = coordinator.resume("discover-mrq", bindings)
+            outcome = coordinator.resume("analyze-dif", bindings)
         assert outcome.status == "running"
-        lease = store.lease("discover-mrq")
+        lease = store.lease("analyze-dif")
         assert lease is not None and lease["state"] == "running"
     finally:
         coordinator.close()
@@ -212,8 +213,8 @@ def test_resume_marks_old_workflow_contract_stale(tmp_path: Path) -> None:
     coordinator, store, event_store = _coordinator(tmp_path)
     try:
         bindings = _fake_bindings()
-        started = _start(coordinator, "discover-mrq", bindings)
-        coordinator.soft_stop("discover-mrq")
+        started = _start(coordinator, "analyze-dif", bindings)
+        coordinator.soft_stop("analyze-dif")
         run = event_store.run_snapshot(started.run_id)
         assert run is not None
         run["execution_snapshot"]["application_version"] = "one-c-autoresearch/0.1"
@@ -224,15 +225,15 @@ def test_resume_marks_old_workflow_contract_stale(tmp_path: Path) -> None:
         with store.conn:
             store.conn.execute(
                 "UPDATE dispatcher_leases SET execution_snapshot_fingerprint = ? WHERE job_id = ?",
-                (fingerprint, "discover-mrq"),
+                (fingerprint, "analyze-dif"),
             )
 
-        outcome = coordinator.resume("discover-mrq", bindings)
+        outcome = coordinator.resume("analyze-dif", bindings)
         assert outcome.status == "stale"
         assert outcome.blocker == {
             "code": "workflow_contract_stale",
             "message": "workflow_contract_stale",
-            "action": "discover-mrq",
+            "action": "analyze-dif",
         }
     finally:
         coordinator.close()
@@ -246,14 +247,14 @@ def test_only_one_process_can_resume_a_saved_run(tmp_path: Path) -> None:
     second = DispatcherCoordinator(tmp_path, "proj-1", second_store, event_store, actor="second")
     try:
         bindings = _fake_bindings()
-        _start(coordinator, "discover-mrq", bindings)
-        coordinator.soft_stop("discover-mrq")
+        _start(coordinator, "analyze-dif", bindings)
+        coordinator.soft_stop("analyze-dif")
         barrier = threading.Barrier(2)
         outcomes = []
 
         def resume(candidate: DispatcherCoordinator) -> None:
             barrier.wait()
-            outcomes.append(candidate.resume("discover-mrq", bindings))
+            outcomes.append(candidate.resume("analyze-dif", bindings))
 
         with patch("one_c_autoresearch.agents.validate_execution_snapshot", lambda *_args: None):
             threads = [
@@ -265,7 +266,7 @@ def test_only_one_process_can_resume_a_saved_run(tmp_path: Path) -> None:
             for thread in threads:
                 thread.join(5)
         assert sorted(outcome.status for outcome in outcomes) == ["blocked", "running"]
-        assert coordinator.store.lease("discover-mrq")["state"] == "running"
+        assert coordinator.store.lease("analyze-dif")["state"] == "running"
     finally:
         coordinator.close()
         second.close()
@@ -276,10 +277,10 @@ def test_only_one_process_can_resume_a_saved_run(tmp_path: Path) -> None:
 def test_cancel_releases_lease_and_deletes_thread(tmp_path: Path) -> None:
     coordinator, store, _ = _coordinator(tmp_path)
     try:
-        _start(coordinator, "discover-mrq", _fake_bindings())
-        outcome = coordinator.cancel("discover-mrq")
+        _start(coordinator, "analyze-dif", _fake_bindings())
+        outcome = coordinator.cancel("analyze-dif")
         assert outcome.status == "cancelled"
-        assert store.lease("discover-mrq") is None
+        assert store.lease("analyze-dif") is None
     finally:
         coordinator.close()
         store.close()
@@ -288,10 +289,10 @@ def test_cancel_releases_lease_and_deletes_thread(tmp_path: Path) -> None:
 def test_retry_requires_terminal_state(tmp_path: Path) -> None:
     coordinator, store, event_store = _coordinator(tmp_path)
     try:
-        first = _start(coordinator, "discover-mrq", _fake_bindings())
-        blocked = coordinator.retry("discover-mrq", _fake_bindings())
+        first = _start(coordinator, "analyze-dif", _fake_bindings())
+        blocked = coordinator.retry("analyze-dif", _fake_bindings())
         assert blocked.status == "blocked" and blocked.blocker["code"] == "dispatcher.retry.busy"
-        coordinator.soft_stop("discover-mrq")
+        coordinator.soft_stop("analyze-dif")
         retry_run_id = str(uuid.uuid4())
         retry_snapshot = {
             **event_store.run_snapshot(first.run_id)["execution_snapshot"],
@@ -300,7 +301,7 @@ def test_retry_requires_terminal_state(tmp_path: Path) -> None:
             "predecessor_run_id": first.run_id,
         }
         restarted = coordinator.retry(
-            "discover-mrq",
+            "analyze-dif",
             _fake_bindings(),
             run_id=retry_run_id,
             execution_snapshot=retry_snapshot,
@@ -315,12 +316,47 @@ def test_verify_bindings_blocks_after_expiry(tmp_path: Path) -> None:
     coordinator, store, _ = _coordinator(tmp_path)
     try:
         bindings = _fake_bindings()
-        _start(coordinator, "discover-mrq", bindings)
+        _start(coordinator, "analyze-dif", bindings)
         stale = (datetime.now(timezone.utc) - timedelta(seconds=LEASE_EXPIRY_SECONDS + 5)).isoformat()
         conn = store.conn
-        conn.execute("UPDATE dispatcher_leases SET renewed_at = ? WHERE job_id = ?", (stale, "discover-mrq"))
+        conn.execute("UPDATE dispatcher_leases SET renewed_at = ? WHERE job_id = ?", (stale, "analyze-dif"))
         conn.commit()
-        assert coordinator.verify_bindings("discover-mrq", bindings) is False
+        assert coordinator.verify_bindings("analyze-dif", bindings) is False
+    finally:
+        coordinator.close()
+        store.close()
+
+
+def test_analyze_bindings_allow_own_classification_publication(tmp_path: Path) -> None:
+    coordinator, store, _ = _coordinator(tmp_path)
+    bindings = replace(
+        _fake_bindings(),
+        classification_generation_id="classification-before",
+        consolidation_transaction_id="transaction",
+    )
+    (tmp_path / "research").mkdir()
+    (tmp_path / "research/active-dif-classification-generation.json").write_text(
+        json.dumps({"generation_id": "classification-after"}), encoding="utf-8"
+    )
+    (tmp_path / "research/active-consolidation-generation.json").write_text(
+        json.dumps({"mrq_generation_id": "canon-1", "transaction_id": "transaction"}), encoding="utf-8"
+    )
+    try:
+        started = _start(coordinator, "analyze-dif", bindings)
+        lease = store.lease("analyze-dif")
+        bindings = replace(
+            bindings,
+            run_id=started.run_id,
+            execution_snapshot_fingerprint=lease["execution_snapshot_fingerprint"],
+        )
+        with patch(
+            "one_c_autoresearch.stage_recompute.active_state",
+            return_value=(
+                {"source": {"generation_id": "src-1"}, "diff": {"generation_id": "diff-1"}},
+                bindings.workflow_fingerprint,
+            ),
+        ):
+            assert coordinator.verify_bindings("analyze-dif", bindings) is True
     finally:
         coordinator.close()
         store.close()
@@ -329,10 +365,10 @@ def test_verify_bindings_blocks_after_expiry(tmp_path: Path) -> None:
 def test_mark_stale_uses_dispatcher_kind_in_existing_event_type(tmp_path: Path) -> None:
     coordinator, store, event_store = _coordinator(tmp_path)
     try:
-        _start(coordinator, "discover-mrq", _fake_bindings())
-        outcome = coordinator.mark_stale("discover-mrq")
+        _start(coordinator, "analyze-dif", _fake_bindings())
+        outcome = coordinator.mark_stale("analyze-dif")
         assert outcome.status == "stale"
-        assert store.lease("discover-mrq") is None
+        assert store.lease("analyze-dif") is None
         events = event_store.events()
         snapshot_events = [event for event in events if event["type"] == "approval.required"]
         assert snapshot_events and snapshot_events[-1]["payload"]["kind"] == "dispatcher.bindings.stale"
@@ -344,9 +380,9 @@ def test_mark_stale_uses_dispatcher_kind_in_existing_event_type(tmp_path: Path) 
 def test_emit_transition_uses_only_existing_event_types(tmp_path: Path) -> None:
     coordinator, store, event_store = _coordinator(tmp_path)
     try:
-        started = _start(coordinator, "discover-mrq", _fake_bindings())
+        started = _start(coordinator, "analyze-dif", _fake_bindings())
         revision_before = store.revision()[0]
-        revision_after = coordinator.emit_transition("discover-mrq", started.run_id, started.thread_id, "step.progress", "dispatcher.group.validated", {"status": "running", "progress": {"current": 1, "total": 3}})
+        revision_after = coordinator.emit_transition("analyze-dif", started.run_id, started.thread_id, "step.progress", "dispatcher.group.validated", {"status": "running", "progress": {"current": 1, "total": 3}})
         assert revision_after > revision_before
         events = event_store.events()
         kinds = [event["payload"].get("kind") for event in events]
@@ -361,16 +397,16 @@ def test_emit_transition_uses_only_existing_event_types(tmp_path: Path) -> None:
 def test_fenced_owner_cannot_emit_transition_after_lease_takeover(tmp_path: Path) -> None:
     coordinator, store, event_store = _coordinator(tmp_path)
     try:
-        started = _start(coordinator, "discover-mrq", _fake_bindings())
+        started = _start(coordinator, "analyze-dif", _fake_bindings())
         before = len(event_store.events())
         stale = (datetime.now(timezone.utc) - timedelta(seconds=LEASE_EXPIRY_SECONDS + 1)).isoformat()
         store.conn.execute(
             "UPDATE dispatcher_leases SET renewed_at = ? WHERE job_id = ?",
-            (stale, "discover-mrq"),
+            (stale, "analyze-dif"),
         )
         store.conn.commit()
         assert store.acquire_lease(
-            "discover-mrq",
+            "analyze-dif",
             "new-thread",
             "DIF-BBB",
             "new-owner",
@@ -378,7 +414,7 @@ def test_fenced_owner_cannot_emit_transition_after_lease_takeover(tmp_path: Path
         )
         with pytest.raises(RuntimeError, match="fenced"):
             coordinator.emit_transition(
-                "discover-mrq",
+                "analyze-dif",
                 started.run_id,
                 started.thread_id,
                 "step.progress",
@@ -395,7 +431,7 @@ def test_emit_transition_rejects_new_event_type(tmp_path: Path) -> None:
     coordinator, store, _ = _coordinator(tmp_path)
     try:
         with pytest.raises(ValueError, match="unsupported existing workflow event type"):
-            coordinator.emit_transition("discover-mrq", "run-1", "thread-1", "dispatcher.custom", "dispatcher.x", {})
+            coordinator.emit_transition("analyze-dif", "run-1", "thread-1", "dispatcher.custom", "dispatcher.x", {})
     finally:
         coordinator.close()
         store.close()
@@ -404,11 +440,11 @@ def test_emit_transition_rejects_new_event_type(tmp_path: Path) -> None:
 def test_snapshot_projection_excludes_canonical_fields(tmp_path: Path) -> None:
     coordinator, store, _ = _coordinator(tmp_path)
     try:
-        _start(coordinator, "discover-mrq", _fake_bindings())
+        _start(coordinator, "analyze-dif", _fake_bindings())
         projection = coordinator.snapshot_projection()
         assert projection["schema_version"] == "2"
         assert "revision" in projection and projection["revision"] >= 1
-        assert "discover-mrq" in projection["jobs"]
+        assert "analyze-dif" in projection["jobs"]
         # проекция не содержит канонических отпечатков
         assert "workflow_fingerprint" not in projection
         assert "gates" not in projection
@@ -421,18 +457,18 @@ def test_lease_renewer_updates_renewed_at_in_background(tmp_path: Path) -> None:
     store = DispatcherStore(tmp_path, base=tmp_path)
     store.open()
     try:
-        token = store.acquire_lease("discover-mrq", "thread-1", "DIF-1", "owner", None)
+        token = store.acquire_lease("analyze-dif", "thread-1", "DIF-1", "owner", None)
         assert token
-        before = store.lease("discover-mrq")["renewed_at"]
+        before = store.lease("analyze-dif")["renewed_at"]
         stop = threading.Event()
-        renewer = LeaseRenewer(store, "discover-mrq", token, stop, interval_seconds=0)
+        renewer = LeaseRenewer(store, "analyze-dif", token, stop, interval_seconds=0)
         renewer.start()
         # мини-сон достаточен для одного обновления в быстрых тестах
         import time as _time
         _time.sleep(0.05)
         stop.set()
         renewer.join(timeout=1)
-        after = store.lease("discover-mrq")["renewed_at"]
+        after = store.lease("analyze-dif")["renewed_at"]
         # обновление фонового таймера может совпасть с initial; проверяем что renew вызван без ошибки
         assert before is not None and after is not None
     finally:
@@ -444,10 +480,10 @@ def test_lease_renewer_confirms_each_successful_renewal(tmp_path: Path) -> None:
     store.open()
     confirmations: list[bool] = []
     try:
-        token = store.acquire_lease("discover-mrq", "thread-1", "DIF-1", "owner", None)
+        token = store.acquire_lease("analyze-dif", "thread-1", "DIF-1", "owner", None)
         assert token
         stop = threading.Event()
-        renewer = LeaseRenewer(store, "discover-mrq", token, stop, interval_seconds=0, on_renewed=lambda: confirmations.append(True))
+        renewer = LeaseRenewer(store, "analyze-dif", token, stop, interval_seconds=0, on_renewed=lambda: confirmations.append(True))
         renewer.start()
         import time as _time
         _time.sleep(0.05)
@@ -508,10 +544,10 @@ def test_fenced_checkpoint_and_lease_renewal_share_one_lock_order(tmp_path: Path
 def test_finish_deletes_thread_only_for_terminal_states(tmp_path: Path) -> None:
     coordinator, store, _ = _coordinator(tmp_path)
     try:
-        _start(coordinator, "discover-mrq", _fake_bindings())
-        outcome = coordinator.finish("discover-mrq", "completed", {"published": True})
+        _start(coordinator, "analyze-dif", _fake_bindings())
+        outcome = coordinator.finish("analyze-dif", "completed", {"published": True})
         assert outcome.status == "completed"
-        assert store.lease("discover-mrq") is None
+        assert store.lease("analyze-dif") is None
     finally:
         coordinator.close()
         store.close()

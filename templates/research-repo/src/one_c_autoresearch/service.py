@@ -38,11 +38,13 @@ class ApplicationService:
             raise ValueError("invalid registry page")
         generation_id = ""
         if name == "mrq":
-            state = mrq.active(self.repo)
-            generation_id = str(state["pointer"].get("diff_generation_id", ""))
+            from .consolidation import load_active
+            state = load_active(self.repo)
+            generation_id = str(state["pointer"].get("mrq_generation_id", ""))
             if expected_generation and expected_generation != generation_id:
-                raise RuntimeError("stale diff generation")
-            rows = state["mrq.jsonl"] if item_id else state["mrq.jsonl"][offset : offset + limit + 1]
+                raise RuntimeError("stale MRQ generation")
+            mrqs = state["mrq"].get("mrq.jsonl", [])
+            rows = mrqs if item_id else mrqs[offset : offset + limit + 1]
         else:
             pointer = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
             generation_id = str(pointer.get("generation_id", ""))
@@ -117,6 +119,8 @@ class ApplicationService:
         return workflow.preview_step_patch(self.repo, payload["step_id"], payload["parameters"], payload["expected_manifest_fingerprint"], state_base)
 
     def apply(self, operation: str, payload: dict[str, Any], expected_fingerprint: str, cancelled: callable | None = None, *, staged: dict[str, dict[str, Any]] | None = None, fence: callable | None = None) -> dict[str, Any]:
+        from .workflow_migration import guard_mutation
+        guard_mutation(self.repo)
         reject_secrets(payload, "operation payload")
         current = workflow.state_fingerprint(self.repo)
         if expected_fingerprint != current:
@@ -132,20 +136,6 @@ class ApplicationService:
             "indexes.ensure": self._ensure_indexes,
             "indexes.build": self._ensure_indexes,
             "diff.build": self._build_diffs,
-            "mrq.propose": self._mrq_propose,
-            "mrq.decide": self._mrq_decide,
-            "mrq.review": self._mrq_review,
-            "mrq.approve-noise": self._mrq_approve_noise,
-            "mrq.restructure": self._mrq_restructure,
-            "mrq.revalidate-unchanged": self._mrq_revalidate_unchanged,
-            # Внутренняя атомарная граница применения существующей операции
-            # ``mrq.discover-next``: публикует одно каноническое MRQ-поколение из
-            # одобренного пакета групп. Не входит в ``OPERATION_CATALOG`` и не
-            # является девятой операцией workflow-каталога; вызывается только
-            # диспетчером после явного одобрения пакета локальным пользователем.
-            # ``mrq.publish`` сам берёт репозиторную блокировку, поэтому здесь
-            # без внешнего ``_locked`` (иначе вложенная блокировка ``fcntl``).
-            "mrq.publish-source-batch": self._mrq_publish_source_batch,
             "projections.build": lambda value: self._locked(self._build_projections, value),
             "workflow.patch-step": lambda value: self._locked(self._patch_step, value),
             "workflow.verify": self._verify_workflow,
@@ -438,9 +428,10 @@ class ApplicationService:
     def _build_projections(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload:
             raise ValueError("projections.build takes no parameters")
-        state = mrq.active(self.repo)
-        if not state["pointer"].get("canonical_generation_id"):
-            raise ValueError("canonical MRQ generation is absent")
+        from .consolidation import load_active
+        state = load_active(self.repo)
+        if state["pointer"].get("state") != "active":
+            raise ValueError("canonical consolidation generation is absent")
         projections = workflow.projection_value(state)
         atomic_json(self.repo / "outputs/projections.json", projections)
         return projections

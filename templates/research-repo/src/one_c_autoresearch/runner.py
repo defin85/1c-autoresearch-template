@@ -11,13 +11,14 @@ from .events import EventStore, process_identity
 from .workflow import OPERATION_CATALOG, next_work, status, step_configurations
 
 
-AGENT_OPERATIONS = {"mrq.discover-next", "mrq.classify-batches", "mrq.decide-next"}
+AGENT_OPERATIONS = {"dif.classify-next", "mrq.consolidate", "mrq.classify-batches", "mrq.decide-next"}
 AUTOMATABLE = {"sources.acquire", "diff.build", "indexes.build", "projections.build", "workflow.verify", *AGENT_OPERATIONS}
 APPROVAL_REQUIRED = {"sources.acquire"}
 LOCATION = {
     "project.validate": ("configure", "validate-project"), "sources.acquire": ("acquire-sources", "acquire-sources"),
     "diff.build": ("build-diffs", "build-diffs"), "indexes.build": ("index-sources", "index-sources"),
-    "mrq.discover-next": ("discover-mrq", "discover-mrq"),
+    "dif.classify-next": ("analyze-dif", "analyze-dif"),
+    "mrq.consolidate": ("consolidate-mrq", "consolidate-mrq"),
     "mrq.classify-batches": ("classify-mrq", "classify-mrq"),
     "mrq.decide-next": ("decide-mrq", "decide-mrq"),
     "projections.build": ("publish", "build-projections"), "workflow.verify": ("publish", "verify-workflow"),
@@ -50,15 +51,15 @@ def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], boo
     job_id, step_id = LOCATION.get(operation, (str(work.get("job_id", "unknown")), operation.replace(".", "-")))
     configured = next(item for item in step_configurations(repo) if item["step"]["id"] == step_id)
     catalog = OPERATION_CATALOG[operation]
-    primary_role = {"mrq.discover-next": "analyzer", "mrq.classify-batches": "classifier", "mrq.decide-next": "researcher"}.get(operation, "")
+    primary_role = {"dif.classify-next": "analyzer", "mrq.consolidate": "grouper", "mrq.classify-batches": "classifier", "mrq.decide-next": "researcher"}.get(operation, "")
     role_policy = next((role for phase in configured["step"].get("agent_phases", []) for role in phase["roles"] if role["role_id"] == primary_role), None) if operation in AGENT_OPERATIONS else None
     profile_name = role_policy.get("agent_profile") if role_policy else None
     profile = (agent_profiles or {}).get(profile_name) if profile_name else None
     try:
-        pointers = {name: json.loads((repo / "research" / name).read_text(encoding="utf-8")) for name in ("active-source-generation.json", "active-diff-generation.json", "active-generation.json")}
+        pointers = {name: json.loads((repo / "research" / name).read_text(encoding="utf-8")) for name in ("active-source-generation.json", "active-diff-generation.json", "active-consolidation-generation.json")}
     except (OSError, json.JSONDecodeError):
         pointers = {}
-    context = {"actor": actor, "executor": catalog["executor"], "operation": operation, "operation_version": catalog["version"], "gate_id": work.get("gate_id"), "work_unit": work.get("work_unit"), "work_unit_id": (work.get("work_unit") or {}).get("id"), "source_generation_id": pointers.get("active-source-generation.json", {}).get("generation_id"), "diff_generation_id": pointers.get("active-diff-generation.json", {}).get("generation_id"), "canonical_generation_id": pointers.get("active-generation.json", {}).get("canonical_generation_id"), "index_key": (work.get("work_unit") or {}).get("index_key"), "index_keys": (work.get("work_unit") or {}).get("index_keys")}
+    context = {"actor": actor, "executor": catalog["executor"], "operation": operation, "operation_version": catalog["version"], "gate_id": work.get("gate_id"), "work_unit": work.get("work_unit"), "work_unit_id": (work.get("work_unit") or {}).get("id"), "source_generation_id": pointers.get("active-source-generation.json", {}).get("generation_id"), "diff_generation_id": pointers.get("active-diff-generation.json", {}).get("generation_id"), "canonical_generation_id": pointers.get("active-consolidation-generation.json", {}).get("mrq_generation_id"), "index_key": (work.get("work_unit") or {}).get("index_key"), "index_keys": (work.get("work_unit") or {}).get("index_keys")}
     runtime_payload = {"mode": "ensure"} if operation == "indexes.build" else ({"agent_profile": profile_name, "agent_profile_fingerprint": sha256(canonical_json(profile)) if profile else None, "model": profile.get("model") if profile else None, "instructions_version": profile.get("instructions_version") if profile else None, "environment_preset": profile.get("environment_preset") if profile else None, "instruction_supplement": role_policy.get("instruction_supplement", "") if role_policy else "", "agent_phases": configured["step"].get("agent_phases", []), "allowed_paths": (work.get("work_unit") or {}).get("allowed_paths", []), "tool_calls": [{"tool": "codex-cli", "sandbox": "read-only"}], "private_reasoning": "unavailable"} if operation in AGENT_OPERATIONS else ({**(source_routing_preview or {})} if operation == "sources.acquire" else {}))
     idempotency_key = sha256(canonical_json({"manifest_fingerprint": before["manifest_fingerprint"], "job_id": job_id, "step_id": step_id, "work_unit_id": (work.get("work_unit") or {}).get("id"), "source_generation_id": context["source_generation_id"], "diff_generation_id": context["diff_generation_id"], "canonical_generation_id": context["canonical_generation_id"], "parameters": configured["step"], "runtime_payload": runtime_payload}))
     accepted = store.accepted(idempotency_key)
@@ -138,7 +139,7 @@ def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], boo
                 store.emit("job.finished", run_id, {**context, "status": "blocked", "blocker": blocker, "duration_seconds": elapsed()}, job_id=job_id)
                 store.emit("run.finished", run_id, {**context, "status": "blocked", "blocker": blocker, "duration_seconds": elapsed()})
                 return {"run_id": run_id, "result": "blocked", "work": work, "proposal": proposal, "blocker": blocker}
-            canonical_operation = "mrq.propose" if operation == "mrq.discover-next" else "mrq.decide"
+            canonical_operation = "mrq.propose" if operation == "mrq.consolidate" else "mrq.decide"
             output = invoke(canonical_operation, proposal["payload"], lambda: bool(store.cancellation(run_id)))
         else:
             output = None

@@ -79,6 +79,9 @@ type AgentModel = {
   name: string;
   default_reasoning_effort: AgentProfile["reasoning_effort"];
   reasoning_efforts: AgentProfile["reasoning_effort"][];
+  input_context_tokens: number;
+  context_estimator_version: string;
+  capability_fingerprint: string;
 };
 type AgentRole = {
   role_id: string;
@@ -639,6 +642,11 @@ export function AgentProfiles({ project }: { project: Project }) {
                 {models.map((item) => <MenuItem key={item.id} value={item.id}>{item.name}</MenuItem>)}
               </Select>
             </FormControl>
+            {selectedModel && (
+              <Typography variant="caption" color="text.secondary">
+                Проверенная ёмкость входного контекста: {selectedModel.input_context_tokens.toLocaleString("ru-RU")} токенов · оценщик {selectedModel.context_estimator_version}
+              </Typography>
+            )}
             <FormControl>
               <InputLabel id="agent-reasoning-label">Уровень рассуждения</InputLabel>
               <Select labelId="agent-reasoning-label" label="Уровень рассуждения" value={selectedModel?.reasoning_efforts.includes(reasoning) ? reasoning : ""} onChange={(event) => setReasoning(event.target.value as AgentProfile["reasoning_effort"])}>
@@ -702,7 +710,8 @@ const STEP_NAMES: Record<string, string> = {
   "acquire-sources": "Получение исходников",
   "build-diffs": "Построение различий",
   "index-sources": "Индексация",
-  "discover-mrq": "Анализ DIF и формирование MRQ",
+  "analyze-dif": "Анализ DIF",
+  "consolidate-mrq": "Формирование и консолидация MRQ",
   "classify-mrq": "Формирование пакетов",
   "decide-mrq": "Исследование цели",
   "build-projections": "Построение проекций",

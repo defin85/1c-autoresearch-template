@@ -131,7 +131,7 @@ def test_cancel_is_idempotent_and_stage_lease_excludes_mrq(tmp_path: Path, monke
         run_id = response.json()["run_id"]
         assert started.wait(1)
         blocked = client.post(
-            f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/start",
+                f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/start",
             json={"actor": "local-user"},
             headers={**ORIGIN, "Idempotency-Key": "mrq"},
         )
@@ -151,7 +151,7 @@ def test_cancel_is_idempotent_and_stage_lease_excludes_mrq(tmp_path: Path, monke
 
 def test_saved_mrq_lease_blocks_stage_recompute_even_when_expired(tmp_path: Path) -> None:
     with DispatcherStore(REPO, tmp_path) as store:
-        assert store.acquire_lease("discover-mrq", "thread", "DIF-1", "owner", None)
+        assert store.acquire_lease("analyze-dif", "thread", "DIF-1", "owner", None)
         with store.conn:
             store.conn.execute("UPDATE dispatcher_leases SET renewed_at = '2000-01-01T00:00:00+00:00'")
         try:

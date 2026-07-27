@@ -276,10 +276,10 @@ def test_api_uses_repository_snapshot_and_typed_actions(tmp_path: Path, monkeypa
     with TestClient(app) as client:
         project = client.post("/api/v1/projects", json={"name": "example", "root": str(REPO)}, headers=headers).json()
         snapshot = client.get(f"/api/v1/projects/{project['id']}/workflow").json()
-        assert len(snapshot["gates"]) == 7
+        assert len(snapshot["gates"]) == 8
         configuration = client.get(f"/api/v1/projects/{project['id']}/workflow/configuration").json()
-        assert [job["id"] for job in configuration["jobs"]] == ["configure", "acquire-sources", "build-diffs", "index-sources", "discover-mrq", "classify-mrq", "decide-mrq", "publish"]
-        assert len(configuration["steps"]) == 9
+        assert [job["id"] for job in configuration["jobs"]] == ["configure", "acquire-sources", "build-diffs", "index-sources", "analyze-dif", "consolidate-mrq", "classify-mrq", "decide-mrq", "publish"]
+        assert len(configuration["steps"]) == 10
         registry = client.get(f"/api/v1/projects/{project['id']}/registries/diff-inventory?offset=0&limit=1").json()
         assert len(registry["items"]) <= 1 and registry["limit"] == 1
         rejected = client.post(f"/api/v1/projects/{project['id']}/actions", json={"operation": "shell", "payload": {"command": "rm"}, "expected_fingerprint": snapshot["workflow_fingerprint"]}, headers=headers | {"Idempotency-Key": "run-1"})
@@ -332,11 +332,11 @@ def test_api_uses_repository_snapshot_and_typed_actions(tmp_path: Path, monkeypa
         configured = client.put(f"/api/v1/projects/{project['id']}/agent-profiles/local", json={"profile": agent}, headers=headers | {"Idempotency-Key": "agent-profile-1"})
         assert configured.status_code == 200 and client.get(f"/api/v1/projects/{project['id']}/agent-profiles").json()["items"] == {"local": agent}
         assert (tmp_path / "state/projects" / project["id"] / "agent-profiles.json").stat().st_mode & 0o777 == 0o600
-        discover = next(item for item in configuration["steps"] if item["step"]["id"] == "discover-mrq")
+        discover = next(item for item in configuration["steps"] if item["step"]["id"] == "analyze-dif")
         preview = client.post(
             f"/api/v1/projects/{project['id']}/workflow/patch-preview",
             json={
-                "step_id": "discover-mrq",
+                "step_id": "analyze-dif",
                 "parameters": {"agent_phases": discover["step"]["agent_phases"]},
                 "expected_manifest_fingerprint": configuration["manifest_fingerprint"],
             },
@@ -455,7 +455,7 @@ def test_security_boundary_rejects_traversal_and_redacts_conflicts(tmp_path: Pat
         project = client.post("/api/v1/projects", json={"name": "example", "root": str(REPO)}, headers=headers).json()
         assert client.get(f"/api/v1/projects/{project['id']}/artifacts/../../project.toml").status_code == 404
         artifact = client.get(f"/api/v1/projects/{project['id']}/artifacts/outputs/projections.json")
-        assert artifact.status_code == 200 and artifact.headers["content-security-policy"] == "sandbox" and artifact.headers["content-disposition"].startswith("attachment")
+        assert artifact.status_code == 404
         monkeypatch.setattr("one_c_autoresearch.service.ApplicationService.apply", lambda *_: (_ for _ in ()).throw(RuntimeError("--db-pwd=plain-secret")))
         snapshot = client.get(f"/api/v1/projects/{project['id']}/workflow").json()
         response = client.post(f"/api/v1/projects/{project['id']}/actions", json={"operation": "workflow.verify", "payload": {}, "expected_fingerprint": snapshot["workflow_fingerprint"]}, headers=headers | {"Idempotency-Key": "conflict"})

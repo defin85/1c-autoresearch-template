@@ -3,7 +3,7 @@
   "project_sections": ["paths", "source_roles", "parallel_research", "physical_cleanup", "rlm", "autopilot"],
   "path_prefixes": [
     "analysis/queue/", "analysis/reverse-map/", "analysis/subject-cards/", "analysis/functional-gaps/",
-    "analysis/research-review/", "analysis/customization-registry/", "analysis/parallel-research/",
+    "analysis/research-review/", "analysis/parallel-research/",
     "analysis/clean-comparison/", "analysis/detail-maps/", "analysis/features/", "analysis/runs/"
   ],
   "exact_paths": [
@@ -22,7 +22,6 @@
     "analysis/migration-requirements/schemas/migration-requirement.schema.json",
     "docs/method/1c-autoresearch-process.md",
     "docs/method/autopilot-customization-map.md",
-    "docs/method/customization-registry-bootstrap.md",
     "docs/method/evidence-pack-schema.md",
     "docs/method/functional-gap-goal.md",
     "docs/method/manual-markup-goal.md",
@@ -60,7 +59,7 @@
   ],
   "modules": [
     "analysis_work_planner.py", "autopilot.py", "bootstrap.py", "clean_rebase.py", "configuration_source_parser.py",
-    "custom_metadata_inventory.py", "customization_registry.py", "customer_register.py", "detail_maps.py",
+    "custom_metadata_inventory.py", "customer_register.py", "detail_maps.py",
     "detailed_customer_register.py", "detailed_register_reverse_review.py", "external_processing.py", "final_gate.py",
     "functional_gap_dashboard.py", "functional_gap_probes.py", "functional_gaps.py", "manual_cleanup.py",
     "migration_requirements.py", "parallel_research.py", "queue.py", "queue_seed.py", "research_review.py",
@@ -69,7 +68,7 @@
   ],
   "command_tokens": [
     "queue", "reverse-map", "functional-gap", "parallel-research", "manual-cleanup", "autopilot", "clean-rebase",
-    "configuration-source", "custom-metadata", "customization-registry", "v8unpack-refinement",
+    "configuration-source", "custom-metadata", "v8unpack-refinement",
     "v8unpack-autopilot-realign", "final-gate", "review-dashboard", "research-review", "detail-map", "subject-card",
     "customer-register", "detailed-customer-register", "detailed-register-reverse-review", "external-processing", "new-repo"
   ],

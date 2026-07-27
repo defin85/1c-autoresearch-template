@@ -17,7 +17,7 @@ const REQUIRED_ZONES = [
   'analyze-dif-window', 'analyze-workers', 'analyze-meaning', 'analyze-noise',
   'form-meaning', 'form-coordinator', 'form-groupers', 'form-proposals', 'form-review', 'form-publication',
   'classify-input', 'classify-workers', 'classify-validation', 'classify-batches',
-  'decide-mrq-queue', 'decide-target-base', 'decide-researchers', 'decide-approval', 'decide-outcomes', 'decide-summary',
+  'decide-mrq-queue', 'decide-target-base', 'decide-researchers', 'decide-summary',
 ] as const;
 const NEW_REQUIRED_ZONES = REQUIRED_ZONES.filter((zone) =>
   !['vendor-baseline', 'target-cf', 'next-vendor'].includes(zone));
@@ -128,7 +128,7 @@ async function openFixture(page: Page, initialProjection: DispatcherProjection =
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify({ job_id: 'discover-mrq', action: 'retry', outcome: { status: 'running', run_id: 'run-new', thread_id: 'thread-new', revision: projection.revision + 1, summary: {} } }),
+      body: JSON.stringify({ job_id: 'analyze-dif', action: 'retry', outcome: { status: 'running', run_id: 'run-new', thread_id: 'thread-new', revision: projection.revision + 1, summary: {} } }),
     });
   });
   await page.route('**/api/v1/projects/fixture/events?*', (route) => route.fulfill({
@@ -386,12 +386,13 @@ test('the sole dispatcher sends one approved action with the workflow fingerprin
   const projection = structuredClone(approvalProjection);
   projection.items.proposals[0] = {
     ...projection.items.proposals[0],
-    job_id: 'discover-mrq',
+    job_id: 'consolidate-mrq',
     kind: 'approval',
-    approval_stage: 'batch',
+    approval_stage: 'consolidation',
   };
   const ledger = await openFixture(page, projection);
-  await page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="analysis"]').click();
+  projection.jobs = { 'consolidate-mrq': { ...projection.jobs['analyze-dif'], job_id: 'consolidate-mrq' } };
+  await page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="mrq"]').click();
   await page.getByRole('button', { name: 'Одобрить предложение' }).click();
   await expect.poll(() => ledger.actionRequests.length).toBe(1);
   expect(ledger.actionRequests[0]).toMatchObject({
@@ -402,7 +403,7 @@ test('the sole dispatcher sends one approved action with the workflow fingerprin
       expected_fingerprint: 'sha256:fixture',
     },
   });
-  expect(ledger.actionRequests[0].url).toContain('/dispatcher/discover-mrq/approve-batch');
+  expect(ledger.actionRequests[0].url).toContain('/dispatcher/consolidate-mrq/approve-consolidation');
   expect(ledger.actionRequests[0].idempotencyKey).toBeTruthy();
 });
 
@@ -564,7 +565,7 @@ test('dispatcher exposes factual error state and keyboard interaction without lo
   await expect(page.getByRole('heading', { name: 'Диспетчер исследования' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Журнал', exact: true }).first()).toBeVisible();
   await expect(page.getByRole('button', { name: 'Реестры', exact: true }).first()).toBeVisible();
-  await expect(page.getByRole('region', { name: /вложенные зоны/ }).first()).toHaveAttribute('tabindex', '0');
+  await expect(page.getByRole('region', { name: /содержимое/ }).first()).toHaveAttribute('tabindex', '0');
   expect(consoleErrors).toEqual([]);
   expect(pageErrors).toEqual([]);
 });
@@ -590,8 +591,8 @@ test('dispatcher saturated projection is factual, bounded and candidate-ready at
   await expect(page.locator('[data-zone="analyze-workers"], [data-zone="form-coordinator"], [data-zone="form-groupers"], [data-zone="classify-workers"], [data-zone="decide-researchers"]')).toHaveCount(5);
   await expect(page.locator('[data-invocation-id]')).toHaveCount(0);
   await expect(page.locator('[data-zone="analyze-workers"]')).toContainText('Вызовов:');
-  await expect(page.locator('[data-zone="decide-target-base"]')).toContainText('Версия и размер не подтверждены');
-  await expect(page.locator('[data-zone="classify-input"]')).toContainText('MRQ-00001 · MRQ-00002');
+  await expect(page.locator('[data-zone="decide-target-base"]')).toContainText('Ожидают одобрения: 1');
+  await expect(page.locator('[data-zone="classify-input"]')).toContainText('MRQ: 6');
   if (process.env.UPDATE_FIVE_STAGE_VISUALS === '1') {
     await page.screenshot({ path: path.join(CHANGE_ASSETS, 'dispatcher-new-five-stage-saturated-1920x1080-candidate.png'), animations: 'disabled' });
     return;
@@ -653,7 +654,7 @@ test('dispatcher agent focus falls back after SSE removal and its local failure 
 
   const broken = structuredClone(next);
   broken.revision += 1;
-  (broken.items as unknown as { mrqs: unknown }).mrqs = null;
+  (broken.items as unknown as { dif_queue: unknown }).dif_queue = null;
   await ledger.publish(broken, 2);
   await expect(page.getByText(/Холст диспетчера недоступен/)).toBeVisible();
   await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();

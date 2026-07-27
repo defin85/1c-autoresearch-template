@@ -134,9 +134,9 @@ def test_cancellation_stops_before_effect(tmp_path: Path, monkeypatch):
 def test_agent_proposal_requires_a_separate_approved_run(tmp_path: Path, monkeypatch):
     before = {"workflow_fingerprint": "sha256:x", "manifest_fingerprint": "sha256:m", "state": "ready", "gates": []}
     after = {**before, "workflow_fingerprint": "sha256:y"}
-    work = {"action": "mrq.discover-next", "gate_id": "diffs-classified", "work_unit": {"id": "DIF-AAAAAAAAAAAAAAAA", "allowed_paths": ["configuration/a.bsl"]}, "blocker": {"code": "mrq.ownership", "message": "missing", "action": "mrq.discover-next"}}
+    work = {"action": "dif.classify-next", "gate_id": "diffs-classified", "work_unit": {"id": "DIF-AAAAAAAAAAAAAAAA", "allowed_paths": ["configuration/a.bsl"]}, "blocker": {"code": "mrq.ownership", "message": "missing", "action": "dif.classify-next"}}
     monkeypatch.setattr("one_c_autoresearch.runner.status", lambda _repo: before)
-    monkeypatch.setattr("one_c_autoresearch.runner.step_configurations", lambda _repo: [{"step": {"id": "discover-mrq", "operation": "mrq.discover-next", "operation_version": "2", "timeout_seconds": 1800, "agent_phases": [{"phase_id": "analyze-dif", "mode": "parallel-pool", "max_concurrency": 4, "roles": [{"role_id": "analyzer", "agent_profile": "local", "count": 4, "instruction_supplement": ""}]}]}}])
+    monkeypatch.setattr("one_c_autoresearch.runner.step_configurations", lambda _repo: [{"step": {"id": "analyze-dif", "operation": "dif.classify-next", "operation_version": "2", "timeout_seconds": 1800, "agent_phases": [{"phase_id": "analyze-dif", "mode": "parallel-pool", "max_concurrency": 4, "roles": [{"role_id": "analyzer", "agent_profile": "local", "count": 4, "instruction_supplement": ""}]}]}}])
     proposal = {"semantic_key": "requirement", "title": "Requirement", "stable_diff_ids": [work["work_unit"]["id"]], "supporting_diff_ids": [], "evidence": [{"path": "configuration/a.bsl", "fingerprint": "sha256:" + "a" * 64, "stable_diff_id": work["work_unit"]["id"]}], "business_meaning": "Meaning", "scope": "Scope", "confidence": "high", "rationale": "Evidence"}
     agent_calls = 0
     def agent(*_args):
@@ -146,7 +146,7 @@ def test_agent_proposal_requires_a_separate_approved_run(tmp_path: Path, monkeyp
         applied.append((operation, payload)); monkeypatch.setattr("one_c_autoresearch.runner.status", lambda _repo: after); return {"mrq_id": "MRQ-X"}
     store = EventStore(tmp_path / "events", "project")
     profile = {"local": {"provider": "codex-cli", "model": "gpt-5", "reasoning_effort": "high", "instructions_version": "1", "environment_preset": "local-read-only"}}
-    first = run_next(tmp_path, invoke, store, select=lambda: work, approved_operations={"mrq.discover-next"}, agent_profiles=profile, agent_executor=agent)
+    first = run_next(tmp_path, invoke, store, select=lambda: work, approved_operations={"dif.classify-next"}, agent_profiles=profile, agent_executor=agent)
     assert first["result"] == "blocked"
     assert first["blocker"]["code"] == "dispatcher.required"
     assert not applied and agent_calls == 0 and store.events() == []

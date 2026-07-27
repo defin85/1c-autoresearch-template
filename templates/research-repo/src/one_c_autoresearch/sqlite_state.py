@@ -276,6 +276,20 @@ def _ensure_dispatcher_tables(conn) -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS workflow_migration_runs (
+                migration_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                lease_token TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                repository_fingerprint TEXT NOT NULL,
+                workflow_fingerprint TEXT NOT NULL,
+                legacy_lease_preimage TEXT,
+                legacy_audit_ids TEXT NOT NULL,
+                journal_seed TEXT NOT NULL,
+                result TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         columns = {row[1] for row in cur.execute("PRAGMA table_info(dispatcher_leases)")}
@@ -547,6 +561,12 @@ class DispatcherStore:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
+                if job_id == "workflow-migration":
+                    return None
+                if job_id != "workflow-migration" and cur.execute(
+                    "SELECT 1 FROM dispatcher_leases WHERE job_id = 'workflow-migration'"
+                ).fetchone():
+                    return None
                 if job_id != "stage-recompute":
                     cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = 'stage-recompute'")
                     if cur.fetchone() is not None:
@@ -597,6 +617,276 @@ class DispatcherStore:
             finally:
                 cur.close()
         return lease_token
+
+    def acquire_workflow_migration(
+        self,
+        migration_id: str,
+        *,
+        owner: str,
+        process_identity: dict | None,
+        repository_fingerprint: str,
+        workflow_fingerprint: str,
+        journal_seed: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Атомарно заменяет допустимую старую аренду глобальным барьером миграции."""
+
+        now = _now_iso()
+        token = str(uuid.uuid4())
+        thread_id = f"workflow-migration:{migration_id}"
+        with repository_lock(self.repo), self._lock, self.conn:
+            cur = self.conn.cursor()
+            try:
+                prior = cur.execute(
+                    "SELECT migration_id, status, lease_token, thread_id, result "
+                    "FROM workflow_migration_runs WHERE migration_id = ?",
+                    (migration_id,),
+                ).fetchone()
+                if prior is not None:
+                    return {
+                        "migration_id": prior[0],
+                        "status": prior[1],
+                        "lease_token": prior[2],
+                        "thread_id": prior[3],
+                        "result": json.loads(prior[4]) if prior[4] else None,
+                    }
+                leases = cur.execute(
+                    "SELECT job_id, thread_id, work_unit_id, run_id, "
+                    "execution_snapshot_fingerprint, owner, process_identity, acquired_at, "
+                    "renewed_at, state, summary, lease_token FROM dispatcher_leases ORDER BY job_id"
+                ).fetchall()
+                if any(row[0] != "discover-mrq" for row in leases) or len(leases) > 1:
+                    return None
+                legacy = None
+                audit_ids: dict[str, list[str]] = {
+                    "invocation_ids": [], "phase_work_ids": [], "approval_keys": [],
+                }
+                if leases:
+                    row = leases[0]
+                    if row[9] not in {"running", "resumable"}:
+                        return None
+                    keys = (
+                        "job_id", "thread_id", "work_unit_id", "run_id",
+                        "execution_snapshot_fingerprint", "owner", "process_identity",
+                        "acquired_at", "renewed_at", "state", "summary", "lease_token",
+                    )
+                    legacy = dict(zip(keys, row, strict=True))
+                    legacy["process_identity"] = json.loads(legacy["process_identity"]) if legacy["process_identity"] else None
+                    legacy["summary"] = json.loads(legacy["summary"]) if legacy["summary"] else {}
+                    run_id = str(legacy["run_id"])
+                    audit_ids["invocation_ids"] = [
+                        str(item[0]) for item in cur.execute(
+                            "SELECT invocation_id FROM dispatcher_invocations "
+                            "WHERE job_id = 'discover-mrq' AND run_id = ?",
+                            (run_id,),
+                        )
+                    ]
+                    audit_ids["phase_work_ids"] = [
+                        "|".join(map(str, item)) for item in cur.execute(
+                            "SELECT run_id, phase_id, role_id, work_unit_id "
+                            "FROM dispatcher_phase_work WHERE job_id = 'discover-mrq' AND run_id = ?",
+                            (run_id,),
+                        )
+                    ]
+                    audit_ids["approval_keys"] = [
+                        str(item[0]) for item in cur.execute(
+                            "SELECT key FROM dispatcher_proposals "
+                            "WHERE job_id = 'discover-mrq' AND thread_id = ? "
+                            "AND kind = 'approval' AND consumed_at IS NULL",
+                            (str(legacy["thread_id"]),),
+                        )
+                    ]
+                    cur.execute(
+                        "UPDATE dispatcher_proposals SET consumed_at = ? "
+                        "WHERE job_id = 'discover-mrq' AND thread_id = ? "
+                        "AND kind = 'approval' AND consumed_at IS NULL",
+                        (now, str(legacy["thread_id"])),
+                    )
+                    _terminalize_rows(
+                        cur, audit_ids["invocation_ids"], "interrupted", now,
+                        error_code="interrupted",
+                        error_summary="legacy workflow interrupted by version-4 migration",
+                    )
+                    cur.execute(
+                        "UPDATE dispatcher_phase_work SET status = 'interrupted', updated_at = ? "
+                        "WHERE job_id = 'discover-mrq' AND run_id = ? "
+                        "AND status IN ('queued', 'running')",
+                        (now, run_id),
+                    )
+                    cur.execute("DELETE FROM dispatcher_leases WHERE job_id = 'discover-mrq'")
+                cur.execute(
+                    "INSERT INTO dispatcher_leases "
+                    "(job_id, thread_id, work_unit_id, run_id, execution_snapshot_fingerprint, "
+                    "owner, process_identity, acquired_at, renewed_at, state, summary, lease_token) "
+                    "VALUES ('workflow-migration', ?, ?, ?, '', ?, ?, ?, ?, 'running', ?, ?)",
+                    (
+                        thread_id, migration_id, migration_id, owner,
+                        canonical_json(process_identity).decode() if process_identity else None,
+                        now, now,
+                        canonical_json({"phase": "handoff_prepared"}).decode(), token,
+                    ),
+                )
+                cur.execute(
+                    "INSERT INTO workflow_migration_runs "
+                    "(migration_id, status, lease_token, thread_id, repository_fingerprint, "
+                    "workflow_fingerprint, legacy_lease_preimage, legacy_audit_ids, journal_seed, "
+                    "result, created_at, updated_at) "
+                    "VALUES (?, 'handoff_prepared', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                    (
+                        migration_id, token, thread_id, repository_fingerprint,
+                        workflow_fingerprint,
+                        canonical_json(legacy).decode() if legacy else None,
+                        canonical_json(audit_ids).decode(),
+                        canonical_json(journal_seed).decode(), now, now,
+                    ),
+                )
+            finally:
+                cur.close()
+        return {
+            "migration_id": migration_id,
+            "status": "handoff_prepared",
+            "lease_token": token,
+            "thread_id": thread_id,
+            "result": None,
+        }
+
+    def workflow_migration(self, migration_id: str | None = None) -> dict[str, Any] | None:
+        with self._lock:
+            sql = (
+                "SELECT migration_id, status, lease_token, thread_id, repository_fingerprint, "
+                "workflow_fingerprint, legacy_lease_preimage, legacy_audit_ids, journal_seed, "
+                "result, created_at, updated_at FROM workflow_migration_runs"
+            )
+            parameters: tuple[Any, ...] = ()
+            if migration_id is not None:
+                sql += " WHERE migration_id = ?"
+                parameters = (migration_id,)
+            sql += " ORDER BY created_at DESC LIMIT 1"
+            row = self.conn.execute(sql, parameters).fetchone()
+        if row is None:
+            return None
+        keys = (
+            "migration_id", "status", "lease_token", "thread_id",
+            "repository_fingerprint", "workflow_fingerprint", "legacy_lease_preimage",
+            "legacy_audit_ids", "journal_seed", "result", "created_at", "updated_at",
+        )
+        result = dict(zip(keys, row, strict=True))
+        for key in ("legacy_lease_preimage", "legacy_audit_ids", "journal_seed", "result"):
+            result[key] = json.loads(result[key]) if result[key] else None
+        return result
+
+    def update_workflow_migration(
+        self,
+        migration_id: str,
+        lease_token: str,
+        status: str,
+        result: dict[str, Any] | None = None,
+        *,
+        release: bool = False,
+    ) -> bool:
+        with repository_lock(self.repo), self._lock, self.conn:
+            cur = self.conn.cursor()
+            try:
+                changed = cur.execute(
+                    "UPDATE workflow_migration_runs SET status = ?, result = ?, updated_at = ? "
+                    "WHERE migration_id = ? AND lease_token = ? AND EXISTS "
+                    "(SELECT 1 FROM dispatcher_leases WHERE job_id = 'workflow-migration' "
+                    "AND lease_token = ?)",
+                    (
+                        status,
+                        canonical_json(result).decode() if result is not None else None,
+                        _now_iso(), migration_id, lease_token, lease_token,
+                    ),
+                ).rowcount
+                if changed and release:
+                    cur.execute(
+                        "DELETE FROM dispatcher_leases "
+                        "WHERE job_id = 'workflow-migration' AND lease_token = ?",
+                        (lease_token,),
+                    )
+                return changed == 1
+            finally:
+                cur.close()
+
+    def rollback_workflow_migration(
+        self,
+        migration_id: str,
+        lease_token: str,
+        backup_path: Path,
+        result: dict[str, Any],
+    ) -> bool:
+        """Восстанавливает неарендные таблицы и оставляет старую работу прерванной."""
+
+        with repository_lock(self.repo), self._lock, self.conn:
+            cur = self.conn.cursor()
+            backup = sqlite3.connect(backup_path)
+            try:
+                if not cur.execute(
+                    "SELECT 1 FROM dispatcher_leases "
+                    "WHERE job_id = 'workflow-migration' AND lease_token = ?",
+                    (lease_token,),
+                ).fetchone():
+                    return False
+                tables = [
+                    str(row[0])
+                    for row in backup.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+                        "AND name NOT IN ('dispatcher_leases', 'workflow_migration_runs')"
+                    )
+                    if cur.execute(
+                        "SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?",
+                        (str(row[0]),),
+                    ).fetchone()
+                ]
+                for table in tables:
+                    quoted = '"' + table.replace('"', '""') + '"'
+                    rows = backup.execute(f"SELECT * FROM {quoted}").fetchall()
+                    cur.execute(f"DELETE FROM main.{quoted}")
+                    if rows:
+                        placeholders = ",".join("?" for _ in rows[0])
+                        cur.executemany(
+                            f"INSERT INTO main.{quoted} VALUES ({placeholders})", rows
+                        )
+                invocation_ids = [
+                    str(row[0])
+                    for row in cur.execute(
+                        "SELECT invocation_id FROM dispatcher_invocations "
+                        "WHERE job_id = 'discover-mrq' AND status = 'running'"
+                    )
+                ]
+                _terminalize_rows(
+                    cur, invocation_ids, "interrupted", _now_iso(),
+                    error_code="interrupted",
+                    error_summary="legacy workflow remains interrupted after migration rollback",
+                )
+                cur.execute(
+                    "UPDATE dispatcher_phase_work SET status = 'interrupted', updated_at = ? "
+                    "WHERE job_id = 'discover-mrq' AND status IN ('queued', 'running')",
+                    (_now_iso(),),
+                )
+                cur.execute(
+                    "UPDATE dispatcher_proposals SET consumed_at = ? "
+                    "WHERE job_id = 'discover-mrq' AND kind = 'approval' "
+                    "AND consumed_at IS NULL",
+                    (_now_iso(),),
+                )
+                cur.execute(
+                    "UPDATE workflow_migration_runs SET status = 'rolled_back', result = ?, "
+                    "updated_at = ? WHERE migration_id = ? AND lease_token = ?",
+                    (
+                        canonical_json(result).decode(), _now_iso(),
+                        migration_id, lease_token,
+                    ),
+                )
+                cur.execute(
+                    "DELETE FROM dispatcher_leases "
+                    "WHERE job_id = 'workflow-migration' AND lease_token = ?",
+                    (lease_token,),
+                )
+                return True
+            finally:
+                backup.close()
+                cur.close()
 
     def renew_lease(self, job_id: str, lease_token: str, state: str | None = None, summary: dict | None = None) -> bool:
         """Обновляет аренду, если она всё ещё принадлежит активному владельцу."""

@@ -42,7 +42,7 @@ def legacy_failures(repo: Path, manifest: dict[str, Any], tracked: list[str]) ->
 
 def check(repo: Path, strict: bool = False) -> dict[str, Any]:
     repo = repo.resolve(); failures: list[dict[str, str]] = []; warnings: list[dict[str, str]] = []
-    required = ("project.toml", "research/workflow.toml", "research/infobases.toml", "research/external-artifacts.toml", "research/indexing.toml", "research/forbidden-authorities.json")
+    required = ("project.toml", "research/workflow.toml", "research/infobases.toml", "research/external-artifacts.toml", "research/indexing.toml", "research/forbidden-authorities.json", "research/active-consolidation-generation.json")
     missing = [path for path in required if not (repo / path).is_file()]
     if missing:
         failure = {"code": "contract.unsupported", "path": missing[0], "message": "unsupported repository contract; recreate the repository instead of migrating it"}
@@ -68,18 +68,26 @@ def check(repo: Path, strict: bool = False) -> dict[str, Any]:
                 failures.append({"code": "secret.tracked", "path": relative, "message": "tracked secret-like field"})
     try: validate_workflow(repo)
     except ValueError as exc: failures.append({"code": "workflow.invalid", "path": "research/workflow.toml", "message": str(exc)})
+    try:
+        from .consolidation import load_active as load_consolidation
+        load_consolidation(repo)
+        if (repo / "research/active-dif-classification-generation.json").is_file():
+            from .dif_classifications import load_active as load_classifications
+            load_classifications(repo)
+    except (ValueError, OSError, KeyError, json.JSONDecodeError) as exc:
+        failures.append({"code": "generated-state.invalid", "path": "research/", "message": str(exc)})
     try: snapshot = status(repo)
     except (ValueError, RuntimeError, OSError, KeyError) as exc:
         snapshot = None; failures.append({"code": "workflow.unreadable", "path": "research/", "message": str(exc)})
-    if strict and snapshot and snapshot["state"] != "complete": failures.append({"code": "workflow.incomplete", "path": "research/", "message": "all seven gates must be complete for strict publication"})
+    if strict and snapshot and snapshot["state"] != "complete": failures.append({"code": "workflow.incomplete", "path": "research/", "message": "all eight gates must be complete for strict publication"})
     if strict:
         try:
             validate_active(repo, deep=True, require_tracked_clean=True)
             from .diffs import validate_active as validate_active_diffs
-            from .mrq import active as active_mrq
+            from .consolidation import load_active as active_consolidation
             from .contracts import require_tracked_clean
             validate_active_diffs(repo, require_tracked_clean_state=True)
-            active_mrq(repo, require_tracked_clean_state=True)
+            active_consolidation(repo)
             require_tracked_clean(repo, [repo / "outputs/projections.json"])
         except (ValueError, OSError, KeyError, json.JSONDecodeError) as exc: failures.append({"code": "sources.not-publishable", "path": "sources/", "message": str(exc)})
     return {"ok": not failures, "strict": strict, "failures": failures, "warnings": warnings, "snapshot": snapshot, "summary": {"fail": len(failures), "warn": len(warnings)}}

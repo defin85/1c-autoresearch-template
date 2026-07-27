@@ -241,6 +241,29 @@ def _component_id(evidence: dict[str, Any], diffs: dict[str, dict[str, str]], co
 def source_mrq_payload(repo: Path, generation_id: str | None = None) -> tuple[str, str, list[dict[str, Any]]]:
     """Возвращает канонический предобраз и отпечаток разрешённых исходных полей MRQ."""
 
+    from .consolidation import load_active as load_consolidation
+    consolidated = load_consolidation(repo)
+    if consolidated["pointer"]["state"] == "active":
+        evidence_by_mrq: dict[str, list[dict[str, Any]]] = {}
+        for row in consolidated["mrq"]["evidence.jsonl"]:
+            evidence_by_mrq.setdefault(row["mrq_id"], []).append(row)
+        records = []
+        for mrq in consolidated["mrq"]["mrq.jsonl"]:
+            evidence = sorted(evidence_by_mrq.get(mrq["mrq_id"], []), key=canonical_json)
+            records.append({
+                "mrq_id": mrq["mrq_id"],
+                "semantic_key": mrq.get("semantic_key", ""),
+                "title": mrq.get("title", ""),
+                "business_meaning": mrq.get("business_meaning", ""),
+                "scope": mrq.get("scope", ""),
+                "primary_dif_ids": sorted({item["stable_diff_id"] for item in evidence}),
+                "supporting_dif_ids": [],
+                "source_component_ids": [],
+                "source_evidence": evidence,
+            })
+        payload = {"schema_version": SCHEMA_VERSION, "window_algorithm_version": WINDOW_ALGORITHM_VERSION, "mrqs": records}
+        return consolidated["pointer"]["mrq_generation_id"], "sha256:" + sha256(canonical_json(payload)), records
+
     pointer, mrqs, dispositions, diffs, components = _source_inputs(repo, generation_id)
     relations: dict[str, list[dict[str, Any]]] = {}
     for row in dispositions:
@@ -330,12 +353,27 @@ def publish(repo: Path, batches: list[MRQBatch], expected_source_mrq_fingerprint
         origin_id, current_fingerprint, records = source_mrq_payload(repo)
         if current_fingerprint != expected_source_mrq_fingerprint:
             raise RuntimeError("stale source MRQ fingerprint")
-        pointer_path = repo / "research/active-generation.json"
-        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-        existing = pointer.get("batch_generation")
-        if existing and existing.get("source_mrq_fingerprint") == current_fingerprint:
-            load_active(repo)
-            return existing
+        from .consolidation import load_active as load_consolidation
+        aggregate = load_consolidation(repo)["pointer"]
+        if aggregate["state"] == "active":
+            existing_id = aggregate.get("batch_generation_id")
+            if existing_id and aggregate.get("batch_input_fingerprint") == current_fingerprint:
+                load_active(repo)
+                root = repo / "analysis/migration-requirements/batch-generations" / existing_id
+                payload = (root / "batches.jsonl").read_bytes()
+                return {
+                    "generation_id": existing_id,
+                    "result_fingerprint": "sha256:" + sha256(payload),
+                    "source_mrq_fingerprint": current_fingerprint,
+                    "origin_canonical_generation_id": origin_id,
+                }
+        else:
+            legacy_pointer_path = repo / "research/active-generation.json"
+            legacy_pointer = json.loads(legacy_pointer_path.read_text(encoding="utf-8"))
+            existing = legacy_pointer.get("batch_generation")
+            if existing and existing.get("source_mrq_fingerprint") == current_fingerprint:
+                load_active(repo)
+                return existing
         rows = [_batch_row(batch) for batch in batches]
         validate_rows(rows, records)
         payload = b"".join(canonical_json(row) + b"\n" for row in rows)
@@ -366,21 +404,43 @@ def publish(repo: Path, batches: list[MRQBatch], expected_source_mrq_fingerprint
             "source_mrq_fingerprint": current_fingerprint,
             "origin_canonical_generation_id": origin_id,
         }
-        atomic_json(pointer_path, {**pointer, "batch_generation": binding})
+        if aggregate["state"] == "active":
+            from .consolidation import replace_downstream_binding
+            replace_downstream_binding(
+                repo, "batch", generation_id, current_fingerprint,
+                expected_transaction_id=aggregate["transaction_id"],
+                already_locked=True,
+            )
+        else:
+            atomic_json(legacy_pointer_path, {**legacy_pointer, "batch_generation": binding})
         return binding
 
 
 def load_active(repo: Path) -> list[MRQBatch]:
     """Проверяет активную привязку и возвращает только опубликованные пакеты."""
 
-    pointer = json.loads((repo / "research/active-generation.json").read_text(encoding="utf-8"))
-    binding = pointer.get("batch_generation")
-    if not isinstance(binding, dict):
-        raise ValueError("active MRQ batch generation is missing")
-    origin_id, source_fingerprint, records = source_mrq_payload(repo)
-    if binding.get("source_mrq_fingerprint") != source_fingerprint:
-        raise ValueError("active MRQ batch generation is stale")
-    generation_id = str(binding.get("generation_id") or "")
+    from .consolidation import load_active as load_consolidation
+    pointer = load_consolidation(repo)["pointer"]
+    if pointer["state"] != "active":
+        legacy = json.loads((repo / "research/active-generation.json").read_text(encoding="utf-8"))
+        binding = legacy.get("batch_generation")
+        if not isinstance(binding, dict):
+            raise ValueError("active MRQ batch generation is missing")
+        origin_id, source_fingerprint, records = source_mrq_payload(repo)
+        if binding.get("source_mrq_fingerprint") != source_fingerprint:
+            raise ValueError("active MRQ batch generation is stale")
+        generation_id = str(binding.get("generation_id") or "")
+    else:
+        binding = None
+    if not pointer.get("batch_generation_id"):
+        if pointer["state"] == "active":
+            raise ValueError("active MRQ batch generation is missing")
+    if pointer["state"] == "active":
+        origin_id, source_fingerprint, records = source_mrq_payload(repo)
+        if pointer.get("batch_input_fingerprint") != source_fingerprint:
+            raise ValueError("active MRQ batch generation is stale")
+        generation_id = str(pointer["batch_generation_id"])
+        binding = {"generation_id": generation_id, "source_mrq_fingerprint": source_fingerprint, "origin_canonical_generation_id": origin_id}
     root = repo / "analysis/migration-requirements/batch-generations" / generation_id
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     payload = (root / "batches.jsonl").read_bytes()
@@ -397,8 +457,6 @@ def load_active(repo: Path) -> list[MRQBatch]:
     expected_generation = sha256(canonical_json(expected_manifest))
     if manifest != {**expected_manifest, "generation_id": expected_generation} or generation_id != expected_generation:
         raise ValueError("active MRQ batch manifest is corrupt")
-    if binding.get("result_fingerprint") != expected_manifest["result_fingerprint"]:
-        raise ValueError("active MRQ batch result fingerprint mismatch")
     validate_rows(rows, records)
     return [
         MRQBatch(row["batch_id"], tuple(row["mrq_ids"]), row["basis"], tuple(row["anchor_component_ids"]))

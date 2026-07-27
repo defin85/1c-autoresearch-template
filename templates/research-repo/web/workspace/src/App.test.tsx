@@ -215,7 +215,7 @@ test("agent profile explains the read-only environment and persists it", async (
       json: async () => init?.method === "PUT"
         ? {}
         : _url.endsWith("/agent-capabilities")
-          ? { models: [{ id: "gpt-5.6-sol", name: "GPT-5.6-Sol", default_reasoning_effort: "low", reasoning_efforts: ["low", "max", "ultra"] }] }
+          ? { models: [{ id: "gpt-5.6-sol", name: "GPT-5.6-Sol", default_reasoning_effort: "low", reasoning_efforts: ["low", "max", "ultra"], input_context_tokens: 272000, context_estimator_version: "utf8-v1", capability_fingerprint: "sha256:test" }] }
           : { items: {} },
     }),
   );
@@ -249,10 +249,10 @@ test("workflow preview is invalidated by edits and apply uses the reviewed param
     manifest_fingerprint: "sha256:manifest",
     jobs: [],
     steps: [{
-      job_id: "discover-mrq",
+      job_id: "analyze-dif",
       step: {
         id: "step-1",
-        operation: "mrq.discover-next",
+        operation: "dif.classify-next",
         timeout_seconds: 1800,
         agent_phases: [phase],
       },
@@ -326,10 +326,10 @@ test("workflow editor shows a server topology error", async () => {
     manifest_fingerprint: "sha256:manifest",
     jobs: [],
     steps: [{
-      job_id: "discover-mrq",
+      job_id: "analyze-dif",
       step: {
         id: "step-1",
-        operation: "mrq.discover-next",
+        operation: "dif.classify-next",
         timeout_seconds: 1800,
         agent_phases: [{
           phase_id: "analyze-dif",

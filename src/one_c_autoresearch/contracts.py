@@ -20,6 +20,7 @@ ROLES = ("vendor_baseline", "target_cf", "next_vendor")
 DECISIONS = ("adopt_vendor", "adapt", "retain_custom", "out_of_scope")
 MRQ_STATES = ("draft", "ready_for_review", "approved", "superseded")
 SECRET_KEYS = re.compile(r"(?:password|passwd|pwd|token|secret|private[_-]?key)", re.I)
+SAFE_SECRET_LIKE_KEYS = {"input_context_tokens"}
 _PROCESS_REPOSITORY_LOCKS: dict[str, threading.RLock] = {}
 _PROCESS_REPOSITORY_LOCKS_GUARD = threading.Lock()
 _HELD_REPOSITORY_LOCKS = threading.local()
@@ -135,7 +136,7 @@ def require_tracked_clean(repo: Path, paths: list[Path]) -> None:
 def reject_secrets(value: Any, location: str = "root") -> None:
     if isinstance(value, dict):
         for key, child in value.items():
-            if SECRET_KEYS.search(str(key)) and child not in (None, "", [], {}):
+            if str(key).lower() not in SAFE_SECRET_LIKE_KEYS and SECRET_KEYS.search(str(key)) and child not in (None, "", [], {}):
                 raise ValueError(f"secret value is forbidden at {location}.{key}")
             reject_secrets(child, f"{location}.{key}")
     elif isinstance(value, list):

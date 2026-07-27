@@ -1,4 +1,4 @@
-schema_version = "3"
+schema_version = "4"
 tool_version = "0.2.0"
 
 [[gates]]
@@ -14,7 +14,11 @@ id = "diffs-built"
 validator = "diff.validate"
 
 [[gates]]
-id = "diffs-classified"
+id = "all-dif-classified"
+validator = "dif.classification"
+
+[[gates]]
+id = "mrq-consolidated"
 validator = "mrq.ownership"
 
 [[gates]]
@@ -50,10 +54,16 @@ needs = ["build-diffs"]
 steps = [{ id = "index-sources", operation = "indexes.build", operation_version = "1", timeout_seconds = 1800 }]
 
 [[jobs]]
-id = "discover-mrq"
+id = "analyze-dif"
 needs = ["index-sources"]
-steps = [{ id = "discover-mrq", operation = "mrq.discover-next", operation_version = "2", timeout_seconds = 1800, agent_phases = [
+steps = [{ id = "analyze-dif", operation = "dif.classify-next", operation_version = "1", timeout_seconds = 1800, agent_phases = [
   { phase_id = "analyze-dif", mode = "parallel-pool", max_concurrency = 4, roles = [{ role_id = "analyzer", agent_profile = "local", count = 4, instruction_supplement = "" }] },
+] }]
+
+[[jobs]]
+id = "consolidate-mrq"
+needs = ["analyze-dif"]
+steps = [{ id = "consolidate-mrq", operation = "mrq.consolidate", operation_version = "1", timeout_seconds = 1800, agent_phases = [
   { phase_id = "form-mrq", mode = "coordinated-pool", max_concurrency = 4, roles = [
     { role_id = "coordinator", agent_profile = "local", count = 1, instruction_supplement = "" },
     { role_id = "grouper", agent_profile = "local", count = 4, instruction_supplement = "" },
@@ -62,7 +72,7 @@ steps = [{ id = "discover-mrq", operation = "mrq.discover-next", operation_versi
 
 [[jobs]]
 id = "classify-mrq"
-needs = ["discover-mrq"]
+needs = ["consolidate-mrq"]
 steps = [{ id = "classify-mrq", operation = "mrq.classify-batches", operation_version = "1", timeout_seconds = 1800, agent_phases = [
   { phase_id = "classify-batches", mode = "sequential", max_concurrency = 1, roles = [{ role_id = "classifier", agent_profile = "local", count = 1, instruction_supplement = "" }] },
 ] }]

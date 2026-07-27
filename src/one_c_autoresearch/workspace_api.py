@@ -112,6 +112,8 @@ def codex_capabilities() -> dict[str, Any]:
         timeout=15,
     )
     catalog = json.loads(result.stdout)
+    from .user_state import codex_model_capabilities
+    context = codex_model_capabilities()
     models = [
         {
             "id": item["slug"],
@@ -120,6 +122,7 @@ def codex_capabilities() -> dict[str, Any]:
             "reasoning_efforts": [
                 level["effort"] for level in item.get("supported_reasoning_levels", [])
             ],
+            **context.get(item["slug"], {}),
         }
         for item in catalog.get("models", [])
         if item.get("visibility") == "list" and item.get("supported_in_api", True)
@@ -334,11 +337,16 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
     @app.post("/api/v1/projects/{project_id}/workflow/patch-preview")
     def workflow_patch_preview(project_id: str, body: StepPatchBody):
-        return ApplicationService(repo(project_id)).preview_step_patch(body.model_dump(), operational)
+        project = repo(project_id)
+        from .workflow_migration import guard_mutation
+        guard_mutation(project, base=operational)
+        return ApplicationService(project).preview_step_patch(body.model_dump(), operational)
 
     @app.post("/api/v1/projects/{project_id}/workflow/run-next")
     def run_next_step(project_id: str, body: RunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
         mutation(request, idempotency_key); project = repo(project_id)
+        from .workflow_migration import guard_mutation
+        guard_mutation(project, base=operational)
         from .user_state import load_agent_profiles, load_connections
         preview_root = operational / "projects" / project_id / "source-routing-previews"
         service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts", routing_previews=preview_root)
@@ -352,7 +360,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 result = json.loads(result_path.read_text(encoding="utf-8")); result["snapshot"] = service.snapshot(); return result
             if body.expected_fingerprint != service.snapshot()["workflow_fingerprint"]: raise RuntimeError("stale workflow fingerprint")
             invoke = lambda operation, payload, cancelled: service.apply(operation, payload, service.snapshot()["workflow_fingerprint"], cancelled)
-            if set(body.approved_operations) - {"sources.acquire", "mrq.discover-next", "mrq.decide-next"}: raise ValueError("unsupported run approval")
+            if set(body.approved_operations) - {"sources.acquire", "dif.classify-next", "mrq.consolidate", "mrq.decide-next"}: raise ValueError("unsupported run approval")
             source_preview = {"source_routing_preview_id": body.source_routing_preview_id, "routing_plan_fingerprint": body.routing_plan_fingerprint} if body.source_routing_preview_id and body.routing_plan_fingerprint else None
             result = run_next(service.repo, invoke, store, select=service.next, approved_operations=set(body.approved_operations), agent_profiles=load_agent_profiles(project, operational), source_routing_preview=source_preview)
             from .contracts import atomic_json
@@ -362,6 +370,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
     @app.post("/api/v1/projects/{project_id}/source-acquisition-runs", status_code=202)
     def start_source_acquisition(project_id: str, body: RunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
         mutation(request, idempotency_key); project = repo(project_id)
+        from .workflow_migration import guard_mutation
+        guard_mutation(project, base=operational)
         if set(body.approved_operations) != {"sources.acquire"} or not body.source_routing_preview_id or not body.routing_plan_fingerprint:
             raise ValueError("source acquisition approval and routing preview are required")
         from .user_state import load_agent_profiles, load_connections
@@ -424,10 +434,12 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
     @app.post("/api/v1/projects/{project_id}/workflow/run-until-blocked")
     def run_until(project_id: str, body: RunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
         mutation(request, idempotency_key); project = repo(project_id)
+        from .workflow_migration import guard_mutation
+        guard_mutation(project, base=operational)
         from .user_state import load_agent_profiles, load_connections
         preview_root = operational / "projects" / project_id / "source-routing-previews"
         service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts", routing_previews=preview_root)
-        if set(body.approved_operations) - {"sources.acquire", "mrq.discover-next", "mrq.decide-next"}: raise ValueError("unsupported run approval")
+        if set(body.approved_operations) - {"sources.acquire", "dif.classify-next", "mrq.consolidate", "mrq.decide-next"}: raise ValueError("unsupported run approval")
         from .runner import run_until_blocked
         store = EventStore(operational / "projects", project_id)
         result_path = store.root / ("idempotency-until-" + sha256(idempotency_key.encode()) + ".json")
@@ -445,7 +457,9 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
     @app.post("/api/v1/projects/{project_id}/runs/{run_id}/cancel")
     def cancel_run(project_id: str, run_id: str, body: CancelBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
-        mutation(request, idempotency_key); repo(project_id)
+        mutation(request, idempotency_key); project = repo(project_id)
+        from .workflow_migration import guard_mutation
+        guard_mutation(project, base=operational)
         EventStore(operational / "projects", project_id).cancel(run_id, body.actor)
         return {"run_id": run_id, "status": "cancellation_requested"}
 
@@ -747,6 +761,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
     def run_stage_recompute(project_id: str, body: StageRunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
         mutation(request, idempotency_key)
         project = repo(project_id)
+        from .workflow_migration import guard_mutation
+        guard_mutation(project, base=operational)
         candidates = [None]
         if body.boundary == "sources":
             preview_root = operational / "projects" / project_id / "source-routing-previews"
@@ -956,6 +972,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
     def cancel_stage_recompute(project_id: str, run_id: str, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
         mutation(request, idempotency_key)
         project = repo(project_id)
+        from .workflow_migration import guard_mutation
+        guard_mutation(project, base=operational)
         from .sqlite_state import DispatcherStore
         with DispatcherStore(project, operational) as store:
             record = store.stage_run(run_id)
@@ -977,12 +995,14 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
     @app.post("/api/v1/projects/{project_id}/dispatcher/{job_id}/{action}")
     def dispatcher_action(project_id: str, job_id: str, action: str, request: Request, body: DispatcherActionBody | None = Body(default=None), idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
-        if job_id not in {"discover-mrq", "classify-mrq", "decide-mrq"}:
+        if job_id not in {"analyze-dif", "consolidate-mrq", "classify-mrq", "decide-mrq"}:
             raise ValueError("unsupported dispatcher job")
-        if action not in {"start", "stop", "resume", "cancel", "retry", "approve-noise", "approve-batch", "approve-decision"}:
+        if action not in {"start", "stop", "resume", "cancel", "retry", "approve-consolidation", "approve-decision"}:
             raise ValueError("unsupported dispatcher action")
-        if job_id == "classify-mrq" and action.startswith("approve-"):
-            raise ValueError("classification does not require approval")
+        if action == "approve-consolidation" and job_id != "consolidate-mrq":
+            raise ValueError("only consolidation plans require this approval")
+        if action == "approve-decision" and job_id != "decide-mrq":
+            raise ValueError("only target decisions require this approval")
         mutation(request, idempotency_key)
         request_body = body.model_dump(exclude_none=True, exclude_unset=True) if body is not None else {}
         allowed_body_fields = {
@@ -991,13 +1011,14 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             "resume": {"actor"},
             "cancel": {"actor"},
             "retry": {"policy_source", "predecessor_run_id", "expected_workflow_fingerprint", "expected_input_fingerprints"},
-            "approve-noise": {"actor", "proposal_key", "expected_fingerprint"},
-            "approve-batch": {"actor", "proposal_key", "expected_fingerprint", "payload"},
+            "approve-consolidation": {"actor", "proposal_key", "expected_fingerprint", "payload"},
             "approve-decision": {"actor", "proposal_key", "expected_fingerprint", "payload"},
         }[action]
         if unknown := set(request_body) - allowed_body_fields:
             raise ValueError(f"unsupported fields for dispatcher {action}: {sorted(unknown)}")
         project = repo(project_id)
+        from .workflow_migration import guard_mutation
+        guard_mutation(project, base=operational)
         from .dispatcher import DispatcherCoordinator, DispatcherOutcome, load_bindings
         from .sqlite_state import DispatcherStore
         from .user_state import load_agent_profiles
@@ -1010,7 +1031,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                     raise RuntimeError("stage recompute lease blocks dispatcher start and continuation")
         action_result_path = event_store.root / ("idempotency-dispatcher-" + sha256(idempotency_key.encode()) + ".json")
         action_lock = None
-        if action not in {"approve-noise", "approve-batch", "approve-decision"}:
+        if action not in {"approve-consolidation", "approve-decision"}:
             action_lock = action_result_path.with_suffix(".lock").open("a+b")
             fcntl.flock(action_lock.fileno(), fcntl.LOCK_EX)
             if action != "retry" and action_result_path.is_file():
@@ -1031,25 +1052,48 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             agent_profile = None
             phase_policies: dict[str, dict[str, Any]] = {}
             profiles_by_role: dict[str, dict[str, Any]] = {}
-            if job_id in {"discover-mrq", "classify-mrq", "decide-mrq"}:
+            if job_id in {"analyze-dif", "consolidate-mrq", "classify-mrq", "decide-mrq"}:
                 profiles = load_agent_profiles(project, operational)
                 step_id = job_id
                 configured = next((item for item in step_configurations(project) if item["step"]["id"] == step_id), None)
                 if configured:
                     phase_policies = {phase["phase_id"]: phase for phase in configured["step"].get("agent_phases", [])}
-                    primary_role = {"discover-mrq": "analyzer", "classify-mrq": "classifier", "decide-mrq": "researcher"}[job_id]
+                    primary_role = {"analyze-dif": "analyzer", "consolidate-mrq": "grouper", "classify-mrq": "classifier", "decide-mrq": "researcher"}[job_id]
                     profile_name = next((role["agent_profile"] for phase in phase_policies.values() for role in phase["roles"] if role["role_id"] == primary_role), None)
                     agent_profile = profiles.get(profile_name) if profile_name else None
                     profiles_by_role = {role["role_id"]: profiles[role["agent_profile"]] for phase in phase_policies.values() for role in phase["roles"] if role["agent_profile"] in profiles}
             supplement = next((role["instruction_supplement"] for phase in phase_policies.values() for role in phase["roles"] if role["role_id"] in {"analyzer", "classifier", "researcher"}), "")
             from .workflow import next_work
             current_work = next_work(project) or {}
-            expected_action = {"discover-mrq": "mrq.discover-next", "classify-mrq": "mrq.classify-batches", "decide-mrq": "mrq.decide-next"}[job_id]
+            expected_action = {"analyze-dif": "dif.classify-next", "consolidate-mrq": "mrq.consolidate", "classify-mrq": "mrq.classify-batches", "decide-mrq": "mrq.decide-next"}[job_id]
+            if action == "start" and job_id == "consolidate-mrq" and current_work.get("action") != expected_action:
+                from .dif_classifications import coverage
+                counts = coverage(project)
+                if not counts["all_dif_classified"]:
+                    outcome = DispatcherOutcome(
+                        job_id, "", "blocked", "", store.revision()[0],
+                        {"phase": "classification_incomplete", "remaining": counts["remaining"]},
+                        {
+                            "code": "consolidation.classification_incomplete",
+                            "message": f"{counts['remaining']} customer DIF remain unclassified",
+                            "action": "dif.classify-next",
+                        },
+                    )
+                    should_launch_graph = False
             work_unit = current_work.get("work_unit") if current_work.get("action") == expected_action else None
             if not isinstance(work_unit, dict):
                 work_unit = {"id": job_id, "kind": "dispatcher-root", "allowed_paths": []}
             work_unit_id = str(work_unit["id"])
             bindings = load_bindings(project, project_id, job_id, work_unit_id, agent_profile, supplement)
+            if action == "start" and not should_launch_graph:
+                return {
+                    "job_id": job_id, "action": action,
+                    "outcome": {
+                        "status": outcome.status, "run_id": outcome.run_id,
+                        "thread_id": outcome.thread_id, "revision": outcome.revision,
+                        "summary": outcome.summary, "blocker": outcome.blocker,
+                    },
+                }
             if action == "start" and agent_profile is None:
                 outcome = DispatcherOutcome(
                     job_id,
@@ -1194,7 +1238,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 else:
                     outcome = coordinator.retry(job_id, bindings, run_id=candidate_run_id, execution_snapshot=execution_snapshot)
                     store.update_retry(candidate_run_id, reservation["owner_token"], "started", {"status": outcome.status})
-            elif action in {"approve-noise", "approve-batch", "approve-decision"}:
+            elif action in {"approve-consolidation", "approve-decision"}:
                 proposal_key = str(request_body.get("proposal_key", ""))
                 expected_fingerprint = str(request_body.get("expected_fingerprint", ""))
                 if not proposal_key or not expected_fingerprint:
@@ -1202,10 +1246,47 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 proposal = store.proposal(proposal_key)
                 if proposal is None or proposal["job_id"] != job_id:
                     raise RuntimeError("dispatcher proposal is missing, stale, or already consumed")
+                if action == "approve-consolidation" and proposal.get("consumed_at") is not None:
+                    from .consolidation import load_active as load_consolidation
+                    pointer = load_consolidation(project)["pointer"]
+                    if pointer.get("plan_fingerprint") == proposal["payload"].get("plan_fingerprint"):
+                        return {
+                            "job_id": job_id, "action": action,
+                            "outcome": {
+                                "status": "completed", "run_id": "", "thread_id": proposal["thread_id"],
+                                "revision": store.revision()[0],
+                                "summary": {
+                                    "mrq_generation_id": pointer["mrq_generation_id"],
+                                    "plan_fingerprint": pointer["plan_fingerprint"],
+                                    "already_applied": True,
+                                },
+                                "blocker": None,
+                            },
+                        }
                 lease = store.lease(job_id)
                 if lease is None or lease["thread_id"] != proposal["thread_id"]:
                     raise RuntimeError("dispatcher approval lease is missing or belongs to another run")
                 if proposal.get("consumed_at") is not None:
+                    if action == "approve-consolidation":
+                        from .consolidation import load_active as load_consolidation
+                        pointer = load_consolidation(project)["pointer"]
+                        if pointer.get("plan_fingerprint") == proposal["payload"].get("plan_fingerprint"):
+                            return {
+                                "job_id": job_id,
+                                "action": action,
+                                "outcome": {
+                                    "status": "completed",
+                                    "run_id": str(lease.get("run_id", "")),
+                                    "thread_id": proposal["thread_id"],
+                                    "revision": store.revision()[0],
+                                    "summary": {
+                                        "mrq_generation_id": pointer["mrq_generation_id"],
+                                        "plan_fingerprint": pointer["plan_fingerprint"],
+                                        "already_applied": True,
+                                    },
+                                    "blocker": None,
+                                },
+                            }
                     recovered_noise = (
                         action == "approve-noise"
                         and lease["state"] == "resumable"
@@ -1289,68 +1370,102 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                             summary,
                         ):
                             raise RuntimeError("dispatcher lease was fenced before noise approval persistence")
-                    elif action == "approve-batch":
-                        groups = saved.get("batch_proposals", [])
-                        approved_noise = saved.get("approved_noise", [])
-                        canonical_payload = {
-                            "approved_noise": approved_noise,
-                            "group_proposals": [
-                                {key: group[key] for key in ("semantic_key", "title", "stable_diff_ids", "supporting_diff_ids", "evidence", "business_meaning", "scope", "confidence", "rationale")}
-                                for group in groups
-                            ],
+                    elif action == "approve-consolidation":
+                        from .consolidation import approve_plan, fingerprint
+                        relative = str(saved.get("plan_path", ""))
+                        plan_path = (operational / "projects" / project_id / relative).resolve()
+                        plan_root = (operational / "projects" / project_id / "consolidation-plans").resolve()
+                        if plan_root not in plan_path.parents or not plan_path.is_file():
+                            raise ValueError("dispatcher consolidation plan is missing")
+                        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                        if fingerprint(plan) != saved.get("plan_fingerprint"):
+                            raise RuntimeError("dispatcher consolidation plan fingerprint is stale")
+                        approval_fence()
+                        already_applied = saved["expected_pointer"].get("plan_fingerprint") == saved["plan_fingerprint"]
+                        approval = {
+                            "schema_version": "2",
+                            "kind": "consolidation",
+                            "actor": str(request_body.get("actor", "local-user")),
+                            "rationale": str(request_body.get("rationale", "explicit dispatcher approval")),
+                            "evidence": list(request_body.get("evidence", [])),
+                            **{
+                                key: plan["bindings"][key]
+                                for key in (
+                                    "source_fingerprint", "diff_fingerprint",
+                                    "classification_fingerprint", "prior_mrq_fingerprint",
+                                )
+                            },
+                            "plan_fingerprint": saved["plan_fingerprint"],
                         }
-                        from .mrq import active
-                        canonical = active(project)
-                        active_by_key = {item.get("semantic_key"): item for item in canonical["mrq.jsonl"] if item.get("state") != "superseded"}
-                        recovered_ids: list[str] = []
-                        for group in canonical_payload["group_proposals"]:
-                            row = active_by_key.get(group["semantic_key"])
-                            if row is None:
-                                recovered_ids = []
-                                break
-                            source = row.get("source_customization", {})
-                            primary = sorted(item.get("stable_diff_id") for item in canonical["dispositions.jsonl"] if item.get("mrq_id") == row["mrq_id"] and item.get("primary"))
-                            if primary != sorted(group["stable_diff_ids"]) or any(source.get(key) != group[key] for key in ("business_meaning", "scope", "confidence", "rationale")):
-                                recovered_ids = []
-                                break
-                            recovered_ids.append(row["mrq_id"])
-                        if (groups or approved_noise) and len(recovered_ids) == len(groups) and _reviewed_noise_is_active(canonical, approved_noise):
-                            with store.lease_guard(job_id, lease_token, proposal["thread_id"]):
-                                approval_fence()
-                                current = active(project)
-                                if current["pointer"].get("canonical_generation_id") != canonical["pointer"].get("canonical_generation_id"):
-                                    raise RuntimeError("canonical recovery changed before approval completion")
-                                current_ids = {
-                                    item.get("mrq_id")
-                                    for item in current["mrq.jsonl"]
-                                    if item.get("state") != "superseded"
-                                }
-                                if not set(recovered_ids) <= current_ids:
-                                    raise RuntimeError("canonical recovery changed before approval completion")
-                                result = {"mrq_ids": recovered_ids, "recovered": True}
-                        else:
-                            result = ApplicationService(project).apply("mrq.publish-source-batch", canonical_payload, expected_fingerprint, fence=approval_fence)
-                        canonical_snapshot = ApplicationService(project).snapshot()
-                        summary = {"published_mrq_ids": result.get("mrq_ids", []), "workflow_fingerprint": canonical_snapshot["workflow_fingerprint"]}
+                        pointer = approve_plan(project, plan, saved["expected_pointer"], approval)
+                        summary = {
+                            "mrq_generation_id": pointer["mrq_generation_id"],
+                            "plan_fingerprint": pointer["plan_fingerprint"],
+                            "already_applied": already_applied,
+                        }
                     else:
                         decision = saved.get("decision_proposal")
                         if not isinstance(decision, dict):
                             raise ValueError("dispatcher decision proposal is missing")
-                        from .mrq import active
-                        row = next((item for item in active(project)["mrq.jsonl"] if item.get("mrq_id") == decision.get("mrq_id") and item.get("state") != "superseded"), None)
-                        decision_fields = ("decision", "target_evidence", "target_coverage", "residual_gap", "target_solution", "rationale", "acceptance_criteria", "risk", "open_questions")
-                        if row is not None and all(row.get("migration_decision", {}).get(key) == decision.get(key) for key in decision_fields):
-                            with store.lease_guard(job_id, lease_token, proposal["thread_id"]):
-                                approval_fence()
-                                current = active(project)
-                                current_row = next((item for item in current["mrq.jsonl"] if item.get("mrq_id") == decision.get("mrq_id") and item.get("state") != "superseded"), None)
-                                if current_row is None or any(current_row.get("migration_decision", {}).get(key) != decision.get(key) for key in decision_fields):
-                                    raise RuntimeError("canonical recovery changed before approval completion")
-                                result = {"generation_id": current["pointer"].get("canonical_generation_id"), "recovered": True}
-                        else:
-                            result = ApplicationService(project).apply("mrq.decide", decision, expected_fingerprint, fence=approval_fence)
-                        canonical_snapshot = ApplicationService(project).snapshot()
-                        summary = {"approved_mrq_id": decision.get("mrq_id"), "generation_id": result.get("generation_id"), "workflow_fingerprint": canonical_snapshot["workflow_fingerprint"]}
+                        from .consolidation import load_active as load_consolidation
+                        from .decision_generations import (
+                            consolidation_input_fingerprint,
+                            fingerprint as decision_fingerprint,
+                            publish as publish_decisions,
+                            validate_generation as validate_decisions,
+                        )
+                        pointer = load_consolidation(project)["pointer"]
+                        input_fingerprint = consolidation_input_fingerprint(pointer)
+                        rows = []
+                        if pointer.get("decision_input_fingerprint") == input_fingerprint:
+                            rows = validate_decisions(project, pointer["decision_generation_id"])["decisions.jsonl"]
+                        approved = {**decision, "agreement_status": "approved"}
+                        actor = str(request_body.get("actor", "local-user"))
+                        rationale = str(request_body.get("rationale", "explicit dispatcher approval"))
+                        evidence = list(request_body.get("evidence", []))
+                        decision_row = {
+                            "schema_version": "1",
+                            "mrq_id": decision["mrq_id"],
+                            "decision": approved,
+                            "approval_fingerprint": decision_fingerprint({
+                                "actor": actor,
+                                "rationale": rationale,
+                                "evidence": evidence,
+                                "input_fingerprint": input_fingerprint,
+                                "proposal_key": proposal_key,
+                                "decision": approved,
+                            }),
+                            "provenance": {"kind": "stage-5"},
+                        }
+                        rows = sorted(
+                            [row for row in rows if row["mrq_id"] != decision["mrq_id"]] + [decision_row],
+                            key=canonical_json,
+                        )
+                        rows_fingerprint = decision_fingerprint(rows)
+                        approval = {
+                            "schema_version": "1",
+                            "kind": "target-decisions",
+                            "actor": actor,
+                            "rationale": rationale,
+                            "evidence": evidence,
+                            "input_fingerprint": input_fingerprint,
+                            "decision_fingerprint": rows_fingerprint,
+                            "row_approval_fingerprints": {
+                                row["mrq_id"]: row["approval_fingerprint"]
+                                for row in rows
+                            },
+                        }
+                        approval_fence()
+                        result = publish_decisions(
+                            project, rows, approval,
+                            expected_transaction_id=pointer["transaction_id"],
+                        )
+                        summary = {
+                            "approved_mrq_id": decision.get("mrq_id"),
+                            "generation_id": result["generation"]["manifest"]["generation_id"],
+                            "workflow_fingerprint": expected_fingerprint,
+                            "already_applied": result["idempotent"],
+                        }
                     if action != "approve-noise" and not store.consume_proposal(proposal_key, lease_token):
                         raise RuntimeError("dispatcher lease was fenced before proposal consumption")
                     remaining = [item for item in store.proposals() if item["job_id"] == job_id and item["thread_id"] == proposal["thread_id"] and item["kind"] == "approval" and item.get("consumed_at") is None]
@@ -1388,7 +1503,12 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 saved_execution = (saved_run or {}).get("execution_snapshot", {})
                 saved_phases = saved_execution.get("agent_phases", [])
                 saved_profiles = saved_execution.get("profiles", {})
-                saved_primary_role = "analyzer" if job_id == "discover-mrq" else "researcher"
+                saved_primary_role = {
+                    "analyze-dif": "analyzer",
+                    "consolidate-mrq": "grouper",
+                    "classify-mrq": "classifier",
+                    "decide-mrq": "researcher",
+                }[job_id]
                 saved_profile_name = next(
                     (
                         role["agent_profile"]

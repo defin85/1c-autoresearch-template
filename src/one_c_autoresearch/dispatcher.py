@@ -24,6 +24,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,7 +41,7 @@ from .sqlite_state import (
 )
 
 
-DISPATCHER_JOBS = ("discover-mrq", "classify-mrq", "decide-mrq")
+DISPATCHER_JOBS = ("analyze-dif", "consolidate-mrq", "classify-mrq", "decide-mrq")
 LEASE_RENEWAL_SECONDS_EFFECTIVE = LEASE_RENEWAL_SECONDS
 STALE_AFTER_SECONDS = 10  # UI-порог несвежего активного запуска (spec.md)
 
@@ -68,12 +69,16 @@ class DispatcherBindings:
     instruction_supplement: str
     run_id: str = ""
     execution_snapshot_fingerprint: str = ""
+    classification_generation_id: str = ""
+    consolidation_transaction_id: str = ""
 
     def thread_id(self) -> str:
         preimage = {
             "schema_version": "2",
             "run_id": self.run_id,
             "execution_snapshot_fingerprint": self.execution_snapshot_fingerprint,
+            "classification_generation_id": self.classification_generation_id,
+            "consolidation_transaction_id": self.consolidation_transaction_id,
             "project_id": self.project_id,
             "job_id": self.job_id,
             "work_unit_id": self.work_unit_id,
@@ -93,6 +98,8 @@ class DispatcherBindings:
             "instruction_supplement": self.instruction_supplement,
             "run_id": self.run_id,
             "execution_snapshot_fingerprint": self.execution_snapshot_fingerprint,
+            "classification_generation_id": self.classification_generation_id,
+            "consolidation_transaction_id": self.consolidation_transaction_id,
             "thread_id": self.thread_id(),
         }
 
@@ -102,16 +109,20 @@ def load_bindings(repo: Path, project_id: str, job_id: str, work_unit_id: str, a
 
     from .stage_recompute import active_state
     pointers, workflow_fingerprint = active_state(repo)
+    classification = json.loads((repo / "research/active-dif-classification-generation.json").read_text(encoding="utf-8")) if (repo / "research/active-dif-classification-generation.json").is_file() else {}
+    consolidation = json.loads((repo / "research/active-consolidation-generation.json").read_text(encoding="utf-8")) if (repo / "research/active-consolidation-generation.json").is_file() else {}
     return DispatcherBindings(
         project_id=project_id,
         job_id=job_id,
         work_unit_id=work_unit_id,
         source_generation_id=str((pointers.get("source") or {}).get("generation_id", "")),
         diff_generation_id=str((pointers.get("diff") or {}).get("generation_id", "")),
-        canonical_generation_id=str((pointers.get("mrq") or {}).get("canonical_generation_id", "")),
+        canonical_generation_id=str(consolidation.get("mrq_generation_id", "")),
         workflow_fingerprint=workflow_fingerprint,
-        agent_profile_fingerprint=sha256(canonical_json(agent_profile)) if agent_profile else "",
+        agent_profile_fingerprint="sha256:" + sha256(canonical_json(agent_profile)) if agent_profile else "",
         instruction_supplement=instruction_supplement,
+        classification_generation_id=str(classification.get("generation_id", "")),
+        consolidation_transaction_id=str(consolidation.get("transaction_id", "")),
     )
 
 
@@ -193,9 +204,14 @@ class DispatcherCoordinator:
 
     # -- запуск и жизненный цикл ---------------------------------------
 
+    def _guard_migration(self) -> None:
+        from .workflow_migration import guard_mutation
+        guard_mutation(self.repo, base=self.store.base)
+
     def start(self, job_id: str, bindings: DispatcherBindings, *, run_id: str | None = None, execution_snapshot: dict[str, Any] | None = None, emit_events: bool = True) -> DispatcherOutcome:
         """Запускает график, если аренда свободна. Иначе возвращает ``blocked``."""
 
+        self._guard_migration()
         if job_id not in DISPATCHER_JOBS:
             raise ValueError(f"unsupported dispatcher job: {job_id}")
         if execution_snapshot is None:
@@ -341,6 +357,7 @@ class DispatcherCoordinator:
     def soft_stop(self, job_id: str, *, timeout_seconds: int | None = None, emit_events: bool = True) -> DispatcherOutcome:
         """Мягкая остановка: прекращает выдачу новых узлов и сохраняет чекпойнт."""
 
+        self._guard_migration()
         with self._lock:
             stop_event = self._stop_events.get(job_id)
             if stop_event is not None:
@@ -375,6 +392,7 @@ class DispatcherCoordinator:
     def resume(self, job_id: str, bindings: DispatcherBindings, *, emit_events: bool = True) -> DispatcherOutcome:
         """Продолжение незавершённого потока, если привязки совпадают."""
 
+        self._guard_migration()
         lease = self.store.lease(job_id)
         if lease is None:
             return DispatcherOutcome(
@@ -483,6 +501,7 @@ class DispatcherCoordinator:
     def cancel(self, job_id: str, *, emit_events: bool = True) -> DispatcherOutcome:
         """Явная отмена: останавливает график и очищает операционные предложения."""
 
+        self._guard_migration()
         with self._lock:
             stop_event = self._stop_events.pop(job_id, None)
             if stop_event is not None:
@@ -539,6 +558,7 @@ class DispatcherCoordinator:
     def retry(self, job_id: str, bindings: DispatcherBindings, *, run_id: str | None = None, execution_snapshot: dict[str, Any] | None = None, emit_events: bool = True) -> DispatcherOutcome:
         """Явный повтор после сбоя: освобождает аренду и запускает заново."""
 
+        self._guard_migration()
         lease = self.store.lease(job_id)
         predecessor_run_id = str((execution_snapshot or {}).get("predecessor_run_id", ""))
         source_thread_id = ""
@@ -709,7 +729,7 @@ class DispatcherCoordinator:
 
     def _run_graph(self, outcome: DispatcherOutcome, bindings: DispatcherBindings, profile: dict[str, Any], phase_policies: dict[str, dict[str, Any]], profiles_by_role: dict[str, dict[str, Any]], timeout_seconds: int) -> None:
         from .agents import build_context_manifest, execute as agent_execute, validate_execution_snapshot
-        from .pipeline_graphs import build_classify_state, build_decide_state, build_discover_state, compile_classify_graph, compile_decide_graph, compile_discover_graph
+        from .pipeline_graphs import build_classify_state, build_decide_state, build_discover_state, compile_analyze_graph, compile_classify_graph, compile_consolidate_graph, compile_decide_graph
 
         stop_event = self._stop_events[outcome.job_id]
         run_file = self.event_store.run_snapshot(outcome.run_id)
@@ -728,7 +748,7 @@ class DispatcherCoordinator:
             for role in phase["roles"]
         }
         timeout_seconds = int(execution_snapshot["timeout_seconds"])
-        primary_role = {"discover-mrq": "analyzer", "classify-mrq": "classifier", "decide-mrq": "researcher"}[outcome.job_id]
+        primary_role = {"analyze-dif": "analyzer", "consolidate-mrq": "grouper", "classify-mrq": "classifier", "decide-mrq": "researcher"}[outcome.job_id]
         profile = profiles_by_role[primary_role]
         if not phase_policies:
             phase_policies = {
@@ -743,6 +763,10 @@ class DispatcherCoordinator:
                 phase_id, role_id = "research-target", "researcher"
             elif operation == "mrq.classify-batches":
                 phase_id, role_id = "classify-batches", "classifier"
+            elif operation == "mrq.consolidate" and work_unit.get("kind") == "consolidation-coordinate":
+                phase_id, role_id = "form-mrq", "coordinator"
+            elif operation == "mrq.consolidate":
+                phase_id, role_id = "form-mrq", "grouper"
             elif work_unit.get("kind") == "coordinate-groups":
                 phase_id, role_id = "form-mrq", "coordinator"
             elif work_unit.get("kind") == "preliminary-group":
@@ -909,21 +933,19 @@ class DispatcherCoordinator:
                 "source_execution_snapshot_fingerprint": str(predecessor["execution_snapshot_fingerprint"]),
             }
         try:
-            if outcome.job_id == "discover-mrq":
-                approved_noise = [
-                    item
-                    for proposal in self.store.proposals()
-                    if proposal["job_id"] == outcome.job_id
-                    and proposal["thread_id"] == outcome.thread_id
-                    and proposal["kind"] == "noise-approval"
-                    and proposal.get("consumed_at") is None
-                    for item in proposal["payload"].get("items", [])
-                ]
-                graph = compile_discover_graph(
+            if outcome.job_id == "analyze-dif":
+                graph = compile_analyze_graph(
                     **common,
                     phase_policies=phase_policies or None,
                     profiles_by_role=profiles_by_role or None,
-                    approved_noise=approved_noise,
+                )
+                initial = build_discover_state(bindings.canonical_payload(), outcome.run_id, outcome.thread_id)
+            elif outcome.job_id == "consolidate-mrq":
+                graph = compile_consolidate_graph(
+                    **common,
+                    phase_policies=phase_policies or None,
+                    profiles_by_role=profiles_by_role or None,
+                    plan_root=self.store.path.parent,
                 )
                 initial = build_discover_state(bindings.canonical_payload(), outcome.run_id, outcome.thread_id)
             elif outcome.job_id == "classify-mrq":
@@ -931,10 +953,17 @@ class DispatcherCoordinator:
                 initial = build_classify_state(bindings.canonical_payload(), outcome.run_id, outcome.thread_id)
             else:
                 graph = compile_decide_graph(**common, phase_policy=phase_policies.get("research-target") or None, profiles_by_role=profiles_by_role or None)
-                from .mrq import active
+                from .consolidation import load_active as load_consolidation
+                from .decision_generations import validate_generation as validate_decisions
                 from .mrq_batches import load_active
-                rows = active(self.repo)["mrq.jsonl"]
-                pending = {item["mrq_id"] for item in rows if item.get("state") != "superseded" and not item.get("migration_decision", {}).get("decision")}
+                consolidated = load_consolidation(self.repo)
+                rows = consolidated["mrq"]["mrq.jsonl"]
+                decision_id = consolidated["pointer"].get("decision_generation_id")
+                decided = {
+                    item["mrq_id"]
+                    for item in validate_decisions(self.repo, decision_id)["decisions.jsonl"]
+                } if decision_id else set()
+                pending = {item["mrq_id"] for item in rows if item["mrq_id"] not in decided}
                 batches = load_active(self.repo)
                 batch = next((item for item in batches if bindings.work_unit_id in item.mrq_ids), None)
                 if batch is None:
@@ -947,7 +976,11 @@ class DispatcherCoordinator:
             blocker = state.get("blocker")
             if status == "blocked":
                 proposals: list[tuple[str, dict[str, Any]]] = []
-                if outcome.job_id == "decide-mrq":
+                if outcome.job_id == "consolidate-mrq" and state.get("consolidation_plan"):
+                    saved_plan = state["consolidation_plan"]
+                    key = sha256(canonical_json({"thread_id": outcome.thread_id, "plan_fingerprint": saved_plan["plan_fingerprint"]}))
+                    proposals.append((key, saved_plan))
+                elif outcome.job_id == "decide-mrq":
                     for mrq_id, findings in sorted(state.get("findings", {}).items()):
                         decision = findings[-1].get("proposal") if findings else None
                         if decision:
@@ -1041,11 +1074,18 @@ class DispatcherCoordinator:
         try:
             from .stage_recompute import active_state
             pointers, _workflow_fingerprint = active_state(self.repo)
+            classification = json.loads((self.repo / "research/active-dif-classification-generation.json").read_text(encoding="utf-8")) if (self.repo / "research/active-dif-classification-generation.json").is_file() else {}
+            consolidation = json.loads((self.repo / "research/active-consolidation-generation.json").read_text(encoding="utf-8")) if (self.repo / "research/active-consolidation-generation.json").is_file() else {}
             if (
                 str((pointers.get("source") or {}).get("generation_id", "")) != bindings.source_generation_id
                 or str((pointers.get("diff") or {}).get("generation_id", "")) != bindings.diff_generation_id
-                or str((pointers.get("mrq") or {}).get("canonical_generation_id", "")) != bindings.canonical_generation_id
+                or str(consolidation.get("mrq_generation_id", "")) != bindings.canonical_generation_id
             ):
+                return False
+            if (
+                job_id != "analyze-dif"
+                and str(classification.get("generation_id", "")) != bindings.classification_generation_id
+            ) or str(consolidation.get("transaction_id", "")) != bindings.consolidation_transaction_id:
                 return False
             run_file = self.event_store.run_snapshot(bindings.run_id)
             if run_file is None or run_file.get("execution_snapshot_fingerprint") != bindings.execution_snapshot_fingerprint:

@@ -34,7 +34,7 @@ def _test_execution_snapshot(_repo, run_id, operation, step, profiles, work_unit
         "application_version": "one-c-autoresearch/0.2", "subject_bindings": {
             "source_generation_id": str((pointers.get("source") or {}).get("generation_id", "")),
             "diff_generation_id": str((pointers.get("diff") or {}).get("generation_id", "")),
-            "canonical_generation_id": str((pointers.get("mrq") or {}).get("canonical_generation_id", "")),
+            "canonical_generation_id": str((pointers.get("mrq") or {}).get("mrq_generation_id", "")),
         }, "policy_source": "current-policy", "work_unit": work_unit, "context_manifest": {
             "schema_version": "1", "work_unit_id": work_unit["id"],
             "work_unit_fingerprint": "sha256:" + "0" * 64, "paths": [],
@@ -87,7 +87,7 @@ def test_snapshot_includes_dispatcher_section(tmp_path: Path) -> None:
         event_store = EventStore(tmp_path / "state/projects", project["id"])
         execution = {
             "schema_version": "1",
-            "operation": "mrq.discover-next",
+            "operation": "dif.classify-next",
             "workflow_fingerprint": snapshot["workflow_fingerprint"],
             "policy_source": "current-policy",
             "subject_bindings": {
@@ -111,7 +111,7 @@ def test_snapshot_includes_dispatcher_section(tmp_path: Path) -> None:
                 "actor": "local-user",
                 "process_identity": None,
                 "workflow_fingerprint": snapshot["workflow_fingerprint"],
-                "operation": "mrq.discover-next",
+                "operation": "dif.classify-next",
                 **metadata,
             },
         )
@@ -130,7 +130,7 @@ def test_snapshot_includes_dispatcher_section(tmp_path: Path) -> None:
                 "actor": "local-user",
                 "process_identity": None,
                 "workflow_fingerprint": snapshot["workflow_fingerprint"],
-                "operation": "mrq.discover-next",
+                "operation": "dif.classify-next",
                 **blocked_metadata,
             },
         )
@@ -207,7 +207,7 @@ def test_dispatcher_projection_reports_bounded_invocation_window(tmp_path: Path,
     rows = [
         {
             "invocation_id": f"invocation-{index}",
-            "job_id": "discover-mrq",
+            "job_id": "analyze-dif",
             "run_id": "run-window",
             "phase_id": "analyze-dif",
             "role_id": "analyzer",
@@ -222,7 +222,7 @@ def test_dispatcher_projection_reports_bounded_invocation_window(tmp_path: Path,
     monkeypatch.setattr(
         DispatcherStore,
         "latest_phase_run",
-        lambda _self, job_id: "run-window" if job_id == "discover-mrq" else "",
+        lambda _self, job_id: "run-window" if job_id == "analyze-dif" else "",
     )
     monkeypatch.setattr(
         DispatcherStore,
@@ -281,14 +281,14 @@ def test_dispatcher_start_reports_missing_configured_executor(tmp_path: Path) ->
     with _client(tmp_path) as client:
         project = _bookmark(client, tmp_path)
         headers = {"Origin": "http://testserver", "Idempotency-Key": "start-1"}
-        response = client.post(f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/start", json={"actor": "local-user"}, headers=headers)
+        response = client.post(f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/start", json={"actor": "local-user"}, headers=headers)
         assert response.status_code == 200
         outcome = response.json()["outcome"]
         assert outcome["status"] == "blocked"
         assert outcome["thread_id"] == ""
         assert outcome["blocker"]["code"] == "executor.agent_profile_missing"
         # повторный start тем же idempotency-key — идемпотентный
-        repeat = client.post(f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/start", json={"actor": "local-user"}, headers=headers)
+        repeat = client.post(f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/start", json={"actor": "local-user"}, headers=headers)
         assert repeat.status_code == 200
 
 
@@ -311,8 +311,8 @@ def test_dispatcher_cancel_releases_lease(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         project = _bookmark(client, tmp_path)
         headers = {"Origin": "http://testserver", "Idempotency-Key": "cancel-1"}
-        client.post(f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/start", json={"actor": "local-user"}, headers=headers)
-        cancel = client.post(f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/cancel", json={"actor": "local-user"}, headers={"Origin": "http://testserver", "Idempotency-Key": "cancel-2"})
+        client.post(f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/start", json={"actor": "local-user"}, headers=headers)
+        cancel = client.post(f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/cancel", json={"actor": "local-user"}, headers={"Origin": "http://testserver", "Idempotency-Key": "cancel-2"})
         assert cancel.status_code == 200
         assert cancel.json()["outcome"]["status"] == "cancelled"
 
@@ -336,7 +336,7 @@ def test_dispatcher_rejects_invalid_job(tmp_path: Path) -> None:
 def test_dispatcher_rejects_invalid_action(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         project = _bookmark(client, tmp_path)
-        response = client.post(f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/invalid-action", json={}, headers={"Origin": "http://testserver", "Idempotency-Key": "invalid-2"})
+        response = client.post(f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/invalid-action", json={}, headers={"Origin": "http://testserver", "Idempotency-Key": "invalid-2"})
         assert response.status_code == 422
 
 
@@ -344,10 +344,10 @@ def test_dispatcher_requires_origin_and_idempotency(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         project = _bookmark(client, tmp_path)
         # без Origin и Idempotency-Key запрос отклоняется безопасности
-        response = client.post(f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/start", json={"actor": "local-user"})
+        response = client.post(f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/start", json={"actor": "local-user"})
         assert response.status_code in {400, 403}
         # с Origin, но без Idempotency-Key — 400
-        response_no_key = client.post(f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/start", json={"actor": "local-user"}, headers={"Origin": "http://testserver"})
+        response_no_key = client.post(f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/start", json={"actor": "local-user"}, headers={"Origin": "http://testserver"})
         assert response_no_key.status_code == 400
 
 
@@ -355,7 +355,7 @@ def test_dispatcher_retry_body_is_action_specific_and_closed(tmp_path: Path) -> 
     with _client(tmp_path) as client:
         project = _bookmark(client, tmp_path)
         response = client.post(
-            f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/retry",
+            f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/retry",
             json={
                 "actor": "not-allowed-for-retry",
                 "policy_source": "reuse-snapshot",
@@ -376,7 +376,7 @@ def test_dispatcher_section_is_not_part_of_canonical_fingerprint(tmp_path: Path)
         project = _bookmark(client, tmp_path)
         snapshot_before = client.get(f"/api/v1/projects/{project['id']}/workflow").json()
         # запускаем и останавливаем диспетчер (изменяется только SQLite)
-        client.post(f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/start", json={"actor": "local-user"}, headers={"Origin": "http://testserver", "Idempotency-Key": "fp-1"})
+        client.post(f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/start", json={"actor": "local-user"}, headers={"Origin": "http://testserver", "Idempotency-Key": "fp-1"})
         snapshot_after = client.get(f"/api/v1/projects/{project['id']}/workflow").json()
         assert snapshot_before["workflow_fingerprint"] == snapshot_after["workflow_fingerprint"]
         # но projection revision вырос
@@ -405,7 +405,7 @@ def test_retry_recovers_same_run_after_owner_dies_post_lease(tmp_path: Path, mon
     monkeypatch.setattr(
         "one_c_autoresearch.workflow.next_work",
         lambda _repo: {
-            "action": "mrq.discover-next",
+            "action": "dif.classify-next",
             "work_unit": {"id": "DIF-RECOVERY", "kind": "customer-diff", "allowed_paths": []},
         },
     )
@@ -414,13 +414,13 @@ def test_retry_recovers_same_run_after_owner_dies_post_lease(tmp_path: Path, mon
     with TestClient(app) as client:
         project = client.post("/api/v1/projects", json={"name": "example", "root": str(REPO)}, headers=headers).json()
         start = client.post(
-            f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/start",
+            f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/start",
             json={"actor": "local-user"},
             headers={"Origin": "http://testserver", "Idempotency-Key": "recovery-start"},
         ).json()["outcome"]
         assert start["status"] == "running", json.dumps(start, ensure_ascii=False)
         stop_response = client.post(
-            f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/stop",
+            f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/stop",
             json={"timeout_seconds": 1},
             headers={"Origin": "http://testserver", "Idempotency-Key": "recovery-stop"},
         )
@@ -428,7 +428,7 @@ def test_retry_recovers_same_run_after_owner_dies_post_lease(tmp_path: Path, mon
         stopped = stop_response.json()["outcome"]
         assert stopped["status"] == "resumable"
         with DispatcherStore(REPO, state) as store:
-            predecessor = store.lease("discover-mrq")
+            predecessor = store.lease("analyze-dif")
             assert predecessor is not None and predecessor["state"] == "resumable"
         workflow = client.get(f"/api/v1/projects/{project['id']}/workflow").json()
         execution = EventStore(state / "projects", project["id"]).run_snapshot(start["run_id"])["execution_snapshot"]
@@ -443,7 +443,7 @@ def test_retry_recovers_same_run_after_owner_dies_post_lease(tmp_path: Path, mon
         }
         retry_headers = {"Origin": "http://testserver", "Idempotency-Key": "recovery-retry"}
         first_response = client.post(
-            f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/retry",
+            f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/retry",
             json=retry_body,
             headers=retry_headers,
         )
@@ -452,18 +452,18 @@ def test_retry_recovers_same_run_after_owner_dies_post_lease(tmp_path: Path, mon
         assert first["status"] == "running"
 
     with DispatcherStore(REPO, state) as store:
-        lease = store.lease("discover-mrq")
+        lease = store.lease("analyze-dif")
         assert lease is not None and lease["run_id"] == first["run_id"]
         old_token = lease["lease_token"]
         with store.conn:
             store.conn.execute(
                 "UPDATE dispatcher_leases SET process_identity = ? WHERE job_id = ?",
-                (json.dumps({"pid": 999_999_999, "start_time": "0", "boot_id": "dead"}), "discover-mrq"),
+                (json.dumps({"pid": 999_999_999, "start_time": "0", "boot_id": "dead"}), "analyze-dif"),
             )
 
     with TestClient(create_app(state, [REPO], testing=True)) as client:
         recovered_response = client.post(
-            f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/retry",
+            f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/retry",
             json=retry_body,
             headers=retry_headers,
         )
@@ -472,73 +472,16 @@ def test_retry_recovers_same_run_after_owner_dies_post_lease(tmp_path: Path, mon
         assert recovered["run_id"] == first["run_id"]
         assert recovered["status"] == "running"
     with DispatcherStore(REPO, state) as store:
-        assert store.lease("discover-mrq")["lease_token"] != old_token
+        assert store.lease("analyze-dif")["lease_token"] != old_token
 
 
-def test_noise_approval_resumes_same_run_and_thread(tmp_path: Path, monkeypatch) -> None:
-    state = tmp_path / "state"
-    monkeypatch.setattr("one_c_autoresearch.agents.resolve_execution_snapshot", _test_execution_snapshot)
-    monkeypatch.setattr(
-        "one_c_autoresearch.agents.build_context_manifest",
-        lambda _repo, work_unit: {
-            "schema_version": "1",
-            "work_unit_id": work_unit["id"],
-            "work_unit_fingerprint": "sha256:" + "0" * 64,
-            "paths": [],
-        },
-    )
-    monkeypatch.setattr("one_c_autoresearch.agents.validate_execution_snapshot", lambda *_args: None)
-    monkeypatch.setattr(DispatcherCoordinator, "_validate_new_run_snapshot", lambda *_args: None)
-    launches: list[str] = []
-    monkeypatch.setattr(
-        DispatcherCoordinator,
-        "launch_graph",
-        lambda _self, outcome, *_args, **_kwargs: launches.append(outcome.run_id),
-    )
-    save_agent_profiles(
-        REPO,
-        {"local": {"provider": "codex-cli", "model": "test-model", "reasoning_effort": "low", "instructions_version": "1", "environment_preset": "local-read-only"}},
-        state,
-    )
-    with TestClient(create_app(state, [REPO], testing=True)) as client:
+def test_analyze_dif_has_no_approval_action(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
         project = _bookmark(client, tmp_path)
-        start = client.post(
-            f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/start",
-            json={"actor": "local-user"},
-            headers={"Origin": "http://testserver", "Idempotency-Key": "noise-start"},
-        ).json()["outcome"]
-        proposal_key = "noise-review-resume"
-        with DispatcherStore(REPO, state) as store:
-            lease = store.lease("discover-mrq")
-            assert lease is not None
-            assert store.save_proposal(
-                proposal_key,
-                "discover-mrq",
-                lease["thread_id"],
-                "approval",
-                {
-                    "approval_stage": "noise",
-                    "noise_proposals": [{
-                        "stable_diff_id": "DIF-AAAAAAAAAAAAAAAA",
-                        "rationale": "Reviewed noise",
-                        "evidence": [{"path": "a.bsl", "fingerprint": "sha256:" + "a" * 64}],
-                    }],
-                },
-                lease["lease_token"],
-            )
-        fingerprint = client.get(f"/api/v1/projects/{project['id']}/workflow").json()["workflow_fingerprint"]
-        approved = client.post(
-            f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/approve-noise",
-            json={"actor": "local-user", "proposal_key": proposal_key, "expected_fingerprint": fingerprint},
-            headers={"Origin": "http://testserver", "Idempotency-Key": "noise-approve"},
-        ).json()["outcome"]
-        assert approved["status"] == "resumable"
-        resumed = client.post(
-            f"/api/v1/projects/{project['id']}/dispatcher/discover-mrq/resume",
-            json={"actor": "local-user"},
-            headers={"Origin": "http://testserver", "Idempotency-Key": "noise-resume"},
-        ).json()["outcome"]
-        assert resumed["status"] == "running"
-        assert resumed["run_id"] == start["run_id"]
-        assert resumed["thread_id"] == start["thread_id"]
-    assert launches == [start["run_id"], start["run_id"]]
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/dispatcher/analyze-dif/approve-noise",
+            json={},
+            headers={"Origin": "http://testserver", "Idempotency-Key": "noise-forbidden"},
+        )
+        assert response.status_code == 422
+        assert "unsupported dispatcher action" in response.text

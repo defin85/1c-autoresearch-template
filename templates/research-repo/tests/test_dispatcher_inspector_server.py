@@ -588,7 +588,7 @@ def test_dispatcher_shows_current_analyzer_results_before_publication(
         lambda _repo, _name: {},
     )
     results = [{
-        "job_id": "discover-mrq",
+        "job_id": "analyze-dif",
         "thread_id": "current",
         "kind": "node-result",
         "payload": {

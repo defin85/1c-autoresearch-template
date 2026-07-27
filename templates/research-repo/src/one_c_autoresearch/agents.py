@@ -13,11 +13,12 @@ from .sources import _run_command
 
 
 PROPOSAL_FIELDS = {
+    "dif.classify-next": {"classification", "semantic_hints", "evidence", "rationale"},
     "mrq.discover-next": {"semantic_key", "title", "stable_diff_ids", "supporting_diff_ids", "evidence", "business_meaning", "scope", "confidence", "rationale"},
     "mrq.classify-batches": {"mrq_ids", "basis", "linkage_proven"},
     "mrq.decide-next": {"mrq_id", "decision", "target_evidence", "target_coverage", "residual_gap", "target_solution", "rationale", "acceptance_criteria", "risk", "open_questions"},
 }
-STRING_ARRAY_FIELDS = {"stable_diff_ids", "supporting_diff_ids", "mrq_ids", "acceptance_criteria", "open_questions"}
+STRING_ARRAY_FIELDS = {"semantic_hints", "stable_diff_ids", "supporting_diff_ids", "mrq_ids", "acceptance_criteria", "open_questions"}
 EVIDENCE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -258,7 +259,11 @@ def resolve_execution_snapshot(
         "subject_bindings": {
             "source_generation_id": str((pointers.get("source") or {}).get("generation_id", "")),
             "diff_generation_id": str((pointers.get("diff") or {}).get("generation_id", "")),
-            "canonical_generation_id": str((pointers.get("mrq") or {}).get("canonical_generation_id", "")),
+            "canonical_generation_id": str(
+                json.loads(
+                    (repo / "research/active-consolidation-generation.json").read_text(encoding="utf-8")
+                ).get("mrq_generation_id", "")
+            ),
         },
         "policy_source": "current-policy",
         "work_unit": work_unit,
@@ -288,6 +293,8 @@ def validate_proposal(operation: str, payload: dict[str, Any], work_unit: dict[s
     if required is None or set(payload) != required:
         raise ValueError("agent proposal does not match the fixed operation schema")
     work_id = str(work_unit.get("id", ""))
+    if operation == "dif.classify-next" and payload["classification"] not in {"meaning", "noise"}:
+        raise ValueError("DIF classification must be meaning or noise")
     if operation == "mrq.discover-next" and work_id not in payload["stable_diff_ids"]:
         raise ValueError("discovery proposal does not own its selected DIF work unit")
     if operation == "mrq.decide-next" and payload["mrq_id"] != work_id:
@@ -323,8 +330,9 @@ def execute(
     properties = {
         key: {"type": "array", "items": {"type": "string"}} if key in STRING_ARRAY_FIELDS
         else {"type": "array", "items": TARGET_COVERAGE_SCHEMA} if key == "target_coverage"
-        else {"type": "array", "items": EVIDENCE_SCHEMA} if key in {"evidence", "target_evidence"}
+        else {"type": "array", "items": EVIDENCE_SCHEMA, **({"minItems": 1} if key == "evidence" else {})} if key in {"evidence", "target_evidence"}
         else {"type": "boolean"} if key == "linkage_proven"
+        else {"type": "string", "enum": ["meaning", "noise"]} if key == "classification"
         else {"type": "string"}
         for key in sorted(fields)
     }

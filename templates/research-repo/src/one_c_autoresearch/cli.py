@@ -46,6 +46,8 @@ def parser() -> argparse.ArgumentParser:
     apply.add_argument("operation")
     apply.add_argument("--payload", type=_payload, default={})
     apply.add_argument("--expected-fingerprint", required=True)
+    migrate = commands.add_parser("migrate-workflow-v4")
+    migrate.add_argument("--workflow-v4", required=True)
     external = commands.add_parser("external-artifacts").add_subparsers(dest="external_command", required=True)
     preview = external.add_parser("folder-preview")
     preview.add_argument("path")
@@ -67,6 +69,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         from .doctor import check
         value = check(Path(args.repo_path), args.strict)
+    elif args.command == "migrate-workflow-v4":
+        from .contracts import sha256
+        from .workflow_migration import execute, start_migration
+        workflow_bytes = (repo / args.workflow_v4).read_bytes() if not Path(args.workflow_v4).is_absolute() else Path(args.workflow_v4).read_bytes()
+        workflow_fingerprint = "sha256:" + sha256((repo / "research/workflow.toml").read_bytes())
+        repository_fingerprint = "sha256:" + sha256(str(repo).encode())
+        journal = start_migration(
+            repo, repository_fingerprint=repository_fingerprint,
+            workflow_fingerprint=workflow_fingerprint, owner="local-user",
+        )
+        value = execute(repo, journal["migration_id"], workflow_v4=workflow_bytes)
     elif args.command == "status":
         value = service.snapshot()
     elif args.command == "next":
@@ -82,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         invoke = lambda operation, payload, cancelled: service.apply(operation, payload, service.snapshot()["workflow_fingerprint"], cancelled)
         approvals = {"sources.acquire"} if args.approve_source_acquisition else set()
         if args.approve_agent_proposal:
-            approvals.update({"mrq.discover-next", "mrq.decide-next"})
+            approvals.update({"dif.classify-next", "mrq.consolidate", "mrq.decide-next"})
         profiles = load_agent_profiles(repo)
         value = run_next(repo, invoke, store, select=service.next, approved_operations=approvals, agent_profiles=profiles) if args.command == "run-next" else run_until_blocked(repo, invoke, store, max_units=args.max_units, select=service.next, approved_operations=approvals, agent_profiles=profiles)
     elif args.command == "external-artifacts":
@@ -97,4 +110,4 @@ def main(argv: list[str] | None = None) -> int:
     else:
         value = service.apply(args.operation, args.payload, args.expected_fingerprint)
     print(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))
-    return 0
+    return 1 if args.command == "doctor" and not value.get("ok", False) else 0

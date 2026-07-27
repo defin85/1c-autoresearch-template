@@ -229,7 +229,7 @@ def test_executor_stops_after_unchanged_diff_and_skips_empty_conditional_step():
         "workflow_fingerprint": "wf",
         "steps": [
             {"step_id": "1:diff", "operation": "diff.build", "input_fingerprint": "a"},
-            {"step_id": "2:mrq", "operation": "mrq.revalidate-unchanged", "input_fingerprint": "b"},
+            {"step_id": "2:mrq", "operation": "dif.classification-reset", "input_fingerprint": "b"},
             {"step_id": "3:indexes", "operation": "indexes.build", "input_fingerprint": "c", "conditional": True},
         ],
     }
@@ -285,10 +285,8 @@ def test_application_service_stages_real_writer_operations_until_pointer_transac
     monkeypatch.setattr("one_c_autoresearch.stage_recompute.state_fingerprint", lambda _repo: "wf")
     source = {"generation_id": "new-source"}
     diff = {"generation_id": "new-diff", "source_generation_id": "new-source"}
-    canonical = {"schema_version": "1", "canonical_generation_id": "new-mrq", "source_generation_id": "new-source", "diff_generation_id": "new-diff"}
     monkeypatch.setattr("one_c_autoresearch.sources.acquire", lambda *args, activate, **kwargs: source if activate is False else pytest.fail("source activated early"))
     monkeypatch.setattr("one_c_autoresearch.diffs.build", lambda *args, activate, **kwargs: diff if activate is False else pytest.fail("diff activated early"))
-    monkeypatch.setattr("one_c_autoresearch.mrq.revalidate_unchanged", lambda *args, activate, **kwargs: canonical if activate is False else pytest.fail("MRQ activated early"))
     staged = {}
     preview_path = previews / "route.json"
     expired = json.loads(preview_path.read_text(encoding="utf-8"))
@@ -300,16 +298,17 @@ def test_application_service_stages_real_writer_operations_until_pointer_transac
     preview_path.write_text(json.dumps(expired), encoding="utf-8")
     service.apply("sources.acquire", {"source_routing_preview_id": "route", "routing_plan_fingerprint": "route"}, "wf", staged=staged)
     service.apply("diff.build", {}, "wf", staged=staged)
-    service.apply("mrq.revalidate-unchanged", {"actor": "a", "rationale": "r", "timestamp": "2026-01-01T00:00:00Z"}, "wf", staged=staged)
-    assert active_pointers(repo) == {**old, "mrq": {"canonical_generation_id": "old-mrq"}}
+    from one_c_autoresearch.consolidation import sentinel
+    staged["mrq"] = sentinel()
+    assert active_pointers(repo) == old
     publish_pointers(repo, active_pointers(repo), staged, lease_check=lambda: True, validate=lambda values: None, expected_workflow_fingerprint="wf")
-    assert active_pointers(repo) == {"source": source, "diff": diff, "mrq": canonical}
+    assert active_pointers(repo) == {"source": source, "diff": diff, "mrq": sentinel()}
 
 
 def test_resume_skips_only_validated_linked_prefix_and_never_unpublished_sources():
     steps = [
         {"step_id": "1:diff", "operation": "diff.build", "input_fingerprint": "in-diff"},
-        {"step_id": "2:mrq", "operation": "mrq.revalidate-unchanged", "input_fingerprint": "in-mrq"},
+        {"step_id": "2:mrq", "operation": "dif.classification-reset", "input_fingerprint": "in-mrq"},
     ]
     plan = {"boundary": "diffs", "steps": steps}
     predecessor = {

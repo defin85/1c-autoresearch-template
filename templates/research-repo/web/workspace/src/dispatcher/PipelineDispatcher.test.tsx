@@ -24,7 +24,7 @@ const snapshotWithDispatcher = {
     },
     agent_phases: [
       {
-        job_id: 'discover-mrq',
+        job_id: 'analyze-dif',
         phase_id: 'analyze-dif',
         mode: 'parallel-pool',
         max_concurrency: 4,
@@ -56,7 +56,7 @@ const snapshotWithDispatcher = {
           ],
         }],
       },
-      { job_id: 'discover-mrq', phase_id: 'form-mrq', mode: 'coordinated-pool', max_concurrency: 2, roles: [
+      { job_id: 'consolidate-mrq', phase_id: 'form-mrq', mode: 'coordinated-pool', max_concurrency: 2, roles: [
         { role_id: 'coordinator', agent_profile: 'local', configured_slots: 1, requested: 1, running: 0, queued: 0, completed: 1, failed: 0, cancelled: 0, interrupted: 0, invocations: [] },
         { role_id: 'grouper', agent_profile: 'local', configured_slots: 2, requested: 2, running: 0, queued: 0, completed: 2, failed: 0, cancelled: 0, interrupted: 0, invocations: [] },
       ] },
@@ -71,7 +71,7 @@ const snapshotWithDispatcher = {
       dif_queue: [{ id: 'DIF-001', path: 'Catalogs/Test.xml', kind: 'extension_intervention', state: 'queued', intervention_kind: 'method_interception', object_scope: 'adopted', target_coverage: 'needs_semantic_review', extension_uuid: '471acdde-293c-497c-bd55-e6ab48d98dc4', component_id: 'target_cf:extension:471acdde-293c-497c-bd55-e6ab48d98dc4', affected_base_identity: 'catalog.products', evidence_count: 2, dependency_count: 1, compatibility_summary: { unresolved: 1 }, blocker_codes: ['unresolved_dependency'] }],
       meaning_diffs: [{ id: 'DIF-002', path: 'Documents/Test.xml', kind: 'changed', state: 'meaning' }],
       noise_diffs: [{ id: 'DIF-003', path: 'Forms/Test.xml', kind: 'changed', state: 'noise' }],
-      proposals: [{ id: 'group-1', job_id: 'discover-mrq', kind: 'group.ready', semantic_key: 'orders', dif_ids: ['DIF-002'], evidence_count: 2, noise_count: 0, mrq_id: '', created_at: '2026-07-21T12:00:00Z' }],
+      proposals: [],
       mrqs: [{ id: 'MRQ-014', title: 'Согласование заказа', semantic_key: 'orders', state: 'approved', dif_ids: ['DIF-002'], evidence_count: 2 }],
       batches: [{ id: 'MRQB-1234567890ABCDEF', mrq_ids: ['MRQ-014'], reason: 'orders' }],
       decisions: [{ id: 'MRQ-014', title: 'Согласование заказа', decision: 'adapt', target_solution: 'Адаптировать', evidence_count: 4, gap: true }],
@@ -102,7 +102,7 @@ afterEach(cleanup);
 test('PipelineDispatcher renders five circuits and freshness label', async () => {
   render(<PipelineDispatcher projectId="proj-1" />);
   expect((await screen.findAllByText('Подготовка')).length).toBeGreaterThan(0);
-  for (const title of ['Подготовка различий', 'Анализ DIF', 'Формирование MRQ', 'Формирование пакетов', 'Исследование цели']) {
+  for (const title of ['Подготовка различий', 'Анализ DIF', 'Формирование и консолидация MRQ', 'Формирование пакетов', 'Исследование цели']) {
     expect((await screen.findAllByText(title)).length).toBeGreaterThan(0);
   }
   expect(screen.queryByText('DIF-002')).not.toBeInTheDocument();
@@ -290,7 +290,7 @@ test('dispatcher stages have keyboard-focusable text controls', async () => {
   expect(within(screen.getByRole('navigation', { name: 'Этапы диспетчера' })).getAllByRole('button').map((button) => button.textContent)).toEqual([
     'Подготовка различий',
     'Анализ DIF',
-    'Формирование MRQ',
+    'Формирование и консолидация MRQ',
     'Формирование пакетов',
     'Исследование цели',
   ]);
@@ -336,7 +336,7 @@ test('dispatcher new uses the shared action callback and restores focus', async 
   const fetchMock = vi.mocked(fetch);
   fetchMock.mockImplementation((url) => Promise.resolve({
     ok: true,
-    json: async () => String(url).endsWith('/dispatcher/discover-mrq/start')
+    json: async () => String(url).endsWith('/dispatcher/analyze-dif/start')
       ? { outcome: { status: 'running', revision: 8, summary: {} } }
       : { events: [], next_cursor: 0, resync_required: false },
   } as Response));
@@ -348,9 +348,9 @@ test('dispatcher new uses the shared action callback and restores focus', async 
   fireEvent.click(role);
   expect(await screen.findByText('Текущее задание')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Запустить' }));
-  await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/dispatcher/discover-mrq/start'))).toHaveLength(1));
+  await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/dispatcher/analyze-dif/start'))).toHaveLength(1));
   expect(fetchMock).toHaveBeenCalledWith(
-    '/api/v1/projects/proj-1/dispatcher/discover-mrq/start',
+    '/api/v1/projects/proj-1/dispatcher/analyze-dif/start',
     expect.objectContaining({ method: 'POST', body: JSON.stringify({ actor: 'local-user' }) }),
   );
   fireEvent.click(screen.getByRole('button', { name: 'Закрыть' }));
@@ -374,9 +374,9 @@ test('context settings action passes the selected workflow step', () => {
 });
 
 test('PipelineDispatcher shows real invocation states independently of a soft-stopped lease', async () => {
-  const lease = { job_id: 'discover-mrq', thread_id: 'thread-1', work_unit_id: 'DIF-001', owner: 'agent-1', acquired_at: new Date().toISOString(), renewed_at: new Date().toISOString(), state: 'resumable', summary: { execution_snapshot_fingerprint: 'sha256:snapshot' } };
+  const lease = { job_id: 'analyze-dif', thread_id: 'thread-1', work_unit_id: 'DIF-001', owner: 'agent-1', acquired_at: new Date().toISOString(), renewed_at: new Date().toISOString(), state: 'resumable', summary: { execution_snapshot_fingerprint: 'sha256:snapshot' } };
   const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
-  projection.jobs = { 'discover-mrq': lease };
+  projection.jobs = { 'analyze-dif': lease };
   projection.circuits[1].leases = [lease];
   render(<PipelineDispatcher projectId="proj-1" initialProjection={projection} initialFingerprint="sha256:abc" />);
   expect(await screen.findByText(/Выполняется: 1/)).toBeInTheDocument();
@@ -413,11 +413,11 @@ test.each([
   projection.circuits[1].state = 'ready';
   if (state) {
     const lease = {
-      job_id: 'discover-mrq', thread_id: 'thread-1', work_unit_id: 'DIF-001', owner: 'agent-1',
+      job_id: 'analyze-dif', thread_id: 'thread-1', work_unit_id: 'DIF-001', owner: 'agent-1',
       acquired_at: new Date().toISOString(), renewed_at: new Date().toISOString(), state,
       summary: { execution_snapshot_fingerprint: 'sha256:snapshot' },
     };
-    projection.jobs = { 'discover-mrq': lease };
+    projection.jobs = { 'analyze-dif': lease };
     projection.circuits[1].leases = [lease];
   } else {
     projection.jobs = {};
@@ -429,7 +429,7 @@ test.each([
   fireEvent.click(screen.getByRole('button', { name: button }));
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
   expect(fetchMock).toHaveBeenCalledWith(
-    `/api/v1/projects/proj-1/dispatcher/discover-mrq/${action}`,
+    `/api/v1/projects/proj-1/dispatcher/analyze-dif/${action}`,
     expect.objectContaining({
       method: 'POST',
       body: JSON.stringify(body),
@@ -447,7 +447,7 @@ test('read-only panel blocks mutations while a resync snapshot is unavailable', 
 });
 
 test.each([
-  ['пакет MRQ', 'discover-mrq', 'form-mrq', 'batch', 'approve-batch'],
+  ['консолидация MRQ', 'consolidate-mrq', 'form-mrq', 'consolidation', 'approve-consolidation'],
   ['целевое решение', 'decide-mrq', 'decide-target', 'decision', 'approve-decision'],
 ] as const)('одобрение: %s выполняет ровно один типизированный POST', async (_name, job, circuit, stage, action) => {
   const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
@@ -458,7 +458,7 @@ test.each([
     },
   };
   projection.items.proposals = [{
-    id: `${stage}-proposal`, job_id: job, kind: 'approval', approval_stage: stage === 'batch' ? 'batch' : '',
+    id: `${stage}-proposal`, job_id: job, kind: 'approval', approval_stage: stage,
     semantic_key: '', dif_ids: [], evidence_count: 1, noise_count: 0, mrq_id: '', created_at: new Date().toISOString(),
   }];
   const fetchMock = vi.mocked(fetch);
@@ -491,7 +491,7 @@ test('panel separates current task and recompute preview before run', async () =
           steps: [{ step_id: '1:diff.build', operation: 'diff.build' }],
           required_confirmations: ['confirm_recompute'],
           possible_result: 'unchanged',
-          stop_before: 'mrq.discover-next',
+          stop_before: 'dif.classify-next',
           generations: { source: 'src-1', diff: 'diff-1' },
         }),
       } as Response);
@@ -561,7 +561,7 @@ test('MRQ panel guides to explicit actions without reset', () => {
 test('explicit retry sends policy, predecessor and expected fingerprints', async () => {
   const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
   const lease = {
-    job_id: 'discover-mrq',
+    job_id: 'analyze-dif',
     thread_id: 'thread-1',
     work_unit_id: 'DIF-001',
     owner: 'agent-1',
@@ -578,7 +578,7 @@ test('explicit retry sends policy, predecessor and expected fingerprints', async
       },
     },
   };
-  projection.jobs = { 'discover-mrq': lease };
+  projection.jobs = { 'analyze-dif': lease };
   projection.circuits[1].leases = [lease];
   const fetchMock = vi.mocked(fetch);
   fetchMock.mockResolvedValue({
@@ -592,7 +592,7 @@ test('explicit retry sends policy, predecessor and expected fingerprints', async
   fireEvent.click(screen.getByRole('option', { name: 'Текущая политика' }));
   fireEvent.click(screen.getByRole('button', { name: 'Запустить повтор' }));
   await waitFor(() => {
-    const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/dispatcher/discover-mrq/retry'));
+    const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/dispatcher/analyze-dif/retry'));
     expect(call).toBeDefined();
     expect(JSON.parse(String(call![1]?.body))).toMatchObject({
       policy_source: 'current-policy',
@@ -612,7 +612,7 @@ test('explicit retry sends policy, predecessor and expected fingerprints', async
 test('resume explains immutable execution snapshot', () => {
   const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
   const lease = {
-    job_id: 'discover-mrq',
+    job_id: 'analyze-dif',
     thread_id: 'thread-1',
     work_unit_id: 'DIF-001',
     owner: 'agent-1',
@@ -621,17 +621,17 @@ test('resume explains immutable execution snapshot', () => {
     state: 'resumable',
     summary: { execution_snapshot_fingerprint: 'sha256:snapshot' },
   };
-  projection.jobs = { 'discover-mrq': lease };
+  projection.jobs = { 'analyze-dif': lease };
   render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
   expect(screen.getByText(/неизменяемый исходный снимок sha256:snapshot/)).toBeInTheDocument();
   expect(screen.getByText(/текущая политика не перечитывается/)).toBeInTheDocument();
 });
 
-test('noise approval is a separate action before MRQ coordination', async () => {
+test('DIF analysis never exposes approval for a noise candidate', () => {
   const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
   projection.jobs = {
-    'discover-mrq': {
-      job_id: 'discover-mrq',
+    'analyze-dif': {
+      job_id: 'analyze-dif',
       thread_id: 'thread-1',
       work_unit_id: 'DIF-001',
       owner: 'agent-1',
@@ -643,9 +643,9 @@ test('noise approval is a separate action before MRQ coordination', async () => 
   };
   projection.items.proposals = [{
     id: 'noise-review',
-    job_id: 'discover-mrq',
-    kind: 'approval',
-    approval_stage: 'noise',
+    job_id: 'analyze-dif',
+    kind: 'noise_candidate',
+    approval_stage: '',
     semantic_key: '',
     dif_ids: [],
     evidence_count: 2,
@@ -653,32 +653,17 @@ test('noise approval is a separate action before MRQ coordination', async () => 
     mrq_id: '',
     created_at: new Date().toISOString(),
   }];
-  const fetchMock = vi.mocked(fetch);
-  fetchMock.mockResolvedValueOnce({
-    ok: true,
-    json: async () => ({ outcome: { status: 'resumable', run_id: 'run-1', thread_id: 'thread-1', revision: 8, summary: { next_action: 'resume' } } }),
-  } as Response);
   render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
-  fireEvent.click(screen.getByRole('button', { name: 'Одобрить шум (2)' }));
-  await waitFor(() => {
-    const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/dispatcher/discover-mrq/approve-noise'));
-    expect(call).toBeDefined();
-    expect(JSON.parse(String(call![1]?.body))).toEqual({
-      actor: 'local-user',
-      proposal_key: 'noise-review',
-      expected_fingerprint: 'sha256:workflow',
-    });
-    expect(new Headers(call![1]?.headers).get('Idempotency-Key')).toEqual(expect.any(String));
-  });
+  expect(screen.queryByRole('button', { name: /Одобрить/ })).not.toBeInTheDocument();
 });
 
 test('stale approval proposal remains an explicit error instead of a decision', async () => {
   const projection = structuredClone(approvalProjection);
   projection.items.proposals = [{
     id: 'stale-proposal',
-    job_id: 'discover-mrq',
+    job_id: 'consolidate-mrq',
     kind: 'approval',
-    approval_stage: 'batch',
+    approval_stage: 'consolidation',
     semantic_key: 'fixture',
     dif_ids: ['DIF-00001'],
     evidence_count: 1,
@@ -690,7 +675,8 @@ test('stale approval proposal remains an explicit error instead of a decision', 
     ok: false,
     json: async () => ({ detail: 'proposal_stale' }),
   } as Response);
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:fixture" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
+  projection.jobs = { 'consolidate-mrq': { ...projection.jobs['analyze-dif'], job_id: 'consolidate-mrq' } };
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:fixture" selection={{ kind: 'circuit', circuitId: 'form-mrq' }} onClose={() => {}} />);
   fireEvent.click(screen.getByRole('button', { name: 'Одобрить предложение' }));
   expect(await screen.findByText('proposal_stale')).toBeInTheDocument();
   expect(screen.queryByText(/Решение утверждено/)).not.toBeInTheDocument();
@@ -700,7 +686,7 @@ test('completed run remains selectable as an explicit retry predecessor', () => 
   const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
   projection.retry_candidates = [{
     run_id: 'run-completed',
-    job_id: 'discover-mrq',
+    job_id: 'analyze-dif',
     status: 'completed',
     execution_snapshot_fingerprint: 'sha256:snapshot',
     policy_source: 'current-policy',
@@ -719,6 +705,42 @@ test('completed run remains selectable as an explicit retry predecessor', () => 
   expect(screen.getByRole('combobox', { name: 'Запуск-предшественник' })).toHaveTextContent('run-completed · completed');
 });
 
+test('split stages show canonical window progress, context preflight and blockers', () => {
+  const projection = structuredClone(saturatedProjection);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
+  expect(screen.getByRole('region', { name: 'Ход анализа DIF' })).toHaveTextContent('Всего: 12 · классифицировано: 11 · осталось: 1');
+  expect(screen.getByRole('region', { name: 'Ход анализа DIF' })).toHaveTextContent('Текущее окно: 11 из 12 · ошибки: 1');
+  expect(screen.getByText(/Текущее окно не опубликовано/)).toBeInTheDocument();
+  cleanup();
+
+  projection.circuits.find((item) => item.id === 'form-mrq')!.aggregates = {
+    ...projection.circuits.find((item) => item.id === 'form-mrq')!.aggregates,
+    blocker_code: 'consolidation.context_capacity',
+    blocker_message: 'Ёмкость контекста недостаточна',
+    uncovered_partition_count: 2,
+  };
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'form-mrq' }} onClose={() => {}} />);
+  const progress = screen.getByRole('region', { name: 'Ход консолидации MRQ' });
+  expect(progress).toHaveTextContent('Предварительный расчёт: разделов 2, пар 3, вызовов 5');
+  expect(progress).toHaveTextContent('Фактическая ёмкость модели: 200000 токенов · оценщик: utf8-v1');
+  expect(progress).toHaveTextContent('consolidation.context_capacity');
+  expect(progress).toHaveTextContent('непокрытых разделов: 2');
+});
+
+test('already applied consolidation is shown as an idempotent result', () => {
+  const projection = structuredClone(saturatedProjection);
+  projection.circuits.find((item) => item.id === 'form-mrq')!.aggregates!.already_applied = true;
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'form-mrq' }} onClose={() => {}} />);
+  expect(screen.getByText(/возвращён существующий результат без нового поколения/)).toBeInTheDocument();
+});
+
+test('stale legacy decisions are visible after consolidation', () => {
+  const projection = structuredClone(saturatedProjection);
+  projection.circuits.find((item) => item.id === 'form-mrq')!.aggregates!.legacy_decisions_stale = 2;
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'form-mrq' }} onClose={() => {}} />);
+  expect(screen.getByText(/Устаревшие решения прежнего поколения: 2/)).toBeInTheDocument();
+});
+
 type NewCanvasActionCase = {
   name: string;
   node: 'analysis' | 'mrq' | 'classify' | 'target';
@@ -728,10 +750,10 @@ type NewCanvasActionCase = {
   invoke: () => Promise<void>;
 };
 
-const leaseFor = (job: 'discover-mrq' | 'classify-mrq' | 'decide-mrq', state: string) => ({
+const leaseFor = (job: 'analyze-dif' | 'consolidate-mrq' | 'classify-mrq' | 'decide-mrq', state: string) => ({
   job_id: job,
   thread_id: `${job}-thread`,
-  work_unit_id: job === 'discover-mrq' ? 'DIF-001' : job === 'classify-mrq' ? 'classify:sha256:fixture' : 'MRQ-014',
+  work_unit_id: job === 'analyze-dif' ? 'DIF-001' : job === 'consolidate-mrq' ? 'consolidation:sha256:fixture' : job === 'classify-mrq' ? 'classify:sha256:fixture' : 'MRQ-014',
   owner: 'matrix-agent',
   acquired_at: new Date().toISOString(),
   renewed_at: new Date().toISOString(),
@@ -742,7 +764,7 @@ const leaseFor = (job: 'discover-mrq' | 'classify-mrq' | 'decide-mrq', state: st
       source_generation_id: 'source-1',
       diff_generation_id: 'diff-1',
       canonical_generation_id: 'canonical-1',
-      work_unit_id: job === 'discover-mrq' ? 'DIF-001' : job === 'classify-mrq' ? 'classify:sha256:fixture' : 'MRQ-014',
+      work_unit_id: job === 'analyze-dif' ? 'DIF-001' : job === 'consolidate-mrq' ? 'consolidation:sha256:fixture' : job === 'classify-mrq' ? 'classify:sha256:fixture' : 'MRQ-014',
     },
   },
 });
@@ -781,8 +803,8 @@ const clickStartRecompute = async () => {
 };
 
 const setupJobAction = (
-  job: 'discover-mrq' | 'classify-mrq' | 'decide-mrq',
-  circuit: 'analyze-dif' | 'classify-mrq' | 'decide-target',
+  job: 'analyze-dif' | 'consolidate-mrq' | 'classify-mrq' | 'decide-mrq',
+  circuit: 'analyze-dif' | 'form-mrq' | 'classify-mrq' | 'decide-target',
   state?: string,
 ) => (projection: DispatcherProjection) => {
   const target = projection.circuits.find((item) => item.id === circuit)!;
@@ -797,8 +819,8 @@ const setupJobAction = (
 };
 
 const approvalSetup = (
-  job: 'discover-mrq' | 'decide-mrq',
-  stage: 'noise' | 'batch' | 'decision',
+  job: 'consolidate-mrq' | 'decide-mrq',
+  stage: 'consolidation' | 'decision',
 ) => (projection: DispatcherProjection) => {
   const lease = leaseFor(job, 'blocked');
   projection.jobs = { [job]: lease };
@@ -806,17 +828,17 @@ const approvalSetup = (
     id: `${stage}-proposal`,
     job_id: job,
     kind: 'approval',
-    approval_stage: stage === 'decision' ? '' : stage,
+    approval_stage: stage,
     semantic_key: '',
     dif_ids: [],
     evidence_count: 2,
-    noise_count: stage === 'noise' ? 2 : 0,
+    noise_count: 0,
     mrq_id: '',
     created_at: new Date().toISOString(),
   }];
 };
 
-const retryBody = (job: 'discover-mrq' | 'classify-mrq' | 'decide-mrq') => ({
+const retryBody = (job: 'analyze-dif' | 'consolidate-mrq' | 'classify-mrq' | 'decide-mrq') => ({
   policy_source: 'reuse-snapshot',
   predecessor_run_id: `${job}-run`,
   expected_workflow_fingerprint: 'sha256:workflow',
@@ -824,12 +846,13 @@ const retryBody = (job: 'discover-mrq' | 'classify-mrq' | 'decide-mrq') => ({
     source_generation_id: 'source-1',
     diff_generation_id: 'diff-1',
     canonical_generation_id: 'canonical-1',
-    work_unit_id: job === 'discover-mrq' ? 'DIF-001' : job === 'classify-mrq' ? 'classify:sha256:fixture' : 'MRQ-014',
+    work_unit_id: job === 'analyze-dif' ? 'DIF-001' : job === 'consolidate-mrq' ? 'consolidation:sha256:fixture' : job === 'classify-mrq' ? 'classify:sha256:fixture' : 'MRQ-014',
   },
 });
 
 const basicNewCanvasActions: NewCanvasActionCase[] = ([
-  ['discover-mrq', 'analysis', 'analyze-dif'],
+  ['analyze-dif', 'analysis', 'analyze-dif'],
+  ['consolidate-mrq', 'mrq', 'form-mrq'],
   ['classify-mrq', 'classify', 'classify-mrq'],
   ['decide-mrq', 'target', 'decide-target'],
 ] as const).flatMap(([job, node, circuit]) => [
@@ -877,19 +900,11 @@ const basicNewCanvasActions: NewCanvasActionCase[] = ([
 
 const specializedNewCanvasActions: NewCanvasActionCase[] = [
   {
-    name: 'одобрение шума',
-    node: 'analysis',
-    endpoint: '/dispatcher/discover-mrq/approve-noise',
-    body: { actor: 'local-user', proposal_key: 'noise-proposal', expected_fingerprint: 'sha256:workflow' },
-    setup: approvalSetup('discover-mrq', 'noise'),
-    invoke: clickButton('Одобрить шум (2)'),
-  },
-  {
-    name: 'одобрение пакета MRQ',
+    name: 'одобрение консолидации MRQ',
     node: 'mrq',
-    endpoint: '/dispatcher/discover-mrq/approve-batch',
-    body: { actor: 'local-user', proposal_key: 'batch-proposal', expected_fingerprint: 'sha256:workflow' },
-    setup: approvalSetup('discover-mrq', 'batch'),
+    endpoint: '/dispatcher/consolidate-mrq/approve-consolidation',
+    body: { actor: 'local-user', proposal_key: 'consolidation-proposal', expected_fingerprint: 'sha256:workflow' },
+    setup: approvalSetup('consolidate-mrq', 'consolidation'),
     invoke: clickButton('Одобрить предложение'),
   },
   {
@@ -905,7 +920,7 @@ const specializedNewCanvasActions: NewCanvasActionCase[] = [
     node: 'analysis',
     endpoint: '/stage-recompute/preview',
     body: { boundary: 'diffs', expected_workflow_fingerprint: 'sha256:workflow' },
-    setup: setupJobAction('discover-mrq', 'analyze-dif'),
+    setup: setupJobAction('analyze-dif', 'analyze-dif'),
     invoke: clickButton('Пересчитать с этапа'),
   },
   {
@@ -918,7 +933,7 @@ const specializedNewCanvasActions: NewCanvasActionCase[] = [
       plan_fingerprint: 'sha256:plan',
       confirmations: ['a-confirmation', 'z-confirmation'],
     },
-    setup: setupJobAction('discover-mrq', 'analyze-dif'),
+    setup: setupJobAction('analyze-dif', 'analyze-dif'),
     invoke: clickStartRecompute,
   },
   {
@@ -927,7 +942,7 @@ const specializedNewCanvasActions: NewCanvasActionCase[] = [
     endpoint: '/stage-recompute/runs/recompute-run/cancel',
     body: {},
     setup: (projection) => {
-      setupJobAction('discover-mrq', 'analyze-dif')(projection);
+      setupJobAction('analyze-dif', 'analyze-dif')(projection);
       projection.jobs['stage-recompute'] = {
         job_id: 'stage-recompute',
         thread_id: 'recompute-thread',

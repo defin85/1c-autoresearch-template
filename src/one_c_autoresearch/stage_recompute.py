@@ -11,14 +11,14 @@ from .workflow import state_fingerprint
 
 
 BOUNDARY_STEPS = {
-    "sources": ("sources.acquire", "diff.build", "mrq.revalidate-unchanged", "indexes.build"),
-    "diffs": ("diff.build", "mrq.revalidate-unchanged"),
+    "sources": ("sources.acquire", "diff.build", "dif.classification-reset", "indexes.build"),
+    "diffs": ("diff.build", "dif.classification-reset"),
     "projections": ("projections.build", "workflow.verify"),
 }
 POINTERS = {
     "source": "active-source-generation.json",
     "diff": "active-diff-generation.json",
-    "mrq": "active-generation.json",
+    "mrq": "active-consolidation-generation.json",
 }
 INTENT = ".stage-recompute-transaction.json"
 
@@ -141,16 +141,6 @@ def build_plan(
         source_inputs = None
     if any(not value for value in pointers.values()):
         raise RuntimeError("stage recompute requires active source, diff and MRQ generations")
-    canonical_id = pointers["mrq"].get("canonical_generation_id")
-    manifest_path = repo / "research" / "generations" / str(canonical_id) / "manifest.json"
-    if manifest_path.is_file():
-        from .mrq import comparison_epoch_fingerprint
-
-        analyzer_path = repo / "analysis" / "indexes" / "generations" / str(pointers["diff"].get("generation_id")) / "extension-analyzer-manifest.json"
-        analyzer = json.loads(analyzer_path.read_text(encoding="utf-8")) if analyzer_path.is_file() else None
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("comparison_epoch_fingerprint") != comparison_epoch_fingerprint(pointers["source"], analyzer):
-            raise RuntimeError("comparison epoch changed; use sources.configure")
     plan = {
         "schema_version": "1",
         "boundary": boundary,
@@ -232,13 +222,13 @@ def _durable_json(path: Path, value: Any) -> None:
 
 def _validate_pointer_set(repo: Path, values: dict[str, dict[str, Any]]) -> None:
     from .diffs import validate_active as validate_diff
-    from .mrq import active as validate_mrq
+    from .consolidation import _validate_pointer as validate_consolidation
     from .sources import validate_active as validate_source
 
-    source, diff, canonical = (values[kind] for kind in ("source", "diff", "mrq"))
+    source, diff, consolidation = (values[kind] for kind in ("source", "diff", "mrq"))
     validate_source(repo, deep=True, candidate=source)
     validate_diff(repo, candidate=diff, source_candidate=source)
-    validate_mrq(repo, pointer_candidate=canonical, source_candidate=source, diff_candidate=diff)
+    validate_consolidation(consolidation)
 
 
 def recover_active_publication(repo: Path) -> str | None:
@@ -458,7 +448,7 @@ def execute(
                 and prior_steps[2].get("next_input_fingerprint") == prior_plan_steps[3].get("input_fingerprint")
                 and source_result.get("generation_id") == (current["source"] or {}).get("generation_id")
                 and diff_result.get("generation_id") == (current["diff"] or {}).get("generation_id")
-                and mrq_result.get("canonical_generation_id") == (current["mrq"] or {}).get("canonical_generation_id")
+                and mrq_result.get("transaction_id") == (current["mrq"] or {}).get("transaction_id")
             )
             if published:
                 old_components = {
@@ -475,9 +465,9 @@ def execute(
         for step in predecessor_run.get("steps", []):
             result = step.get("result", {})
             operation = step.get("operation")
-            pointer = current["diff"] if operation == "diff.build" else current["mrq"] if operation == "mrq.revalidate-unchanged" else None
-            identifier = result.get("generation_id") or result.get("canonical_generation_id")
-            active_identifier = pointer.get("generation_id") if operation == "diff.build" and pointer else pointer.get("canonical_generation_id") if pointer else None
+            pointer = current["diff"] if operation == "diff.build" else current["mrq"] if operation == "dif.classification-reset" else None
+            identifier = result.get("generation_id") or result.get("transaction_id")
+            active_identifier = pointer.get("generation_id") if operation == "diff.build" and pointer else pointer.get("transaction_id") if pointer else None
             if identifier and identifier == active_identifier:
                 artifacts[operation] = step.get("output_fingerprint", "")
         if not skipped:
@@ -488,7 +478,7 @@ def execute(
             "source_routing_preview_id": source_inputs.get("source_routing_preview_id", ""),
             "routing_plan_fingerprint": source_inputs.get("routing_plan_fingerprint", ""),
         },
-        "mrq.revalidate-unchanged": {
+        "dif.classification-reset": {
             "actor": "stage-recompute",
             "rationale": f"controlled recompute from {plan['boundary']}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -497,6 +487,11 @@ def execute(
     }
     staged: dict[str, dict[str, Any]] = {}
     old_pointers = active_pointers(repo)
+    try:
+        from .dif_classifications import load_active as load_classifications
+        prior_classification_rows = load_classifications(repo)["rows"]
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        prior_classification_rows = []
     payloads["indexes.build"]["component_ids"] = changed_components
 
     def validate_candidates(values: dict[str, dict[str, Any]]) -> None:
@@ -504,8 +499,13 @@ def execute(
 
     def apply(operation: str, payload: dict[str, Any], expected: str, signal: Callable[[], bool]) -> dict[str, Any]:
         nonlocal changed_components
-        candidate_mode = operation in {"sources.acquire", "diff.build", "mrq.revalidate-unchanged"}
-        result = service.apply(operation, payload, expected, signal, staged=staged if candidate_mode else None)
+        candidate_mode = operation in {"sources.acquire", "diff.build", "dif.classification-reset"}
+        if operation == "dif.classification-reset":
+            from .consolidation import sentinel
+            staged["mrq"] = sentinel()
+            result = staged["mrq"]
+        else:
+            result = service.apply(operation, payload, expected, signal, staged=staged if candidate_mode else None)
         if operation == "sources.acquire":
             previous = {item["component_id"]: item.get("fingerprint") for item in (old_pointers["source"] or {}).get("components", [])}
             changed_components = [
@@ -520,7 +520,7 @@ def execute(
             if diff_same and (plan["boundary"] == "diffs" or source_same):
                 return {**result, "_stop": True}
         next_fingerprint = expected
-        if operation == "mrq.revalidate-unchanged":
+        if operation == "dif.classification-reset":
             candidates = {kind: staged[kind] for kind in ("source", "diff", "mrq") if kind in staged}
             publish_pointers(
                 repo,
@@ -530,6 +530,32 @@ def execute(
                 validate=validate_candidates,
                 expected_workflow_fingerprint=plan["workflow_fingerprint"],
             )
+            from .dif_classifications import physical_evidence_fingerprints, publish_empty, publish_window, reusable_rows
+            classification_path = repo / "research/active-dif-classification-generation.json"
+            current_classification = json.loads(classification_path.read_text(encoding="utf-8")) if classification_path.is_file() else {}
+            classification = publish_empty(
+                repo,
+                expected_generation_id=current_classification.get("generation_id"),
+            )
+            current_evidence = physical_evidence_fingerprints(repo)
+            expected_reuse = {
+                row["stable_diff_id"]: {
+                    "evidence_fingerprint": current_evidence.get(row["stable_diff_id"], ""),
+                    "result_schema_fingerprint": row["result_schema_fingerprint"],
+                    "profile_fingerprint": row["profile_fingerprint"],
+                    "instruction_fingerprint": row["instruction_fingerprint"],
+                    "context_fingerprint": row["context_fingerprint"],
+                }
+                for row in prior_classification_rows
+                if row["stable_diff_id"] in current_evidence
+            }
+            compatible = reusable_rows(prior_classification_rows, expected_reuse)
+            if compatible:
+                classification = publish_window(
+                    repo, compatible,
+                    expected_generation_id=classification["generation_id"],
+                )
+            result = {**result, "classification_generation_id": classification["generation_id"]}
             next_fingerprint = service.snapshot(deep=False)["workflow_fingerprint"]
         elif not candidate_mode:
             next_fingerprint = result.get("workflow_fingerprint", expected)

@@ -34,7 +34,7 @@ The managed workspace SHALL map stage 2 only to `analyze-dif` and stage 3 only t
 
 #### Scenario: Start stage 3
 - **WHEN** the user starts a ready MRQ-consolidation stage
-- **THEN** the service MUST launch only `consolidate-mrq` against the complete classification generation, compatible CUS registry, and complete active MRQ graph, then stop for explicit plan approval before canonical mutation.
+- **THEN** the service MUST launch only `consolidate-mrq` against the complete classification generation and complete active MRQ graph, then stop for explicit plan approval before canonical mutation.
 
 #### Scenario: Attempt to start stage 3 early
 - **WHEN** the user or client requests stage 3 before `all-dif-classified` is complete
@@ -73,5 +73,5 @@ The managed workspace SHALL map stage 2 only to `analyze-dif` and stage 3 only t
 - **THEN** stage 3 MUST report `consolidation.plan_storage`, retain no approval action, and leave canonical repository state unchanged.
 
 #### Scenario: Downstream result becomes stale
-- **WHEN** a new CUS/MRQ generation invalidates active batch, target-decision, or derived-output bindings
+- **WHEN** a new MRQ generation invalidates active batch, target-decision, or derived-output bindings
 - **THEN** the workspace MUST mark the affected later stages stale, identify the changed MRQ fingerprint, and offer only their supported explicit rebuild or revalidation actions.

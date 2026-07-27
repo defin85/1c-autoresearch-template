@@ -20,6 +20,8 @@ FILES = (
     "tests/test_stage_recompute_api.py", "tests/test_dispatcher.py", "tests/test_dispatcher_api.py",
     "tests/test_dispatcher_inspector_server.py", "tests/test_dispatcher_smoke.py", "tests/test_doctor.py", "tests/test_mrq.py",
     "tests/test_mrq_batches.py", "tests/test_pipeline_graphs.py", "tests/test_workflow.py",
+    "tests/test_dif_classifications.py", "tests/test_consolidation.py",
+    "tests/test_decision_generations.py", "tests/test_workflow_migration.py",
 )
 TREES = (
     "src/one_c_autoresearch", "one_c_autoresearch", "research/schemas", "web/workspace",
@@ -53,6 +55,16 @@ def write_seed(root: Path) -> None:
     (research / "infobases.toml").write_text("\n".join(lines), encoding="utf-8")
     (research / "external-artifacts.toml").write_text('schema_version = "1"\nartifacts = []\n', encoding="utf-8")
     (research / "active-diff-generation.json").write_text("{}\n", encoding="utf-8")
+    (research / "active-consolidation-generation.json").write_text(json.dumps({
+        "batch_generation_id": None, "batch_input_fingerprint": None,
+        "classification_fingerprint": None,
+        "consolidation_approval_fingerprint": None,
+        "decision_generation_id": None,
+        "decision_input_fingerprint": None, "diff_fingerprint": None,
+        "mrq_generation_id": None, "plan_fingerprint": None,
+        "schema_version": "2", "source_fingerprint": None,
+        "state": "unpublished", "transaction_id": None,
+    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     (root / "outputs").mkdir(exist_ok=True)
     for path in (root / "sources/generations", root / "analysis/indexes/generations", root / "analysis/migration-requirements/generations", root / "research/generations", root / "outputs"):
         path.mkdir(parents=True, exist_ok=True); (path / ".gitkeep").touch()

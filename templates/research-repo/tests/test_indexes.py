@@ -88,6 +88,8 @@ def test_unsupported_representation_is_not_indexed(tmp_path: Path):
 
 def test_index_loss_does_not_change_canonical_workflow(tmp_path: Path):
     from one_c_autoresearch.workflow import status
+    if not (REPO / "outputs/projections.json").is_file():
+        pytest.skip("repository has no published projections")
     before = status(REPO), (REPO / "outputs/projections.json").read_bytes()
     indexes.ensure(REPO, lambda *_: {"ready": True}, state_root=tmp_path)
     assert (status(REPO), (REPO / "outputs/projections.json").read_bytes()) == before

@@ -76,7 +76,7 @@ describe('dispatcherNewGraphModel', () => {
     expect(byId.get('review')).toMatchObject({
       zoneId: 'form-review',
       state: 'Готово',
-      detail: 'Предложений: 5 · Доказательств: 10 · Полное покрытие: подтверждено',
+      detail: 'План: approval_required · ожидают одобрения: 1 · покрытие: complete',
     });
     expect(byId.get('review')?.subzones).toBeUndefined();
     expect(graph.nodes.find((node) => node.id === 'review')?.style?.height).toBe(115);
@@ -111,7 +111,7 @@ describe('dispatcherNewGraphModel', () => {
     expect(graph.nodes.find((node) => node.id === 'target-db')?.data.detail).toBe('Ожидают одобрения: 0');
     expect(graph.nodes.find((node) => node.id === 'review')?.data).toMatchObject({
       state: 'Недоступно',
-      detail: 'Предложений: 0 · Доказательств: 0 · Полное покрытие: не подтверждено',
+      detail: 'План: не построен · ожидают одобрения: 0 · покрытие: не подтверждено',
     });
     expect([...nestedZones(emptyProjection).values()].every((zone) =>
       zone.state === 'Ожидает' || zone.state === 'Недоступно')).toBe(true);

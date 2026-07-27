@@ -18,7 +18,7 @@ import { useDispatcherStream } from './useDispatcherStream';
 const CIRCUIT_LABEL: Record<CircuitId, string> = {
   'prepare-diffs': 'Подготовка различий',
   'analyze-dif': 'Анализ DIF',
-  'form-mrq': 'Формирование MRQ',
+  'form-mrq': 'Формирование и консолидация MRQ',
   'classify-mrq': 'Формирование пакетов',
   'decide-target': 'Исследование цели',
 };
@@ -87,7 +87,7 @@ interface RecomputeRun {
   next_work_unit_id?: string;
 }
 
-async function postDispatcherAction(projectId: string, jobId: 'discover-mrq' | 'classify-mrq' | 'decide-mrq', action: string, body: DispatcherActionPayload): Promise<DispatcherOutcome> {
+async function postDispatcherAction(projectId: string, jobId: 'analyze-dif' | 'consolidate-mrq' | 'classify-mrq' | 'decide-mrq', action: string, body: DispatcherActionPayload): Promise<DispatcherOutcome> {
   const response = await api<DispatcherActionResponse>(`/projects/${projectId}/dispatcher/${jobId}/${action}`, {
     method: 'POST',
     headers: mutationHeaders(),
@@ -131,6 +131,7 @@ const COLLECTIONS = {
   'meaning-diffs': { title: 'Смысловые DIF', itemKind: 'dif', items: (projection: DispatcherProjection) => projection.items.meaning_diffs },
   'noise-diffs': { title: 'Технический шум', itemKind: 'dif', items: (projection: DispatcherProjection) => projection.items.noise_diffs },
   proposals: { title: 'Предложения групп', itemKind: 'proposal', items: (projection: DispatcherProjection) => projection.items.proposals },
+  'mrq-outcomes': { title: 'Исходы консолидации MRQ', itemKind: 'outcome', items: (projection: DispatcherProjection) => projection.items.mrq_outcomes },
   'mrq-queue': { title: 'MRQ', itemKind: 'mrq', items: (projection: DispatcherProjection) => projection.items.mrqs },
   batches: { title: 'Пакеты MRQ', itemKind: 'batch', items: (projection: DispatcherProjection) => projection.items.batches },
   approvals: { title: 'Ожидают одобрения', itemKind: 'proposal', items: (projection: DispatcherProjection) => projection.items.proposals.filter((item) => item.kind === 'approval') },
@@ -187,6 +188,7 @@ function projectionEntityView(selection: DispatcherSelection | null, projection:
   const items = selection.itemKind === 'dif'
     ? [...projection.items.dif_queue, ...projection.items.meaning_diffs, ...projection.items.noise_diffs]
     : selection.itemKind === 'mrq' ? projection.items.mrqs
+    : selection.itemKind === 'outcome' ? projection.items.mrq_outcomes
     : selection.itemKind === 'batch' ? projection.items.batches
     : selection.itemKind === 'decision' ? projection.items.decisions
     : projection.items.proposals;
@@ -333,6 +335,56 @@ export function leaseActionMatrix(
   };
 }
 
+const aggregateValue = (value: number | string | boolean | undefined) =>
+  value === undefined ? 'не определено' : typeof value === 'boolean' ? value ? 'да' : 'нет' : String(value);
+
+function SplitStageProgress({ circuitId, projection }: { circuitId: 'analyze-dif' | 'form-mrq'; projection: DispatcherProjection }) {
+  const aggregates = projection.circuits.find((item) => item.id === circuitId)?.aggregates ?? {};
+  if (circuitId === 'analyze-dif') {
+    const current = Number(aggregates.current_window_completed ?? 0);
+    const total = Number(aggregates.current_window_total ?? 0);
+    return <Paper component="section" variant="outlined" sx={{ p: 1.4 }} aria-label="Ход анализа DIF">
+      <Typography variant="subtitle2" fontWeight={700}>Классификация DIF</Typography>
+      <Typography variant="body2">
+        Всего: {aggregateValue(aggregates.total)} · классифицировано: {aggregateValue(aggregates.classified)} · осталось: {aggregateValue(aggregates.remaining)}
+      </Typography>
+      <Typography variant="body2">
+        Смысловые: {aggregateValue(aggregates.meaning)} · кандидаты в технический шум: {aggregateValue(aggregates.noise_candidate)}
+      </Typography>
+      <Typography variant="body2">
+        Текущее окно: {current} из {total} · ошибки: {aggregateValue(aggregates.failed)} · пригодно для явного восстановления: {aggregateValue(aggregates.reusable_completed)}
+      </Typography>
+      {total > 0 && <LinearProgress sx={{ mt: 1 }} variant="determinate" value={Math.min(100, 100 * current / total)} aria-label="Прогресс текущего окна DIF" />}
+      {aggregates.window_published === false && <Alert severity="warning" sx={{ mt: 1 }}>Текущее окно не опубликовано. Каноническое состояние не изменено.</Alert>}
+    </Paper>;
+  }
+  const blocked = Boolean(aggregates.blocker_code);
+  return <Paper component="section" variant="outlined" sx={{ p: 1.4 }} aria-label="Ход консолидации MRQ">
+    <Typography variant="subtitle2" fontWeight={700}>Глобальная консолидация</Typography>
+    <Typography variant="body2">
+      Сохранено: {aggregateValue(aggregates.retained)} · новых: {aggregateValue(aggregates.new)} · объединено: {aggregateValue(aggregates.merged)} · разделено: {aggregateValue(aggregates.split)} · заменено: {aggregateValue(aggregates.superseded)}
+    </Typography>
+    <Typography variant="body2">
+      Доказательства: {aggregateValue(aggregates.evidence)} · покрытие: {aggregateValue(aggregates.coverage)} · ожидают одобрения: {aggregateValue(aggregates.approval_pending)} · опубликовано: {aggregateValue(aggregates.published)}
+    </Typography>
+    <Typography variant="body2">
+      Предварительный расчёт: разделов {aggregateValue(aggregates.partition_count)}, пар {aggregateValue(aggregates.pair_count)}, вызовов {aggregateValue(aggregates.planned_invocation_count)}
+    </Typography>
+    <Typography variant="body2">
+      Фактическая ёмкость модели: {aggregateValue(aggregates.input_context_tokens)} токенов · оценщик: {aggregateValue(aggregates.context_estimator_version)}
+    </Typography>
+    {aggregates.plan_fingerprint && <Typography variant="caption" display="block">План: {aggregates.plan_fingerprint} · состояние: {aggregateValue(aggregates.plan_status)}</Typography>}
+    {aggregates.already_applied && <Alert severity="success" sx={{ mt: 1 }}>Этот план уже применён; возвращён существующий результат без нового поколения.</Alert>}
+    {Number(aggregates.legacy_decisions_stale ?? 0) > 0 && <Alert severity="warning" sx={{ mt: 1 }}>
+      Устаревшие решения прежнего поколения: {aggregates.legacy_decisions_stale}. Они не перенесены и требуют нового решения.
+    </Alert>}
+    {blocked && <Alert severity="error" sx={{ mt: 1 }}>
+      {aggregates.blocker_code}: {aggregates.blocker_message || 'Выполнение заблокировано'}
+      {Number(aggregates.uncovered_partition_count ?? 0) > 0 ? ` · непокрытых разделов: ${aggregates.uncovered_partition_count}` : ''}
+    </Alert>}
+  </Paper>;
+}
+
 export function DispatcherPanel({ projectId, projection, fingerprint, selection, refreshToken = 0, onSelect, onClose, onOpenSources, onOpenIndexes, onOpenSettings, onOpenJournal, onOpenRegistry, readOnly = false }: { projectId: string; projection: DispatcherProjection; fingerprint: string; selection: DispatcherSelection | null; refreshToken?: number; onSelect?: (selection: DispatcherSelection, initiator: HTMLElement) => void; onClose: () => void; readOnly?: boolean } & ContextActions) {
   const [busy, setBusy] = useState(false);
   const [outcome, setOutcome] = useState<DispatcherOutcome | null>(null);
@@ -356,7 +408,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
   const entityStale = Boolean(!projectedView && entityView);
   const headingRef = useRef<HTMLHeadingElement | null>(null);
   useEffect(() => { if (selection) headingRef.current?.focus(); }, [selection && selectionKey(selection)]);
-  const job = selectedCircuit === 'analyze-dif' || selectedCircuit === 'form-mrq' ? 'discover-mrq' : selectedCircuit === 'classify-mrq' ? 'classify-mrq' : selectedCircuit === 'decide-target' ? 'decide-mrq' : null;
+  const job = selectedCircuit === 'analyze-dif' ? 'analyze-dif' : selectedCircuit === 'form-mrq' ? 'consolidate-mrq' : selectedCircuit === 'classify-mrq' ? 'classify-mrq' : selectedCircuit === 'decide-target' ? 'decide-mrq' : null;
   const lease = job ? projection.jobs[job] : undefined;
   const recomputeLease = projection.jobs['stage-recompute'];
   const recomputeActive = recomputeLease?.state === 'running';
@@ -373,10 +425,14 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
       });
     }
   }, [projection.stage_recompute_run, recomputeRun?.run_id]);
-  const pendingApproval = job ? projection.items.proposals.find((proposal) => proposal.job_id === job && proposal.kind === 'approval') : undefined;
+  const pendingApproval = job === 'consolidate-mrq' || job === 'decide-mrq'
+    ? projection.items.proposals.find((proposal) => proposal.job_id === job && proposal.kind === 'approval')
+    : undefined;
   const retryCandidates = job ? (projection.retry_candidates || []).filter((item) => item.job_id === job) : [];
   const circuitReady = projection.circuits.find((item) => item.id === selectedCircuit)?.state === 'ready';
   const actions = leaseActionMatrix(lease, circuitReady, recomputeActive, Boolean(pendingApproval));
+  const circuitAggregates = projection.circuits.find((item) => item.id === selectedCircuit)?.aggregates;
+  if (circuitAggregates?.blocker_code) actions.approve = false;
   actions.retry = actions.retry || (!recomputeActive && retryCandidates.length > 0);
 
   const run = useCallback(async (action: 'start' | 'stop' | 'resume' | 'cancel', extra: DispatcherActionPayload = {}) => {
@@ -425,9 +481,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
     setBusy(true);
     setError('');
     try {
-      const action = pendingApproval.approval_stage === 'noise'
-        ? 'approve-noise'
-        : job === 'discover-mrq' ? 'approve-batch' : 'approve-decision';
+      const action = job === 'consolidate-mrq' ? 'approve-consolidation' : 'approve-decision';
       const result = await postDispatcherAction(projectId, job, action, {
         actor: 'local-user',
         proposal_key: pendingApproval.id,
@@ -516,6 +570,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
       <Stack direction="row" alignItems="center"><Typography ref={headingRef} tabIndex={-1} component="h2" variant="subtitle1" fontWeight={700} flex={1}>{title}</Typography><Button size="small" onClick={onClose}>Закрыть</Button></Stack>
       {inspection.loading && <LinearProgress aria-label="Загрузка сведений" />}
       {inspection.error && <Alert severity="warning">{inspection.error}</Alert>}
+      {(selectedCircuit === 'analyze-dif' || selectedCircuit === 'form-mrq') && <SplitStageProgress circuitId={selectedCircuit} projection={projection} />}
       {(selection?.kind === 'slot' || selection?.kind === 'invocation') && entityView && <Paper component="section" variant="outlined" sx={{ p: 1.4 }}>
         <Typography variant="subtitle2">Текущее состояние</Typography>
         <DetailRows value={entityView} />
@@ -557,7 +612,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
             <Button onClick={(event) => {
               const next: DispatcherSelection = {
                 kind: 'item',
-                itemKind: entityView.item_kind as 'dif' | 'mrq' | 'batch' | 'decision' | 'proposal',
+                itemKind: entityView.item_kind as 'dif' | 'mrq' | 'outcome' | 'batch' | 'decision' | 'proposal',
                 circuitId: selection.circuitId,
                 queueId: selection.queueId,
                 itemId: item.id,
@@ -631,7 +686,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
           <Button variant="outlined" disabled={readOnly || busy || !actions.resume} onClick={() => void run('resume')}>Продолжить</Button>
           <Button color="warning" disabled={readOnly || busy || !actions.retry} onClick={() => { setPredecessorRunId(String(lease?.summary?.run_id || retryCandidates[0]?.run_id || '')); setRetryOpen(true); }}>Явный повтор</Button>
           <Button color="error" disabled={readOnly || busy || !actions.cancel} onClick={() => void run('cancel')}>Отменить задание</Button>
-          {pendingApproval && <Button color="success" variant="contained" disabled={readOnly || busy || !actions.approve} onClick={() => void approve()}>{pendingApproval.approval_stage === 'noise' ? `Одобрить шум (${pendingApproval.noise_count})` : 'Одобрить предложение'}</Button>}
+          {pendingApproval && <Button color="success" variant="contained" disabled={readOnly || busy || !actions.approve} onClick={() => void approve()}>Одобрить предложение</Button>}
           {onOpenSettings && <Button onClick={() => onOpenSettings(job || undefined)}>Профили и параметры</Button>}
         </Stack>
         {lease?.state === 'resumable' && (
@@ -729,7 +784,7 @@ function StageRail({ projection }: { projection: DispatcherProjection }) {
   const stages = [
     ['Подготовка', '#1976d2'],
     ['Анализ DIF', '#1976d2'],
-    ['Формирование MRQ', '#6d3be7'],
+    ['Формирование и консолидация MRQ', '#6d3be7'],
     ['Формирование пакетов', '#7b1fa2'],
     ['Исследование цели', '#0097a7'],
   ] as const;
@@ -737,7 +792,8 @@ function StageRail({ projection }: { projection: DispatcherProjection }) {
   const readyCircuit = projection.circuits.find((circuit) => circuit.state === 'ready' || circuit.state === 'blocked')?.id;
   const active = runningJob === 'decide-mrq' || readyCircuit === 'decide-target' ? 4
     : runningJob === 'classify-mrq' || readyCircuit === 'classify-mrq' ? 3
-    : runningJob === 'discover-mrq' || readyCircuit === 'form-mrq' ? 2
+    : runningJob === 'consolidate-mrq' || readyCircuit === 'form-mrq' ? 2
+      : runningJob === 'analyze-dif' ? 1
       : readyCircuit === 'analyze-dif' ? 1
       : projection.items.decisions.length ? 4
         : projection.items.batches.length ? 3

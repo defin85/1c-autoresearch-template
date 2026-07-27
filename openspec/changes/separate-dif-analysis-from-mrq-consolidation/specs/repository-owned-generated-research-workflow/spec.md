@@ -12,7 +12,7 @@ The template SHALL generate a repository with workflow schema version `4`, exact
 - **THEN** DIF analysis and MRQ consolidation have different job identifiers, operation identifiers, dependencies, profiles, leases, runs, and recovery actions.
 
 ### Requirement: Generated state follows immutable generation boundaries
-Generated repositories SHALL keep source payloads, physical differences, complete DIF classifications, CUS registries, MRQ graphs, and target-decision payloads in immutable generation directories and SHALL update only their canonical active pointers through typed operations.
+Generated repositories SHALL keep source payloads, physical differences, complete DIF classifications, MRQ graphs, and target-decision payloads in immutable generation directories and SHALL update only their canonical active pointers through typed operations.
 
 #### Scenario: Source acquisition publishes
 - **WHEN** all three roles and declared external artifacts validate
@@ -28,11 +28,11 @@ Generated repositories SHALL keep source payloads, physical differences, complet
 
 #### Scenario: MRQ consolidation publishes
 - **WHEN** a complete consolidation plan passes approval and validation
-- **THEN** one compatible immutable CUS/MRQ generation pair MUST be activated through one atomically replaced aggregate consolidation pointer and no partial pair MUST be visible to a supported reader.
+- **THEN** one immutable MRQ generation MUST be activated through one atomically replaced consolidation pointer and no partial generation MUST be visible to a supported reader.
 
 #### Scenario: Target decisions publish
 - **WHEN** stage 5 decisions pass their typed approval against the current consolidation fingerprint
-- **THEN** one immutable decision generation MUST be written and an aggregate compare-and-swap MUST update only its decision binding while preserving the active CUS/MRQ pair, consolidation receipt, and compatible batch binding.
+- **THEN** one immutable decision generation MUST be written and an aggregate compare-and-swap MUST update only its decision binding while preserving the active MRQ generation, consolidation receipt, and compatible batch binding.
 
 #### Scenario: Operation is unsupported
 - **WHEN** a caller submits an arbitrary command or removed legacy operation
@@ -116,4 +116,4 @@ The generated runtime SHALL provide an explicit migration from compatible legacy
 
 #### Scenario: Legacy target decisions exist
 - **WHEN** migration or first version-4 consolidation reads approved target decisions embedded in MRQ version 1
-- **THEN** it MUST carry only decisions whose retained or revalidated MRQ identity, exact DIF-to-CUS closure, target payload, approval fingerprint, and normalized inputs remain compatible into a separate decision generation, and report every other decision stale.
+- **THEN** it MUST carry only decisions whose retained or revalidated MRQ identity, exact DIF closure, target payload, approval fingerprint, and normalized inputs remain compatible into a separate decision generation, and report every other decision stale.
