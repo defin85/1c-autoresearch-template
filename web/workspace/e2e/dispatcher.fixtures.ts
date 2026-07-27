@@ -77,6 +77,10 @@ export const saturatedProjection: DispatcherProjection = {
   fresh_at: NOW,
   circuits,
   jobs: { 'discover-mrq': lease('running') },
+  queue_aggregates: {
+    'dif-queue': { total: 12, visible: 12, omitted: 0 },
+    'mrq-queue': { total: 6, visible: 6, omitted: 0 },
+  },
   items: {
     dif_queue: Array.from({ length: 12 }, (_, index) => dif(index + 1, 'queued')),
     meaning_diffs: Array.from({ length: 6 }, (_, index) => dif(index + 21, 'meaning')),

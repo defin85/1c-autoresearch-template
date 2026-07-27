@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -31,10 +32,102 @@ LEASE_RENEWAL_SECONDS = 10
 LEASE_EXPIRY_SECONDS = 30
 BUSY_TIMEOUT_MS = 5000
 REVISION_SCHEMA_VERSION = "1"
+INVOCATION_ERROR_CODES = {
+    "validation_error",
+    "provider_error",
+    "provider_blocked",
+    "provider_timeout",
+    "tool_error",
+    "cancelled",
+    "interrupted",
+    "environment_unavailable",
+    "internal_error",
+}
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _terminalize_rows(
+    cur,
+    invocation_ids: list[str],
+    status: str,
+    now: str,
+    *,
+    error_code: str = "",
+    error_summary: str = "",
+    result_ref: str = "",
+) -> int:
+    changed = 0
+    for invocation_id in invocation_ids:
+        row = cur.execute(
+            "SELECT run_id, phase_id, role_id, slot_id, work_unit_id, created_at "
+            "FROM dispatcher_invocations WHERE invocation_id = ? AND status = 'running'",
+            (invocation_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        cur.execute(
+            "UPDATE dispatcher_invocations SET status = ?, updated_at = ?, "
+            "finished_at = ?, error_code = ?, error_summary = ?, result_ref = ? "
+            "WHERE invocation_id = ? AND status = 'running'",
+            (
+                status,
+                now,
+                now,
+                error_code or (status if status in {"cancelled", "interrupted"} else None),
+                error_summary or None,
+                result_ref or None,
+                invocation_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            continue
+        changed += 1
+        cur.execute(
+            "UPDATE dispatcher_phase_work SET status = ?, updated_at = ? "
+            "WHERE invocation_id = ? AND status = 'running'",
+            (status, now, invocation_id),
+        )
+        try:
+            duration = max(
+                0.0,
+                (datetime.fromisoformat(now) - datetime.fromisoformat(row[5])).total_seconds(),
+            )
+        except (TypeError, ValueError):
+            duration = 0.0
+        payload = {
+            "transition_key": f"invocation:{invocation_id}:finished",
+            "invocation_id": invocation_id,
+            "run_id": row[0],
+            "phase_id": row[1],
+            "role_id": row[2],
+            "slot_id": row[3],
+            "work_unit_id": row[4],
+            "invocation_status": status,
+            "timestamp": now,
+            "duration_seconds": duration,
+        }
+        if error_code or status in {"cancelled", "interrupted"}:
+            payload["error_code"] = error_code or status
+        if error_summary:
+            payload["error_summary"] = error_summary
+        if result_ref:
+            payload["result_ref"] = result_ref
+        cur.execute(
+            "INSERT OR IGNORE INTO dispatcher_invocation_outbox "
+            "(transition_key, invocation_id, run_id, event_type, payload, created_at) "
+            "VALUES (?, ?, ?, 'invocation.finished', ?, ?)",
+            (
+                payload["transition_key"],
+                invocation_id,
+                row[0],
+                canonical_json(payload).decode(),
+                now,
+            ),
+        )
+    return changed
 
 
 def dispatcher_db_path(repo: Path, base: Path | None = None) -> Path:
@@ -148,6 +241,15 @@ def _ensure_dispatcher_tables(conn) -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS dispatcher_invocation_outbox (
+                transition_key TEXT PRIMARY KEY,
+                invocation_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                delivered_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS dispatcher_phase_work (
                 job_id TEXT NOT NULL,
                 run_id TEXT NOT NULL,
@@ -186,6 +288,28 @@ def _ensure_dispatcher_tables(conn) -> None:
         retry_columns = {row[1] for row in cur.execute("PRAGMA table_info(dispatcher_retry_runs)")}
         if "owner_token" not in retry_columns:
             cur.execute("ALTER TABLE dispatcher_retry_runs ADD COLUMN owner_token TEXT NOT NULL DEFAULT ''")
+        invocation_columns = {
+            row[1] for row in cur.execute("PRAGMA table_info(dispatcher_invocations)")
+        }
+        additions = {
+            "execution_snapshot_fingerprint": "TEXT",
+            "profile_id": "TEXT",
+            "context_manifest_fingerprint": "TEXT",
+            "finished_at": "TEXT",
+            "error_code": "TEXT",
+            "error_summary": "TEXT",
+            "result_ref": "TEXT",
+        }
+        for name, column_type in additions.items():
+            if name not in invocation_columns:
+                cur.execute(
+                    f"ALTER TABLE dispatcher_invocations ADD COLUMN {name} {column_type}"
+                )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS dispatcher_invocation_history "
+            "ON dispatcher_invocations "
+            "(run_id, phase_id, role_id, slot_id, created_at DESC, invocation_id DESC)"
+        )
         conn.commit()
     finally:
         cur.close()
@@ -204,6 +328,21 @@ def _acquire_saver(repo: Path, base: Path | None = None):
     saver = saver_cm.__enter__()
     try:
         _apply_pragmas(saver)
+        columns = {
+            row[1]
+            for row in saver.conn.execute(
+                "PRAGMA table_info(dispatcher_invocations)"
+            )
+        }
+        if columns and "execution_snapshot_fingerprint" not in columns:
+            backup = path.with_suffix(".pre-inspector.sqlite")
+            if not backup.exists():
+                destination = sqlite3.connect(backup)
+                try:
+                    saver.conn.backup(destination)
+                finally:
+                    destination.close()
+                backup.chmod(0o600)
         _ensure_dispatcher_tables(saver.conn)
     except Exception:
         saver_cm.__exit__(None, None, None)
@@ -424,15 +563,16 @@ class DispatcherStore:
                     expired = (now - renewed_epoch) >= LEASE_EXPIRY_SECONDS
                     if not expired:
                         return None
-                    cur.execute(
-                        "UPDATE dispatcher_invocations SET status = 'interrupted', updated_at = ? "
-                        "WHERE job_id = ? AND status = 'running'",
-                        (renewed_at, job_id),
-                    )
-                    cur.execute(
-                        "UPDATE dispatcher_phase_work SET status = 'interrupted', updated_at = ? "
-                        "WHERE job_id = ? AND status = 'running'",
-                        (renewed_at, job_id),
+                    invocation_ids = [
+                        str(row[0])
+                        for row in cur.execute(
+                            "SELECT invocation_id FROM dispatcher_invocations "
+                            "WHERE job_id = ? AND status = 'running'",
+                            (job_id,),
+                        )
+                    ]
+                    _terminalize_rows(
+                        cur, invocation_ids, "interrupted", renewed_at
                     )
                     cur.execute("DELETE FROM dispatcher_leases WHERE job_id = ?", (job_id,))
                 cur.execute(
@@ -993,7 +1133,20 @@ class DispatcherStore:
                 cur.close()
         return copied
 
-    def start_invocation(self, job_id: str, run_id: str, phase_id: str, role_id: str, work_unit_id: str, configured_slots: int, lease_token: str) -> dict[str, str] | None:
+    def start_invocation(
+        self,
+        job_id: str,
+        run_id: str,
+        phase_id: str,
+        role_id: str,
+        work_unit_id: str,
+        configured_slots: int,
+        lease_token: str,
+        *,
+        execution_snapshot_fingerprint: str = "",
+        profile_id: str = "",
+        context_manifest_fingerprint: str = "",
+    ) -> dict[str, str] | None:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
@@ -1008,36 +1161,133 @@ class DispatcherStore:
                 invocation_id = str(uuid.uuid4())
                 slot_id = f"{phase_id}:{role_id}:{ordinal}"
                 now = _now_iso()
-                cur.execute("INSERT INTO dispatcher_invocations VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)", (invocation_id, job_id, run_id, phase_id, role_id, work_unit_id, slot_id, now, now))
+                cur.execute(
+                    "INSERT INTO dispatcher_invocations "
+                    "(invocation_id, job_id, run_id, phase_id, role_id, "
+                    "work_unit_id, slot_id, status, created_at, updated_at, "
+                    "execution_snapshot_fingerprint, profile_id, "
+                    "context_manifest_fingerprint) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)",
+                    (
+                        invocation_id,
+                        job_id,
+                        run_id,
+                        phase_id,
+                        role_id,
+                        work_unit_id,
+                        slot_id,
+                        now,
+                        now,
+                        execution_snapshot_fingerprint or None,
+                        profile_id or None,
+                        context_manifest_fingerprint or None,
+                    ),
+                )
                 cur.execute(
                     "UPDATE dispatcher_phase_work SET status = 'running', invocation_id = ?, updated_at = ? "
                     "WHERE run_id = ? AND phase_id = ? AND role_id = ? AND work_unit_id = ?",
                     (invocation_id, now, run_id, phase_id, role_id, work_unit_id),
                 )
+                payload = {
+                    "transition_key": f"invocation:{invocation_id}:started",
+                    "invocation_id": invocation_id,
+                    "run_id": run_id,
+                    "phase_id": phase_id,
+                    "role_id": role_id,
+                    "slot_id": slot_id,
+                    "work_unit_id": work_unit_id,
+                    "invocation_status": "running",
+                    "timestamp": now,
+                }
+                cur.execute(
+                    "INSERT OR IGNORE INTO dispatcher_invocation_outbox "
+                    "(transition_key, invocation_id, run_id, event_type, payload, created_at) "
+                    "VALUES (?, ?, ?, 'invocation.started', ?, ?)",
+                    (
+                        payload["transition_key"],
+                        invocation_id,
+                        run_id,
+                        canonical_json(payload).decode(),
+                        now,
+                    ),
+                )
                 return {"invocation_id": invocation_id, "slot_id": slot_id}
             finally:
                 cur.close()
 
-    def finish_invocation(self, invocation_id: str, status: str, lease_token: str) -> bool:
+    def terminalize_invocation(
+        self,
+        invocation_id: str,
+        status: str,
+        lease_token: str | None = None,
+        *,
+        error_code: str = "",
+        error_summary: str = "",
+        result_ref: str = "",
+    ) -> bool:
         if status not in {"completed", "failed", "cancelled", "interrupted"}:
             raise ValueError("invalid invocation terminal status")
+        if error_code and (
+            error_code not in INVOCATION_ERROR_CODES
+            or
+            len(error_code) > 64
+            or not all(character.isascii() and (character.isalnum() or character in "_.-") for character in error_code)
+        ):
+            raise ValueError("invalid invocation error code")
+        from .events import redact
+        encoded_summary = str(redact(error_summary)).encode("utf-8")[:4096]
+        while encoded_summary:
+            try:
+                safe_summary = encoded_summary.decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                encoded_summary = encoded_summary[:-1]
+        else:
+            safe_summary = ""
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute(
-                    "UPDATE dispatcher_invocations SET status = ?, updated_at = ? WHERE invocation_id = ? AND status = 'running' AND EXISTS (SELECT 1 FROM dispatcher_leases l WHERE l.job_id = dispatcher_invocations.job_id AND l.lease_token = ?)",
-                    (status, _now_iso(), invocation_id, lease_token),
-                )
-                changed = cur.rowcount == 1
-                if changed:
-                    cur.execute(
-                        "UPDATE dispatcher_phase_work SET status = ?, updated_at = ? "
-                        "WHERE invocation_id = ? AND status = 'running'",
-                        (status, _now_iso(), invocation_id),
-                    )
-                return changed
+                now = _now_iso()
+                if lease_token is not None and not cur.execute(
+                    "SELECT 1 FROM dispatcher_invocations i JOIN dispatcher_leases l "
+                    "ON l.job_id = i.job_id WHERE i.invocation_id = ? AND l.lease_token = ?",
+                    (invocation_id, lease_token),
+                ).fetchone():
+                    return False
+                return bool(_terminalize_rows(
+                    cur,
+                    [invocation_id],
+                    status,
+                    now,
+                    error_code=error_code,
+                    error_summary=safe_summary,
+                    result_ref=result_ref,
+                ))
             finally:
                 cur.close()
+
+    def finish_invocation(self, invocation_id: str, status: str, lease_token: str) -> bool:
+        return self.terminalize_invocation(invocation_id, status, lease_token)
+
+    def reconcile_invocation_outbox(self, event_store) -> int:
+        delivered = 0
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT transition_key, event_type, run_id, payload "
+                "FROM dispatcher_invocation_outbox WHERE delivered_at IS NULL "
+                "ORDER BY created_at, transition_key"
+            ).fetchall()
+        for transition_key, event_type, run_id, encoded in rows:
+            payload = json.loads(encoded)
+            event_store.emit(event_type, run_id, payload)
+            with self._lock, self.conn:
+                changed = self.conn.execute(
+                    "UPDATE dispatcher_invocation_outbox SET delivered_at = ? "
+                    "WHERE transition_key = ? AND delivered_at IS NULL",
+                    (_now_iso(), transition_key),
+                ).rowcount
+            delivered += changed
+        return delivered
 
     def register_phase_work(
         self,
@@ -1121,6 +1371,32 @@ class DispatcherStore:
             finally:
                 cur.close()
 
+    def cancel_running_work(
+        self, job_id: str, run_id: str, lease_token: str
+    ) -> int:
+        with repository_lock(self.repo), self._lock, self.conn:
+            cur = self.conn.cursor()
+            try:
+                if not cur.execute(
+                    "SELECT 1 FROM dispatcher_leases "
+                    "WHERE job_id = ? AND run_id = ? AND lease_token = ?",
+                    (job_id, run_id, lease_token),
+                ).fetchone():
+                    return 0
+                invocation_ids = [
+                    str(row[0])
+                    for row in cur.execute(
+                        "SELECT invocation_id FROM dispatcher_invocations "
+                        "WHERE job_id = ? AND run_id = ? AND status = 'running'",
+                        (job_id, run_id),
+                    )
+                ]
+                return _terminalize_rows(
+                    cur, invocation_ids, "cancelled", _now_iso()
+                )
+            finally:
+                cur.close()
+
     def cancel_run_work(self, job_id: str, run_id: str, lease_token: str) -> int:
         """Закрывает выполняемые и ожидающие единицы явной отменой запуска."""
 
@@ -1134,17 +1410,23 @@ class DispatcherStore:
                 if cur.fetchone() is None:
                     return 0
                 now = _now_iso()
-                cur.execute(
-                    "UPDATE dispatcher_invocations SET status = 'cancelled', updated_at = ? "
-                    "WHERE job_id = ? AND run_id = ? AND status = 'running'",
-                    (now, job_id, run_id),
+                invocation_ids = [
+                    str(row[0])
+                    for row in cur.execute(
+                        "SELECT invocation_id FROM dispatcher_invocations "
+                        "WHERE job_id = ? AND run_id = ? AND status = 'running'",
+                        (job_id, run_id),
+                    )
+                ]
+                invocation_count = _terminalize_rows(
+                    cur, invocation_ids, "cancelled", now
                 )
                 cur.execute(
                     "UPDATE dispatcher_phase_work SET status = 'cancelled', updated_at = ? "
                     "WHERE job_id = ? AND run_id = ? AND status IN ('running', 'queued')",
                     (now, job_id, run_id),
                 )
-                return cur.rowcount
+                return invocation_count + cur.rowcount
             finally:
                 cur.close()
 
@@ -1159,17 +1441,17 @@ class DispatcherStore:
                 if cur.fetchone() is None:
                     return 0
                 now = _now_iso()
-                cur.execute(
-                    "UPDATE dispatcher_invocations SET status = 'interrupted', updated_at = ? "
-                    "WHERE job_id = ? AND run_id = ? AND status = 'running'",
-                    (now, job_id, run_id),
+                invocation_ids = [
+                    str(row[0])
+                    for row in cur.execute(
+                        "SELECT invocation_id FROM dispatcher_invocations "
+                        "WHERE job_id = ? AND run_id = ? AND status = 'running'",
+                        (job_id, run_id),
+                    )
+                ]
+                return _terminalize_rows(
+                    cur, invocation_ids, "interrupted", now
                 )
-                cur.execute(
-                    "UPDATE dispatcher_phase_work SET status = 'interrupted', updated_at = ? "
-                    "WHERE job_id = ? AND run_id = ? AND status = 'running'",
-                    (now, job_id, run_id),
-                )
-                return cur.rowcount
             finally:
                 cur.close()
 
@@ -1204,14 +1486,74 @@ class DispatcherStore:
                         parameters.append(value)
                 where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
                 cur.execute(
-                    "SELECT invocation_id, job_id, run_id, phase_id, role_id, work_unit_id, slot_id, status, created_at, updated_at "
+                    "SELECT invocation_id, job_id, run_id, phase_id, role_id, work_unit_id, slot_id, status, created_at, updated_at, "
+                    "execution_snapshot_fingerprint, profile_id, context_manifest_fingerprint, finished_at, error_code, error_summary, result_ref "
                     f"FROM dispatcher_invocations{where} ORDER BY created_at DESC, invocation_id DESC LIMIT ?",
                     (*parameters, limit),
                 )
                 rows = cur.fetchall()
             finally:
                 cur.close()
-        keys = ("invocation_id", "job_id", "run_id", "phase_id", "role_id", "work_unit_id", "slot_id", "status", "created_at", "updated_at")
+        keys = ("invocation_id", "job_id", "run_id", "phase_id", "role_id", "work_unit_id", "slot_id", "status", "created_at", "updated_at", "execution_snapshot_fingerprint", "profile_id", "context_manifest_fingerprint", "finished_at", "error_code", "error_summary", "result_ref")
+        return [dict(zip(keys, row, strict=True)) for row in rows]
+
+    def invocation(self, invocation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT invocation_id, job_id, run_id, phase_id, role_id, "
+                "work_unit_id, slot_id, status, created_at, updated_at, "
+                "execution_snapshot_fingerprint, profile_id, "
+                "context_manifest_fingerprint, finished_at, error_code, "
+                "error_summary, result_ref FROM dispatcher_invocations "
+                "WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        keys = (
+            "invocation_id", "job_id", "run_id", "phase_id", "role_id",
+            "work_unit_id", "slot_id", "status", "created_at", "updated_at",
+            "execution_snapshot_fingerprint", "profile_id",
+            "context_manifest_fingerprint", "finished_at", "error_code",
+            "error_summary", "result_ref",
+        )
+        return dict(zip(keys, row, strict=True))
+
+    def invocation_history(
+        self,
+        run_id: str,
+        phase_id: str,
+        role_id: str,
+        slot_id: str,
+        limit: int,
+        before: tuple[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        parameters: list[Any] = [run_id, phase_id, role_id, slot_id]
+        before_clause = ""
+        if before is not None:
+            before_clause = (
+                " AND (created_at < ? OR (created_at = ? AND invocation_id < ?))"
+            )
+            parameters.extend((before[0], before[0], before[1]))
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT invocation_id, job_id, run_id, phase_id, role_id, "
+                "work_unit_id, slot_id, status, created_at, updated_at, "
+                "execution_snapshot_fingerprint, profile_id, "
+                "context_manifest_fingerprint, finished_at, error_code, "
+                "error_summary, result_ref FROM dispatcher_invocations "
+                "WHERE run_id = ? AND phase_id = ? AND role_id = ? AND slot_id = ?"
+                + before_clause
+                + " ORDER BY created_at DESC, invocation_id DESC LIMIT ?",
+                (*parameters, limit),
+            ).fetchall()
+        keys = (
+            "invocation_id", "job_id", "run_id", "phase_id", "role_id",
+            "work_unit_id", "slot_id", "status", "created_at", "updated_at",
+            "execution_snapshot_fingerprint", "profile_id",
+            "context_manifest_fingerprint", "finished_at", "error_code",
+            "error_summary", "result_ref",
+        )
         return [dict(zip(keys, row, strict=True)) for row in rows]
 
     def invocation_count(self, run_id: str, phase_id: str, role_id: str) -> int:
@@ -1225,6 +1567,46 @@ class DispatcherStore:
                 return int(cur.fetchone()[0])
             finally:
                 cur.close()
+
+    def slot_assignments(
+        self, run_id: str, phase_id: str, role_id: str
+    ) -> dict[str, dict[str, dict[str, Any] | None]]:
+        """Returns current and latest invocation per slot in one bounded-result query."""
+
+        with self._lock:
+            rows = self.conn.execute(
+                "WITH ranked AS ("
+                "SELECT invocation_id, job_id, run_id, phase_id, role_id, "
+                "work_unit_id, slot_id, status, created_at, updated_at, "
+                "execution_snapshot_fingerprint, profile_id, "
+                "context_manifest_fingerprint, finished_at, error_code, "
+                "error_summary, result_ref, "
+                "ROW_NUMBER() OVER (PARTITION BY slot_id "
+                "ORDER BY created_at DESC, invocation_id DESC) AS row_number "
+                "FROM dispatcher_invocations "
+                "WHERE run_id = ? AND phase_id = ? AND role_id = ?"
+                ") SELECT * FROM ranked WHERE row_number = 1 OR status = 'running' "
+                "ORDER BY slot_id, row_number",
+                (run_id, phase_id, role_id),
+            ).fetchall()
+        keys = (
+            "invocation_id", "job_id", "run_id", "phase_id", "role_id",
+            "work_unit_id", "slot_id", "status", "created_at", "updated_at",
+            "execution_snapshot_fingerprint", "profile_id",
+            "context_manifest_fingerprint", "finished_at", "error_code",
+            "error_summary", "result_ref",
+        )
+        result: dict[str, dict[str, dict[str, Any] | None]] = {}
+        for row in rows:
+            invocation = dict(zip(keys, row[: len(keys)], strict=True))
+            slot = result.setdefault(
+                invocation["slot_id"], {"current": None, "latest": None}
+            )
+            if row[-1] == 1:
+                slot["latest"] = invocation
+            if invocation["status"] == "running":
+                slot["current"] = invocation
+        return result
 
     def consume_proposal(self, key: str, lease_token: str | None = None) -> bool:
         with repository_lock(self.repo), self._lock, self.conn:

@@ -35,11 +35,18 @@ describe('dispatcherNewGraphModel', () => {
       .flatMap((node) => node.data.subzones ?? [])
       .map((zone) => [zone.id, zone]));
 
-  test('меняет только данные узлов, сохраняя буквальную геометрию и линии эталона', () => {
+  test('увеличивает только карточки ролей, сохраняя остальную геометрию и линии эталона', () => {
     const graph = buildDispatcherNewGraph(saturatedProjection);
     const nodes = ENRICHED_SUBFLOW_NODES.filter((node) => !redundantAgentNodes.has(node.id));
     const nodeIds = new Set(nodes.map((node) => node.id));
-    expect(graph.nodes.map(nodeGeometry)).toEqual(nodes.map(nodeGeometry));
+    expect(graph.nodes.map(nodeGeometry)).toEqual(nodes.map((node) => nodeGeometry(roleNodes.has(node.id) ? {
+      ...node,
+      style: {
+        ...node.style,
+        width: 135,
+        height: Math.max(Number(node.style?.height ?? 0), 150),
+      },
+    } : node)));
     expect(graph.edges.map(edgeGeometry)).toEqual(ENRICHED_SUBFLOW_EDGES
       .filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target))
       .map((edge) => edgeGeometry({
@@ -47,12 +54,11 @@ describe('dispatcherNewGraphModel', () => {
         sourceHandle: roleNodes.has(edge.source) ? roleHandle(edge.sourceHandle, 'out') : edge.sourceHandle,
         targetHandle: roleNodes.has(edge.target) ? roleHandle(edge.targetHandle, 'in') : edge.targetHandle,
       })));
-    expect(graph.nodes.every((node) =>
-      node.focusable
-      && node.ariaRole === 'button'
-      && node.data.interaction === 'open-circuit'
-      && Boolean(node.data.circuitId)
-      && Boolean(node.ariaLabel))).toBe(true);
+    expect(graph.nodes.every((node) => Boolean(node.data.circuitId) && Boolean(node.ariaLabel))).toBe(true);
+    expect(graph.nodes.filter((node) => roleNodes.has(node.id)).every((node) =>
+      !node.focusable && node.ariaRole === 'group' && node.data.interaction === 'none')).toBe(true);
+    expect(graph.nodes.filter((node) => !roleNodes.has(node.id)).every((node) =>
+      node.focusable && node.ariaRole === 'button' && node.data.interaction === 'open-circuit')).toBe(true);
   });
 
   test('показывает фактические значения проекции вместо демонстрационных', () => {
@@ -63,24 +69,27 @@ describe('dispatcherNewGraphModel', () => {
     expect(byId.get('coordinator')).toMatchObject({ zoneId: 'form-coordinator', state: 'Готово', active: false });
     expect(byId.get('grouper-1')).toMatchObject({ zoneId: 'form-groupers', state: 'В работе', active: true });
     expect(byId.get('researcher-1')).toMatchObject({ zoneId: 'decide-researchers', state: 'В работе', active: true });
-    expect(byId.get('semantic-dif')?.detail).toContain('DIF-00021');
+    expect(byId.get('semantic-dif')?.detail).toBe('Смысловых DIF: 6');
+    expect(byId.get('technical-noise')?.detail).toBe('Элементов шума: 5');
     expect(graph.nodes.find((node) => node.id === 'semantic-dif')?.style?.width).toBeGreaterThanOrEqual(96);
-    expect(byId.get('publication')).toMatchObject({ zoneId: 'form-publication', detail: expect.stringContaining('MRQ-00001 · DIF 1 · доказательств 2') });
-    expect(byId.get('results')?.detail).toContain('типовых: 1');
+    expect(byId.get('publication')).toMatchObject({ zoneId: 'form-publication', detail: 'MRQ: 6' });
+    expect(byId.get('review')).toMatchObject({
+      zoneId: 'form-review',
+      state: 'Готово',
+      detail: 'Предложений: 5 · Доказательств: 10 · Полное покрытие: подтверждено',
+    });
+    expect(byId.get('review')?.subzones).toBeUndefined();
+    expect(graph.nodes.find((node) => node.id === 'review')?.style?.height).toBe(115);
+    expect(byId.get('target-db')).toMatchObject({ state: 'Ожидает', detail: 'Ожидают одобрения: 1' });
+    expect(byId.get('results')).toMatchObject({ state: 'Готово', detail: 'Решений: 4' });
+    expect(byId.get('target-db')?.subzones).toBeUndefined();
+    expect(byId.get('results')?.subzones).toBeUndefined();
     expect(graph.nodes.flatMap((node) => node.data.invocations ?? [])).toHaveLength(24);
     expect(new Set(graph.nodes.flatMap((node) => node.data.invocations?.map((item) => item.id) ?? [])).size).toBe(24);
     expect(graph.nodes.filter((node) => node.type === 'role')).toHaveLength(5);
     expect(graph.nodes.some((node) => redundantAgentNodes.has(node.id))).toBe(false);
-    expect([...nestedZones(saturatedProjection).keys()]).toEqual([
-      'analyze-noise',
-      'form-barrier',
-      'form-publication',
-      'form-summary',
-      'decide-approval',
-      'decide-outcomes',
-    ]);
-    expect(byId.get('batch-output')).toMatchObject({ state: 'Готово', detail: expect.stringContaining('MRQB-') });
-    expect(nestedZones(saturatedProjection).get('decide-approval')).toMatchObject({ state: 'Ожидает', detail: 'Ожидают: 1' });
+    expect([...nestedZones(saturatedProjection).keys()]).toEqual([]);
+    expect(byId.get('batch-output')).toMatchObject({ state: 'Готово', detail: 'Пакетов: 5' });
 
     const serialized = JSON.stringify(graph);
     for (const demo of ['77 079', '1 342', '3.0.4', '28 731', 'прогресс 45%', 'прогресс 65%']) {
@@ -99,7 +108,11 @@ describe('dispatcherNewGraphModel', () => {
       detail: 'Работа не назначена',
       invocations: [],
     });
-    expect(graph.nodes.find((node) => node.id === 'target-db')?.data.detail).toBe('Версия и размер не подтверждены проекцией');
+    expect(graph.nodes.find((node) => node.id === 'target-db')?.data.detail).toBe('Ожидают одобрения: 0');
+    expect(graph.nodes.find((node) => node.id === 'review')?.data).toMatchObject({
+      state: 'Недоступно',
+      detail: 'Предложений: 0 · Доказательств: 0 · Полное покрытие: не подтверждено',
+    });
     expect([...nestedZones(emptyProjection).values()].every((zone) =>
       zone.state === 'Ожидает' || zone.state === 'Недоступно')).toBe(true);
   });
@@ -114,6 +127,6 @@ describe('dispatcherNewGraphModel', () => {
       state: 'Ошибка',
       active: false,
     });
-    expect(nestedZones(errorProjection).get('form-publication')?.state).toBe('Ожидает');
+    expect(failed.nodes.find((node) => node.id === 'publication')?.data.state).toBe('Готово');
   });
 });

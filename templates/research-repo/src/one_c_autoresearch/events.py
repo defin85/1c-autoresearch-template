@@ -15,7 +15,7 @@ from .contracts import atomic_bytes, atomic_json, canonical_json, reject_secrets
 EVENT_LIMIT = 10_000
 PAYLOAD_LIMIT = 64 * 1024
 LOG_LIMIT = 50 * 1024 * 1024
-EVENT_TYPES = {"run.created", "run.finished", "job.started", "job.finished", "step.started", "step.progress", "step.action", "step.output", "step.validation", "step.finished", "log.append", "approval.required"}
+EVENT_TYPES = {"run.created", "run.finished", "job.started", "job.finished", "step.started", "step.progress", "step.action", "step.output", "step.validation", "step.finished", "log.append", "approval.required", "invocation.started", "invocation.finished"}
 TERMINAL_STATUSES = {"completed", "blocked", "failed", "cancelled", "interrupted"}
 RETRYABLE_RUN_STATUSES = frozenset((TERMINAL_STATUSES - {"blocked"}) | {"stale"})
 REQUIRED_PAYLOAD = {
@@ -31,6 +31,15 @@ REQUIRED_PAYLOAD = {
     "step.finished": {"status", "actor", "operation", "duration_seconds"},
     "log.append": {"status", "log"},
     "approval.required": {"status", "blocker"},
+    "invocation.started": {
+        "transition_key", "invocation_id", "run_id", "phase_id", "role_id",
+        "slot_id", "work_unit_id", "invocation_status", "timestamp",
+    },
+    "invocation.finished": {
+        "transition_key", "invocation_id", "run_id", "phase_id", "role_id",
+        "slot_id", "work_unit_id", "invocation_status", "timestamp",
+        "duration_seconds",
+    },
 }
 
 
@@ -128,6 +137,10 @@ class EventStore:
             raise ValueError("step event requires job, step, and positive attempt")
         if event_type in {"run.finished", "job.finished", "step.finished"} and payload.get("status") not in TERMINAL_STATUSES:
             raise ValueError("terminal workflow event requires a terminal status")
+        if event_type == "invocation.started" and payload.get("invocation_status") != "running":
+            raise ValueError("invocation started event requires running invocation status")
+        if event_type == "invocation.finished" and payload.get("invocation_status") not in {"completed", "failed", "cancelled", "interrupted"}:
+            raise ValueError("invocation finished event requires terminal invocation status")
         if event_type in {"run.created", "run.finished"}:
             prepared = self.run_snapshot(run_id)
             if prepared is not None and prepared.get("schema_version") == "2":
@@ -144,7 +157,7 @@ class EventStore:
         missing = REQUIRED_PAYLOAD[event_type] - set(payload)
         if missing:
             raise ValueError(f"workflow event {event_type} is missing payload fields: {sorted(missing)}")
-        if event_type.endswith(".created") or event_type.endswith(".started") or event_type in {"step.progress", "step.action", "log.append"}:
+        if (event_type.endswith(".created") or event_type.endswith(".started") or event_type in {"step.progress", "step.action", "log.append"}) and not event_type.startswith("invocation."):
             if payload.get("status") != "running":
                 raise ValueError(f"workflow event {event_type} requires running status")
         if "duration_seconds" in payload and (not isinstance(payload["duration_seconds"], (int, float)) or payload["duration_seconds"] < 0):
@@ -156,6 +169,24 @@ class EventStore:
     def _emit_locked(self, event_type: str, run_id: str, payload: dict[str, Any], **hierarchy: Any) -> dict[str, Any]:
         events = self.events()
         cleaned = redact(payload)
+        transition_key = cleaned.get("transition_key")
+        if transition_key:
+            snapshot_path = self.root / "runs" / f"{sha256(run_id.encode())}.json"
+            try:
+                run_events = json.loads(
+                    snapshot_path.read_text(encoding="utf-8")
+                ).get("events", [])
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                run_events = []
+            duplicate = next(
+                (
+                    event for event in [*events, *run_events]
+                    if event.get("payload", {}).get("transition_key") == transition_key
+                ),
+                None,
+            )
+            if duplicate is not None:
+                return duplicate
         encoded = canonical_json(cleaned)
         if len(encoded) > PAYLOAD_LIMIT:
             artifacts = self.root / "artifacts"; artifacts.mkdir(exist_ok=True)
@@ -187,7 +218,7 @@ class EventStore:
             prior_snapshot = {}; history = []
         history = [*history, event][-1000:]
         identity = cleaned.get("process_identity") if event_type == "run.created" else prior_snapshot.get("process_identity")
-        snapshot = {"schema_version": "2" if "execution_snapshot" in prior_snapshot else "1", "run_id": run_id, "last_sequence": sequence, "status": cleaned.get("status", "running"), "process_identity": identity, "events": history}
+        snapshot = {"schema_version": "2" if "execution_snapshot" in prior_snapshot else "1", "run_id": run_id, "last_sequence": sequence, "status": prior_snapshot.get("status", "running") if event_type.startswith("invocation.") else cleaned.get("status", "running"), "process_identity": identity, "events": history}
         if "execution_snapshot" in prior_snapshot:
             snapshot["execution_snapshot"] = prior_snapshot["execution_snapshot"]
             snapshot["execution_snapshot_fingerprint"] = prior_snapshot["execution_snapshot_fingerprint"]

@@ -24,13 +24,17 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def _test_execution_snapshot(_repo, run_id, operation, step, profiles, work_unit):
+    from one_c_autoresearch.stage_recompute import active_state
+    pointers, _ = active_state(_repo)
     return {
         "schema_version": "1", "run_id": run_id, "operation": operation,
         "operation_version": step["operation_version"], "workflow_fingerprint": "sha256:" + "0" * 64,
         "timeout_seconds": step["timeout_seconds"], "agent_phases": step.get("agent_phases", []),
         "profiles": profiles, "instructions": {}, "environment": {}, "codex_version": "test",
         "application_version": "one-c-autoresearch/0.2", "subject_bindings": {
-            "source_generation_id": "", "diff_generation_id": "", "canonical_generation_id": "",
+            "source_generation_id": str((pointers.get("source") or {}).get("generation_id", "")),
+            "diff_generation_id": str((pointers.get("diff") or {}).get("generation_id", "")),
+            "canonical_generation_id": str((pointers.get("mrq") or {}).get("canonical_generation_id", "")),
         }, "policy_source": "current-policy", "work_unit": work_unit, "context_manifest": {
             "schema_version": "1", "work_unit_id": work_unit["id"],
             "work_unit_fingerprint": "sha256:" + "0" * 64, "paths": [],
@@ -74,7 +78,10 @@ def test_snapshot_includes_dispatcher_section(tmp_path: Path) -> None:
         assert circuits[2]["publication"]["id"] == "publication"
         assert circuits[2]["publication"]["state"] in {"unknown", "waiting", "complete"}
         items = snapshot["dispatcher"]["items"]
+        totals = snapshot["dispatcher"]["queue_aggregates"]
         assert {"dif_queue", "meaning_diffs", "noise_diffs", "proposals", "mrqs", "batches", "decisions"} <= set(items)
+        assert totals["dif-queue"]["total"] == len(items["dif_queue"]) + totals["dif-queue"]["omitted"]
+        assert totals["mrq-queue"]["total"] == len(items["mrqs"]) + totals["mrq-queue"]["omitted"]
         assert all(item["id"].startswith("DIF-") for item in items["dif_queue"])
         assert all(item["id"].startswith("MRQ-") for item in items["mrqs"])
         event_store = EventStore(tmp_path / "state/projects", project["id"])

@@ -80,7 +80,7 @@ def _bootstrap_repo(tmp_path: Path, customer_diffs: list[dict[str, str]], *, wit
         writer.writeheader()
         for row in customer_diffs:
             writer.writerow(row)
-            source_path = repo / row["path"]
+            source_path = repo / "sources/generations" / source_id / "target_cf" / row["path"]
             source_path.parent.mkdir(parents=True, exist_ok=True)
             source_path.write_text(f"// {row['stable_diff_id']}\n", encoding="utf-8")
     with (diff_root / "target-coverage.csv").open("w", encoding="utf-8", newline="") as stream:
@@ -258,6 +258,7 @@ def test_discover_partial_agent_failure_is_not_retried_automatically(tmp_path: P
 
 def test_bounded_map_has_no_implicit_total_20_and_respects_requested_limit() -> None:
     lock = threading.Lock()
+    ready = threading.Barrier(24)
     active = peak = 0
 
     def invoke(identifier: str) -> str:
@@ -265,7 +266,7 @@ def test_bounded_map_has_no_implicit_total_20_and_respects_requested_limit() -> 
         with lock:
             active += 1
             peak = max(peak, active)
-        time.sleep(0.01)
+        ready.wait(timeout=2)
         with lock:
             active -= 1
         return identifier

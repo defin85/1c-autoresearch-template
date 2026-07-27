@@ -24,7 +24,7 @@ LOCATION = {
 }
 
 
-def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], bool]], dict[str, Any]], store: EventStore, actor: str = "local-user", select: Callable[[], dict[str, Any] | None] | None = None, approved_operations: set[str] | None = None, agent_profiles: dict[str, dict[str, Any]] | None = None, agent_executor: Callable[..., dict[str, Any]] | None = None, source_routing_preview: dict[str, str] | None = None) -> dict[str, Any]:
+def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], bool]], dict[str, Any]], store: EventStore, actor: str = "local-user", select: Callable[[], dict[str, Any] | None] | None = None, approved_operations: set[str] | None = None, agent_profiles: dict[str, dict[str, Any]] | None = None, agent_executor: Callable[..., dict[str, Any]] | None = None, source_routing_preview: dict[str, str] | None = None, run_id: str | None = None, precreated: bool = False) -> dict[str, Any]:
     run_started = time.monotonic()
     elapsed = lambda: time.monotonic() - run_started
     store.reconcile()
@@ -40,8 +40,9 @@ def run_next(repo: Path, invoke: Callable[[str, dict[str, Any], Callable[[], boo
                 "action": work["action"],
             },
         }
-    run_id = str(uuid.uuid4())
-    store.emit("run.created", run_id, {"status": "running", "actor": actor, "process_identity": process_identity(), "workflow_fingerprint": before["workflow_fingerprint"], "operation": work.get("action") if work else "none", "work_unit": work})
+    run_id = run_id or str(uuid.uuid4())
+    if not precreated:
+        store.emit("run.created", run_id, {"status": "running", "actor": actor, "process_identity": process_identity(), "workflow_fingerprint": before["workflow_fingerprint"], "operation": work.get("action") if work else "none", "work_unit": work})
     if work is None:
         store.emit("run.finished", run_id, {"status": "completed", "result": "already_complete", "duration_seconds": elapsed()})
         return {"run_id": run_id, "result": "already_complete", "snapshot": before}

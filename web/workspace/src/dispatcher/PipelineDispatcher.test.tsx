@@ -18,6 +18,10 @@ const snapshotWithDispatcher = {
       { id: 'decide-target', state: 'unknown', aggregates: { decision_count: 0 } },
     ],
     jobs: {},
+    queue_aggregates: {
+      'dif-queue': { total: 75, visible: 1, omitted: 74 },
+      'mrq-queue': { total: 1, visible: 1, omitted: 0 },
+    },
     agent_phases: [
       {
         job_id: 'discover-mrq',
@@ -39,6 +43,13 @@ const snapshotWithDispatcher = {
           reasoning_effort: 'low',
           environment_preset: 'local-read-only',
           environment_status: 'ready',
+          run_id: 'run-1',
+          slots: [
+            { slot_id: 'analyzer-1', display_label: 'Анализатор 1', state: 'running', current_invocation_id: 'i-1' },
+            { slot_id: 'analyzer-2', display_label: 'Анализатор 2', state: 'idle', idle_reason_code: 'waiting_for_dispatch' },
+            { slot_id: 'analyzer-3', display_label: 'Анализатор 3', state: 'idle', idle_reason_code: 'work_not_requested' },
+            { slot_id: 'analyzer-4', display_label: 'Анализатор 4', state: 'idle', idle_reason_code: 'work_not_requested' },
+          ],
           invocations: [
             { invocation_id: 'i-1', slot_id: 'analyzer-1', work_unit_id: 'DIF-001', status: 'running' },
             { invocation_id: 'i-2', slot_id: 'analyzer-2', work_unit_id: 'DIF-004', status: 'queued' },
@@ -94,13 +105,169 @@ test('PipelineDispatcher renders five circuits and freshness label', async () =>
   for (const title of ['Подготовка различий', 'Анализ DIF', 'Формирование MRQ', 'Формирование пакетов', 'Исследование цели']) {
     expect((await screen.findAllByText(title)).length).toBeGreaterThan(0);
   }
-  expect((await screen.findAllByText('DIF-002')).length).toBeGreaterThan(0);
-  expect((await screen.findAllByText(/MRQ-014/)).length).toBeGreaterThan(0);
-  expect(document.querySelector('[data-zone="decide-outcomes"]')).not.toBeNull();
+  expect(screen.queryByText('DIF-002')).not.toBeInTheDocument();
+  expect(screen.queryByText(/MRQ-014/)).not.toBeInTheDocument();
+  expect((await screen.findAllByText(/Смысловых DIF: 1/)).length).toBeGreaterThan(0);
+  expect(document.querySelector('[data-zone="decide-outcomes"]')).toBeNull();
   expect(screen.getByText('Легенда')).toBeInTheDocument();
   expect(screen.getByTestId('dispatcher-new-canvas')).toBeInTheDocument();
   expect(document.querySelectorAll('[data-stage-state="active"]')).toHaveLength(1);
   expect(document.querySelectorAll('[data-stage-state="future"]')).toHaveLength(3);
+});
+
+test('opens target approvals as a collection', async () => {
+  const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
+  projection.items.proposals.push({
+    id: 'approval-1', job_id: 'decide-mrq', kind: 'approval', approval_stage: '',
+    semantic_key: 'orders', dif_ids: [], evidence_count: 1, noise_count: 0, mrq_id: 'MRQ-014', created_at: '2026-07-21T12:00:00Z',
+  });
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={projection} />);
+  fireEvent.click(document.querySelector<HTMLElement>('[data-zone="decide-target-base"]')!);
+  expect(await screen.findByRole('heading', { name: 'Ожидают одобрения' })).toBeInTheDocument();
+  expect(screen.getByText('Всего: 1', { exact: false })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'approval-1' })).toBeInTheDocument();
+});
+
+test('server-projected idle slot and invocation open exact inspector resources', async () => {
+  const fetchMock = vi.mocked(fetch);
+  fetchMock.mockImplementation((input) => {
+    const url = String(input);
+    if (url.includes('/dispatcher/inspect?')) return Promise.resolve({ ok: true, json: async () => ({ observed_at: '2026-07-27T00:00:00Z', history: { items: [] }, events: { items: [] } }) } as Response);
+    return Promise.resolve({ ok: true, json: async () => url.endsWith('/workflow') ? snapshotWithDispatcher : { events: [], next_cursor: 0, resync_required: false } } as Response);
+  });
+  const neverRun = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
+  neverRun.agent_phases![0].roles[0].run_id = undefined;
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={neverRun} />);
+  fireEvent.click(document.querySelector<HTMLElement>('[data-dispatcher-kind="role"][data-role-id="analyzer"]')!);
+  fireEvent.click(await screen.findByRole('button', { name: 'Анализатор 4' }));
+  expect(await screen.findByRole('heading', { name: 'Слот analyzer-4' })).toHaveFocus();
+  expect(screen.getByText('Работа ещё не запрошена')).toBeInTheDocument();
+  await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes('kind=slot') && String(url).includes('slot_id=analyzer-4'))).toBe(true));
+  fireEvent.click(document.querySelector<HTMLElement>('[data-dispatcher-kind="role"][data-role-id="analyzer"]')!);
+  fireEvent.click(await screen.findByRole('button', { name: 'Анализатор 2' }));
+  expect(await screen.findByText('Ожидается назначение работы')).toBeInTheDocument();
+  fireEvent.click(document.querySelector<HTMLElement>('[data-dispatcher-kind="role"][data-role-id="analyzer"]')!);
+  fireEvent.click(await screen.findByRole('button', { name: /Вызов i-1/ }));
+  expect(await screen.findByRole('heading', { name: 'Вызов i-1' })).toHaveFocus();
+  await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes('kind=invocation') && String(url).includes('invocation_id=i-1'))).toBe(true));
+});
+
+test.each([
+  [{ kind: 'role', circuitId: 'analyze-dif', phaseId: 'analyze-dif', roleId: 'analyzer' } as const, 'Профиль: local'],
+  [{ kind: 'queue', circuitId: 'analyze-dif', queueId: 'dif-queue' } as const, 'Всего: 75'],
+  [{ kind: 'item', itemKind: 'dif', circuitId: 'analyze-dif', queueId: 'dif-queue', itemId: 'DIF-001' } as const, 'Catalogs/Test.xml'],
+])('preserves last resolved %s view when its projection entity disappears', async (selection, expected) => {
+  const { rerender } = render(<DispatcherPanel projectId="proj-1" projection={snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection} fingerprint="sha256:fixture" selection={selection} onClose={() => {}} />);
+  expect(await screen.findByText(expected, { exact: false })).toBeInTheDocument();
+  const missing = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
+  if (selection.kind === 'role') missing.agent_phases = [];
+  if (selection.kind === 'queue') missing.circuits = missing.circuits.filter((item) => item.id !== 'analyze-dif');
+  if (selection.kind === 'item') missing.items.dif_queue = [];
+  rerender(<DispatcherPanel projectId="proj-1" projection={missing} fingerprint="sha256:fixture" selection={selection} onClose={() => {}} />);
+  expect(await screen.findByText(/показаны последние доступные сведения/i)).toBeInTheDocument();
+  expect(screen.getByText(expected, { exact: false })).toBeInTheDocument();
+});
+
+test('ignores a late invocation A response after invocation B is selected and renders markup literally', async () => {
+  let resolveA!: (response: Response) => void;
+  let resolveB!: (response: Response) => void;
+  const fetchMock = vi.mocked(fetch);
+  fetchMock.mockImplementation((input) => {
+    const url = String(input);
+    if (url.includes('invocation_id=i-1')) return new Promise((resolve) => { resolveA = resolve; });
+    if (url.includes('invocation_id=i-2')) return new Promise((resolve) => { resolveB = resolve; });
+    return Promise.resolve({ ok: true, json: async () => ({ events: [], next_cursor: 0, resync_required: false }) } as Response);
+  });
+  const neverRun = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
+  neverRun.agent_phases![0].roles[0].run_id = undefined;
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={neverRun} />);
+  fireEvent.click(document.querySelector<HTMLElement>('[data-dispatcher-kind="role"][data-role-id="analyzer"]')!);
+  fireEvent.click(await screen.findByRole('button', { name: /Вызов i-1/ }));
+  fireEvent.click(document.querySelector<HTMLElement>('[data-dispatcher-kind="role"][data-role-id="analyzer"]')!);
+  fireEvent.click(await screen.findByRole('button', { name: /Вызов i-2/ }));
+  resolveB({ ok: true, json: async () => ({ invocation: { invocation_id: 'i-2', error_summary: '<img src=x onerror=alert(1)>' }, history: { items: [] }, events: { items: [] } }) } as Response);
+  expect(await screen.findByText('<img src=x onerror=alert(1)>')).toBeInTheDocument();
+  resolveA({ ok: true, json: async () => ({ invocation: { invocation_id: 'i-1', error_summary: 'late-A' }, history: { items: [] }, events: { items: [] } }) } as Response);
+  await waitFor(() => expect(screen.queryByText('late-A')).not.toBeInTheDocument());
+  expect(document.querySelector('img')).toBeNull();
+});
+
+test('keeps inspection cache keyed by selection and never renders B details under A heading', async () => {
+  let resolveA!: (response: Response) => void;
+  vi.mocked(fetch).mockImplementation((input) => {
+    const url = String(input);
+    if (url.includes('invocation_id=i-1')) return new Promise((resolve) => { resolveA = resolve; });
+    if (url.includes('invocation_id=i-2')) return Promise.resolve({
+      ok: true,
+      json: async () => ({ invocation: { invocation_id: 'i-2', error_summary: 'ТОЛЬКО-Б' }, history: { items: [] }, events: { items: [] } }),
+    } as Response);
+    return Promise.resolve({ ok: true, json: async () => ({}) } as Response);
+  });
+  const projectionValue = snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection;
+  const a = { kind: 'invocation', circuitId: 'analyze-dif', phaseId: 'analyze-dif', roleId: 'analyzer', slotId: 'analyzer-1', invocationId: 'i-1' } as const;
+  const b = { ...a, slotId: 'analyzer-2', invocationId: 'i-2' } as const;
+  const { rerender } = render(<DispatcherPanel projectId="proj-1" projection={projectionValue} fingerprint="sha256:fixture" selection={b} onClose={() => {}} />);
+  expect(await screen.findByText('ТОЛЬКО-Б')).toBeInTheDocument();
+  rerender(<DispatcherPanel projectId="proj-1" projection={projectionValue} fingerprint="sha256:fixture" selection={a} onClose={() => {}} />);
+  expect(await screen.findByRole('heading', { name: 'Вызов i-1' })).toBeInTheDocument();
+  expect(screen.queryByText('ТОЛЬКО-Б')).not.toBeInTheDocument();
+  rerender(<DispatcherPanel projectId="proj-1" projection={projectionValue} fingerprint="sha256:fixture" selection={b} onClose={() => {}} />);
+  expect(await screen.findByText('ТОЛЬКО-Б')).toBeInTheDocument();
+  resolveA({ ok: true, json: async () => ({ invocation: { invocation_id: 'i-1', error_summary: 'ПОЗДНИЙ-А' }, history: { items: [] }, events: { items: [] } }) } as Response);
+  await waitFor(() => expect(screen.queryByText('ПОЗДНИЙ-А')).not.toBeInTheDocument());
+});
+
+test('aborts an invocation history page when selection changes', async () => {
+  let resolvePage!: (response: Response) => void;
+  vi.mocked(fetch).mockImplementation((input) => {
+    const url = String(input);
+    if (url.includes('history_cursor=next-a')) return new Promise((resolve) => { resolvePage = resolve; });
+    if (url.includes('invocation_id=i-1')) return Promise.resolve({ ok: true, json: async () => ({ invocation: { invocation_id: 'i-1' }, history: { items: [], next_cursor: 'next-a' }, events: { items: [] } }) } as Response);
+    if (url.includes('invocation_id=i-2')) return Promise.resolve({ ok: true, json: async () => ({ invocation: { invocation_id: 'i-2' }, history: { items: [] }, events: { items: [] } }) } as Response);
+    return Promise.resolve({ ok: true, json: async () => ({}) } as Response);
+  });
+  const projection = snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection;
+  const a = { kind: 'invocation', circuitId: 'analyze-dif', phaseId: 'analyze-dif', roleId: 'analyzer', slotId: 'analyzer-1', invocationId: 'i-1' } as const;
+  const b = { ...a, slotId: 'analyzer-2', invocationId: 'i-2' } as const;
+  const { rerender } = render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:fixture" selection={a} onClose={() => {}} />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Ещё история' }));
+  rerender(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:fixture" selection={b} onClose={() => {}} />);
+  expect(await screen.findByText('i-2')).toBeInTheDocument();
+  resolvePage({ ok: true, json: async () => ({ history: { items: [{ invocation_id: 'old-page-a' }] } }) } as Response);
+  await waitFor(() => expect(screen.queryByText('old-page-a')).not.toBeInTheDocument());
+});
+
+test('item view opens the exact typed registry target', () => {
+  const onOpenRegistry = vi.fn();
+  render(<DispatcherPanel projectId="proj-1" projection={snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection} fingerprint="sha256:fixture"
+    selection={{ kind: 'item', itemKind: 'dif', circuitId: 'analyze-dif', queueId: 'dif-queue', itemId: 'DIF-001' }} onClose={() => {}} onOpenRegistry={onOpenRegistry} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Открыть запись реестра' }));
+  expect(onOpenRegistry).toHaveBeenCalledWith({ registry: 'diff-inventory', itemId: 'DIF-001' });
+});
+
+test('a never-run slot adopts the first matching invocation event run', async () => {
+  class Source {
+    static instance: Source;
+    listeners: Record<string, Array<(event: MessageEvent) => void>> = {};
+    constructor() { Source.instance = this; }
+    addEventListener(name: string, listener: (event: MessageEvent) => void) { (this.listeners[name] ??= []).push(listener); }
+    emit(name: string, payload: unknown) { this.listeners[name]?.forEach((listener) => listener({ data: JSON.stringify(payload) } as MessageEvent)); }
+    close() {}
+  }
+  vi.stubGlobal('EventSource', Source);
+  const fetchMock = vi.mocked(fetch);
+  fetchMock.mockImplementation((input) => {
+    const url = String(input);
+    if (url.includes('/dispatcher/inspect?')) return Promise.resolve({ ok: true, json: async () => ({ history: { items: [] }, events: { items: [] } }) } as Response);
+    return Promise.resolve({ ok: true, json: async () => url.endsWith('/workflow') ? snapshotWithDispatcher : { events: [], next_cursor: 0, resync_required: false } } as Response);
+  });
+  const projectionWithoutRun = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
+  projectionWithoutRun.agent_phases![0].roles[0].run_id = undefined;
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={projectionWithoutRun} />);
+  fireEvent.click(document.querySelector<HTMLElement>('[data-dispatcher-kind="role"][data-role-id="analyzer"]')!);
+  fireEvent.click(await screen.findByRole('button', { name: 'Анализатор 4' }));
+  Source.instance.emit('workflow', { sequence: 1, type: 'invocation.started', run_id: 'run-first', phase_id: 'analyze-dif', role_id: 'analyzer', slot_id: 'analyzer-4' });
+  await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => String(input).includes('slot_id=analyzer-4') && String(input).includes('run_id=run-first'))).toBe(true));
 });
 
 test('local canvas error keeps the surrounding shell mounted', () => {
@@ -139,6 +306,31 @@ test('dispatcher stages have keyboard-focusable text controls', async () => {
   expect(await screen.findByText('Текущее задание')).toBeInTheDocument();
 });
 
+test('DIF queue node shows only counts and opens detailed side panel', async () => {
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection} initialFingerprint="sha256:workflow" />);
+  const node = await waitFor(() => document.querySelector<HTMLElement>('.react-flow__node[data-id="dif-queue"]')!);
+  expect(node).toHaveTextContent('Всего DIF: 75');
+  expect(node).not.toHaveTextContent('DIF-001');
+  fireEvent.click(node);
+  expect(await screen.findByText('DIF-001')).toBeInTheDocument();
+  expect(screen.getByText('Catalogs/Test.xml')).toBeInTheDocument();
+});
+
+test('collection nodes show counts and open their typed items in the side panel', async () => {
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection} initialFingerprint="sha256:workflow" />);
+  const semantic = await waitFor(() => document.querySelector<HTMLElement>('.react-flow__node[data-id="semantic-dif"]')!);
+  expect(semantic).toHaveTextContent('Смысловых DIF: 1');
+  expect(semantic).not.toHaveTextContent('DIF-002');
+  fireEvent.click(semantic);
+  expect(await screen.findByRole('button', { name: 'DIF-002' })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Закрыть' }));
+
+  const batches = document.querySelector<HTMLElement>('.react-flow__node[data-id="batch-output"]')!;
+  expect(batches).toHaveTextContent('Пакетов: 1');
+  fireEvent.click(batches);
+  expect(await screen.findByRole('button', { name: 'MRQB-1234567890ABCDEF' })).toBeInTheDocument();
+});
+
 test('dispatcher new uses the shared action callback and restores focus', async () => {
   const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
   const fetchMock = vi.mocked(fetch);
@@ -149,10 +341,11 @@ test('dispatcher new uses the shared action callback and restores focus', async 
       : { events: [], next_cursor: 0, resync_required: false },
   } as Response));
   render(<PipelineDispatcher projectId="proj-1" initialProjection={projection} initialFingerprint="sha256:fixture" />);
-  const node = document.querySelector<HTMLElement>('.react-flow__node[data-id="analyzer-1"]');
-  expect(node).not.toBeNull();
-  expect(node).toHaveAttribute('tabindex', '0');
-  fireEvent.keyDown(node!, { key: 'Enter' });
+  const node = document.querySelector<HTMLElement>('.react-flow__node[data-id="analyzer-1"]')!;
+  const role = node.querySelector<HTMLElement>('[data-dispatcher-kind="role"]')!;
+  expect(node).not.toHaveAttribute('tabindex');
+  expect(role.tagName).toBe('BUTTON');
+  fireEvent.click(role);
   expect(await screen.findByText('Текущее задание')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Запустить' }));
   await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/dispatcher/discover-mrq/start'))).toHaveLength(1));
@@ -161,7 +354,7 @@ test('dispatcher new uses the shared action callback and restores focus', async 
     expect.objectContaining({ method: 'POST', body: JSON.stringify({ actor: 'local-user' }) }),
   );
   fireEvent.click(screen.getByRole('button', { name: 'Закрыть' }));
-  await waitFor(() => expect(document.querySelector<HTMLElement>('.react-flow__node[data-id="analyzer-1"]')).toHaveFocus());
+  await waitFor(() => expect(role).toHaveFocus());
 });
 
 test.each([
@@ -169,13 +362,13 @@ test.each([
   ['ошибочное', errorProjection, 'Ошибка'],
   ['ожидающее одобрения', approvalProjection, 'Ожидает одобрения'],
 ] as const)('%s состояние аренды показано текстом', (_name, projection, label) => {
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:fixture" selectedCircuit="analyze-dif" onClose={() => {}} />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:fixture" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
   expect(screen.getByText(new RegExp(`Аренда: fixture-agent \\(${label}\\)`))).toBeInTheDocument();
 });
 
 test('context settings action passes the selected workflow step', () => {
   const onOpenSettings = vi.fn();
-  render(<DispatcherPanel projectId="proj-1" projection={snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection} fingerprint="sha256:fixture" selectedCircuit="classify-mrq" onClose={() => {}} onOpenSettings={onOpenSettings} />);
+  render(<DispatcherPanel projectId="proj-1" projection={snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection} fingerprint="sha256:fixture" selection={{ kind: 'circuit', circuitId: 'classify-mrq' }} onClose={() => {}} onOpenSettings={onOpenSettings} />);
   fireEvent.click(screen.getByRole('button', { name: 'Профили и параметры' }));
   expect(onOpenSettings).toHaveBeenCalledWith('classify-mrq');
 });
@@ -186,7 +379,7 @@ test('PipelineDispatcher shows real invocation states independently of a soft-st
   projection.jobs = { 'discover-mrq': lease };
   projection.circuits[1].leases = [lease];
   render(<PipelineDispatcher projectId="proj-1" initialProjection={projection} initialFingerprint="sha256:abc" />);
-  expect(await screen.findByText('Выполняется')).toBeInTheDocument();
+  expect(await screen.findByText(/Выполняется: 1/)).toBeInTheDocument();
   expect(screen.queryByText('Анализирует')).not.toBeInTheDocument();
 });
 
@@ -232,7 +425,7 @@ test.each([
   }
   const fetchMock = vi.mocked(fetch);
   fetchMock.mockResolvedValue({ ok: true, json: async () => ({ outcome: { status: 'running', revision: 8, summary: {} } }) } as Response);
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="analyze-dif" onClose={() => {}} />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
   fireEvent.click(screen.getByRole('button', { name: button }));
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
   expect(fetchMock).toHaveBeenCalledWith(
@@ -248,7 +441,7 @@ test.each([
 test('read-only panel blocks mutations while a resync snapshot is unavailable', () => {
   const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
   projection.circuits[1].state = 'ready';
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="analyze-dif" onClose={() => {}} readOnly />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} readOnly />);
   expect(screen.getByRole('button', { name: 'Запустить' })).toBeDisabled();
   expect(screen.getByRole('button', { name: 'Пересчитать с этапа' })).toBeDisabled();
 });
@@ -270,7 +463,7 @@ test.each([
   }];
   const fetchMock = vi.mocked(fetch);
   fetchMock.mockResolvedValue({ ok: true, json: async () => ({ outcome: { status: 'complete', revision: 8, summary: {} } }) } as Response);
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit={circuit} onClose={() => {}} />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: circuit }} onClose={() => {}} />);
   fireEvent.click(screen.getByRole('button', { name: 'Одобрить предложение' }));
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
   expect(fetchMock).toHaveBeenCalledWith(
@@ -308,7 +501,7 @@ test('panel separates current task and recompute preview before run', async () =
     }
     return Promise.resolve({ ok: true, json: async () => ({}) } as Response);
   });
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="analyze-dif" onClose={() => {}} />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
   expect(screen.getByRole('region', { name: 'Текущее задание' })).toBeInTheDocument();
   expect(screen.getByRole('region', { name: 'Пересчёт этапа' })).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Пересчитать с этапа' }));
@@ -351,7 +544,7 @@ test('active recompute disables normal start and has a separate cancel', () => {
     state: 'running',
     summary: { run_id: 'run-1', current_step: 'diff.build' },
   };
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="analyze-dif" onClose={() => {}} />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
   expect(screen.getByRole('button', { name: 'Запустить' })).toBeDisabled();
   expect(screen.getByRole('button', { name: 'Отменить пересчёт' })).toBeEnabled();
   expect(screen.getByText(/Выполняется шаг: diff.build/)).toBeInTheDocument();
@@ -360,7 +553,7 @@ test('active recompute disables normal start and has a separate cancel', () => {
 
 test('MRQ panel guides to explicit actions without reset', () => {
   const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="form-mrq" onClose={() => {}} />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'form-mrq' }} onClose={() => {}} />);
   expect(screen.getByText(/массовый сброс не поддерживается/)).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: 'Пересчитать с этапа' })).not.toBeInTheDocument();
 });
@@ -392,7 +585,7 @@ test('explicit retry sends policy, predecessor and expected fingerprints', async
     ok: true,
     json: async () => ({ outcome: { status: 'running', run_id: 'run-new', thread_id: 'thread-new', revision: 8, summary: {} } }),
   } as Response);
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="analyze-dif" onClose={() => {}} />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
   fireEvent.click(screen.getByRole('button', { name: 'Явный повтор' }));
   expect(screen.getByRole('dialog', { name: 'Явный повтор задания' })).toBeInTheDocument();
   fireEvent.mouseDown(screen.getByLabelText('Источник политики'));
@@ -429,7 +622,7 @@ test('resume explains immutable execution snapshot', () => {
     summary: { execution_snapshot_fingerprint: 'sha256:snapshot' },
   };
   projection.jobs = { 'discover-mrq': lease };
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="analyze-dif" onClose={() => {}} />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
   expect(screen.getByText(/неизменяемый исходный снимок sha256:snapshot/)).toBeInTheDocument();
   expect(screen.getByText(/текущая политика не перечитывается/)).toBeInTheDocument();
 });
@@ -465,7 +658,7 @@ test('noise approval is a separate action before MRQ coordination', async () => 
     ok: true,
     json: async () => ({ outcome: { status: 'resumable', run_id: 'run-1', thread_id: 'thread-1', revision: 8, summary: { next_action: 'resume' } } }),
   } as Response);
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="analyze-dif" onClose={() => {}} />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
   fireEvent.click(screen.getByRole('button', { name: 'Одобрить шум (2)' }));
   await waitFor(() => {
     const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/dispatcher/discover-mrq/approve-noise'));
@@ -497,7 +690,7 @@ test('stale approval proposal remains an explicit error instead of a decision', 
     ok: false,
     json: async () => ({ detail: 'proposal_stale' }),
   } as Response);
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:fixture" selectedCircuit="analyze-dif" onClose={() => {}} />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:fixture" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
   fireEvent.click(screen.getByRole('button', { name: 'Одобрить предложение' }));
   expect(await screen.findByText('proposal_stale')).toBeInTheDocument();
   expect(screen.queryByText(/Решение утверждено/)).not.toBeInTheDocument();
@@ -519,7 +712,7 @@ test('completed run remains selectable as an explicit retry predecessor', () => 
       work_unit_id: 'DIF-001',
     },
   }];
-  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selectedCircuit="analyze-dif" onClose={() => {}} />);
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:workflow" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
   const retry = screen.getByRole('button', { name: 'Явный повтор' });
   expect(retry).toBeEnabled();
   fireEvent.click(retry);

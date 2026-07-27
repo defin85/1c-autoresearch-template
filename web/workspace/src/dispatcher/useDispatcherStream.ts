@@ -26,6 +26,19 @@ export interface DispatcherStreamState {
   fingerprint: string;
   resyncing: boolean;
   error: string;
+  connectionState: 'connecting' | 'connected' | 'degraded';
+  lastEvent: DispatcherWorkflowEvent | null;
+  reconciliationToken: number;
+}
+export interface DispatcherWorkflowEvent {
+  sequence: number;
+  type?: string;
+  run_id?: string;
+  invocation_id?: string;
+  phase_id?: string;
+  role_id?: string;
+  slot_id?: string;
+  payload?: Record<string, unknown>;
 }
 
 export function useDispatcherStream({ projectId, initialProjection, initialFingerprint = '' }: DispatcherStreamOptions): DispatcherStreamState & { refresh: () => Promise<void> } {
@@ -33,6 +46,9 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
   const [fingerprint, setFingerprint] = useState(initialFingerprint);
   const [resyncing, setResyncing] = useState(!initialProjection);
   const [error, setError] = useState('');
+  const [connectionState, setConnectionState] = useState<'connecting' | 'connected' | 'degraded'>('connecting');
+  const [lastEvent, setLastEvent] = useState<DispatcherWorkflowEvent | null>(null);
+  const [reconciliationToken, setReconciliationToken] = useState(0);
   const cursorRef = useRef(0);
   const closedRef = useRef(false);
   const revisionRef = useRef(initialProjection?.revision ?? 0);
@@ -46,10 +62,14 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
   const waitersRef = useRef<Array<{ target: number; resolve: () => void }>>([]);
   const lastLoadSucceededRef = useRef(true);
   const resyncingRef = useRef(!initialProjection);
+  const projectRef = useRef(projectId);
+  const generationRef = useRef(0);
 
   const loadSnapshot = useCallback(async () => {
+    const generation = generationRef.current;
     try {
       const snapshot = await api<SnapshotWithDispatcher>(`/projects/${projectId}/workflow`);
+      if (generation !== generationRef.current) return;
       const next = snapshot.dispatcher ?? EMPTY_PROJECTION;
       if (next.revision < revisionRef.current) {
         setError(`snapshot revision ${next.revision} is older than current revision ${revisionRef.current}`);
@@ -62,6 +82,7 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
       setError('');
       lastLoadSucceededRef.current = true;
     } catch (fetchError) {
+      if (generation !== generationRef.current) return;
       setError(fetchError instanceof Error ? fetchError.message : 'snapshot fetch failed');
       lastLoadSucceededRef.current = false;
     }
@@ -117,6 +138,23 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
 
   useEffect(() => {
     closedRef.current = false;
+    const projectChanged = projectRef.current !== projectId;
+    if (projectChanged) {
+      projectRef.current = projectId;
+      generationRef.current += 1;
+      cursorRef.current = 0;
+      revisionRef.current = 0;
+      hasBootstrapProjectionRef.current = false;
+      lastLoadSucceededRef.current = true;
+      resyncingRef.current = true;
+      setProjection(EMPTY_PROJECTION);
+      setFingerprint('');
+      setResyncing(true);
+      setError('');
+      setConnectionState('connecting');
+      setLastEvent(null);
+      setReconciliationToken(0);
+    }
     let eventSource: EventSource | null = null;
     const connect = () => {
       if (closedRef.current) return;
@@ -125,7 +163,7 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
       eventSource = new EventSource(`/api/v1/projects/${projectId}/events/stream?cursor=${cursorRef.current}`, { withCredentials: true });
       eventSource.addEventListener('workflow', (event) => {
         try {
-          const payload = JSON.parse((event as MessageEvent).data) as { sequence: number; job_id?: string; payload?: { revision?: number; kind?: string; operation?: string } };
+          const payload = JSON.parse((event as MessageEvent).data) as DispatcherWorkflowEvent;
           if (typeof payload.sequence !== 'number' || payload.sequence <= cursorRef.current) return;
           if (cursorRef.current > 0 && payload.sequence !== cursorRef.current + 1) {
             cursorRef.current = 0;
@@ -133,6 +171,7 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
             return;
           }
           cursorRef.current = payload.sequence;
+          setLastEvent(payload);
           void queueRefresh(false);
         } catch {
           // игнорируем мусорные события; снимок останется прежним
@@ -143,11 +182,13 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
         void resync();
       });
       eventSource.addEventListener('open', () => {
+        setConnectionState('connected');
         if (!resyncingRef.current) setError('');
       });
       eventSource.addEventListener('error', () => {
         // EventSource переподключается сам с Last-Event-ID; параллельный опрос запрещён.
         if (closedRef.current) return;
+        setConnectionState('degraded');
         setError('Поток событий временно недоступен, выполняется переподключение');
       });
       } catch (sourceError) {
@@ -155,7 +196,7 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
       }
     };
     // Родитель уже получил общий снимок; без него загружаем его перед SSE.
-    if (hasBootstrapProjectionRef.current) connect(); else void resync().then((loaded) => {
+    if (!projectChanged && hasBootstrapProjectionRef.current) connect(); else void resync().then((loaded) => {
       if (loaded) connect();
     });
     return () => {
@@ -167,5 +208,17 @@ export function useDispatcherStream({ projectId, initialProjection, initialFinge
     };
   }, [projectId, queueRefresh, resync]);
 
-  return { projection, fingerprint, resyncing, error, refresh };
+  const workActive = Object.values(projection.jobs).some((lease) => lease.state === 'running')
+    || Boolean(projection.agent_phases?.some((phase) => phase.roles.some((role) => role.running > 0 || role.queued > 0)));
+  useEffect(() => {
+    const delay = connectionState === 'degraded' ? 5_000 : connectionState === 'connected' && workActive ? 30_000 : 0;
+    if (!delay) return;
+    const timer = window.setInterval(() => {
+      setReconciliationToken((value) => value + 1);
+      void queueRefresh(false);
+    }, delay);
+    return () => clearInterval(timer);
+  }, [connectionState, workActive, queueRefresh]);
+
+  return { projection, fingerprint, resyncing, error, connectionState, lastEvent, reconciliationToken, refresh };
 }

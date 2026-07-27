@@ -395,7 +395,7 @@ def _active_rows(repo: Path) -> tuple[list[dict[str, str]], list[dict[str, Any]]
     diff_root = repo / "analysis/indexes/generations" / str(diff_pointer.get("generation_id"))
     with (diff_root / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
         diffs = [row for row in csv.DictReader(stream) if row.get("comparison_id", "").startswith("CMP-")]
-    pointer = pointers["mrq"]
+    pointer = pointers["mrq"] or {}
     generation = pointer.get("canonical_generation_id")
     if not generation:
         return diffs, [], [], []
@@ -480,7 +480,8 @@ def status(repo: Path, *, deep: bool = True) -> dict[str, Any]:
         active = [item for item in mrqs if item.get("state") != "superseded"]
         checks.append([] if all(item.get("source_customization", {}).get("evidence") for item in active) else [Blocker("mrq.source_evidence", "active MRQ source evidence is incomplete", "mrq.discover-next")])
         checks.append([] if all(item.get("state") == "approved" and item.get("migration_decision", {}).get("decision") for item in active) else [Blocker("mrq.approvals", "active MRQ decisions are incomplete or unapproved", "mrq.decide-next")])
-        checks.append(_publication_blockers(repo, _pointer(repo, "active-generation.json").get("canonical_generation_id"), deep=deep))
+        pointer_path = repo / "research/active-generation.json"
+        checks.append(_publication_blockers(repo, _pointer(repo, pointer_path.name).get("canonical_generation_id") if pointer_path.is_file() else None, deep=deep))
     while len(checks) < len(GATES):
         checks.append([Blocker("predecessor.blocked", "a predecessor gate is incomplete", "")])
     gates: list[Gate] = []
@@ -757,6 +758,7 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
         safe_profiles = {}
     codex_probe = probe_codex_environment()
     phases: list[dict[str, Any]] = []
+    transient_meaning_ids: set[str] = set()
     for configured in step_configurations(repo):
         active_run_id = str(
             (lease_by_job.get(configured["job_id"]) or {}).get("run_id", "")
@@ -778,7 +780,7 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
                 snapshot_environment_available = True
             except (OSError, RuntimeError, ValueError):
                 pass
-        for phase in phase_definitions:
+        for phase_index, phase in enumerate(phase_definitions):
             roles = []
             for role in phase["roles"]:
                 rows = store.invocations(
@@ -793,30 +795,72 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
                     role["role_id"],
                 ) if active_run_id else 0
                 units = [item for item in work_rows if item["phase_id"] == phase["phase_id"] and item["role_id"] == role["role_id"]]
+                if phase["phase_id"] == "form-mrq" and role["role_id"] == "grouper":
+                    transient_meaning_ids.update(str(item["work_unit_id"]) for item in units)
                 counts = {state: sum(item["status"] == state for item in units) for state in ("running", "queued", "completed", "failed", "cancelled", "interrupted")}
                 profile = profile_definitions.get(role["agent_profile"], {})
+                environment_status = (
+                    "available"
+                    if snapshot_environment_available
+                    or (
+                        not active_run_id
+                        and profile.get("environment_preset") == "local-read-only"
+                        and codex_probe is not None
+                    )
+                    else "unavailable"
+                )
+                assignments = (
+                    store.slot_assignments(
+                        active_run_id, phase["phase_id"], role["role_id"]
+                    )
+                    if active_run_id
+                    else {}
+                )
+                slots = []
+                for ordinal in range(1, role["count"] + 1):
+                    slot_id = f"{phase['phase_id']}:{role['role_id']}:{ordinal}"
+                    assignment = assignments.get(
+                        slot_id, {"current": None, "latest": None}
+                    )
+                    latest = assignment["latest"]
+                    current = assignment["current"]
+                    if current:
+                        reason = "none"
+                    elif not active_run_id:
+                        reason = "work_not_requested"
+                    elif environment_status == "unavailable":
+                        reason = "environment_unavailable"
+                    elif counts["queued"]:
+                        reason = "waiting_for_dispatch"
+                    elif units and counts["running"] == 0:
+                        reason = "phase_complete"
+                    elif not units:
+                        reason = "waiting_for_prerequisite" if phase_index else "work_not_requested"
+                    else:
+                        reason = "queue_empty"
+                    slots.append({
+                        "slot_id": slot_id,
+                        "display_label": str(ordinal),
+                        "state": "running" if current else "idle",
+                        "idle_reason_code": reason,
+                        "run_id": active_run_id or None,
+                        "current_invocation_id": current["invocation_id"] if current else None,
+                        "latest_invocation_id": latest["invocation_id"] if latest else None,
+                    })
                 roles.append({
                     "role_id": role["role_id"],
                     "agent_profile": role["agent_profile"],
                     "model": profile.get("model", ""),
                     "reasoning_effort": profile.get("reasoning_effort", ""),
                     "environment_preset": profile.get("environment_preset", ""),
-                    "environment_status": (
-                        "available"
-                        if snapshot_environment_available
-                        or (
-                            not active_run_id
-                            and profile.get("environment_preset") == "local-read-only"
-                            and codex_probe is not None
-                        )
-                        else "unavailable"
-                    ),
+                    "environment_status": environment_status,
                     "configured_slots": role["count"],
                     "requested": len(units),
                     **counts,
                     "invocation_total": invocation_total,
                     "invocation_omitted": max(invocation_total - len(rows), 0),
                     "invocations": rows,
+                    "slots": slots,
                 })
             phases.append({"job_id": configured["job_id"], "phase_id": phase["phase_id"], "mode": phase["mode"], "max_concurrency": phase["max_concurrency"], "roles": roles})
     # контуры выводятся из канонического снимка
@@ -875,6 +919,8 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
             continue
         if len(retry_candidates) == 20:
             break
+    items = _dispatcher_items(repo, store, transient_meaning_ids)
+    queue_aggregates = items.pop("_queue_aggregates")
     return {
         "schema_version": "2",
         "revision": revision,
@@ -883,17 +929,38 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
         "jobs": {lease["job_id"]: lease for lease in leases},
         "stage_recompute": next((lease for lease in leases if lease["job_id"] == "stage-recompute"), None),
         "stage_recompute_run": store.latest_stage_recompute(),
-        "items": _dispatcher_items(repo, store),
+        "items": items,
+        "queue_aggregates": queue_aggregates,
         "agent_phases": phases,
         "retry_candidates": retry_candidates,
     }
 
 
-def _dispatcher_items(repo: Path, store: Any) -> dict[str, Any]:
+def _dispatcher_items(
+    repo: Path,
+    store: Any,
+    transient_meaning_ids: set[str] | None = None,
+) -> dict[str, Any]:
     """Компактные карточки для экрана без второго предметного хранилища."""
 
     try:
         diffs, mrqs, dispositions, approvals = _active_rows(repo)
+        operational = store.proposals()
+        analyze_results = [
+            row for row in operational
+            if row.get("job_id") == "discover-mrq"
+            and row.get("kind") == "node-result"
+            and str(row.get("payload", {}).get("name", "")).startswith("analyze-dif:")
+        ]
+        latest_thread = analyze_results[-1]["thread_id"] if analyze_results else ""
+        transient = {identifier: "meaning" for identifier in transient_meaning_ids or ()}
+        transient.update({
+            str(result["stable_diff_id"]): str(result["kind"])
+            for row in analyze_results
+            if row.get("thread_id") == latest_thread
+            for result in [row.get("payload", {}).get("envelope", {}).get("result", {})]
+            if result.get("kind") in {"meaning", "noise"} and result.get("stable_diff_id")
+        })
         customer = sorted(
             (row for row in diffs if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"),
             key=lambda row: row["stable_diff_id"],
@@ -919,19 +986,47 @@ def _dispatcher_items(repo: Path, store: Any) -> dict[str, Any]:
             dependencies_by_id.get(row["stable_diff_id"], []),
         )
         from .mrq_batches import load_active
-        batches = load_active(repo)
+        canonical_pointer_path = repo / "research/active-generation.json"
+        canonical_pointer = _pointer(repo, canonical_pointer_path.name) if canonical_pointer_path.is_file() else {}
+        batches = load_active(repo) if canonical_pointer.get("batch_generation") else []
+        pending_difs = [
+            row for row in customer
+            if row["stable_diff_id"] not in owners and row["stable_diff_id"] not in transient
+        ]
+        pending_mrqs = active_mrqs
+        meaning_difs = [row for row in customer if (row["stable_diff_id"] in owners and row["stable_diff_id"] not in noise) or transient.get(row["stable_diff_id"]) == "meaning"]
+        noise_difs = [row for row in customer if row["stable_diff_id"] in noise or transient.get(row["stable_diff_id"]) == "noise"]
+        proposals = [row for row in operational if row.get("kind") == "approval" and row.get("consumed_at") is None]
+        decisions = [row for row in active_mrqs if row.get("migration_decision", {}).get("decision")]
         return {
-            "dif_queue": [card(row, "queued") for row in customer if row["stable_diff_id"] not in owners][:32],
-            "meaning_diffs": [card(row, "meaning") for row in customer if row["stable_diff_id"] in owners and row["stable_diff_id"] not in noise][:16],
-            "noise_diffs": [card(row, "noise") for row in customer if row["stable_diff_id"] in noise][:16],
-            "proposals": [_proposal_card(row) for row in store.proposals() if row.get("kind") == "approval" and row.get("consumed_at") is None][:16],
-            "mrqs": [_mrq_card(row, dispositions) for row in active_mrqs[:32]],
+            "dif_queue": [card(row, "queued") for row in pending_difs[:32]],
+            "meaning_diffs": [card(row, "meaning") for row in meaning_difs[:16]],
+            "noise_diffs": [card(row, "noise") for row in noise_difs[:16]],
+            "proposals": [_proposal_card(row) for row in proposals[:16]],
+            "mrqs": [_mrq_card(row, dispositions) for row in pending_mrqs[:32]],
             "batches": [{"id": batch.batch_id, "mrq_ids": list(batch.mrq_ids), "reason": batch.basis} for batch in batches[:16]],
-            "decisions": [_decision_card(row) for row in active_mrqs if row.get("migration_decision", {}).get("decision")][:32],
+            "decisions": [_decision_card(row) for row in decisions[:32]],
             "approval_count": len(approvals),
+            "_queue_aggregates": {
+                "dif-queue": {
+                    "total": len(pending_difs),
+                    "visible": min(len(pending_difs), 32),
+                    "omitted": max(len(pending_difs) - 32, 0),
+                },
+                "mrq-queue": {
+                    "total": len(pending_mrqs),
+                    "visible": min(len(pending_mrqs), 32),
+                    "omitted": max(len(pending_mrqs) - 32, 0),
+                },
+                "meaning-diffs": {"total": len(meaning_difs), "visible": min(len(meaning_difs), 16), "omitted": max(len(meaning_difs) - 16, 0)},
+                "noise-diffs": {"total": len(noise_difs), "visible": min(len(noise_difs), 16), "omitted": max(len(noise_difs) - 16, 0)},
+                "proposals": {"total": len(proposals), "visible": min(len(proposals), 16), "omitted": max(len(proposals) - 16, 0)},
+                "batches": {"total": len(batches), "visible": min(len(batches), 16), "omitted": max(len(batches) - 16, 0)},
+                "decisions": {"total": len(decisions), "visible": min(len(decisions), 32), "omitted": max(len(decisions) - 32, 0)},
+            },
         }
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
-        return {"dif_queue": [], "meaning_diffs": [], "noise_diffs": [], "proposals": [], "mrqs": [], "batches": [], "decisions": [], "approval_count": 0}
+        return {"dif_queue": [], "meaning_diffs": [], "noise_diffs": [], "proposals": [], "mrqs": [], "batches": [], "decisions": [], "approval_count": 0, "_queue_aggregates": {"dif-queue": {"total": 0, "visible": 0, "omitted": 0}, "mrq-queue": {"total": 0, "visible": 0, "omitted": 0}}}
 
 
 def _dif_card(

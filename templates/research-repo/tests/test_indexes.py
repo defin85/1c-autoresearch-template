@@ -10,6 +10,37 @@ from one_c_autoresearch import indexes
 REPO = Path(__file__).parents[1]
 
 
+def test_index_executable_is_found_above_nested_project(tmp_path: Path, monkeypatch) -> None:
+    executable = tmp_path / "OneC/rlm-tools-bsl/.venv/bin/rlm-bsl-index"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    repo = tmp_path / "OneC/Presail/project"
+    repo.mkdir(parents=True)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    assert indexes.discover_executable(repo) == str(executable)
+
+
+def test_next_work_indexes_every_source_component_before_research(tmp_path: Path, monkeypatch) -> None:
+    from one_c_autoresearch.service import ApplicationService
+    from one_c_autoresearch import workflow
+
+    service = ApplicationService.__new__(ApplicationService)
+    service.repo = tmp_path
+    service.rlm_executable = "rlm-bsl-index"
+    service.snapshot = lambda: {}
+    monkeypatch.setattr(workflow, "next_work", lambda _repo: {"action": "mrq.discover-next", "work_unit": {"id": "DIF-1"}})
+    monkeypatch.setattr(indexes, "discover", lambda _repo: [{"component_id": "b"}, {"component_id": "a"}])
+    monkeypatch.setattr(indexes, "statuses", lambda *_args, **_kwargs: [
+        {"component_id": "b", "status": "stale", "index_key": "b-key"},
+        {"component_id": "a", "status": "stale", "index_key": "a-key"},
+    ])
+    monkeypatch.setattr(indexes, "cli_probe", lambda *_args: {})
+    work = service.next()
+    assert work["action"] == "indexes.build"
+    assert work["work_unit"]["component_ids"] == ["b", "a"]
+
+
 def test_components_are_generation_bound_and_never_role_parents(tmp_path: Path):
     rows = indexes.discover(REPO)
     assert [row["component_id"] for row in rows] == sorted(row["component_id"] for row in rows)
@@ -24,6 +55,12 @@ def test_components_are_generation_bound_and_never_role_parents(tmp_path: Path):
     assert evidence["path"] == "configuration/CommonModules/ЗагрузкаМетаданныхEDT/Ext/Module.bsl" and evidence["fingerprint"].startswith("sha256:")
     with pytest.raises(ValueError, match="unsafe relative path"):
         indexes.canonical_evidence(REPO, "target_cf:configuration", "../rlm-snippet")
+
+
+def test_routed_pointer_metadata_avoids_source_tree_scan(monkeypatch):
+    monkeypatch.setattr(indexes, "_component_fingerprint", lambda _path: (_ for _ in ()).throw(AssertionError("source tree scanned")))
+    rows = indexes.discover(REPO)
+    assert all(row["fingerprint"].startswith("sha256:") and row["bsl_file_count"] >= 0 for row in rows)
 
 
 def test_index_ensure_reuses_ready_state_and_rebuild_is_confirmed(tmp_path: Path):

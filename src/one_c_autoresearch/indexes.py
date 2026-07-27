@@ -15,8 +15,16 @@ from .contracts import ROLES, atomic_json, canonical_json, confined, file_manife
 
 def discover_executable(repo: Path) -> str | None:
     found = shutil.which("rlm-bsl-index")
-    sibling = repo.resolve().parent / "rlm-tools-bsl/.venv/bin/rlm-bsl-index"
-    return found or (str(sibling) if sibling.is_file() and os.access(sibling, os.X_OK) else None)
+    sibling = next(
+        (
+            parent / "rlm-tools-bsl/.venv/bin/rlm-bsl-index"
+            for parent in repo.resolve().parents
+            if (parent / "rlm-tools-bsl/.venv/bin/rlm-bsl-index").is_file()
+            and os.access(parent / "rlm-tools-bsl/.venv/bin/rlm-bsl-index", os.X_OK)
+        ),
+        None,
+    )
+    return found or (str(sibling) if sibling else None)
 
 
 @lru_cache(maxsize=64)
@@ -49,32 +57,32 @@ def discover(repo: Path) -> list[dict[str, Any]]:
     config = tomllib.loads((repo / "research/indexing.toml").read_text(encoding="utf-8"))
     if pointer.get("schema_version") == "2":
         candidates = [
-            (item["component_id"], confined(root, item["path"]) / "source" if item["kind"] in {"epf", "erf", "source-tree"} else confined(root, item["path"]), item["representation_schema"])
+            (item["component_id"], confined(root, item["path"]) / "source" if item["kind"] in {"epf", "erf", "source-tree"} else confined(root, item["path"]), item["representation_schema"], item.get("fingerprint"), item.get("bsl_file_count"))
             for item in pointer.get("components", [])
         ]
     elif pointer.get("schema_version") == "1" and pointer.get("representation_schema") in {"xml-hierarchical", "v8unpack", "edt-project"}:
         candidates = []
         for role in ROLES:
             role_root = confined(root, role)
-            candidates.append((f"{role}:configuration", role_root / "configuration", pointer["representation_schema"]))
+            candidates.append((f"{role}:configuration", role_root / "configuration", pointer["representation_schema"], None, None))
             extensions = role_root / "extensions"
             if extensions.is_dir():
-                candidates.extend((f"{role}:extension:{item.name.lower()}", item, pointer["representation_schema"]) for item in extensions.iterdir() if item.is_dir())
+                candidates.extend((f"{role}:extension:{item.name.lower()}", item, pointer["representation_schema"], None, None) for item in extensions.iterdir() if item.is_dir())
             external = role_root / "external"
             if external.is_dir():
-                candidates.extend((f"{role}:external:{item.name}", item / "source", pointer["representation_schema"]) for item in external.iterdir() if item.is_dir())
+                candidates.extend((f"{role}:external:{item.name}", item / "source", pointer["representation_schema"], None, None) for item in external.iterdir() if item.is_dir())
     else:
         raise ValueError(f"unsupported source representation for indexing: {pointer.get('representation_schema')}")
     result: list[dict[str, Any]] = []
-    for component_id, component_root, representation in sorted(candidates):
+    for component_id, component_root, representation, fingerprint, bsl_file_count in sorted(candidates):
         if not component_root.is_dir():
             continue
         relative = component_root.relative_to(root).as_posix()
-        bsl_count = sum(1 for path in component_root.rglob("*.bsl") if path.is_file())
+        bsl_count = bsl_file_count if isinstance(bsl_file_count, int) else sum(1 for path in component_root.rglob("*.bsl") if path.is_file())
         result.append({
             "component_id": component_id,
             "path": relative,
-            "fingerprint": _component_fingerprint(str(component_root.resolve())),
+            "fingerprint": fingerprint or _component_fingerprint(str(component_root.resolve())),
             "representation": representation,
             "source_generation_id": generation,
             "engine": config["engine"],

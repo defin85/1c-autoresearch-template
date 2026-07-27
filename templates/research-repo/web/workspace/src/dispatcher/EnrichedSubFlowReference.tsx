@@ -52,7 +52,8 @@ export const ENRICHED_SUBFLOW_NODES: Node<EnrichedNodeData>[] = [
   item('analyzer-1', 'analysis', 'Анализатор-1', 138, 105, 165, 112, '#1976d2', 'Текущий: DIF-002 · прогресс 65%', 'Анализирует', true),
   item('analyzer-2', 'analysis', 'Анализатор-2', 138, 270, 165, 96, '#757575', 'Работа не назначена', 'Свободен'),
   item('analyzer-3', 'analysis', 'Анализатор-3', 138, 420, 165, 112, '#ed6c02', 'Текущий: DIF-008 · повтор через 15 с', 'Ошибка'),
-  item('semantic-dif', 'analysis', 'Смысловые DIF', 325, 120, 96, 410, '#1976d2', 'DIF-002 · DIF-005 · DIF-017', '23'),
+  item('semantic-dif', 'analysis', 'Смысловые DIF', 325, 120, 96, 190, '#1976d2', 'DIF-002 · DIF-005 · DIF-017', '23'),
+  item('technical-noise', 'analysis', 'Технический шум', 325, 340, 96, 190, '#1976d2', 'DIF-008 · DIF-013', '2'),
 
   item('semantic-queue', 'mrq', 'Смысловые DIF', 18, 110, 92, 430, '#6d3be7', '23 DIF', 'Ожидает'),
   item('coordinator', 'mrq', 'Координатор MRQ', 140, 190, 150, 190, '#6d3be7', 'Опорный DIF: 002 · кандидатов: 4', 'Работает', true),
@@ -60,8 +61,8 @@ export const ENRICHED_SUBFLOW_NODES: Node<EnrichedNodeData>[] = [
   item('grouper-2', 'mrq', 'Группировщик-2', 325, 235, 155, 110, '#6d3be7', 'DIF-007, DIF-129', 'В работе', true),
   item('grouper-3', 'mrq', 'Группировщик-3', 325, 390, 155, 110, '#6d3be7', 'Работа не назначена', 'Свободен'),
   item('proposal', 'mrq', 'Предложение группы', 515, 170, 116, 145, '#6d3be7', 'Заказ · DIF-002, 005, 017', 'Предложено'),
-  item('review', 'mrq', 'Проверка', 515, 350, 116, 100, '#6d3be7', 'Доказательств: 6', '60%', true),
-  item('publication', 'mrq', 'Публикация MRQ', 515, 490, 116, 82, '#6d3be7', 'MRQ-014 · MRQ-015', 'Готово: 13'),
+  item('review', 'mrq', 'Проверка', 515, 350, 116, 115, '#6d3be7', 'Доказательств: 6', '60%', true),
+  item('publication', 'mrq', 'Публикация MRQ', 515, 490, 116, 100, '#6d3be7', 'MRQ-014 · MRQ-015', 'Готово: 13'),
 
   item('batch-input', 'classify', 'Исходные MRQ', 18, 105, 92, 450, '#7b1fa2', 'MRQ-014 · 015 · 016 · 017', '13'),
   item('classifier-1', 'classify', 'Классификатор', 140, 105, 170, 112, '#7b1fa2', 'Окно 1 · 13 MRQ', 'В работе', true),

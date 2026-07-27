@@ -1,4 +1,5 @@
 import hashlib
+import json
 import time
 from pathlib import Path
 
@@ -11,6 +12,49 @@ from one_c_autoresearch.sources import draft_fingerprint
 
 
 REPO = Path(__file__).parents[1]
+
+
+def test_source_acquisition_continues_automatic_pipeline(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+
+    class ImmediateThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+        def start(self):
+            self.target()
+
+    class Service:
+        def __init__(self, repo, **_kwargs):
+            self.repo = repo
+        def snapshot(self, **_kwargs):
+            return {"workflow_fingerprint": "sha256:test"}
+        def next(self):
+            return None
+        def apply(self, *_args, **_kwargs):
+            return {}
+
+    monkeypatch.setattr("one_c_autoresearch.workspace_api.threading.Thread", ImmediateThread)
+    monkeypatch.setattr("one_c_autoresearch.workspace_api.ApplicationService", Service)
+    monkeypatch.setattr("one_c_autoresearch.runner.run_next", lambda *_args, **_kwargs: {"result": "progressed"})
+    monkeypatch.setattr("one_c_autoresearch.runner.run_until_blocked", lambda *_args, **kwargs: calls.append(kwargs) or {"result": "blocked"})
+    app = create_app(tmp_path / "state", [REPO], testing=True)
+    headers = {"Origin": "http://testserver", "Idempotency-Key": "bookmark"}
+    with TestClient(app) as client:
+        project = client.post("/api/v1/projects", json={"name": "test", "root": str(REPO)}, headers=headers).json()
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/source-acquisition-runs",
+            json={
+                "expected_fingerprint": "sha256:test",
+                "approved_operations": ["sources.acquire"],
+                "source_routing_preview_id": "preview",
+                "routing_plan_fingerprint": "sha256:route",
+            },
+            headers=headers | {"Idempotency-Key": "acquire"},
+        )
+    assert response.status_code == 202
+    assert len(calls) == 1
+    assert calls[0]["max_units"] == 3
+    assert calls[0]["select"].__self__.__class__ is Service
 
 
 def test_legacy_agent_profile_can_be_explicitly_resaved(tmp_path: Path) -> None:
@@ -44,6 +88,26 @@ def test_legacy_agent_profile_can_be_explicitly_resaved(tmp_path: Path) -> None:
         assert response.status_code == 200
         assert response.json()["profile"] == profile
         assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_codex_capabilities_are_read_from_cli(monkeypatch) -> None:
+    from one_c_autoresearch.workspace_api import codex_capabilities
+
+    monkeypatch.setattr("one_c_autoresearch.workspace_api.shutil.which", lambda _: "/bin/codex")
+    monkeypatch.setattr(
+        "one_c_autoresearch.workspace_api.subprocess.run",
+        lambda *args, **kwargs: type("Result", (), {"stdout": json.dumps({"models": [
+            {"slug": "actual", "display_name": "Actual", "visibility": "list", "supported_in_api": True, "default_reasoning_level": "max", "supported_reasoning_levels": [{"effort": "max"}]},
+            {"slug": "hidden", "visibility": "hide", "default_reasoning_level": "low"},
+        ]})})(),
+    )
+
+    assert codex_capabilities()["models"] == [{
+        "id": "actual",
+        "name": "Actual",
+        "default_reasoning_effort": "max",
+        "reasoning_efforts": ["max"],
+    }]
 
 
 def test_extension_registries_are_paged_and_bound_to_active_diff(tmp_path: Path):
@@ -249,8 +313,20 @@ def test_api_uses_repository_snapshot_and_typed_actions(tmp_path: Path, monkeypa
         setup = client.get(f"/api/v1/projects/{project['id']}/source-setup").json()
         assert setup["profiles"] == ["designer+form-aware/v1", "ibcmd+form-aware/v1"]
         assert setup["connection_profiles"]["local-baseline"]["available"] is True
+        assert setup["connection_profiles"]["local-baseline"]["reference"] == "baseline"
+        assert setup["connection_profiles"]["local-baseline"]["db_name"] == "baseline"
+        assert setup["connection_profiles"]["local-baseline"]["db_password_set"] is True
+        assert setup["connection_profiles"]["local-baseline"]["infobase_password_set"] is True
         assert "private-db" not in str(setup) and "private-ib" not in str(setup)
+        updated = client.put(
+            f"/api/v1/projects/{project['id']}/connection-profiles/local-baseline",
+            json={"profile": {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}}},
+            headers=headers | {"Idempotency-Key": "profile-2"},
+        )
+        assert updated.status_code == 200
         stored = tmp_path / "state/projects" / project["id"] / "connections.json"
+        assert "private-db" in stored.read_text(encoding="utf-8")
+        assert "private-ib" in stored.read_text(encoding="utf-8")
         assert stored.stat().st_mode & 0o777 == 0o600
         agent = {"provider": "codex-cli", "model": "gpt-5", "reasoning_effort": "high", "instructions_version": "1", "environment_preset": "local-read-only"}
         configured = client.put(f"/api/v1/projects/{project['id']}/agent-profiles/local", json={"profile": agent}, headers=headers | {"Idempotency-Key": "agent-profile-1"})
@@ -297,6 +373,31 @@ def test_external_upload_uses_declared_size_bytes(tmp_path: Path):
         )
         assert response.status_code == 200, response.text
         assert response.json()["size_bytes"] == len(payload)
+
+
+def test_tested_connection_updates_declared_configuration_identity(tmp_path: Path):
+    repo = tmp_path / "repo"; research = repo / "research"; research.mkdir(parents=True)
+    (repo / "project.toml").write_bytes((REPO / "project.toml").read_bytes())
+    (research / "workflow.toml").write_bytes((REPO / "research/workflow.toml").read_bytes())
+    roles = ("vendor_baseline", "target_cf", "next_vendor")
+    (research / "infobases.toml").write_text(
+        'schema_version = "1"\nacquisition_profile = "ibcmd+form-aware/v1"\n\n'
+        + "".join(f'[roles.{role}]\nconnection_profile = "profile"\nconfiguration_name = "Product"\nroot_uuid = "00000000-0000-0000-0000-000000000001"\nversion = "1.0"\n\n' for role in roles),
+        encoding="utf-8",
+    )
+    (research / "external-artifacts.toml").write_text('schema_version = "1"\n', encoding="utf-8")
+    identity = {"uuid": "11111111-1111-1111-1111-111111111111", "name": "InternalName", "version": "1.0"}
+    tester = lambda profile_id, _platform, _profile: {"profile_id": profile_id, "tested": True, "configuration": identity, "extensions": [], "tested_fingerprint": "sha256:" + "a" * 64}
+    app = create_app(tmp_path / "state", [repo], testing=True, connection_tester=tester)
+    headers = {"Origin": "http://testserver", "Idempotency-Key": "bookmark"}
+    profile = {"kind": "server", "server": "localhost", "reference": "db", "platform_path": "/opt/1cv8", "dbms": "PostgreSQL", "db_server": "localhost", "db_name": "db", "db_user": "postgres", "db_password": "secret", "infobase_user": "user", "infobase_password": "secret"}
+    with TestClient(app) as client:
+        project = client.post("/api/v1/projects", json={"name": "test", "root": str(repo)}, headers=headers).json()
+        response = client.put(f"/api/v1/projects/{project['id']}/connection-profiles/profile", json={"profile": profile}, headers=headers | {"Idempotency-Key": "profile"})
+        assert response.status_code == 200, response.text
+    contract = (research / "infobases.toml").read_text(encoding="utf-8")
+    assert contract.count('configuration_name = "InternalName"') == 3
+    assert contract.count('root_uuid = "11111111-1111-1111-1111-111111111111"') == 3
 
 
 def test_external_folder_http_flow_is_paged_and_stages_selected_bytes(tmp_path: Path):

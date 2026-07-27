@@ -31,6 +31,7 @@
         "kind": {"enum": ["configuration", "extension", "epf", "erf", "source-tree", "other"]},
         "path": {"type": "string", "minLength": 1},
         "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "bsl_file_count": {"type": "integer", "minimum": 0},
         "representation_schema": {"enum": ["xml-hierarchical/v1", "v8unpack/v1", "source-tree/v1", "raw-binary/v1"]},
         "routing_group_id": {"type": "string", "minLength": 1}
       }

@@ -11,7 +11,7 @@ import { Check, CheckCircle, DataObject, Hub, TaskAlt, WarningAmber } from '@mui
 import { ReactFlowProvider, type Viewport } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { api, mutationHeaders } from '../api';
-import { freshnessLabel, type CircuitId, type CircuitLease, type DispatcherProjection } from './projection';
+import { freshnessLabel, type CircuitId, type CircuitLease, type DispatcherProjection, type DispatcherSelection } from './projection';
 import { DispatcherNew } from './DispatcherNew';
 import { useDispatcherStream } from './useDispatcherStream';
 
@@ -96,7 +96,221 @@ async function postDispatcherAction(projectId: string, jobId: 'discover-mrq' | '
   return response.outcome;
 }
 
-interface ContextActions { onOpenSources?: () => void; onOpenIndexes?: () => void; onOpenSettings?: (stepId?: string) => void }
+export interface JournalTarget { runId?: string; invocationId?: string }
+export interface RegistryTarget { registry: 'diff-inventory' | 'mrq'; itemId: string }
+interface ContextActions {
+  onOpenSources?: () => void;
+  onOpenIndexes?: () => void;
+  onOpenSettings?: (stepId?: string) => void;
+  onOpenJournal?: (target?: JournalTarget) => void;
+  onOpenRegistry?: (target: RegistryTarget) => void;
+}
+
+interface InspectionPage<T> { items: T[]; next_cursor?: string | null; truncated?: boolean; available?: boolean }
+interface DispatcherInspection {
+  observed_at?: string;
+  slot?: Record<string, unknown>;
+  invocation?: Record<string, unknown>;
+  history?: InspectionPage<Record<string, unknown>>;
+  events?: InspectionPage<Record<string, unknown>>;
+  result?: Record<string, unknown>;
+  availability?: Record<string, unknown>;
+}
+
+const selectionKey = (selection: DispatcherSelection) => JSON.stringify(selection);
+const IDLE_REASON: Record<string, string> = {
+  work_not_requested: 'Работа ещё не запрошена',
+  waiting_for_prerequisite: 'Ожидается завершение предыдущего этапа',
+  waiting_for_dispatch: 'Ожидается назначение работы',
+  queue_empty: 'Очередь пуста',
+  phase_complete: 'Работа этапа завершена',
+  environment_unavailable: 'Окружение недоступно',
+};
+const COLLECTIONS = {
+  'dif-queue': { title: 'Очередь DIF', itemKind: 'dif', items: (projection: DispatcherProjection) => projection.items.dif_queue },
+  'meaning-diffs': { title: 'Смысловые DIF', itemKind: 'dif', items: (projection: DispatcherProjection) => projection.items.meaning_diffs },
+  'noise-diffs': { title: 'Технический шум', itemKind: 'dif', items: (projection: DispatcherProjection) => projection.items.noise_diffs },
+  proposals: { title: 'Предложения групп', itemKind: 'proposal', items: (projection: DispatcherProjection) => projection.items.proposals },
+  'mrq-queue': { title: 'MRQ', itemKind: 'mrq', items: (projection: DispatcherProjection) => projection.items.mrqs },
+  batches: { title: 'Пакеты MRQ', itemKind: 'batch', items: (projection: DispatcherProjection) => projection.items.batches },
+  approvals: { title: 'Ожидают одобрения', itemKind: 'proposal', items: (projection: DispatcherProjection) => projection.items.proposals.filter((item) => item.kind === 'approval') },
+  decisions: { title: 'Решения', itemKind: 'decision', items: (projection: DispatcherProjection) => projection.items.decisions },
+} as const;
+
+function projectionEntityView(selection: DispatcherSelection | null, projection: DispatcherProjection): Record<string, unknown> | null {
+  if (!selection || selection.kind === 'circuit') return null;
+  if (selection.kind === 'role' || selection.kind === 'slot' || selection.kind === 'invocation') {
+    const role = projection.agent_phases?.find((phase) => phase.phase_id === selection.phaseId)?.roles.find((item) => item.role_id === selection.roleId);
+    if (!role) return null;
+    if (selection.kind === 'role') return {
+      phase: selection.phaseId, role: role.role_id, profile: role.agent_profile, model: role.model,
+      reasoning_effort: role.reasoning_effort, configured_slots: role.configured_slots,
+      environment: role.environment_status || role.environment_preset,
+      requested: role.requested, running: role.running, queued: role.queued, completed: role.completed,
+      failed: role.failed, cancelled: role.cancelled, interrupted: role.interrupted,
+      slots: role.slots ?? [...new Map(role.invocations.map((invocation) => [invocation.slot_id, {
+        slot_id: invocation.slot_id,
+        display_label: invocation.slot_id,
+        state: invocation.status === 'running' ? 'running' : 'idle',
+        current_invocation_id: invocation.invocation_id,
+      }])).values()],
+      invocations: role.invocations,
+      run_id: role.run_id,
+      invocation_total: role.invocation_total ?? role.invocations.length,
+      invocation_omitted: role.invocation_omitted ?? 0,
+    };
+    if (selection.kind === 'slot') {
+      const slot = role.slots?.find((item) => item.slot_id === selection.slotId);
+      return slot ? { ...slot, idle_reason: slot.idle_reason_code ? IDLE_REASON[slot.idle_reason_code] || slot.idle_reason_code : undefined } : null;
+    }
+    const invocation = role.invocations.find((item) => item.invocation_id === selection.invocationId);
+    return invocation ? { ...invocation } : null;
+  }
+  if (selection.kind === 'queue') {
+    if (!projection.circuits.some((circuit) => circuit.id === selection.circuitId)) return null;
+    const collection = COLLECTIONS[selection.queueId as keyof typeof COLLECTIONS];
+    if (!collection) return null;
+    const items = collection.items(projection);
+    const aggregate = projection.queue_aggregates?.[selection.queueId];
+    const total = selection.queueId === 'approvals' ? projection.items.approval_count : aggregate?.total;
+    return {
+      queue_id: selection.queueId,
+      title: collection.title,
+      item_kind: collection.itemKind,
+      total,
+      visible: aggregate?.visible ?? items.length,
+      omitted: aggregate?.omitted ?? (total === undefined ? undefined : Math.max(total - items.length, 0)),
+      aggregate_available: total !== undefined,
+      items,
+    };
+  }
+  const items = selection.itemKind === 'dif'
+    ? [...projection.items.dif_queue, ...projection.items.meaning_diffs, ...projection.items.noise_diffs]
+    : selection.itemKind === 'mrq' ? projection.items.mrqs
+    : selection.itemKind === 'batch' ? projection.items.batches
+    : selection.itemKind === 'decision' ? projection.items.decisions
+    : projection.items.proposals;
+  return (items.find((item) => item.id === selection.itemId) as Record<string, unknown> | undefined) ?? null;
+}
+
+function DetailRows({ value }: { value: Record<string, unknown> }) {
+  return <Stack component="dl" spacing={0.5} sx={{ m: 0 }}>
+    {Object.entries(value).map(([key, item]) => <Box key={key}>
+      <Typography component="dt" variant="caption" color="text.secondary">{key}</Typography>
+      <Typography component="dd" variant="body2" sx={{ m: 0, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
+        {item == null ? 'недоступно' : typeof item === 'object' ? JSON.stringify(item) : String(item)}
+      </Typography>
+    </Box>)}
+  </Stack>;
+}
+
+function useDispatcherInspection(projectId: string, selection: DispatcherSelection | null, refreshToken: number) {
+  const [resolvedByKey, setResolvedByKey] = useState<Record<string, DispatcherInspection>>({});
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const requestRef = useRef(0);
+  const pageRequestRef = useRef(0);
+  const pageControllerRef = useRef<AbortController | null>(null);
+  const activeKeyRef = useRef('');
+  const projectRef = useRef(projectId);
+  activeKeyRef.current = selection ? `${projectId}:${selectionKey(selection)}` : '';
+  useEffect(() => {
+    if (projectRef.current === projectId) return;
+    projectRef.current = projectId;
+    pageControllerRef.current?.abort();
+    setResolvedByKey({});
+    setError('');
+    setLoading(false);
+    requestRef.current += 1;
+    pageRequestRef.current += 1;
+  }, [projectId]);
+  useEffect(() => {
+    if (!selection || (selection.kind !== 'slot' && selection.kind !== 'invocation')) return;
+    const controller = new AbortController();
+    const request = ++requestRef.current;
+    const key = `${projectId}:${selectionKey(selection)}`;
+    const params = new URLSearchParams({ kind: selection.kind });
+    if (selection.kind === 'invocation') params.set('invocation_id', selection.invocationId);
+    else {
+      params.set('phase_id', selection.phaseId);
+      params.set('role_id', selection.roleId);
+      params.set('slot_id', selection.slotId);
+      if (selection.runId) params.set('run_id', selection.runId);
+    }
+    setLoading(true);
+    setError('');
+    api<DispatcherInspection>(`/projects/${projectId}/dispatcher/inspect?${params}`, { signal: controller.signal })
+      .then((value) => {
+        if (request === requestRef.current && key === activeKeyRef.current) setResolvedByKey((cache) => {
+          const current = cache[key];
+          const merge = (previous?: InspectionPage<Record<string, unknown>>, next?: InspectionPage<Record<string, unknown>>) => {
+            if (!previous || !next || previous.items.length <= next.items.length) return next;
+            const items = [...next.items, ...previous.items.filter((item) => !next.items.some((candidate) => JSON.stringify(candidate) === JSON.stringify(item)))];
+            return { ...next, items, next_cursor: previous.next_cursor, truncated: previous.truncated || next.truncated };
+          };
+          return {
+            ...cache,
+            [key]: current
+              ? { ...value, history: merge(current.history, value.history), events: merge(current.events, value.events) }
+              : value,
+          };
+        });
+      })
+      .catch((caught) => {
+        if (!controller.signal.aborted && request === requestRef.current) {
+          setError(caught instanceof Error ? caught.message : 'Не удалось загрузить сведения');
+        }
+      })
+      .finally(() => {
+        if (request === requestRef.current) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [projectId, selection && selectionKey(selection), refreshToken]);
+  useEffect(() => {
+    pageControllerRef.current?.abort();
+    pageRequestRef.current += 1;
+  }, [selection && selectionKey(selection)]);
+  useEffect(() => () => pageControllerRef.current?.abort(), []);
+  const resolved = activeKeyRef.current ? resolvedByKey[activeKeyRef.current] : undefined;
+  const loadPage = useCallback(async (section: 'history' | 'events') => {
+    if (!selection || (selection.kind !== 'slot' && selection.kind !== 'invocation') || !resolved) return;
+    const cursor = resolved[section]?.next_cursor;
+    if (!cursor) return;
+    pageControllerRef.current?.abort();
+    const controller = new AbortController();
+    pageControllerRef.current = controller;
+    const request = ++pageRequestRef.current;
+    const activeKey = `${projectId}:${selectionKey(selection)}`;
+    const params = new URLSearchParams({ kind: selection.kind, [section === 'events' ? 'event_cursor' : 'history_cursor']: cursor });
+    if (selection.kind === 'invocation') params.set('invocation_id', selection.invocationId);
+    else {
+      params.set('phase_id', selection.phaseId);
+      params.set('role_id', selection.roleId);
+      params.set('slot_id', selection.slotId);
+      if (selection.runId) params.set('run_id', selection.runId);
+    }
+    try {
+      const page = await api<DispatcherInspection>(`/projects/${projectId}/dispatcher/inspect?${params}`, { signal: controller.signal });
+      if (controller.signal.aborted || request !== pageRequestRef.current || activeKey !== activeKeyRef.current) return;
+      setResolvedByKey((cache) => {
+        const current = cache[activeKey];
+        return current ? {
+          ...cache,
+          [activeKey]: {
+          ...current,
+          [section]: {
+            ...page[section],
+            items: [...(current[section]?.items ?? []), ...(page[section]?.items ?? [])],
+          },
+        },
+        } : cache;
+      });
+    } catch (caught) {
+      if (!controller.signal.aborted && request === pageRequestRef.current) setError(caught instanceof Error ? caught.message : 'Не удалось загрузить страницу');
+    }
+  }, [projectId, resolved, selection && selectionKey(selection)]);
+  return { resolved: resolved ?? null, stale: false, error, loading, loadPage };
+}
 
 type LeaseAction = 'start' | 'stop' | 'resume' | 'retry' | 'cancel' | 'approve';
 
@@ -119,7 +333,7 @@ export function leaseActionMatrix(
   };
 }
 
-export function DispatcherPanel({ projectId, projection, fingerprint, selectedCircuit, onClose, onOpenSources, onOpenIndexes, onOpenSettings, readOnly = false }: { projectId: string; projection: DispatcherProjection; fingerprint: string; selectedCircuit: CircuitId | null; onClose: () => void; readOnly?: boolean } & ContextActions) {
+export function DispatcherPanel({ projectId, projection, fingerprint, selection, refreshToken = 0, onSelect, onClose, onOpenSources, onOpenIndexes, onOpenSettings, onOpenJournal, onOpenRegistry, readOnly = false }: { projectId: string; projection: DispatcherProjection; fingerprint: string; selection: DispatcherSelection | null; refreshToken?: number; onSelect?: (selection: DispatcherSelection, initiator: HTMLElement) => void; onClose: () => void; readOnly?: boolean } & ContextActions) {
   const [busy, setBusy] = useState(false);
   const [outcome, setOutcome] = useState<DispatcherOutcome | null>(null);
   const [plan, setPlan] = useState<RecomputePlan | null>(null);
@@ -129,6 +343,19 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selectedCi
   const [retryOpen, setRetryOpen] = useState(false);
   const [policySource, setPolicySource] = useState<'reuse-snapshot' | 'current-policy'>('reuse-snapshot');
   const [predecessorRunId, setPredecessorRunId] = useState('');
+  const selectedCircuit = selection?.circuitId ?? null;
+  const inspection = useDispatcherInspection(projectId, selection, refreshToken);
+  const projectedView = projectionEntityView(selection, projection);
+  const [lastViews, setLastViews] = useState<Record<string, Record<string, unknown>>>({});
+  const currentSelectionKey = selection ? selectionKey(selection) : '';
+  useEffect(() => setLastViews({}), [projectId]);
+  useEffect(() => {
+    if (projectedView && currentSelectionKey) setLastViews((views) => ({ ...views, [currentSelectionKey]: projectedView }));
+  }, [currentSelectionKey, projectedView && JSON.stringify(projectedView)]);
+  const entityView = projectedView ?? lastViews[currentSelectionKey] ?? null;
+  const entityStale = Boolean(!projectedView && entityView);
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
+  useEffect(() => { if (selection) headingRef.current?.focus(); }, [selection && selectionKey(selection)]);
   const job = selectedCircuit === 'analyze-dif' || selectedCircuit === 'form-mrq' ? 'discover-mrq' : selectedCircuit === 'classify-mrq' ? 'classify-mrq' : selectedCircuit === 'decide-target' ? 'decide-mrq' : null;
   const lease = job ? projection.jobs[job] : undefined;
   const recomputeLease = projection.jobs['stage-recompute'];
@@ -276,11 +503,123 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selectedCi
   }, [projectId, recomputeLease, recomputeRun]);
 
   if (!selectedCircuit) return null;
+  const title = selection?.kind === 'role' ? `Роль ${selection.roleId}`
+    : selection?.kind === 'slot' ? `Слот ${selection.slotId}`
+      : selection?.kind === 'invocation' ? `Вызов ${selection.invocationId}`
+        : selection?.kind === 'queue' ? 'Очередь'
+          : selection?.kind === 'item' ? `${selection.itemKind.toUpperCase()} ${selection.itemId}`
+              : selectedCircuit ? CIRCUIT_LABEL[selectedCircuit] : '';
   return (
-    <Paper elevation={8} className="nodrag nowheel" sx={{ position: 'absolute', zIndex: 5, right: 16, bottom: 16, width: 500, maxWidth: 'calc(100% - 32px)', maxHeight: 'calc(100% - 32px)', overflowY: 'auto', p: 2 }}>
+    <Paper component="aside" role="complementary" aria-label="Сведения диспетчера" elevation={8} className="nodrag nowheel" sx={{ position: 'absolute', zIndex: 5, right: 16, bottom: 16, width: 500, maxWidth: 'calc(100% - 32px)', maxHeight: 'calc(100% - 32px)', overflowY: 'auto', p: 2 }}>
     <Stack spacing={1.4}>
       {error && <Alert severity="error">{error}</Alert>}
-      <Stack direction="row" alignItems="center"><Typography variant="subtitle1" fontWeight={700} flex={1}>{CIRCUIT_LABEL[selectedCircuit]}</Typography><Button size="small" onClick={onClose}>Закрыть</Button></Stack>
+      <Stack direction="row" alignItems="center"><Typography ref={headingRef} tabIndex={-1} component="h2" variant="subtitle1" fontWeight={700} flex={1}>{title}</Typography><Button size="small" onClick={onClose}>Закрыть</Button></Stack>
+      {inspection.loading && <LinearProgress aria-label="Загрузка сведений" />}
+      {inspection.error && <Alert severity="warning">{inspection.error}</Alert>}
+      {(selection?.kind === 'slot' || selection?.kind === 'invocation') && entityView && <Paper component="section" variant="outlined" sx={{ p: 1.4 }}>
+        <Typography variant="subtitle2">Текущее состояние</Typography>
+        <DetailRows value={entityView} />
+      </Paper>}
+      {(inspection.resolved || inspection.stale) && (selection?.kind === 'slot' || selection?.kind === 'invocation') && <Paper component="section" variant="outlined" sx={{ p: 1.4 }}>
+        {inspection.stale && <Alert severity="warning">Показаны последние доступные сведения</Alert>}
+        {inspection.resolved?.slot && <><Typography variant="subtitle2">Слот</Typography><DetailRows value={inspection.resolved.slot} /></>}
+        {inspection.resolved?.invocation && <><Typography variant="subtitle2" mt={1}>Вызов</Typography><DetailRows value={inspection.resolved.invocation} /></>}
+        {inspection.resolved?.history && <Stack component="section" spacing={0.5} mt={1}>
+          <Typography variant="subtitle2">История ({inspection.resolved.history.items.length}{inspection.resolved.history.truncated ? ', показана частично' : ''})</Typography>
+          {inspection.resolved.history.items.map((item, index) => <Paper variant="outlined" sx={{ p: 0.7 }} key={String(item.invocation_id ?? index)}><DetailRows value={item} /></Paper>)}
+          {!inspection.resolved.history.available && !inspection.resolved.history.items.length && <Typography color="text.secondary">История недоступна</Typography>}
+        </Stack>}
+        {inspection.resolved?.events && <Stack component="section" spacing={0.5} mt={1}>
+          <Typography variant="subtitle2">События ({inspection.resolved.events.items.length}{inspection.resolved.events.truncated ? ', показаны частично' : ''})</Typography>
+          {inspection.resolved.events.items.map((item, index) => <Paper variant="outlined" sx={{ p: 0.7 }} key={String(item.sequence ?? index)}><DetailRows value={item} /></Paper>)}
+          {!inspection.resolved.events.available && !inspection.resolved.events.items.length && <Typography color="text.secondary">События недоступны</Typography>}
+        </Stack>}
+        {inspection.resolved?.result && <><Typography variant="subtitle2" mt={1}>Результат</Typography><DetailRows value={inspection.resolved.result} /></>}
+        <Stack direction="row" spacing={1}>
+          {inspection.resolved?.history?.next_cursor && <Button onClick={() => void inspection.loadPage('history')}>Ещё история</Button>}
+          {inspection.resolved?.events?.next_cursor && <Button onClick={() => void inspection.loadPage('events')}>Ещё события</Button>}
+        </Stack>
+        {selection.kind === 'invocation' && onOpenJournal && <Button onClick={() => onOpenJournal({ invocationId: selection.invocationId, runId: selection.runId })}>Открыть в журнале</Button>}
+      </Paper>}
+      {entityStale && <Alert severity="warning">Сущность больше не присутствует; показаны последние доступные сведения</Alert>}
+      {(selection?.kind === 'queue') && entityView && <Paper component="section" variant="outlined" sx={{ p: 1.4 }}>
+        <Typography variant="subtitle2" fontWeight={700}>{String(entityView.title)}</Typography>
+        <Typography variant="caption" color="text.secondary">
+          В текущем окне: {String(entityView.visible)}
+        </Typography>
+        <Typography variant="caption" display="block" color="text.secondary">
+          {entityView.aggregate_available
+            ? `Всего: ${String(entityView.total)} · не показано: ${String(entityView.omitted)}`
+            : 'Точный размер очереди сервером не предоставлен'}
+        </Typography>
+        <Stack spacing={1} mt={1}>
+          {((entityView.items as Array<{ id: string; path?: string; title?: string; state?: string; evidence_count?: number }>) ?? []).map((item) => <Box key={item.id}>
+            <Button onClick={(event) => {
+              const next: DispatcherSelection = {
+                kind: 'item',
+                itemKind: entityView.item_kind as 'dif' | 'mrq' | 'batch' | 'decision' | 'proposal',
+                circuitId: selection.circuitId,
+                queueId: selection.queueId,
+                itemId: item.id,
+              };
+              event.stopPropagation();
+              onSelect?.(next, event.currentTarget);
+            }}>{item.id}</Button>
+            <Typography variant="caption" display="block" sx={{ overflowWrap: 'anywhere' }}>{item.path || item.title}</Typography>
+            <Typography variant="caption" color="text.secondary">Состояние: {item.state || 'не определено'} · доказательств: {item.evidence_count ?? 0}</Typography>
+            <Divider sx={{ mt: 1 }} />
+          </Box>)}
+          {!((entityView.items as unknown[]) ?? []).length && <Typography variant="body2" color="text.secondary">Элементов пока нет</Typography>}
+        </Stack>
+      </Paper>}
+      {selection?.kind === 'item' && entityView && <Paper component="section" variant="outlined" sx={{ p: 1.4 }}>
+        <DetailRows value={entityView} />
+        {onOpenRegistry && selection.itemKind !== 'batch' && selection.itemKind !== 'proposal' && <Button onClick={() => onOpenRegistry({ registry: selection.itemKind === 'dif' ? 'diff-inventory' : 'mrq', itemId: selection.itemId })}>Открыть запись реестра</Button>}
+      </Paper>}
+      {selection?.kind === 'role' && entityView && <Paper component="section" variant="outlined" sx={{ p: 1.4 }}>
+        <Typography>Профиль: {String(entityView.profile || 'не определён')}</Typography>
+        <Typography>Модель: {String(entityView.model || 'не определена')}</Typography>
+        <Typography>Уровень рассуждения: {String(entityView.reasoning_effort || 'не определён')}</Typography>
+        <Typography>Одновременность: {String(entityView.configured_slots)}</Typography>
+        <Typography>Окружение: {String(entityView.environment || 'не определено')}</Typography>
+        <Typography>Запрошено: {String(entityView.requested)} · выполняется: {String(entityView.running)} · ожидает: {String(entityView.queued)} · завершено: {String(entityView.completed)} · ошибки: {String(entityView.failed)}</Typography>
+        <Typography>Вызовов: {String(entityView.invocation_total)} · не показано: {String(entityView.invocation_omitted)}</Typography>
+        <Typography variant="subtitle2" mt={1}>Все слоты</Typography>
+        <Stack alignItems="flex-start">{((entityView.slots as Array<{ slot_id: string; display_label: string; state: string; idle_reason_code?: string; current_invocation_id?: string | null }>) ?? []).map((slot) =>
+          <Stack key={slot.slot_id} direction="row" alignItems="center">
+            <Button size="small" onClick={(event) => onSelect?.({
+              kind: 'slot',
+              circuitId: selection.circuitId,
+              phaseId: selection.phaseId,
+              roleId: selection.roleId,
+              slotId: slot.slot_id,
+              ...(typeof entityView.run_id === 'string' ? { runId: entityView.run_id } : {}),
+            }, event.currentTarget)}>{slot.display_label}</Button>
+            <Typography variant="body2">· {slot.state === 'idle' ? IDLE_REASON[slot.idle_reason_code || ''] || slot.idle_reason_code || 'Нет назначенной работы' : 'Выполняется'}</Typography>
+            {slot.current_invocation_id && typeof entityView.run_id === 'string' && <Button size="small" onClick={(event) => onSelect?.({
+              kind: 'invocation',
+              circuitId: selection.circuitId,
+              phaseId: selection.phaseId,
+              roleId: selection.roleId,
+              slotId: slot.slot_id,
+              runId: entityView.run_id as string,
+              invocationId: slot.current_invocation_id!,
+            }, event.currentTarget)}>Открыть вызов</Button>}
+          </Stack>)}</Stack>
+        <Typography variant="subtitle2" mt={1}>Последние вызовы</Typography>
+        <Stack alignItems="flex-start">{((entityView.invocations as Array<{ invocation_id: string; slot_id: string; status: string }>) ?? []).map((invocation) =>
+          <Button key={invocation.invocation_id} size="small" onClick={(event) => onSelect?.({
+            kind: 'invocation',
+            circuitId: selection.circuitId,
+            phaseId: selection.phaseId,
+            roleId: selection.roleId,
+            slotId: invocation.slot_id,
+            invocationId: invocation.invocation_id,
+            ...(typeof entityView.run_id === 'string' ? { runId: entityView.run_id } : {}),
+          }, event.currentTarget)}>
+            Вызов {invocation.invocation_id} · {invocation.status}
+          </Button>)}</Stack>
+      </Paper>}
       {selectedCircuit === 'prepare-diffs' ? <Stack direction="row" spacing={1} flexWrap="wrap">{onOpenSources && <Button variant="contained" onClick={onOpenSources}>Настроить источники</Button>}{onOpenIndexes && <Button variant="outlined" onClick={onOpenIndexes}>Проверить индексы</Button>}</Stack> : <>
       <Paper component="section" variant="outlined" aria-labelledby="current-job-title" sx={{ p: 1.4 }}>
         <Typography id="current-job-title" variant="subtitle2" fontWeight={700}>Текущее задание</Typography>
@@ -428,17 +767,40 @@ export interface PipelineDispatcherProps {
   onOpenSources?: () => void;
   onOpenIndexes?: () => void;
   onOpenSettings?: (stepId?: string) => void;
-  onOpenJournal?: () => void;
-  onOpenRegistries?: () => void;
+  onOpenJournal?: (target?: JournalTarget) => void;
+  onOpenRegistry?: (target: RegistryTarget) => void;
 }
 
-export function PipelineDispatcher({ projectId, initialProjection, initialFingerprint, onOpenSources, onOpenIndexes, onOpenSettings, onOpenJournal, onOpenRegistries }: PipelineDispatcherProps) {
-  const { projection, fingerprint, resyncing, error, refresh } = useDispatcherStream({ projectId, initialProjection, initialFingerprint });
+export function PipelineDispatcher({ projectId, initialProjection, initialFingerprint, onOpenSources, onOpenIndexes, onOpenSettings, onOpenJournal, onOpenRegistry }: PipelineDispatcherProps) {
+  const { projection, fingerprint, resyncing, error, lastEvent, reconciliationToken, refresh } = useDispatcherStream({ projectId, initialProjection, initialFingerprint });
   const [recentEvents, setRecentEvents] = useState<RecentEvent[]>([]);
-  const [selectedCircuit, setSelectedCircuit] = useState<CircuitId | null>(null);
-  const [initiatorKey, setInitiatorKey] = useState<string | null>(null);
+  const [selection, setSelection] = useState<DispatcherSelection | null>(null);
+  const [liveMessage, setLiveMessage] = useState('');
   const [viewport, setViewport] = useState<Viewport>({ x: 4, y: 10, zoom: 0.9 });
   const shellRef = useRef<HTMLDivElement | null>(null);
+  const initiatorRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!lastEvent) return;
+    setSelection((current) => {
+      if (!current || current.kind !== 'slot' || current.runId) return current;
+      const phaseId = String(lastEvent.phase_id || lastEvent.payload?.phase_id || '');
+      const roleId = String(lastEvent.role_id || lastEvent.payload?.role_id || '');
+      const slotId = String(lastEvent.slot_id || lastEvent.payload?.slot_id || '');
+      const runId = String(lastEvent.run_id || lastEvent.payload?.run_id || '');
+      return phaseId === current.phaseId && roleId === current.roleId && slotId === current.slotId && runId
+        ? { ...current, runId }
+        : current;
+    });
+  }, [lastEvent?.sequence]);
+  useEffect(() => {
+    if (!lastEvent || !selection) return;
+    const invocationId = String(lastEvent.invocation_id || lastEvent.payload?.invocation_id || '');
+    const slotId = String(lastEvent.slot_id || lastEvent.payload?.slot_id || '');
+    const related = selection.kind === 'invocation' ? invocationId === selection.invocationId
+      : selection.kind === 'slot' ? slotId === selection.slotId
+        : selection.kind === 'circuit' || selection.kind === 'role' || selection.kind === 'queue';
+    if (related) setLiveMessage(short(`${lastEvent.type || 'Обновление диспетчера'}: ${String(lastEvent.payload?.invocation_status || lastEvent.payload?.status || '')}`, 160));
+  }, [lastEvent?.sequence, selection && selectionKey(selection)]);
   useEffect(() => {
     void api<{ events: RecentEvent[]; snapshot?: { events: RecentEvent[] }[] }>(`/projects/${projectId}/events?cursor=0&limit=50`).then((value) => {
       const events = value.events.length ? value.events : (value.snapshot ?? []).flatMap((item) => item.events ?? []);
@@ -448,42 +810,38 @@ export function PipelineDispatcher({ projectId, initialProjection, initialFinger
   if (resyncing && !initialProjection && !error) {
     return <Stack alignItems="center" spacing={2}><CircularProgress /><Typography>Пересинхронизация операционного состояния&hellip;</Typography></Stack>;
   }
-  const activate = (circuitId: CircuitId, key: string) => {
-    setInitiatorKey(key);
-    setSelectedCircuit(circuitId);
+  const activate = (next: DispatcherSelection, initiator: HTMLElement) => {
+    initiatorRef.current = initiator;
+    setSelection(next);
   };
   const closePanel = () => {
-    const circuit = selectedCircuit;
-    setSelectedCircuit(null);
+    const circuit = selection?.circuitId;
+    const initiator = initiatorRef.current;
+    setSelection(null);
     setTimeout(() => {
-      const separator = initiatorKey?.indexOf(':') ?? -1;
-      const source = separator < 0 ? '' : initiatorKey!.slice(0, separator);
-      const nodeId = separator < 0 ? '' : initiatorKey!.slice(separator + 1);
-      const graphNode = source === 'new'
-        ? [...(shellRef.current?.querySelectorAll<HTMLElement>('.react-flow__node[data-id]') ?? [])]
-          .find((element) => element.dataset.id === nodeId)
-        : undefined;
-      const invocation = source === 'new-invocation' || source === 'new-slot'
-        ? [...(shellRef.current?.querySelectorAll<HTMLElement>('[data-dispatcher-initiator]') ?? [])]
-          .find((element) => element.dataset.dispatcherInitiator === initiatorKey)
-        : undefined;
-      const exact = graphNode ?? invocation;
-      (exact?.isConnected ? exact : shellRef.current?.querySelector<HTMLElement>(`[data-dispatcher-nav="${circuit}"]`))?.focus();
+      (initiator?.isConnected ? initiator : shellRef.current?.querySelector<HTMLElement>(`[data-dispatcher-nav="${circuit}"]`))?.focus();
     }, 0);
   };
+  const selectedInvocationStatus = selection?.kind === 'invocation'
+    ? projection.agent_phases?.find((phase) => phase.phase_id === selection.phaseId)?.roles
+      .find((role) => role.role_id === selection.roleId)?.invocations
+      .find((invocation) => invocation.invocation_id === selection.invocationId)?.status
+    : undefined;
+  const terminalSelection = Boolean(selectedInvocationStatus && ['completed', 'failed', 'cancelled', 'interrupted'].includes(selectedInvocationStatus));
   return (
     <Stack spacing={1} ref={shellRef}>
+      <Box aria-live="polite" aria-atomic="true" sx={{ position: 'absolute', width: '1px', height: '1px', overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>{liveMessage}</Box>
       {error && <Alert severity="warning" action={resyncing ? <Button color="inherit" onClick={() => void refresh()}>Повторить снимок</Button> : undefined}>{error}</Alert>}
       {resyncing && !error && <LinearProgress aria-label="Пересинхронизация операционного состояния" />}
-      <Stack direction="row" alignItems="center" spacing={2}><StageRail projection={projection} /><Stack direction="row" spacing={1} alignItems="center"><Chip size="small" color={freshnessLabel(projection) === 'данные несвежие' ? 'warning' : 'success'} label={freshnessLabel(projection)} /><Typography variant="caption" color="text.secondary">Ревизия {projection.revision}</Typography>{onOpenJournal && <Button size="small" onClick={onOpenJournal}>Журнал</Button>}{onOpenRegistries && <Button size="small" onClick={onOpenRegistries}>Реестры</Button>}</Stack></Stack>
+      <Stack direction="row" alignItems="center" spacing={2}><StageRail projection={projection} /><Stack direction="row" spacing={1} alignItems="center"><Chip size="small" color={freshnessLabel(projection) === 'данные несвежие' ? 'warning' : 'success'} label={freshnessLabel(projection)} /><Typography variant="caption" color="text.secondary">Ревизия {projection.revision}</Typography>{onOpenJournal && <Button size="small" onClick={() => onOpenJournal()}>Журнал</Button>}{onOpenRegistry && <Button size="small" onClick={() => onOpenRegistry({ registry: 'diff-inventory', itemId: '' })}>Реестры</Button>}</Stack></Stack>
       <Stack direction="row" spacing={1} component="nav" aria-label="Этапы диспетчера" useFlexGap flexWrap="wrap">
         {(Object.keys(CIRCUIT_LABEL) as CircuitId[]).map((circuit) => (
           <Button
             key={circuit}
             size="small"
             data-dispatcher-nav={circuit}
-            variant={selectedCircuit === circuit ? 'contained' : 'outlined'}
-            onClick={() => activate(circuit, `nav:${circuit}`)}
+            variant={selection?.circuitId === circuit ? 'contained' : 'outlined'}
+            onClick={(event) => activate({ kind: 'circuit', circuitId: circuit }, event.currentTarget)}
           >
             {CIRCUIT_LABEL[circuit]}
           </Button>
@@ -491,7 +849,7 @@ export function PipelineDispatcher({ projectId, initialProjection, initialFinger
       </Stack>
       <ReactFlowProvider>
         <Box sx={{ position: 'relative' }} onKeyDown={(event) => {
-          if (event.key === 'Escape' && selectedCircuit) closePanel();
+          if (event.key === 'Escape' && selection) closePanel();
         }}>
           <DispatcherCanvasErrorBoundary>
             <DispatcherNew
@@ -505,11 +863,21 @@ export function PipelineDispatcher({ projectId, initialProjection, initialFinger
             projectId={projectId}
             projection={projection}
             fingerprint={fingerprint}
-            selectedCircuit={selectedCircuit}
+            selection={selection}
+            refreshToken={(terminalSelection ? 0 : reconciliationToken) + (lastEvent && (
+              selection?.kind === 'invocation'
+                ? ((lastEvent.invocation_id || lastEvent.payload?.invocation_id) === selection.invocationId ? lastEvent.sequence : 0)
+                : selection?.kind === 'slot'
+                  ? ((lastEvent.phase_id || lastEvent.payload?.phase_id) === selection.phaseId && (lastEvent.role_id || lastEvent.payload?.role_id) === selection.roleId && (lastEvent.slot_id || lastEvent.payload?.slot_id) === selection.slotId ? lastEvent.sequence : 0)
+                  : 0
+            ) || 0)}
+            onSelect={activate}
             onClose={closePanel}
             onOpenSources={onOpenSources}
             onOpenIndexes={onOpenIndexes}
             onOpenSettings={onOpenSettings}
+            onOpenJournal={onOpenJournal}
+            onOpenRegistry={onOpenRegistry}
             readOnly={resyncing}
           />
         </Box>

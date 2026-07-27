@@ -222,6 +222,12 @@ def preflight_connection(profile_id: str, platform: Path, connection: dict[str, 
     if current:
         extensions.append({"name": current["name"], "version": current.get("version", ""), "active": current.get("active") == "yes"})
     with tempfile.TemporaryDirectory(prefix="extension-identities-") as temporary:
+        configuration_root = Path(temporary) / "configuration"
+        command = adapter_plan(f"{exporter}+xml-hierarchical/v1", platform, connection, configuration_root, timeout_seconds=timeout_seconds)[0]
+        exported = _run_command(run, command, cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
+        if exported.returncode:
+            raise RuntimeError("configuration identity export failed")
+        configuration = configuration_identity(configuration_root)
         for index, extension in enumerate(extensions):
             output = Path(temporary) / str(index)
             command = adapter_plan(f"{exporter}+xml-hierarchical/v1", platform, connection, output, extension["name"], timeout_seconds=timeout_seconds)[0]
@@ -235,7 +241,7 @@ def preflight_connection(profile_id: str, platform: Path, connection: dict[str, 
     if len({item["uuid"] for item in extensions}) != len(extensions):
         raise RuntimeError("extension enumeration produced duplicate UUIDs")
     tested = {key: value for key, value in connection.items() if key not in {"db_password", "infobase_password", "tested", "extensions", "tested_fingerprint", "tool_version"}}
-    tested.update({"profile_id": profile_id, "tested": True, "extensions": extensions, "tool_versions": toolchain_versions})
+    tested.update({"profile_id": profile_id, "tested": True, "configuration": configuration, "extensions": extensions, "tool_versions": toolchain_versions})
     tested["tested_fingerprint"] = "sha256:" + sha256(canonical_json(tested))
     return tested
 
@@ -471,7 +477,7 @@ def _verified_artifact_source(upload_drafts: Path | None, member: dict[str, Any]
     return source
 
 
-def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, timeout_seconds: int = 1800, run: callable = subprocess.run, upload_drafts: Path | None = None, cancelled: callable | None = None) -> dict[str, Any]:
+def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, timeout_seconds: int = 1800, run: callable = subprocess.run, upload_drafts: Path | None = None, cancelled: callable | None = None, progress: callable | None = None) -> dict[str, Any]:
     from .source_routing import analyze_forms, component_members, plan_groups
     tested = {name: {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}} for name, profile in connections.items()}
     contract = validate_role_contract(repo, tested)
@@ -479,7 +485,9 @@ def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dic
     members = component_members(contract, connections)
     with tempfile.TemporaryDirectory(prefix="source-routing-preview-") as temporary:
         root = Path(temporary)
-        for member in members:
+        for index, member in enumerate(members):
+            if progress:
+                progress({"phase": "probe", "completed": index, "total": len(members), "subject": member["routing_group_id"]})
             _check_cancelled(cancelled, "probe")
             if member["kind"] in {"source-tree", "other"}:
                 continue
@@ -517,6 +525,8 @@ def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dic
                 if identity["uuid"] != expected_uuid or identity["name"] != expected_name or expected.get("version") and identity["version"] != expected["version"]:
                     raise ValueError(f"source_probe_identity_mismatch:{member['routing_group_id']}")
             member["probe"] = analyze_forms(output, member["component_id"])
+        if progress:
+            progress({"phase": "route", "completed": len(members), "total": len(members), "subject": ""})
         _check_cancelled(cancelled, "route")
         tool_versions = _toolchain_versions(contract["acquisition_profile_id"], platform, timeout_seconds=min(timeout_seconds, 120), run=run, cancelled=cancelled)
         manifest = plan_groups(members, exporter, tool_versions)
@@ -534,17 +544,19 @@ def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dic
     return {**preimage, "routing_plan_fingerprint": "sha256:" + sha256(canonical_json(preimage))}
 
 
-def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, routing_preview: dict[str, Any], normalizer_version: str = NORMALIZER_VERSION, timeout_seconds: int = 1800, run: callable = subprocess.run, upload_drafts: Path | None = None, cancelled: callable | None = None, activate: bool = True) -> dict[str, Any]:
+def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, routing_preview: dict[str, Any], normalizer_version: str = NORMALIZER_VERSION, timeout_seconds: int = 1800, run: callable = subprocess.run, upload_drafts: Path | None = None, cancelled: callable | None = None, progress: callable | None = None, activate: bool = True) -> dict[str, Any]:
     if shutil.disk_usage(repo).free < MINIMUM_FREE_BYTES:
         raise OSError("source acquisition requires at least 1 GiB free space")
     tested = {name: {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}} for name, profile in connections.items()}
     contract = validate_role_contract(repo, tested)
-    for role in ROLES:
+    for index, role in enumerate(ROLES, 1):
+        if progress:
+            progress({"phase": "connections", "completed": index - 1, "total": len(ROLES), "subject": role})
         profile_name = contract["roles"][role]["connection_profile"]
         fresh = preflight_connection(contract["acquisition_profile_id"], platform, connections[profile_name], timeout_seconds=min(timeout_seconds, 120), run=run, cancelled=cancelled)
         if fresh["tested_fingerprint"] != connections[profile_name].get("tested_fingerprint"):
             raise RuntimeError(f"connection profile changed since its saved test: {role}")
-    fresh_preview = build_routing_preview(repo, platform, connections, timeout_seconds=timeout_seconds, run=run, upload_drafts=upload_drafts, cancelled=cancelled)
+    fresh_preview = build_routing_preview(repo, platform, connections, timeout_seconds=timeout_seconds, run=run, upload_drafts=upload_drafts, cancelled=cancelled, progress=progress)
     if routing_preview.get("routing_plan_fingerprint") != fresh_preview["routing_plan_fingerprint"]:
         raise RuntimeError("routing_preview_stale")
     from .source_routing import component_members, source_comparison_epoch
@@ -559,7 +571,9 @@ def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], 
         work_root = staging / ".work"; work_root.mkdir()
         for role in ROLES:
             (staging / role).mkdir()
-        for member in members:
+        for index, member in enumerate(members, 1):
+            if progress:
+                progress({"phase": "export", "completed": index - 1, "total": len(members), "subject": member["component_id"]})
             _check_cancelled(cancelled, "export")
             group = groups[member["routing_group_id"]]
             role = member["role"]
@@ -641,11 +655,18 @@ def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], 
             if member["kind"] == "extension":
                 metadata["active"] = bool(member["extension"]["active"])
             atomic_json(output / "component-manifest.json", metadata)
+            if progress:
+                progress({"phase": "export", "completed": index, "total": len(members), "subject": member["component_id"]})
         shutil.rmtree(work_root)
         if validate_role_contract(repo, tested) != contract or routing_bindings(repo, connections, upload_drafts) != fresh_preview["bindings"]:
             raise RuntimeError("routing_preview_stale")
         _check_cancelled(cancelled, "publication")
-        return publish_routed(repo, staging, contract, fresh_preview["routing_manifest"], normalizer_version, expected_generation, source_comparison_epoch, activate=activate)
+        if progress:
+            progress({"phase": "publication", "completed": 0, "total": 1, "subject": ""})
+        result = publish_routed(repo, staging, contract, fresh_preview["routing_manifest"], normalizer_version, expected_generation, source_comparison_epoch, activate=activate)
+        if progress:
+            progress({"phase": "publication", "completed": 1, "total": 1, "subject": ""})
+        return result
 
 
 def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], routing_manifest: dict[str, Any], normalizer_version: str, expected_generation: str | None, epoch_builder: callable, *, activate: bool = True) -> dict[str, Any]:
@@ -706,13 +727,15 @@ def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], rou
             for manifest_path in sorted((destination / role).rglob("component-manifest.json")):
                 component = json.loads(manifest_path.read_text(encoding="utf-8"))
                 path = manifest_path.parent
+                manifest = file_manifest(path)
                 components.append({
                     "component_id": component["component_id"],
                     "kind": component["kind"],
                     "path": path.relative_to(destination).as_posix(),
                     "representation_schema": component["representation_schema"],
                     "routing_group_id": component["routing_group_id"],
-                    "fingerprint": "sha256:" + sha256(canonical_json(file_manifest(path))),
+                    "fingerprint": "sha256:" + sha256(canonical_json(manifest)),
+                    "bsl_file_count": sum(item["path"].endswith(".bsl") for item in manifest),
                 })
         pointer = {
             "schema_version": "2",
@@ -917,6 +940,12 @@ def _validate_active_routed(repo: Path, pointer: dict[str, Any], *, deep: bool, 
             or item.get("component_id") != component.get("component_id")
             or item.get("routing_group_id") != component.get("routing_group_id")
             or item.get("representation_schema") != component.get("representation_schema")
+            or item.get("bsl_file_count") is not None and (
+                not isinstance(item.get("bsl_file_count"), int)
+                or isinstance(item.get("bsl_file_count"), bool)
+                or item["bsl_file_count"] < 0
+                or deep and item["bsl_file_count"] != sum(entry["path"].endswith(".bsl") for entry in payload_manifest)
+            )
             or not group
             or not any(member["component_id"] == component["component_id"] for member in group["members"])
             or component["representation_schema"] != group["representation_schema"]

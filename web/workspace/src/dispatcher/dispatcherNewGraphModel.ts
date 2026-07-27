@@ -27,6 +27,7 @@ const ZONE_BY_NODE: Record<string, string> = {
   'analysis-queue': 'analyze-dif-window',
   'analyzer-1': 'analyze-workers',
   'semantic-dif': 'analyze-meaning',
+  'technical-noise': 'analyze-noise',
   'semantic-queue': 'form-meaning',
   coordinator: 'form-coordinator',
   'grouper-1': 'form-groupers',
@@ -132,8 +133,29 @@ const listPatch = (
   };
 };
 
+const difQueuePatch = (projection: DispatcherProjection, window: boolean): Partial<EnrichedNodeData> => {
+  const aggregate = projection.queue_aggregates?.['dif-queue'];
+  return {
+    state: projection.items.dif_queue.length ? 'Готово' : 'Ожидает',
+    detail: window
+      ? `В текущем окне: ${aggregate?.visible ?? projection.items.dif_queue.length}`
+      : `Всего DIF: ${aggregate?.total ?? 'недоступно'}`,
+    active: false,
+  };
+};
+
 const collectionDetail = (values: readonly { id: string }[], empty: string) =>
   visibleWindow(values, VISIBLE_QUEUE_LIMIT).map((item) => item.id).join(' · ') || empty;
+
+const collectionPatch = (
+  projection: DispatcherProjection,
+  aggregateId: string,
+  values: readonly unknown[],
+  label: string,
+): Partial<EnrichedNodeData> => {
+  const total = projection.queue_aggregates?.[aggregateId]?.total ?? values.length;
+  return { state: total ? 'Готово' : 'Ожидает', detail: `${label}: ${total}`, active: false };
+};
 
 const nestedZone = (
   id: string,
@@ -152,16 +174,26 @@ const roleInvocations = (projection: DispatcherProjection, roleId: string) =>
     ?.flatMap((phase) => phase.roles.filter((role) => role.role_id === roleId))
     .flatMap((role) => role.invocations) ?? [];
 
+const projectedRole = (projection: DispatcherProjection, roleId: string) =>
+  projection.agent_phases
+    ?.flatMap((phase) => phase.roles.map((role) => ({ phase, role })))
+    .find((item) => item.role.role_id === roleId);
+
 const rolePatch = (
   projection: DispatcherProjection,
   roleId: string,
 ): Partial<EnrichedNodeData> => {
+  const projected = projectedRole(projection, roleId);
   const invocations = roleInvocations(projection, roleId);
   return {
     title: ROLE_TITLE[roleId],
     state: invocations.some((item) => item.status === 'running') ? 'В работе' : invocations.length ? 'Готово' : 'Ожидает',
     detail: invocations.length ? `Вызовов: ${invocations.length}` : 'Работа не назначена',
     active: invocations.some((item) => item.status === 'running'),
+    phaseId: projected?.phase.phase_id,
+    roleId,
+    runId: projected?.role.run_id,
+    slots: projected?.role.slots,
     invocations: invocations.map((item) => ({
       id: item.invocation_id,
       slotId: item.slot_id,
@@ -219,8 +251,9 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
     case 'diff':
       return zonePatch(projection, 'diffs-build');
     case 'dif-queue':
+      return difQueuePatch(projection, false);
     case 'analysis-queue':
-      return listPatch(projection.items.dif_queue, 'Очередь пуста');
+      return difQueuePatch(projection, true);
     case 'analyzer-1':
       return invocationPatch(analyzer[0], 'Анализатор 1');
     case 'analyzer-2':
@@ -228,20 +261,11 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
     case 'analyzer-3':
       return invocationPatch(analyzer[2], 'Анализатор 3');
     case 'semantic-dif':
-      return {
-        ...listPatch(projection.items.meaning_diffs, 'Смысловых DIF пока нет'),
-        detail: [
-          projection.items.meaning_diffs.length
-            ? `Смысловые: ${visibleWindow(projection.items.meaning_diffs, VISIBLE_QUEUE_LIMIT).map((item) => item.id).join(' · ')}`
-            : 'Смысловых DIF пока нет',
-          `Технический шум: ${projection.items.noise_diffs.length}`,
-        ].join(' · '),
-        subzones: [
-          nestedZone('analyze-noise', 'Технический шум', projection.items.noise_diffs, 'Технического шума пока нет'),
-        ],
-      };
+      return collectionPatch(projection, 'meaning-diffs', projection.items.meaning_diffs, 'Смысловых DIF');
+    case 'technical-noise':
+      return collectionPatch(projection, 'noise-diffs', projection.items.noise_diffs, 'Элементов шума');
     case 'semantic-queue':
-      return listPatch(projection.items.meaning_diffs, 'Смысловых DIF пока нет');
+      return collectionPatch(projection, 'meaning-diffs', projection.items.meaning_diffs, 'Смысловых DIF');
     case 'coordinator':
       return invocationPatch(coordinator[0], 'Координатор MRQ');
     case 'grouper-1':
@@ -251,39 +275,22 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
     case 'grouper-3':
       return invocationPatch(grouper[2], 'Группировщик 3');
     case 'proposal': {
-      const proposal = projection.items.proposals[0];
-      return proposal ? {
-        state: 'Предложено',
-        detail: `${proposal.id} · ${visibleWindow(proposal.dif_ids.map((id) => ({ id })), VISIBLE_QUEUE_LIMIT).map((item) => item.id).join(' · ')}`,
-        active: false,
-      } : { state: 'Ожидает', detail: 'Предложений пока нет', active: false };
+      return collectionPatch(projection, 'proposals', projection.items.proposals, 'Предложений');
     }
-    case 'review':
+    case 'review': {
+      const proposals = projection.items.proposals.length;
+      const evidence = projection.items.proposals.reduce((sum, item) => sum + item.evidence_count, 0);
+      const coverage = circuitState(projection, 'form-mrq');
       return {
-        state: projection.items.proposals.length ? 'В работе' : 'Ожидает',
-        detail: projection.items.proposals.length
-          ? `Предложений: ${projection.items.proposals.length} · доказательств: ${projection.items.proposals.reduce((sum, item) => sum + item.evidence_count, 0)}`
-          : 'Предложений пока нет',
+        state: coverage,
+        detail: `Предложений: ${proposals} · Доказательств: ${evidence} · Полное покрытие: ${coverage === 'Готово' ? 'подтверждено' : 'не подтверждено'}`,
         active: false,
-        subzones: [{
-          id: 'form-barrier',
-          title: 'Барьер полного покрытия',
-          state: projection.items.proposals.length ? 'В работе' : 'Ожидает',
-          detail: projection.items.proposals.length
-            ? `Предложений: ${projection.items.proposals.length} · доказательств: ${projection.items.proposals.reduce((sum, item) => sum + item.evidence_count, 0)}`
-            : 'Предложений пока нет',
-        }],
       };
+    }
     case 'publication':
-      return projection.items.mrqs.length ? {
-        ...zonePatch(projection, 'publication'),
-        detail: visibleWindow(projection.items.mrqs, VISIBLE_QUEUE_LIMIT)
-          .map((item) => `${item.id} · DIF ${item.dif_ids.length} · доказательств ${item.evidence_count}`)
-          .join(' · '),
-        subzones: publicationSubzones(projection),
-      } : { ...zonePatch(projection, 'publication'), detail: 'MRQ пока нет', subzones: publicationSubzones(projection) };
+      return { ...zonePatch(projection, 'publication'), ...collectionPatch(projection, 'mrq-queue', projection.items.mrqs, 'MRQ') };
     case 'batch-input':
-      return listPatch(projection.items.mrqs, 'Исходных MRQ пока нет');
+      return collectionPatch(projection, 'mrq-queue', projection.items.mrqs, 'MRQ');
     case 'classifier-1':
       return invocationPatch(classifier[0], 'Классификатор');
     case 'batch-validation': {
@@ -291,9 +298,9 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
       return { state: state === 'valid' ? 'Готово' : 'Ожидает', detail: state === 'valid' ? 'Полное непересекающееся покрытие подтверждено' : 'Поколение пакетов не подтверждено', active: false };
     }
     case 'batch-output':
-      return listPatch(projection.items.batches, 'Пакетов пока нет');
+      return collectionPatch(projection, 'batches', projection.items.batches, 'Пакетов');
     case 'mrq-queue':
-      return listPatch(projection.items.mrqs, 'Очередь MRQ пуста');
+      return collectionPatch(projection, 'mrq-queue', projection.items.mrqs, 'Всего MRQ');
     case 'researcher-1':
       return invocationPatch(researcher[0], 'Исследователь 1');
     case 'researcher-2':
@@ -302,59 +309,15 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
       return invocationPatch(researcher[2], 'Исследователь 3');
     case 'target-db':
       return {
-        state: 'Недоступно',
-        detail: 'Версия и размер не подтверждены проекцией',
+        state: projection.items.approval_count ? 'Ожидает' : circuitState(projection, 'decide-target'),
+        detail: `Ожидают одобрения: ${projection.items.approval_count}`,
         active: false,
-        subzones: [{
-          id: 'decide-approval',
-          title: 'Ожидание одобрения',
-          state: projection.items.approval_count ? 'Ожидает' : 'Недоступно',
-          detail: `Ожидают: ${projection.items.approval_count}`,
-        }],
       };
-    case 'results': {
-      const labels: Record<string, string> = {
-        adopt_vendor: 'типовых',
-        adapt: 'разрывов',
-        retain_custom: 'сохранено',
-        out_of_scope: 'вне объёма',
-      };
-      const counts = Object.entries(labels)
-        .map(([decision, label]) => `${label}: ${projection.items.decisions.filter((item) => item.decision === decision).length}`)
-        .join(' · ');
-      return {
-        state: projection.items.decisions.length ? `${projection.items.decisions.length} решений` : 'Ожидает',
-        detail: projection.items.decisions.length ? counts : 'Решений пока нет',
-        active: false,
-        subzones: [{
-          id: 'decide-outcomes',
-          title: 'Исходы исследования',
-          state: projection.items.decisions.length ? 'Готово' : 'Ожидает',
-          detail: collectionDetail(projection.items.decisions, 'Решений пока нет'),
-        }],
-      };
-    }
+    case 'results':
+      return collectionPatch(projection, 'decisions', projection.items.decisions, 'Решений');
     default:
       return {};
   }
-}
-
-function publicationSubzones(projection: DispatcherProjection): NonNullable<EnrichedNodeData['subzones']> {
-  const publication = zone(projection, 'publication');
-  return [
-    {
-      id: 'form-publication',
-      title: 'Публикация',
-      state: statusLabel(publication?.state),
-      detail: publication?.updated_at ? `Подтверждено ${new Date(publication.updated_at).toLocaleTimeString('ru-RU')}` : 'Состояние не передано сервером',
-    },
-    {
-      id: 'form-summary',
-      title: 'Сводка опубликованных MRQ',
-      state: projection.items.mrqs.length ? 'Готово' : 'Ожидает',
-      detail: `MRQ: ${projection.items.mrqs.length}`,
-    },
-  ];
 }
 
 const cloneNode = (node: Node<EnrichedNodeData>, projection: DispatcherProjection): Node<EnrichedNodeData> => {
@@ -364,16 +327,20 @@ const cloneNode = (node: Node<EnrichedNodeData>, projection: DispatcherProjectio
     ...node,
     type: role ? 'role' : node.type,
     position: { ...node.position },
-    style: { ...node.style },
-    selectable: true,
-    focusable: true,
-    ariaRole: 'button',
+    style: role ? {
+      ...node.style,
+      width: 135,
+      height: Math.max(Number(node.style?.height ?? 0), 150),
+    } : { ...node.style },
+    selectable: !role,
+    focusable: !role,
+    ariaRole: role ? 'group' : 'button',
     ariaLabel: `${node.data.title}: ${patch.state ?? 'Недоступно'}`,
     data: {
       ...node.data,
       zoneId: ZONE_BY_NODE[node.id],
       circuitId: CIRCUIT_BY_STAGE[node.id] ?? CIRCUIT_BY_STAGE[node.parentId ?? ''],
-      interaction: 'open-circuit',
+      interaction: role ? 'none' : 'open-circuit',
       ...patch,
     },
   };

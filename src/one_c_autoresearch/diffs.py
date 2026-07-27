@@ -732,6 +732,14 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
         validate_active(repo, candidate=pointer, source_candidate=source_pointer)
         if activate:
             atomic_json(pointer_path, pointer)
+            canonical_pointer = repo / "research/active-generation.json"
+            if not canonical_pointer.exists():
+                atomic_json(canonical_pointer, {
+                    "schema_version": "1",
+                    "canonical_generation_id": None,
+                    "source_generation_id": source_id,
+                    "diff_generation_id": generation_id,
+                })
         return pointer
 
 

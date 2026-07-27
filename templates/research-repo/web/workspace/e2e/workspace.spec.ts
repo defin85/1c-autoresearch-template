@@ -15,7 +15,7 @@ const LEGACY_VISUAL_MANIFEST = JSON.parse(readFileSync(path.join(LEGACY_ASSETS, 
 const REQUIRED_ZONES = [
   'sources', 'vendor-baseline', 'target-cf', 'next-vendor', 'sources-acquire', 'diffs-build', 'indexes-build', 'prepare-dif-window',
   'analyze-dif-window', 'analyze-workers', 'analyze-meaning', 'analyze-noise',
-  'form-meaning', 'form-coordinator', 'form-groupers', 'form-proposals', 'form-review', 'form-barrier', 'form-publication', 'form-summary',
+  'form-meaning', 'form-coordinator', 'form-groupers', 'form-proposals', 'form-review', 'form-publication',
   'classify-input', 'classify-workers', 'classify-validation', 'classify-batches',
   'decide-mrq-queue', 'decide-target-base', 'decide-researchers', 'decide-approval', 'decide-outcomes', 'decide-summary',
 ] as const;
@@ -94,6 +94,31 @@ async function openFixture(page: Page, initialProjection: DispatcherProjection =
   });
   await page.route('**/api/v1/projects/fixture/dispatcher/**', async (route) => {
     const request = route.request();
+    if (request.method() === 'GET' && request.url().includes('/dispatcher/inspect?')) {
+      const url = new URL(request.url());
+      const invocationId = url.searchParams.get('invocation_id');
+      const historyCursor = url.searchParams.get('history_cursor');
+      const eventCursor = url.searchParams.get('event_cursor');
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          invocation: invocationId ? { invocation_id: invocationId, status: 'running', error_summary: '<b>literal</b>' } : undefined,
+          slot: invocationId ? undefined : { slot_id: url.searchParams.get('slot_id'), state: 'idle', idle_reason_code: 'work_not_requested' },
+          history: {
+            items: [{ invocation_id: invocationId, marker: historyCursor ? 'history-page-2' : 'history-page-1' }],
+            available: true,
+            next_cursor: historyCursor ? undefined : 'history-next',
+          },
+          events: {
+            items: [{ sequence: eventCursor ? 2 : 1, marker: eventCursor ? 'event-page-2' : 'event-page-1' }],
+            available: true,
+            next_cursor: eventCursor ? undefined : 'event-next',
+          },
+        }),
+      });
+      return;
+    }
     actionRequests.push({
       url: request.url(),
       method: request.method(),
@@ -127,6 +152,15 @@ async function openFixture(page: Page, initialProjection: DispatcherProjection =
   }));
   await page.route('**/api/v1/projects/fixture/indexes', (route) => route.fulfill({
     status: 200, contentType: 'application/json', body: JSON.stringify({ items: [] }),
+  }));
+  await page.route('**/api/v1/projects/fixture/registries/diff-inventory?*', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      diff_generation_id: 'generation-fixture',
+      items: [{ stable_diff_id: 'DIF-00001', path: 'Catalogs/Fixture.xml', state: 'queued' }],
+      has_more: false,
+    }),
   }));
   await page.goto('/');
   await page.getByRole('button', { name: 'Открыть репозиторий' }).click();
@@ -162,6 +196,18 @@ async function openFixture(page: Page, initialProjection: DispatcherProjection =
       await page.evaluate(() => {
         const source = (window as typeof window & { __fixtureEventSource: EventTarget }).__fixtureEventSource;
         source.dispatchEvent(new MessageEvent('resync'));
+      });
+    },
+    async degradeStream() {
+      await page.evaluate(() => {
+        const source = (window as typeof window & { __fixtureEventSource: EventTarget }).__fixtureEventSource;
+        source.dispatchEvent(new Event('error'));
+      });
+    },
+    async recoverStream() {
+      await page.evaluate(() => {
+        const source = (window as typeof window & { __fixtureEventSource: EventTarget }).__fixtureEventSource;
+        source.dispatchEvent(new Event('open'));
       });
     },
   };
@@ -321,7 +367,7 @@ test('the sole dispatcher keeps one shell, stream, panel and viewport', async ({
   expect(await ledger.eventSources()).toBe(1);
 
   await page.getByRole('button', { name: 'Закрыть' }).click();
-  const initiator = page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="analyzer-1"]');
+  const initiator = page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="analyzer-1"] [data-dispatcher-kind="role"]');
   await initiator.focus();
   await initiator.press('Enter');
   const refreshed = structuredClone(saturatedProjection);
@@ -360,10 +406,53 @@ test('the sole dispatcher sends one approved action with the workflow fingerprin
   expect(ledger.actionRequests[0].idempotencyKey).toBeTruthy();
 });
 
+test('context inspector navigates circuit, role, slot, invocation and queue item with exact details', async ({ page }) => {
+  await openFixture(page);
+  const analyzer = page.locator('.react-flow__node[data-id="analyzer-1"]');
+  await analyzer.locator('[data-dispatcher-kind="role"]').click();
+  await expect(page.getByRole('heading', { name: 'Роль analyzer' })).toBeFocused();
+  await page.getByRole('complementary', { name: 'Сведения диспетчера' }).getByRole('button', { name: 'analyzer-1' }).click();
+  await expect(page.getByRole('heading', { name: /Слот analyzer-1/ })).toBeFocused();
+  await analyzer.locator('[data-dispatcher-kind="role"]').click();
+  await page.getByRole('complementary', { name: 'Сведения диспетчера' }).getByRole('button', { name: /Вызов invocation-01/ }).click();
+  await expect(page.getByRole('heading', { name: 'Вызов invocation-01' })).toBeFocused();
+  await expect(page.getByText('<b>literal</b>')).toBeVisible();
+  await expect(page.locator('b')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Ещё история' }).click();
+  await expect(page.getByText('history-page-2')).toBeVisible();
+  await page.getByRole('button', { name: 'Ещё события' }).click();
+  await expect(page.getByText('event-page-2')).toBeVisible();
+  await page.getByRole('button', { name: 'Открыть в журнале' }).click();
+  await expect(page.getByRole('textbox', { name: 'Поиск в событиях и журналах' })).toHaveValue('invocation-01');
+
+  await page.getByRole('button', { name: 'Диспетчер', exact: true }).click();
+  await page.locator('.react-flow__node[data-id="dif-queue"]').click();
+  await expect(page.getByRole('heading', { name: 'Очередь', exact: true })).toBeVisible();
+  await page.getByRole('complementary', { name: 'Сведения диспетчера' }).getByRole('button', { name: 'DIF-00001' }).click();
+  await expect(page.getByRole('heading', { name: 'DIF DIF-00001' })).toBeFocused();
+  await page.getByRole('button', { name: 'Открыть запись реестра' }).click();
+  const record = page.getByLabel('Запись реестра DIF-00001');
+  await expect(record).toBeVisible();
+  await expect(record).toContainText('Catalogs/Fixture.xml');
+});
+
+test('degraded SSE reconciles the projection after five seconds', async ({ page }) => {
+  const ledger = await openFixture(page);
+  const before = ledger.workflowRequests();
+  await ledger.degradeStream();
+  await expect(page.getByText('Поток событий временно недоступен, выполняется переподключение')).toBeVisible();
+  await expect.poll(() => ledger.workflowRequests(), { timeout: 6_500 }).toBeGreaterThan(before);
+  await ledger.recoverStream();
+  await expect(page.getByText('Поток событий временно недоступен, выполняется переподключение')).toBeHidden();
+  const recovered = ledger.workflowRequests();
+  await page.waitForTimeout(5_500);
+  expect(ledger.workflowRequests()).toBe(recovered);
+});
+
 test('dispatcher keeps stale projection read-only until an explicit nondecreasing snapshot succeeds', async ({ page }) => {
   const ledger = await openFixture(page);
   const node = page.locator('[data-testid="dispatcher-new-canvas"] .react-flow__node[data-id="analyzer-1"]');
-  await node.click();
+  await node.getByRole('button', { name: /Фактические анализаторы/ }).click();
   const viewport = page.getByTestId('dispatcher-new-canvas').locator('.react-flow__viewport');
   const initialTransform = await viewport.getAttribute('style');
   await page.getByTestId('dispatcher-new-canvas').locator('.react-flow__controls-zoomin').click();
@@ -405,7 +494,7 @@ test('active projection is distinct and only confirmed work is active', async ({
   expect(activeProjection).not.toEqual(saturatedProjection);
   await openFixture(page, activeProjection);
   await assertDispatcherNewGeometry(page, true);
-  await expect(page.locator('[data-invocation-id]')).toHaveCount(1);
+  await expect(page.locator('[data-invocation-id]')).toHaveCount(0);
   await expect(page.locator('[data-zone="analyze-workers"]')).toContainText('В работе');
   await expect(page.locator('[data-zone="form-coordinator"]')).toContainText('Ожидает');
 });
@@ -499,7 +588,8 @@ test('dispatcher saturated projection is factual, bounded and candidate-ready at
   await assertDispatcherNewGeometry(page, true);
   await assertNoClippedNodeContent(page);
   await expect(page.locator('[data-zone="analyze-workers"], [data-zone="form-coordinator"], [data-zone="form-groupers"], [data-zone="classify-workers"], [data-zone="decide-researchers"]')).toHaveCount(5);
-  await expect(page.locator('[data-invocation-id]')).toHaveCount(24);
+  await expect(page.locator('[data-invocation-id]')).toHaveCount(0);
+  await expect(page.locator('[data-zone="analyze-workers"]')).toContainText('Вызовов:');
   await expect(page.locator('[data-zone="decide-target-base"]')).toContainText('Версия и размер не подтверждены');
   await expect(page.locator('[data-zone="classify-input"]')).toContainText('MRQ-00001 · MRQ-00002');
   if (process.env.UPDATE_FIVE_STAGE_VISUALS === '1') {
@@ -544,7 +634,9 @@ test('dispatcher remains reachable through local overview at 1280x720', async ({
 
 test('dispatcher agent focus falls back after SSE removal and its local failure keeps the shell', async ({ page }) => {
   const ledger = await openFixture(page);
-  await page.locator('[data-invocation-id="invocation-01"]').click();
+  const analyzer = page.locator('.react-flow__node[data-id="analyzer-1"]');
+  await analyzer.locator('[data-dispatcher-kind="role"]').click();
+  await page.getByRole('complementary', { name: 'Сведения диспетчера' }).getByRole('button', { name: /Вызов invocation-01/ }).click();
   await expect(page.getByRole('region', { name: 'Текущее задание' })).toBeVisible();
   const next = structuredClone(saturatedProjection);
   next.revision += 1;
@@ -638,7 +730,7 @@ test('the dispatcher uses contextual and compact navigation with a fresh return 
   await returnTo();
 
   await page.getByRole('button', { name: 'Реестры', exact: true }).first().click();
-  await expect(page.getByLabel('Реестр')).toBeVisible();
+  await expect(page.getByRole('combobox', { name: 'Реестр' })).toBeVisible();
   await returnTo();
   expect(ledger.workflowRequests()).toBe(7);
   expect(pageErrors.filter(message => message !== 'project bookmark not found')).toEqual([]);

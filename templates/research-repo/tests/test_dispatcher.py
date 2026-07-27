@@ -19,7 +19,7 @@ from one_c_autoresearch.dispatcher import (
     load_bindings,
 )
 from one_c_autoresearch.events import EventStore
-from one_c_autoresearch.agents import ENVIRONMENT_KEYS, EXEC_ARGUMENTS, ENVIRONMENT_PRESET_VERSION, build_context_manifest
+from one_c_autoresearch.agents import EVIDENCE_SCHEMA, ENVIRONMENT_KEYS, EXEC_ARGUMENTS, ENVIRONMENT_PRESET_VERSION, TARGET_COVERAGE_SCHEMA, build_context_manifest
 from one_c_autoresearch.sqlite_state import DispatcherStore, LEASE_EXPIRY_SECONDS
 
 
@@ -87,6 +87,35 @@ def _start(coordinator: DispatcherCoordinator, job_id: str, bindings: Dispatcher
 def test_dispatcher_jobs_match_fixed_workflow_contract() -> None:
     assert DISPATCHER_JOBS == ("discover-mrq", "classify-mrq", "decide-mrq")
     assert STALE_AFTER_SECONDS == 10
+
+
+def test_agent_environment_inherits_standard_proxy_variables() -> None:
+    assert {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"} <= set(ENVIRONMENT_KEYS)
+    assert EVIDENCE_SCHEMA["additionalProperties"] is False
+    assert TARGET_COVERAGE_SCHEMA["additionalProperties"] is False
+
+
+def test_context_manifest_resolves_active_generation_paths(tmp_path: Path) -> None:
+    source = tmp_path / "sources/generations/source-1/target_cf/configuration"
+    source.mkdir(parents=True)
+    (source / "Configuration.xml").write_text("source", encoding="utf-8")
+    (tmp_path / "research").mkdir()
+    (tmp_path / "research/active-source-generation.json").write_text(
+        '{"generation_id":"source-1"}',
+        encoding="utf-8",
+    )
+
+    manifest = build_context_manifest(tmp_path, {
+        "id": "DIF-1",
+        "allowed_paths": [
+            "target_cf/configuration/Configuration.xml",
+            "configuration/Configuration.xml",
+        ],
+    })
+
+    assert manifest["paths"][0]["path"] == "target_cf/configuration/Configuration.xml"
+    assert manifest["paths"][0]["fingerprint"] == "sha256:" + hashlib_sha256(b"source").hexdigest()
+    assert manifest["paths"][1]["fingerprint"] == manifest["paths"][0]["fingerprint"]
 
 
 def test_bindings_thread_id_is_stable_and_fingerprint_sensitive() -> None:

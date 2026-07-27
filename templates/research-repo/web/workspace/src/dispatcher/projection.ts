@@ -41,6 +41,11 @@ export interface DispatcherProjection {
   stage_recompute_run?: { run_id: string; status: string; result?: Record<string, unknown> | null; plan?: { plan_fingerprint?: string } };
   items: DispatcherItems;
   agent_phases?: AgentPhaseProjection[];
+  queue_aggregates?: Record<string, {
+    total: number;
+    visible?: number;
+    omitted: number;
+  }>;
   retry_candidates?: Array<{
     run_id: string;
     job_id: 'discover-mrq' | 'classify-mrq' | 'decide-mrq';
@@ -55,13 +60,30 @@ export interface DispatcherProjection {
 export interface AgentInvocationProjection {
   invocation_id: string; slot_id: string; work_unit_id: string; status: string; created_at?: string; updated_at?: string;
 }
+export interface AgentSlotProjection {
+  slot_id: string;
+  display_label: string;
+  state: 'running' | 'idle';
+  idle_reason_code?: string | null;
+  current_invocation_id?: string | null;
+}
 export interface AgentRoleProjection {
   role_id: string; agent_profile: string; configured_slots: number; requested: number;
   running: number; queued: number; completed: number; failed: number; cancelled: number; interrupted: number;
   invocations: AgentInvocationProjection[];
+  run_id?: string;
+  slots?: AgentSlotProjection[];
   invocation_total?: number; invocation_omitted?: number;
   model?: string; reasoning_effort?: string; environment_preset?: string; environment_status?: string;
 }
+
+export type DispatcherSelection =
+  | { kind: 'circuit'; circuitId: CircuitId }
+  | { kind: 'role'; circuitId: CircuitId; phaseId: string; roleId: string }
+  | { kind: 'slot'; circuitId: CircuitId; phaseId: string; roleId: string; slotId: string; runId?: string }
+  | { kind: 'invocation'; circuitId: CircuitId; phaseId: string; roleId: string; slotId: string; invocationId: string; runId?: string }
+  | { kind: 'queue'; circuitId: CircuitId; queueId: string }
+  | { kind: 'item'; itemKind: 'dif' | 'mrq' | 'batch' | 'decision' | 'proposal'; circuitId: CircuitId; queueId: string; itemId: string };
 export interface AgentPhaseProjection {
   job_id: string; phase_id: string; mode: string; max_concurrency: number; roles: AgentRoleProjection[];
 }

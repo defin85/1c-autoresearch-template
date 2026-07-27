@@ -13,7 +13,7 @@ import {
   type Viewport,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import type { CircuitId } from './projection';
+import type { AgentSlotProjection, CircuitId, DispatcherSelection } from './projection';
 
 export type EnrichedNodeKind = 'stage' | 'card' | 'role';
 export type EnrichedInteraction = 'none' | 'open-circuit';
@@ -40,10 +40,15 @@ export interface EnrichedNodeData extends Record<string, unknown> {
   accent: string;
   active?: boolean;
   circuitId?: CircuitId;
+  phaseId?: string;
+  roleId?: string;
+  runId?: string;
   interaction?: EnrichedInteraction;
   ports?: Array<{ id: EnrichedPortId; type: 'source' | 'target' }>;
   items?: string[];
   invocations?: EnrichedInvocation[];
+  slots?: AgentSlotProjection[];
+  selectableItems?: Array<{ id: string; kind: 'dif' | 'mrq' }>;
   collectionLabel?: string;
   subzones?: Array<{ id: string; title: string; state: string; detail: string }>;
 }
@@ -119,6 +124,9 @@ const CardNode = memo(function CardNode({ id, data }: NodeProps<Node<EnrichedNod
     data-content-inset
     variant="outlined"
     sx={{
+      width: '100%',
+      minWidth: 0,
+      maxWidth: '100%',
       height: '100%',
       boxSizing: 'border-box',
       p: 1,
@@ -177,11 +185,10 @@ const CardNode = memo(function CardNode({ id, data }: NodeProps<Node<EnrichedNod
 });
 
 const RoleNode = memo(function RoleNode({ id, data }: NodeProps<Node<EnrichedNodeData>>) {
-  const slots = [...new Set(data.invocations?.map((invocation) => invocation.slotId).filter((slotId): slotId is string => Boolean(slotId)) ?? [])]
-    .map((slotId) => ({
-      slotId,
-      invocations: data.invocations?.filter((invocation) => invocation.slotId === slotId) ?? [],
-    }));
+  const invocations = data.invocations ?? [];
+  const running = invocations.filter((invocation) => invocation.state === 'Выполняется').length;
+  const completed = invocations.filter((invocation) => invocation.state === 'Завершено').length;
+  const failed = invocations.filter((invocation) => invocation.state === 'Ошибка').length;
   return <Box
     data-zone={data.zoneId ?? id}
     data-content-inset
@@ -204,49 +211,18 @@ const RoleNode = memo(function RoleNode({ id, data }: NodeProps<Node<EnrichedNod
     }}
   >
     <NamedHandles accent={data.accent} ports={data.ports} />
-    <Stack direction="row" alignItems="flex-start" gap={0.5} sx={{ minHeight: 24 }}>
-      <Typography sx={{ minWidth: 0, fontSize: 11.5, fontWeight: 750, lineHeight: 1.1, flex: 1, overflowWrap: 'anywhere' }}>{data.title}</Typography>
-      <Typography noWrap sx={{ flexShrink: 0, color: data.accent, fontSize: 9.5 }}>{data.state}</Typography>
-    </Stack>
-    {data.detail && <Typography noWrap title={data.detail} sx={{ fontSize: 8.5, color: 'text.secondary' }}>{data.detail}</Typography>}
-    <Stack
-      spacing={0.45}
-      mt={0.4}
-      tabIndex={0}
-      role="region"
-      aria-label={data.collectionLabel ?? `${data.title}: вызовы`}
-      sx={{ flex: 1, minHeight: 0, overflowY: 'auto' }}
-    >
-      {slots.length ? slots.map(({ slotId, invocations }) => <Box
-        key={slotId}
-        component="button"
-        type="button"
-        data-content-inset
-        data-agent-slot-id={slotId}
-        data-dispatcher-initiator={`new-slot:${id}:${slotId}`}
-        data-circuit-id={data.circuitId}
-        sx={{
-          textAlign: 'left',
-          border: 1,
-          borderColor: `${data.accent}55`,
-          bgcolor: '#fff',
-          borderRadius: 1,
-          p: 0.8,
-          flexShrink: 0,
-          minHeight: data.title === 'Координатор MRQ' ? 'calc(100% - 4px)' : 92,
-          cursor: 'pointer',
-        }}
-      >
-        <Typography noWrap title={slotId} sx={{ fontSize: 11.5, fontWeight: 750 }}>{slotId}</Typography>
-        {invocations.map((invocation) => <Box key={invocation.id} data-invocation-id={invocation.id}>
-          <Chip label={invocation.state} size="small" sx={{ my: 0.5, height: 19, color: data.accent, '& .MuiChip-label': { px: 0.7, fontSize: 9 } }} />
-          <Typography noWrap title={`${invocation.id} · ${invocation.workUnitId}`} sx={{ fontSize: 9.5, color: 'text.secondary' }}>
-            {invocation.id} · {invocation.workUnitId}
-          </Typography>
-          <Typography sx={{ mt: 0.35, fontSize: 8.5, color: 'text.secondary' }}>{invocation.updatedAt ? new Date(invocation.updatedAt).toLocaleTimeString('ru-RU') : 'время недоступно'}</Typography>
-        </Box>)}
-      </Box>) : <Typography sx={{ fontSize: 9.5, color: 'text.secondary' }}>Фактических слотов нет</Typography>}
-    </Stack>
+    <Box component="button" type="button" data-dispatcher-kind="role" data-circuit-id={data.circuitId}
+      data-phase-id={data.phaseId} data-role-id={data.roleId}
+      sx={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', border: 0, bgcolor: 'transparent', p: 0, textAlign: 'left', cursor: 'pointer' }}>
+      <Typography sx={{ fontSize: 12.5, fontWeight: 750, lineHeight: 1.15, overflowWrap: 'anywhere' }}>{data.title}</Typography>
+      <Typography noWrap sx={{ color: data.accent, fontSize: 10, mt: 0.25 }}>{data.state}</Typography>
+      <Stack spacing={0.35} mt={1}>
+        <Typography noWrap sx={{ fontSize: 10.5 }}>Вызовов: {invocations.length}</Typography>
+        <Typography noWrap sx={{ fontSize: 10.5 }}>Выполняется: {running}</Typography>
+        <Typography noWrap sx={{ fontSize: 10.5 }}>Завершено: {completed}</Typography>
+        <Typography noWrap sx={{ fontSize: 10.5, color: failed ? 'error.main' : 'text.secondary' }}>Ошибок: {failed}</Typography>
+      </Stack>
+    </Box>
   </Box>;
 });
 
@@ -261,7 +237,7 @@ export interface EnrichedDispatcherGraphProps {
   model: EnrichedDispatcherModel;
   viewport?: Viewport;
   onMoveEnd?: (viewport: Viewport) => void;
-  onActivate?: (circuitId: CircuitId, initiatorKey: string) => void;
+  onActivate?: (selection: DispatcherSelection, initiator: HTMLElement) => void;
   fitView?: boolean;
   testId?: string;
 }
@@ -281,9 +257,25 @@ export function EnrichedDispatcherGraph({
     () => reduceMotion ? model.edges.map((edge) => edge.animated ? { ...edge, animated: false } : edge) : model.edges,
     [model.edges, reduceMotion],
   );
-  const activate = useCallback((node: Node<EnrichedNodeData>) => {
+  const activate = useCallback((node: Node<EnrichedNodeData>, initiator: HTMLElement) => {
     if (node.data.interaction === 'open-circuit' && node.data.circuitId) {
-      onActivate?.(node.data.circuitId, `new:${node.id}`);
+      const queueId = ({
+        'dif-queue': 'dif-queue',
+        'analysis-queue': 'dif-queue',
+        'semantic-dif': 'meaning-diffs',
+        'technical-noise': 'noise-diffs',
+        'semantic-queue': 'meaning-diffs',
+        proposal: 'proposals',
+        publication: 'mrq-queue',
+        'batch-input': 'mrq-queue',
+        'batch-output': 'batches',
+        'mrq-queue': 'mrq-queue',
+        'target-db': 'approvals',
+        results: 'decisions',
+      } as Record<string, string>)[node.id];
+      onActivate?.(queueId
+        ? { kind: 'queue', circuitId: node.data.circuitId, queueId }
+        : { kind: 'circuit', circuitId: node.data.circuitId }, initiator);
     }
   }, [onActivate]);
 
@@ -297,13 +289,23 @@ export function EnrichedDispatcherGraph({
       if (!node || node.data.interaction !== 'open-circuit') return;
       event.preventDefault();
       event.stopPropagation();
-      activate(node);
+      activate(node, target);
     }}
     onClickCapture={(event) => {
-      const target = (event.target as HTMLElement).closest<HTMLElement>('[data-dispatcher-initiator][data-circuit-id]');
+      const target = (event.target as HTMLElement).closest<HTMLElement>('[data-dispatcher-kind][data-circuit-id]');
       if (!target) return;
       event.stopPropagation();
-      onActivate?.(target.dataset.circuitId as CircuitId, target.dataset.dispatcherInitiator!);
+      const common = {
+        circuitId: target.dataset.circuitId as CircuitId,
+        phaseId: target.dataset.phaseId!,
+        roleId: target.dataset.roleId!,
+      };
+      const selection: DispatcherSelection = target.dataset.dispatcherKind === 'role'
+        ? { kind: 'role', ...common }
+        : target.dataset.dispatcherKind === 'invocation'
+          ? { kind: 'invocation', ...common, slotId: target.dataset.agentSlotId!, invocationId: target.dataset.invocationId!, ...(target.dataset.runId ? { runId: target.dataset.runId } : {}) }
+          : { kind: 'slot', ...common, slotId: target.dataset.agentSlotId!, ...(target.dataset.runId ? { runId: target.dataset.runId } : {}) };
+      onActivate?.(selection, target);
     }}
     sx={{
       height: '100%',
@@ -331,7 +333,7 @@ export function EnrichedDispatcherGraph({
       panOnDrag
       zoomOnScroll
       onMoveEnd={(_, nextViewport) => onMoveEnd?.(nextViewport)}
-      onNodeClick={(_, node) => activate(node as Node<EnrichedNodeData>)}
+      onNodeClick={(event, node) => activate(node as Node<EnrichedNodeData>, event.currentTarget as HTMLElement)}
       proOptions={{ hideAttribution: true }}
     >
       <Controls showInteractive={false} />

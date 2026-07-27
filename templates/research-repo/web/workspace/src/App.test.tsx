@@ -3,8 +3,10 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   App,
   AgentProfiles,
+  Events,
   Registry,
   RoutingPreviewSummary,
+  Sources,
   ToolInventory,
   WorkflowEditor,
   groupEvents,
@@ -52,6 +54,28 @@ test("groups workflow events as run, job, step and attempt", () => {
   expect(grouped["run-1"]["job-1"]["step-1"][1][0].sequence).toBe(2);
 });
 
+test("journal target initializes the exact run group and invocation filter", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({
+      events: [{ sequence: 1, timestamp: "2026-01-01T00:00:00Z", type: "invocation.started", run_id: "run-1", payload: { invocation_id: "invoke-1" } }],
+      next_cursor: 1,
+      resync_required: false,
+    }),
+  }));
+  render(<Events project={{ id: "p", name: "p", root: "/repo" }} target={{ runId: "run-1", invocationId: "invoke-1" }} />);
+  expect(await screen.findByRole("button", { name: /Запуск run-1/ })).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByRole("textbox", { name: "Поиск в событиях и журналах" })).toHaveValue("invoke-1");
+});
+
+test("registry target requests only the exact stable item", async () => {
+  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ items: [], has_more: false }) });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<Registry project={{ id: "p", name: "p", root: "/repo" }} target={{ registry: "diff-inventory", itemId: "DIF-EXACT" }} />);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+  expect(String(fetchMock.mock.calls[0][0])).toContain("item_id=DIF-EXACT");
+});
+
 test("shows accessible source tool installations and current use", async () => {
   vi.stubGlobal(
     "fetch",
@@ -94,17 +118,112 @@ test("shows accessible source tool installations and current use", async () => {
   expect(screen.getByText("требуется текущим маршрутом")).toBeInTheDocument();
 });
 
+test("shows a running routing preview before route groups are available", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ complete: true, tools: [] }),
+    }),
+  );
+  render(
+    <>
+      <RoutingPreviewSummary
+        preview={{ preview_id: "preview", status: "running", routing_plan_fingerprint: "", routing_manifest: {}, progress: { phase: "probe", completed: 1, total: 3, subject: "configuration:target_cf" } }}
+      />
+      <ToolInventory
+        project={{ id: "p", name: "p", root: "/repo" }}
+        selectedProfile="ibcmd+form-aware/v1"
+        routingPreview={{ preview_id: "preview", status: "running", routing_plan_fingerprint: "", routing_manifest: {} }}
+      />
+    </>,
+  );
+  expect(screen.getByText(/Состояние: running/)).toBeInTheDocument();
+  expect(screen.getByText("Проверено компонентов: 1 из 3. Текущий: configuration:target_cf")).toBeInTheDocument();
+  expect(await screen.findByText("проверка завершена")).toBeInTheDocument();
+});
+
+test("saved infobase connection parameters are visible and editable without exposing passwords", async () => {
+  const setup = {
+    profiles: ["ibcmd+form-aware/v1"],
+    infobases: {
+      acquisition_profile: "ibcmd+form-aware/v1",
+      roles: {
+        vendor_baseline: {
+          connection_profile: "local-baseline",
+          configuration_name: "СППР",
+          root_uuid: "00000000-0000-0000-0000-000000000001",
+          version: "2.0.14.9",
+        },
+      },
+    },
+    infobases_fingerprint: "sha256:manifest",
+    external_artifacts: { artifacts: [] },
+    upload_draft_fingerprint: "sha256:draft",
+    connection_profiles: {
+      "local-baseline": {
+        available: true,
+        tested: true,
+        profile_id: "ibcmd+form-aware/v1",
+        platform_path: "/opt/1cv8/x86_64/8.3.27.1989",
+        server: "localhost",
+        reference: "example",
+        dbms: "PostgreSQL",
+        db_server: "localhost port=5432",
+        db_name: "example",
+        db_user: "postgres",
+        infobase_user: "chatgpt",
+        client_connection: "/Slocalhost/example",
+        db_password_set: true,
+        infobase_password_set: true,
+        extension_count: 0,
+        extensions: [],
+        tool_versions: {},
+      },
+    },
+    active_source: {},
+    active_diff: {},
+  };
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string) =>
+    Promise.resolve({
+      ok: true,
+      json: async () => url.endsWith("/source-setup") ? setup : ({ complete: true, tools: [] }),
+    }),
+  ));
+  render(
+    <Sources
+      project={{ id: "p", name: "p", root: "/repo" }}
+      snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
+      refreshWorkflow={() => {}}
+    />,
+  );
+  fireEvent.click(await screen.findByRole("button", { name: /Подключения к базам/ }));
+  expect(await screen.findByText("/Slocalhost/example")).toBeInTheDocument();
+  expect(screen.getByText("localhost port=5432 / example / postgres")).toBeInTheDocument();
+  expect(screen.getByText("PostgreSQL: сохранён; 1С: сохранён")).toBeInTheDocument();
+  expect(screen.queryByText("private-db")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Изменить параметры" }));
+  expect(screen.getByLabelText("Имя базы 1С")).toHaveValue("example");
+  expect(screen.getByLabelText("Пароль PostgreSQL")).toHaveValue("");
+  expect(screen.getAllByText(/Пароль сохранён/)).toHaveLength(2);
+});
+
 test("agent profile explains the read-only environment and persists it", async () => {
   const fetchMock = vi.fn().mockImplementation((_url: string, init?: RequestInit) =>
     Promise.resolve({
       ok: true,
-      json: async () => init?.method === "PUT" ? {} : ({ items: {} }),
+      json: async () => init?.method === "PUT"
+        ? {}
+        : _url.endsWith("/agent-capabilities")
+          ? { models: [{ id: "gpt-5.6-sol", name: "GPT-5.6-Sol", default_reasoning_effort: "low", reasoning_efforts: ["low", "max", "ultra"] }] }
+          : { items: {} },
     }),
   );
   vi.stubGlobal("fetch", fetchMock);
   render(<AgentProfiles project={{ id: "p", name: "p", root: "/repo" }} />);
   expect(await screen.findByText(/local-read-only запрещает запись/)).toBeInTheDocument();
   expect(screen.getByText(/allowed_paths ограничивают контекст инструкции/)).toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: "Модель" })).toHaveTextContent("GPT-5.6-Sol");
   fireEvent.click(screen.getByRole("button", { name: "Проверить и сохранить профиль" }));
   await waitFor(() => {
     const put = fetchMock.mock.calls.find(([, init]) => init?.method === "PUT");

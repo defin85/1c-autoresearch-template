@@ -189,6 +189,7 @@ class DispatcherCoordinator:
         self._workers: dict[str, threading.Thread] = {}
         self._lease_tokens: dict[str, str] = {}
         self._lock = threading.RLock()
+        self.store.reconcile_invocation_outbox(self.event_store)
 
     # -- запуск и жизненный цикл ---------------------------------------
 
@@ -365,6 +366,8 @@ class DispatcherCoordinator:
         run_id = run_id or str(uuid.uuid4())
         thread_id = (lease or {}).get("thread_id", "")
         token = self._lease_tokens.get(job_id) or str((lease or {}).get("lease_token", ""))
+        self.store.cancel_running_work(job_id, run_id, token)
+        self.store.reconcile_invocation_outbox(self.event_store)
         self.store.renew_lease(job_id, token, state="resumable", summary={"phase": "soft_stopped"})
         revision = self._emit(emit_events, run_id, job_id, thread_id, "step.progress", {"status": "running", "kind": f"dispatcher.{job_id}.soft_stopped", "progress": {"resumable": True, "timeout_seconds": timeout_seconds or 0}}, revision_first=True)
         return DispatcherOutcome(job_id=job_id, run_id=run_id, status="resumable", thread_id=thread_id, revision=revision, summary={"phase": "soft_stopped"})
@@ -497,6 +500,7 @@ class DispatcherCoordinator:
         run_id = (lease or {}).get("summary", {}).get("run_id") or str(uuid.uuid4())
         token = self._lease_tokens.pop(job_id, None) or str((lease or {}).get("lease_token", ""))
         self.store.cancel_run_work(job_id, run_id, token)
+        self.store.reconcile_invocation_outbox(self.event_store)
         revision = self._emit(emit_events, run_id, job_id, thread_id, "step.finished", {"status": "cancelled", "kind": f"dispatcher.{job_id}.cancelled", "exit": {"reason": "user_cancelled"}, "duration_seconds": 0.0}, revision_first=True, lease_token=token)
         if emit_events:
             run = self.event_store.run_snapshot(run_id) or {}
@@ -566,6 +570,7 @@ class DispatcherCoordinator:
                 str(lease.get("run_id", "")),
                 str(lease["lease_token"]),
             )
+            self.store.reconcile_invocation_outbox(self.event_store)
             self.store.release_lease(job_id, str(lease["lease_token"]))
         outcome = self.start(job_id, bindings, run_id=run_id, execution_snapshot=execution_snapshot, emit_events=emit_events)
         if outcome.status == "running" and source_thread_id and not predecessor_terminal:
@@ -746,12 +751,32 @@ class DispatcherCoordinator:
                 phase_id, role_id = "analyze-dif", "analyzer"
             policy = phase_policies[phase_id]
             configured_slots = next(role["count"] for role in policy["roles"] if role["role_id"] == role_id)
-            invocation = self.store.start_invocation(outcome.job_id, outcome.run_id, phase_id, role_id, str(work_unit.get("id", "")), configured_slots, self._lease_tokens[outcome.job_id])
+            context_manifest = build_context_manifest(repo, work_unit)
+            profile_id = next(
+                role["agent_profile"]
+                for role in policy["roles"]
+                if role["role_id"] == role_id
+            )
+            invocation = self.store.start_invocation(
+                outcome.job_id,
+                outcome.run_id,
+                phase_id,
+                role_id,
+                str(work_unit.get("id", "")),
+                configured_slots,
+                self._lease_tokens[outcome.job_id],
+                execution_snapshot_fingerprint=str(
+                    run_file["execution_snapshot_fingerprint"]
+                ),
+                profile_id=profile_id,
+                context_manifest_fingerprint="sha256:"
+                + sha256(canonical_json(context_manifest)),
+            )
             if invocation is None:
                 raise RuntimeError("dispatcher lease or logical slot is unavailable")
+            self.store.reconcile_invocation_outbox(self.event_store)
             proposal_dir = proposal_root / sha256(canonical_json({"run_id": outcome.run_id, "operation": operation, "work_unit_id": work_unit.get("id"), "nonce": str(uuid.uuid4())}))
             try:
-                context_manifest = build_context_manifest(repo, work_unit)
                 result = agent_execute(
                     repo,
                     proposal_dir,
@@ -765,13 +790,62 @@ class DispatcherCoordinator:
                     context_manifest,
                 )
             except InterruptedError:
-                self.store.finish_invocation(invocation["invocation_id"], "cancelled", self._lease_tokens[outcome.job_id])
+                self.store.terminalize_invocation(
+                    invocation["invocation_id"],
+                    "cancelled",
+                    self._lease_tokens[outcome.job_id],
+                    error_code="cancelled",
+                    error_summary="agent invocation was cancelled",
+                )
+                self.store.reconcile_invocation_outbox(self.event_store)
                 raise
-            except Exception:
-                self.store.finish_invocation(invocation["invocation_id"], "failed", self._lease_tokens[outcome.job_id])
+            except Exception as exc:
+                from .events import redact
+                message = str(redact(str(exc)))
+                lowered = message.lower()
+                error_code = (
+                    "provider_blocked"
+                    if "cloudflare" in lowered or "blocked" in lowered
+                    else "provider_timeout"
+                    if isinstance(exc, TimeoutError) or "timeout" in lowered
+                    else "validation_error"
+                    if isinstance(exc, ValueError)
+                    else "internal_error"
+                )
+                self.store.terminalize_invocation(
+                    invocation["invocation_id"],
+                    "failed",
+                    self._lease_tokens[outcome.job_id],
+                    error_code=error_code,
+                    error_summary=message,
+                )
+                self.store.reconcile_invocation_outbox(self.event_store)
                 raise
-            if not self.store.finish_invocation(invocation["invocation_id"], "completed", self._lease_tokens[outcome.job_id]):
+            work_unit_id = str(work_unit.get("id", ""))
+            result_name = (
+                "form-mrq:coordinate"
+                if role_id == "coordinator"
+                else f"form-mrq:{work_unit_id}"
+                if role_id == "grouper"
+                else f"classify-batches:{work_unit_id}"
+                if role_id == "classifier"
+                else f"research-target:{work_unit_id}"
+                if role_id == "researcher"
+                else f"analyze-dif:{work_unit_id}"
+            )
+            result_ref = sha256(
+                canonical_json(
+                    {"thread_id": outcome.thread_id, "node_result": result_name}
+                )
+            )
+            if not self.store.terminalize_invocation(
+                invocation["invocation_id"],
+                "completed",
+                self._lease_tokens[outcome.job_id],
+                result_ref=result_ref,
+            ):
                 raise RuntimeError("dispatcher lease was fenced before invocation completion")
+            self.store.reconcile_invocation_outbox(self.event_store)
             return result
 
         def result_key(name: str) -> str:
@@ -1010,6 +1084,7 @@ class DispatcherCoordinator:
                 )
         self._stop_background(job_id)
         self.store.interrupt_running_work(job_id, run_id, token)
+        self.store.reconcile_invocation_outbox(self.event_store)
         if thread_id:
             self.store.delete_thread(thread_id, job_id, token, preserve_results=True)
         self._lease_tokens.pop(job_id, None)

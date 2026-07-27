@@ -45,29 +45,30 @@ const model: EnrichedDispatcherModel = {
 };
 
 describe('EnrichedDispatcherGraph', () => {
-  test('активирует этап и фактического агента ровно по одному разу', () => {
+  test('активирует этап и сводную карточку роли ровно по одному разу', () => {
     const onActivate = vi.fn();
     const { container } = render(<EnrichedDispatcherGraph model={model} onActivate={onActivate} />);
     const stage = screen.getByTestId('rf__node-stage');
     fireEvent.click(stage);
-    expect(onActivate).toHaveBeenLastCalledWith('analyze-dif', 'new:stage');
+    expect(onActivate).toHaveBeenLastCalledWith({ kind: 'circuit', circuitId: 'analyze-dif' }, expect.any(HTMLElement));
     fireEvent.keyDown(stage, { key: 'Enter' });
-    expect(onActivate).toHaveBeenLastCalledWith('analyze-dif', 'new:stage');
-    fireEvent.keyDown(screen.getByTestId('rf__node-role'), { key: ' ' });
-    expect(onActivate).toHaveBeenLastCalledWith('analyze-dif', 'new:role');
-    const slot = container.querySelector<HTMLElement>('[data-dispatcher-initiator="new-slot:role:slot-1"]')!;
-    fireEvent.click(slot);
-    expect(onActivate).toHaveBeenLastCalledWith('analyze-dif', 'new-slot:role:slot-1');
-    expect(onActivate).toHaveBeenCalledTimes(4);
-    expect(container.querySelectorAll('[data-agent-slot-id]')).toHaveLength(2);
-    expect(container.querySelectorAll('[data-invocation-id]')).toHaveLength(3);
+    expect(onActivate).toHaveBeenLastCalledWith({ kind: 'circuit', circuitId: 'analyze-dif' }, expect.any(HTMLElement));
+    const role = container.querySelector<HTMLElement>('[data-dispatcher-kind="role"]')!;
+    fireEvent.click(role);
+    expect(onActivate).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'role', circuitId: 'analyze-dif' }), role);
+    expect(onActivate).toHaveBeenCalledTimes(3);
+    expect(container.querySelectorAll('[data-dispatcher-kind="slot"]')).toHaveLength(0);
+    expect(container.querySelectorAll('[data-invocation-id]')).toHaveLength(0);
+    expect(screen.getByText('Вызовов: 3')).toBeInTheDocument();
+    expect(screen.getByText('Выполняется: 1')).toBeInTheDocument();
+    expect(screen.getByText('Завершено: 1')).toBeInTheDocument();
   });
 
-  test('оставляет порты декоративными и выводит проекцию только текстом', () => {
+  test('оставляет порты декоративными и не выводит детали вызовов', () => {
     cleanup();
     render(<EnrichedDispatcherGraph model={model} />);
     expect([...document.querySelectorAll('.react-flow__handle')].every((handle) => handle.getAttribute('aria-hidden') === 'true')).toBe(true);
-    expect(screen.getAllByText(/<img src=x onerror=alert\(1\)>/)).not.toHaveLength(0);
+    expect(screen.queryByText(/<img src=x onerror=alert\(1\)>/)).toBeNull();
     expect(document.querySelector('img')).toBeNull();
     expect(document.querySelector('.react-flow__edge[tabindex]')).toBeNull();
     const role = document.querySelector<HTMLElement>('[data-zone="role"]')!;

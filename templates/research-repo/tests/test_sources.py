@@ -99,6 +99,7 @@ def test_preflight_binds_each_extension_to_exported_uuid(tmp_path: Path):
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     tested = preflight_connection("ibcmd+form-aware/v1", tmp_path, connection, run=fake_run)
+    assert tested["configuration"] == {"uuid": "11111111-1111-1111-1111-111111111111", "name": "Extension", "version": "1.0"}
     assert tested["extensions"] == [{"name": "Extension", "version": "1.0", "active": True, "uuid": "11111111-1111-1111-1111-111111111111"}]
     assert "secret" not in json.dumps(tested)
 
@@ -223,6 +224,7 @@ def test_acquire_exports_all_three_roles_before_one_publication(tmp_path: Path, 
     extension = {"name": "Extension", "version": "1.0", "active": True, "uuid": "11111111-1111-1111-1111-111111111111"}
     profiles = {role: {"kind": "server", "server": "localhost", "reference": role, "profile_id": "ibcmd+form-aware/v1", "tested": True, "dbms": "PostgreSQL", "db_server": "localhost", "db_name": role, "db_user": "u", "db_password": "p", "infobase_user": "u", "infobase_password": "p", "extensions": [extension], "tool_versions": {"platform": "8.3.27.1989", "exporter": "ibcmd"}} for role in ("vendor_baseline", "target_cf", "next_vendor")}
     for profile in profiles.values():
+        profile["configuration"] = {"uuid": "00000000-0000-0000-0000-000000000001", "name": "Cfg", "version": "2" if profile["reference"] == "next_vendor" else "1"}
         tested = {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}}
         profile["tested_fingerprint"] = "sha256:" + sha256(canonical_json(tested))
     mode = {"partial_role": False}
@@ -235,13 +237,15 @@ def test_acquire_exports_all_three_roles_before_one_publication(tmp_path: Path, 
         if mode["partial_role"] and ".work" in output.parts and "next_vendor" in output.parts:
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
         is_extension = "--extension=Extension" in command
-        version = "1.0" if is_extension else "2" if "next_vendor" in output.parts else "1"
+        version = "1.0" if is_extension else "2" if "next_vendor" in " ".join(map(str, command)) else "1"
         uuid = extension["uuid"] if is_extension else "00000000-0000-0000-0000-000000000001"
         name = "Extension" if is_extension else "Cfg"
         (output / "Configuration.xml").write_text(f'<MetaDataObject><Configuration uuid="{uuid}"><Properties><Name>{name}</Name><Version>{version}</Version></Properties></Configuration></MetaDataObject>', encoding="utf-8")
         (output / "ConfigDumpInfo.xml").write_text("<noise/>", encoding="utf-8")
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-    preview = build_routing_preview(tmp_path, Path("/opt/1cv8"), profiles, run=fake_run)
+    progress = []
+    preview = build_routing_preview(tmp_path, Path("/opt/1cv8"), profiles, run=fake_run, progress=progress.append)
+    assert progress[-1] == {"phase": "route", "completed": 6, "total": 6, "subject": ""}
     pointer = acquire(tmp_path, Path("/opt/1cv8"), profiles, routing_preview=preview, run=fake_run)
     root = tmp_path / "sources/generations" / pointer["generation_id"]
     assert pointer["schema_version"] == "2"

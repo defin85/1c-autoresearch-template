@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import fcntl
 import re
+import shutil
+import sqlite3
+import subprocess
 import time
 import threading
 import uuid
@@ -15,6 +19,114 @@ from typing import Any, Literal
 from .contracts import canonical_json, confined, repository_lock, sha256
 from .events import EventStore, RETRYABLE_RUN_STATUSES
 from .service import ApplicationService
+
+
+def _encode_dispatcher_cursor(payload: dict[str, Any]) -> str:
+    return base64.urlsafe_b64encode(canonical_json(payload)).decode().rstrip("=")
+
+
+def _decode_dispatcher_cursor(value: str) -> dict[str, Any]:
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(
+            base64.urlsafe_b64decode(value + padding).decode("utf-8")
+        )
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid dispatcher cursor") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid dispatcher cursor")
+    return payload
+
+
+def _history_cursor(value: str, scope: dict[str, str]) -> tuple[str, str]:
+    cursor = _decode_dispatcher_cursor(value)
+    if (
+        set(cursor) != {"scope", "created_at", "invocation_id"}
+        or cursor.get("scope") != scope
+        or not isinstance(cursor.get("created_at"), str)
+        or not isinstance(cursor.get("invocation_id"), str)
+        or not cursor["invocation_id"]
+    ):
+        raise ValueError("dispatcher history cursor scope mismatch")
+    try:
+        datetime.fromisoformat(cursor["created_at"])
+    except ValueError as exc:
+        raise ValueError("invalid dispatcher history cursor") from exc
+    return cursor["created_at"], cursor["invocation_id"]
+
+
+def _event_cursor(value: str, scope: dict[str, str]) -> int:
+    cursor = _decode_dispatcher_cursor(value)
+    sequence = cursor.get("last_sequence")
+    if (
+        set(cursor) != {"scope", "last_sequence"}
+        or cursor.get("scope") != scope
+        or isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence < 0
+    ):
+        raise ValueError("dispatcher event cursor scope mismatch")
+    return sequence
+
+
+def _safe_result_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    from .events import redact
+    envelope = payload.get("envelope")
+    if isinstance(envelope, dict):
+        payload = {**envelope, **({"name": payload["name"]} if isinstance(payload.get("name"), str) else {})}
+    allowed = {
+        "classification", "confidence", "semantic_key", "title", "decision",
+        "risk", "group_count", "batch_count", "stable_diff_count",
+        "supporting_diff_count", "evidence_count", "target_evidence_count",
+        "target_coverage_count", "open_question_count", "name",
+    }
+    summary = {
+        key: (str(redact(value))[:256] if isinstance(value, str) else value)
+        for key, value in payload.items()
+        if key in allowed and isinstance(value, (str, int, float, bool))
+    }
+    for source, target in (
+        ("stable_diff_ids", "stable_diff_count"),
+        ("supporting_diff_ids", "supporting_diff_count"),
+        ("evidence", "evidence_count"),
+        ("groups", "group_count"),
+        ("batches", "batch_count"),
+        ("target_evidence", "target_evidence_count"),
+        ("target_coverage", "target_coverage_count"),
+        ("open_questions", "open_question_count"),
+    ):
+        if isinstance(payload.get(source), list):
+            summary[target] = len(payload[source])
+    return summary
+
+
+def codex_capabilities() -> dict[str, Any]:
+    executable = shutil.which("codex")
+    if not executable:
+        raise RuntimeError("codex executable is unavailable")
+    result = subprocess.run(
+        [executable, "debug", "models"],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=15,
+    )
+    catalog = json.loads(result.stdout)
+    models = [
+        {
+            "id": item["slug"],
+            "name": item.get("display_name") or item["slug"],
+            "default_reasoning_effort": item["default_reasoning_level"],
+            "reasoning_efforts": [
+                level["effort"] for level in item.get("supported_reasoning_levels", [])
+            ],
+        }
+        for item in catalog.get("models", [])
+        if item.get("visibility") == "list" and item.get("supported_in_api", True)
+    ]
+    if not models:
+        raise RuntimeError("codex returned no available models")
+    return {"provider": "codex-cli", "models": models}
 
 
 def _reviewed_noise_is_active(canonical: dict[str, Any], reviewed: list[dict[str, Any]]) -> bool:
@@ -247,6 +359,68 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             atomic_json(result_path, result)
             return result
 
+    @app.post("/api/v1/projects/{project_id}/source-acquisition-runs", status_code=202)
+    def start_source_acquisition(project_id: str, body: RunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
+        mutation(request, idempotency_key); project = repo(project_id)
+        if set(body.approved_operations) != {"sources.acquire"} or not body.source_routing_preview_id or not body.routing_plan_fingerprint:
+            raise ValueError("source acquisition approval and routing preview are required")
+        from .user_state import load_agent_profiles, load_connections
+        from .runner import run_next, run_until_blocked
+        run_id = str(uuid.uuid4())
+        store = EventStore(operational / "projects", project_id)
+        preview_root = operational / "projects" / project_id / "source-routing-previews"
+        def report(value: dict[str, Any]):
+            store.emit("step.progress", run_id, {"status": "running", "progress": value}, job_id="acquire-sources", step_id="acquire-sources", attempt=1)
+        service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts", routing_previews=preview_root, progress=report)
+        expected_fingerprint = service.snapshot(deep=False)["workflow_fingerprint"]
+        if body.expected_fingerprint != expected_fingerprint:
+            raise RuntimeError("stale workflow fingerprint")
+        source_preview = {"source_routing_preview_id": body.source_routing_preview_id, "routing_plan_fingerprint": body.routing_plan_fingerprint}
+        source_work = {"action": "sources.acquire", "job_id": "acquire-sources", "gate_id": "sources-acquired", "blocker": {"code": "sources.refresh_requested", "message": "source refresh requested by local user", "action": "sources.acquire"}}
+        from .events import process_identity
+        store.emit("run.created", run_id, {"status": "running", "actor": "local-user", "process_identity": process_identity(), "workflow_fingerprint": expected_fingerprint, "operation": "sources.acquire", "work_unit": source_work})
+        report({"phase": "queued", "completed": 0, "total": 0, "subject": ""})
+        def worker():
+            completed = False
+            def invoke(operation, payload, cancelled):
+                nonlocal completed
+                result = service.apply(operation, payload, expected_fingerprint, cancelled)
+                completed = True
+                return result
+            try:
+                result = run_next(service.repo, invoke, store, select=lambda: None if completed else source_work, approved_operations={"sources.acquire"}, agent_profiles=load_agent_profiles(project, operational), source_routing_preview=source_preview, run_id=run_id, precreated=True)
+                if result["result"] == "progressed":
+                    run_until_blocked(
+                        service.repo,
+                        lambda operation, payload, cancelled: service.apply(
+                            operation,
+                            payload,
+                            service.snapshot(deep=False)["workflow_fingerprint"],
+                            cancelled,
+                        ),
+                        store,
+                        max_units=3,
+                        select=service.next,
+                        agent_profiles=load_agent_profiles(project, operational),
+                    )
+            except Exception:
+                pass
+        threading.Thread(target=worker, name=f"source-acquisition-{run_id}", daemon=True).start()
+        return {"run_id": run_id, "status": "running"}
+
+    @app.get("/api/v1/projects/{project_id}/source-acquisition-runs/{run_id}")
+    def source_acquisition_status(project_id: str, run_id: str):
+        repo(project_id)
+        if not re.fullmatch(r"[0-9a-f-]{36}", run_id):
+            raise HTTPException(404, "source acquisition run not found")
+        events = [event for event in EventStore(operational / "projects", project_id).events() if event["run_id"] == run_id]
+        if not events:
+            raise HTTPException(404, "source acquisition run not found")
+        finished = next((event for event in reversed(events) if event["type"] == "run.finished"), None)
+        progress = next((event["payload"]["progress"] for event in reversed(events) if event["type"] == "step.progress"), {"phase": "queued", "completed": 0, "total": 0, "subject": ""})
+        payload = finished["payload"] if finished else {}
+        return {"run_id": run_id, "status": payload.get("status", "running"), "progress": progress, "error": payload.get("message", "")}
+
     @app.post("/api/v1/projects/{project_id}/workflow/run-until-blocked")
     def run_until(project_id: str, body: RunBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
         mutation(request, idempotency_key); project = repo(project_id)
@@ -277,9 +451,276 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
     @app.get("/api/v1/projects/{project_id}/dispatcher")
     def dispatcher_projection(project_id: str):
+        project = repo(project_id)
+        from .sqlite_state import DispatcherStore
+        try:
+            with DispatcherStore(project, operational) as store:
+                store.reconcile_invocation_outbox(
+                    EventStore(operational / "projects", project_id)
+                )
+        except (OSError, RuntimeError, sqlite3.DatabaseError):
+            raise HTTPException(503, "dispatcher operational store unavailable")
         from .workflow import attach_dispatcher
-        snapshot = attach_dispatcher(ApplicationService(repo(project_id)).snapshot(deep=False), repo(project_id), operational)
+        try:
+            snapshot = attach_dispatcher(ApplicationService(project).snapshot(deep=False), project, operational)
+        except sqlite3.DatabaseError:
+            raise HTTPException(503, "dispatcher operational store unavailable")
         return snapshot.get("dispatcher", {"schema_version": "1", "revision": 0, "fresh_at": "", "circuits": [], "jobs": {}})
+
+    @app.get("/api/v1/projects/{project_id}/dispatcher/inspect")
+    def dispatcher_inspect(
+        project_id: str,
+        kind: str,
+        invocation_id: str = "",
+        phase_id: str = "",
+        role_id: str = "",
+        slot_id: str = "",
+        run_id: str = "",
+        history_limit: int = 20,
+        event_limit: int = 50,
+        history_cursor: str = "",
+        event_cursor: str = "",
+    ):
+        if kind not in {"invocation", "slot"}:
+            raise ValueError("invalid dispatcher inspection kind")
+        if not 1 <= history_limit <= 100 or not 1 <= event_limit <= 200:
+            raise ValueError("invalid dispatcher inspection limit")
+        if history_cursor:
+            _decode_dispatcher_cursor(history_cursor)
+        if event_cursor:
+            _decode_dispatcher_cursor(event_cursor)
+        if kind == "invocation":
+            if not invocation_id or any((phase_id, role_id, slot_id, run_id)):
+                raise ValueError("invocation inspection requires only invocation_id")
+        elif invocation_id or not all((phase_id, role_id, slot_id)):
+            raise ValueError("slot inspection requires phase_id, role_id and slot_id")
+        project = repo(project_id)
+        from .sqlite_state import DispatcherStore
+        try:
+            store = DispatcherStore(project, operational)
+            store.open()
+            store.reconcile_invocation_outbox(
+                EventStore(operational / "projects", project_id)
+            )
+        except (OSError, RuntimeError, sqlite3.DatabaseError):
+            raise HTTPException(503, "dispatcher operational store unavailable")
+        try:
+            projection = dispatcher_projection(project_id)
+            selected_slot = next(
+                (
+                    slot
+                    for phase in projection.get("agent_phases", [])
+                    if phase.get("phase_id") == phase_id
+                    for role in phase.get("roles", [])
+                    if role.get("role_id") == role_id
+                    for slot in role.get("slots", [])
+                    if slot.get("slot_id") == slot_id
+                ),
+                None,
+            )
+            invocation = store.invocation(invocation_id) if invocation_id else None
+            if kind == "invocation":
+                if invocation is None:
+                    raise HTTPException(404, "dispatcher invocation not found")
+                phase_id = str(invocation["phase_id"])
+                role_id = str(invocation["role_id"])
+                slot_id = str(invocation["slot_id"])
+                run_id = str(invocation["run_id"])
+            elif selected_slot is None:
+                raise HTTPException(404, "dispatcher slot not found")
+            elif not run_id:
+                run_id = str(selected_slot.get("run_id") or "")
+
+            history_scope = {
+                "project_id": project_id,
+                "run_id": run_id,
+                "phase_id": phase_id,
+                "role_id": role_id,
+                "slot_id": slot_id,
+            }
+            before = None
+            if history_cursor:
+                before = _history_cursor(history_cursor, history_scope)
+            history = (
+                store.invocation_history(
+                    run_id, phase_id, role_id, slot_id, history_limit + 1, before
+                )
+                if run_id
+                else []
+            )
+            history_truncated = len(history) > history_limit
+            history = history[:history_limit]
+            next_history_cursor = None
+            if history_truncated:
+                last = history[-1]
+                next_history_cursor = _encode_dispatcher_cursor({
+                    "scope": history_scope,
+                    "created_at": last["created_at"],
+                    "invocation_id": last["invocation_id"],
+                })
+            if kind == "slot" and invocation is None:
+                invocation = next(
+                    (item for item in history if item["status"] == "running"),
+                    history[0] if history else None,
+                )
+
+            event_items: list[dict[str, Any]] = []
+            events_available = bool(invocation and run_id)
+            events_truncated = False
+            next_event_cursor = None
+            if event_cursor and not invocation:
+                raise ValueError("event cursor requires an invocation")
+            if events_available:
+                event_scope = {
+                    "project_id": project_id,
+                    "run_id": run_id,
+                    "invocation_id": invocation["invocation_id"],
+                }
+                last_sequence = 0
+                if event_cursor:
+                    last_sequence = _event_cursor(event_cursor, event_scope)
+                snapshot = EventStore(
+                    operational / "projects", project_id
+                ).run_snapshot(run_id)
+                events_available = snapshot is not None
+                if snapshot is not None:
+                    correlated = [
+                        event for event in snapshot.get("events", [])
+                        if event.get("payload", {}).get("invocation_id")
+                        == invocation["invocation_id"]
+                    ]
+                    retained = [
+                        event for event in correlated
+                        if event.get("sequence", 0) > last_sequence
+                    ]
+                    retained.sort(key=lambda event: event["sequence"])
+                    has_started = any(
+                        event["type"] == "invocation.started"
+                        for event in correlated
+                    )
+                    page_truncated = len(retained) > event_limit
+                    events_truncated = page_truncated or not has_started
+                    event_items = retained[:event_limit]
+                    if page_truncated:
+                        next_event_cursor = _encode_dispatcher_cursor({
+                            "scope": event_scope,
+                            "last_sequence": event_items[-1]["sequence"],
+                        })
+
+            execution_available = False
+            execution_identity = None
+            result = {"available": False}
+            duration = None
+            if invocation:
+                snapshot = EventStore(
+                    operational / "projects", project_id
+                ).run_snapshot(str(invocation["run_id"]))
+                execution = (snapshot or {}).get("execution_snapshot", {})
+                profile = (execution.get("profiles") or {}).get(
+                    invocation.get("profile_id")
+                )
+                matching_role = next(
+                    (
+                        role
+                        for phase in execution.get("agent_phases", [])
+                        if phase.get("phase_id") == invocation.get("phase_id")
+                        for role in phase.get("roles", [])
+                        if role.get("role_id") == invocation.get("role_id")
+                        and role.get("agent_profile") == invocation.get("profile_id")
+                    ),
+                    None,
+                )
+                execution_available = bool(
+                    snapshot
+                    and snapshot.get("execution_snapshot_fingerprint")
+                    == invocation.get("execution_snapshot_fingerprint")
+                    and isinstance(profile, dict)
+                    and matching_role is not None
+                )
+                if execution_available:
+                    execution_identity = {
+                        "profile_id": invocation.get("profile_id"),
+                        "model": profile.get("model"),
+                        "reasoning_effort": profile.get("reasoning_effort"),
+                        "environment_preset": profile.get("environment_preset"),
+                        "subject_bindings": {
+                            key: (execution.get("subject_bindings") or {}).get(key, "")
+                            for key in (
+                                "source_generation_id",
+                                "diff_generation_id",
+                                "canonical_generation_id",
+                            )
+                        },
+                    }
+                if invocation.get("result_ref"):
+                    proposal = store.proposal(str(invocation["result_ref"]))
+                    if proposal is not None and proposal.get("kind") != "node-result":
+                        proposal = None
+                    result = {
+                        "available": proposal is not None,
+                        "reference": {
+                            "kind": "node-result",
+                            "id": invocation["result_ref"],
+                        },
+                        **(
+                            {"summary": _safe_result_summary(proposal["payload"])}
+                            if proposal is not None
+                            else {}
+                        ),
+                    }
+                try:
+                    start = datetime.fromisoformat(str(invocation["created_at"]))
+                    end = datetime.fromisoformat(
+                        str(invocation.get("finished_at") or datetime.now(timezone.utc).isoformat())
+                    )
+                    duration = max(0.0, (end - start).total_seconds())
+                except ValueError:
+                    duration = None
+
+            idle_reason = (
+                selected_slot.get("idle_reason_code", "none")
+                if selected_slot
+                else "none"
+            )
+            public_invocation = dict(invocation) if invocation else None
+            if public_invocation and public_invocation.get("result_ref"):
+                public_invocation["result_ref"] = {
+                    "kind": "node-result",
+                    "id": public_invocation["result_ref"],
+                }
+            return {
+                "kind": kind,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "slot": {
+                    "phase_id": phase_id,
+                    "role_id": role_id,
+                    "slot_id": slot_id,
+                    "run_id": run_id or None,
+                    "idle_reason_code": idle_reason,
+                    "assignment_state": "assigned" if invocation else "idle",
+                },
+                "invocation": public_invocation,
+                "duration_seconds": duration,
+                "execution_identity_available": execution_available,
+                "execution_identity": execution_identity,
+                "result": result,
+                "history": {
+                    "available": bool(run_id),
+                    "items": history,
+                    "truncated": history_truncated,
+                    "next_cursor": next_history_cursor,
+                },
+                "events": {
+                    "available": events_available,
+                    "items": event_items,
+                    "truncated": events_truncated,
+                    "next_cursor": next_event_cursor,
+                },
+            }
+        except sqlite3.DatabaseError:
+            raise HTTPException(503, "dispatcher operational store unavailable")
+        finally:
+            store.close()
 
     def stage_preview(project: Path, body: StagePreviewBody, *, require_source_preview: bool = True) -> dict[str, Any]:
         if body.boundary not in {"sources", "diffs", "projections"}:
@@ -729,12 +1170,14 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                     from .sqlite_state import is_stale
                     if is_stale(str(existing_lease["renewed_at"])):
                         store.interrupt_running_work(job_id, candidate_run_id, str(existing_lease["lease_token"]))
+                        store.reconcile_invocation_outbox(event_store)
                         store.release_lease(job_id, str(existing_lease["lease_token"]))
                         existing_lease = None
                 if not created and existing_lease and existing_lease.get("run_id") == candidate_run_id:
                     from .events import process_identity_alive
                     if existing_lease["state"] == "running" and not process_identity_alive(existing_lease.get("process_identity")):
                         store.interrupt_running_work(job_id, candidate_run_id, str(existing_lease["lease_token"]))
+                        store.reconcile_invocation_outbox(event_store)
                         store.release_lease(job_id, str(existing_lease["lease_token"]))
                         outcome = coordinator.retry(job_id, bindings, run_id=candidate_run_id, execution_snapshot=execution_snapshot)
                         store.update_retry(candidate_run_id, reservation["owner_token"], "started", {"status": outcome.status, "recovered": True})
@@ -988,7 +1431,22 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         infobases, artifacts = load_contract(repo(project_id))
         from .user_state import load_connections
         available = load_connections(repo(project_id), operational)
-        summaries = {name: {"available": True, "kind": value.get("kind"), "tested": current_profile_test(value, infobases["acquisition_profile"]), "profile_id": value.get("profile_id"), "platform_path": value.get("platform_path", ""), "extensions": value.get("extensions", []), "extension_count": len(value.get("extensions", [])), "tool_versions": value.get("tool_versions", {})} for name, value in available.items()}
+        visible = ("server", "reference", "platform_path", "dbms", "db_server", "db_name", "db_user", "infobase_user", "client_connection")
+        summaries = {
+            name: {
+                "available": True,
+                "kind": value.get("kind"),
+                "tested": current_profile_test(value, infobases["acquisition_profile"]),
+                "profile_id": value.get("profile_id"),
+                **{field: value.get(field, "") for field in visible},
+                "db_password_set": bool(value.get("db_password")),
+                "infobase_password_set": bool(value.get("infobase_password")),
+                "extensions": value.get("extensions", []),
+                "extension_count": len(value.get("extensions", [])),
+                "tool_versions": value.get("tool_versions", {}),
+            }
+            for name, value in available.items()
+        }
         drafts = operational / "projects" / project_id / "upload-drafts"
         declared = [{**item, "external_artifact_id": external_id(item["kind"], item["semantic_key"]), "uploaded": (drafts / item["role"] / external_id(item["kind"], item["semantic_key"]) / item["filename"]).is_file()} for item in artifacts.get("artifacts", [])]
         project = repo(project_id)
@@ -1027,7 +1485,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             import uuid
             preview_id = str(uuid.uuid4())
             path = preview_root / f"{preview_id}.json"
-            atomic_json(path, {"schema_version": "1", "preview_id": preview_id, "project_id": workspace_id(project), "status": "pending", "routing_plan_fingerprint": "", "bindings": {}, "probe_results": [], "routing_manifest": {}, "required_tools": []})
+            atomic_json(path, {"schema_version": "1", "preview_id": preview_id, "project_id": workspace_id(project), "status": "pending", "progress": {"phase": "queued", "completed": 0, "total": 0, "subject": ""}, "routing_plan_fingerprint": "", "bindings": {}, "probe_results": [], "routing_manifest": {}, "required_tools": []})
             from .events import process_identity
             from .workflow import state_fingerprint
             preview_started = time.monotonic()
@@ -1041,6 +1499,13 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                     return
                 record["status"] = "running"; atomic_json(path, record)
             cancelled = lambda: bool(store.cancellation(preview_id)) or json.loads(path.read_text(encoding="utf-8")).get("status") == "cancelled"
+            def update_progress(progress):
+                with (preview_root / ".lock").open("a+b") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    current = json.loads(path.read_text(encoding="utf-8"))
+                    if current.get("status") in {"pending", "running"}:
+                        current["progress"] = progress
+                        atomic_json(path, current)
             def finish(value):
                 with (preview_root / ".lock").open("a+b") as lock:
                     fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -1055,7 +1520,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                     atomic_json(path, value)
             try:
                 from .sources import build_routing_preview
-                value = build_routing_preview(project, Path(next(iter(roots))), connections, upload_drafts=operational / "projects" / project_id / "upload-drafts", cancelled=cancelled)
+                value = build_routing_preview(project, Path(next(iter(roots))), connections, upload_drafts=operational / "projects" / project_id / "upload-drafts", cancelled=cancelled, progress=update_progress)
                 if cancelled():
                     return
                 finish({
@@ -1114,17 +1579,40 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             raise ValueError("invalid current connection profile")
         from .sources import normalize_connection_identity
         normalize_connection_identity(profile)
+        from .user_state import load_connections, save_connections
+        values = load_connections(project, operational)
+        previous = values.get(profile_id, {})
+        for password in ("db_password", "infobase_password"):
+            if not profile.get(password) and previous.get(password):
+                profile[password] = previous[password]
         tester = connection_tester or preflight_connection
         tested = tester(infobases["acquisition_profile"], Path(str(profile.get("platform_path", ""))), profile)
         profile = {**profile, **tested}
-        from .user_state import load_connections, save_connections
-        values = load_connections(project, operational); values[profile_id] = profile; save_connections(project, values, operational)
+        configuration = tested.get("configuration")
+        if configuration:
+            for role, binding in infobases["roles"].items():
+                if binding["connection_profile"] != profile_id:
+                    continue
+                if configuration["version"] != binding["version"]:
+                    raise ValueError(f"infobase version does not match declared role: {role}")
+                binding.update(configuration_name=configuration["name"], root_uuid=configuration["uuid"])
+            lines = ['schema_version = "1"', f'acquisition_profile = {json.dumps(infobases["acquisition_profile"])}', ""]
+            for role, binding in infobases["roles"].items():
+                lines.extend((f"[roles.{role}]", f'connection_profile = {json.dumps(binding["connection_profile"])}', f'configuration_name = {json.dumps(binding["configuration_name"], ensure_ascii=False)}', f'root_uuid = {json.dumps(binding["root_uuid"])}', f'version = {json.dumps(binding["version"])}', ""))
+            from .contracts import atomic_bytes
+            atomic_bytes(project / "research/infobases.toml", "\n".join(lines).encode())
+        values[profile_id] = profile; save_connections(project, values, operational)
         return {"profile_id": profile_id, "available": True, "kind": profile["kind"], "tested": True, "acquisition_profile": profile.get("profile_id"), "extension_count": len(profile.get("extensions", []))}
 
     @app.get("/api/v1/projects/{project_id}/agent-profiles")
     def agent_profiles(project_id: str):
         from .user_state import load_agent_profiles
         return {"items": load_agent_profiles(repo(project_id), operational)}
+
+    @app.get("/api/v1/projects/{project_id}/agent-capabilities")
+    def agent_capabilities(project_id: str):
+        repo(project_id)
+        return codex_capabilities()
 
     @app.put("/api/v1/projects/{project_id}/agent-profiles/{profile_id}")
     def put_agent_profile(project_id: str, profile_id: str, body: AgentProfileBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
@@ -1343,12 +1831,14 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         offset: int = 0,
         limit: int = 100,
         expected_generation: str = "",
+        item_id: str = "",
     ):
         return ApplicationService(repo(project_id)).registry(
             name,
             offset,
             limit,
             expected_generation,
+            item_id,
         )
 
     @app.get("/api/v1/projects/{project_id}/artifacts/{artifact_path:path}")

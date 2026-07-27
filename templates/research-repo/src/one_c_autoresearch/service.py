@@ -13,12 +13,13 @@ from .contracts import atomic_bytes, atomic_json, canonical_json, confined, reje
 
 
 class ApplicationService:
-    def __init__(self, repo: Path, rlm_executable: str | None = None, connections: dict[str, dict[str, Any]] | None = None, upload_drafts: Path | None = None, routing_previews: Path | None = None):
+    def __init__(self, repo: Path, rlm_executable: str | None = None, connections: dict[str, dict[str, Any]] | None = None, upload_drafts: Path | None = None, routing_previews: Path | None = None, progress: callable | None = None):
         self.repo = repo.resolve()
         self.rlm_executable = rlm_executable or indexes.discover_executable(self.repo)
         self.connections = connections
         self.upload_drafts = upload_drafts
         self.routing_previews = routing_previews
+        self.progress = progress
         workflow.validate_workflow(self.repo)
 
     def snapshot(self, *, deep: bool = True) -> dict[str, Any]:
@@ -30,6 +31,7 @@ class ApplicationService:
         offset: int = 0,
         limit: int = 100,
         expected_generation: str = "",
+        item_id: str = "",
     ) -> dict[str, Any]:
         allowed = {"diff-inventory", "target-coverage", "mrq", "extension-diff", "extension-dependencies", "extension-path-coverage", "extension-physical-diff"}
         if name not in allowed or offset < 0 or not 1 <= limit <= 500:
@@ -40,7 +42,7 @@ class ApplicationService:
             generation_id = str(state["pointer"].get("diff_generation_id", ""))
             if expected_generation and expected_generation != generation_id:
                 raise RuntimeError("stale diff generation")
-            rows = state["mrq.jsonl"][offset : offset + limit + 1]
+            rows = state["mrq.jsonl"] if item_id else state["mrq.jsonl"][offset : offset + limit + 1]
         else:
             pointer = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
             generation_id = str(pointer.get("generation_id", ""))
@@ -57,12 +59,27 @@ class ApplicationService:
                     with path.open(encoding="utf-8") as stream:
                         rows = [
                             json.loads(line)
-                            for line in islice((line for line in stream if line.strip()), offset, offset + limit + 1)
+                            for line in (
+                                (line for line in stream if line.strip())
+                                if item_id
+                                else islice((line for line in stream if line.strip()), offset, offset + limit + 1)
+                            )
                         ]
                 else:
                     import csv
                     with path.open(encoding="utf-8", newline="") as stream:
-                        rows = list(islice(csv.DictReader(stream), offset, offset + limit + 1))
+                        reader = csv.DictReader(stream)
+                        rows = list(reader if item_id else islice(reader, offset, offset + limit + 1))
+        if item_id:
+            identifier_fields = {
+                "diff-inventory": ("stable_diff_id",),
+                "mrq": ("mrq_id",),
+            }.get(name, ("item_id", "stable_diff_id", "mrq_id", "id"))
+            rows = [
+                row for row in rows
+                if any(str(row.get(field, "")) == item_id for field in identifier_fields)
+            ]
+            offset = 0
         return {
             "diff_generation_id": generation_id,
             "offset": offset,
@@ -75,9 +92,7 @@ class ApplicationService:
         snapshot = self.snapshot()
         canonical = workflow.next_work(self.repo)
         if canonical and canonical["action"] in {"mrq.discover-next", "mrq.decide-next"}:
-            paths = (canonical.get("work_unit") or {}).get("allowed_paths", [])
-            roles = ("vendor_baseline", "target_cf") if canonical["action"] == "mrq.discover-next" else ("target_cf", "next_vendor")
-            required = indexes.required_component_ids(self.repo, paths, roles)
+            required = [item["component_id"] for item in indexes.discover(self.repo)]
             if required:
                 if not self.rlm_executable:
                     return {**canonical, "job_id": "index-sources", "domain_action": canonical["action"], "action": "indexes.build", "blocker": {"code": "indexes.tool_missing", "message": "rlm-bsl-index is unavailable", "action": "indexes.build"}}
@@ -194,7 +209,7 @@ class ApplicationService:
             raise RuntimeError("routing_preview_stale")
         if datetime.fromisoformat(str(preview.get("expires_at", ""))) <= datetime.now(timezone.utc):
             raise RuntimeError("routing_preview_stale")
-        result = sources.acquire(self.repo, platform, self.connections, routing_preview=preview, timeout_seconds=int(payload.get("timeout_seconds", 1800)), upload_drafts=self.upload_drafts, cancelled=self._cancelled, activate=self._staged is None)
+        result = sources.acquire(self.repo, platform, self.connections, routing_preview=preview, timeout_seconds=int(payload.get("timeout_seconds", 1800)), upload_drafts=self.upload_drafts, cancelled=self._cancelled, progress=getattr(self, "progress", None), activate=self._staged is None)
         if self._staged is not None:
             self._staged["source"] = result
         return result

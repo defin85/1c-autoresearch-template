@@ -44,7 +44,7 @@ def _validate_agent_profiles(values: dict[str, dict[str, Any]]) -> dict[str, dic
     for name, profile in values.items():
         if "environment_preset" not in profile:
             raise ValueError(f"invalid user-scope agent profile: {name}; environment_preset is required, resave the profile")
-        if not name or set(profile) != {"provider", "model", "reasoning_effort", "instructions_version", "environment_preset"} or profile["provider"] != "codex-cli" or profile["reasoning_effort"] not in {"low", "medium", "high", "xhigh"} or profile["instructions_version"] not in INSTRUCTION_CATALOG or profile["environment_preset"] != "local-read-only" or not str(profile["model"]).strip():
+        if not name or set(profile) != {"provider", "model", "reasoning_effort", "instructions_version", "environment_preset"} or profile["provider"] != "codex-cli" or profile["reasoning_effort"] not in {"low", "medium", "high", "xhigh", "max", "ultra"} or profile["instructions_version"] not in INSTRUCTION_CATALOG or profile["environment_preset"] != "local-read-only" or not str(profile["model"]).strip():
             raise ValueError(f"invalid user-scope agent profile: {name}")
     return values
 

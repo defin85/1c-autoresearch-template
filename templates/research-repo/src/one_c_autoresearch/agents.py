@@ -17,8 +17,25 @@ PROPOSAL_FIELDS = {
     "mrq.classify-batches": {"mrq_ids", "basis", "linkage_proven"},
     "mrq.decide-next": {"mrq_id", "decision", "target_evidence", "target_coverage", "residual_gap", "target_solution", "rationale", "acceptance_criteria", "risk", "open_questions"},
 }
-ENVIRONMENT_PRESET_VERSION = "local-read-only/v1"
-ENVIRONMENT_KEYS = ("PATH", "HOME", "CODEX_HOME", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
+STRING_ARRAY_FIELDS = {"stable_diff_ids", "supporting_diff_ids", "mrq_ids", "acceptance_criteria", "open_questions"}
+EVIDENCE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["path", "fingerprint", "stable_diff_id"],
+    "properties": {key: {"type": "string"} for key in ("path", "fingerprint", "stable_diff_id")},
+}
+TARGET_COVERAGE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["customer_diff_id", "target_diff_ids", "coverage_status", "evidence_ref", "notes"],
+    "properties": {key: {"type": "string"} for key in ("customer_diff_id", "target_diff_ids", "coverage_status", "evidence_ref", "notes")},
+}
+ENVIRONMENT_PRESET_VERSION = "local-read-only/v2"
+ENVIRONMENT_KEYS = (
+    "PATH", "HOME", "CODEX_HOME", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+)
 EXEC_ARGUMENTS = ("exec", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only")
 INSTRUCTION_CATALOG = {
     "1": (
@@ -56,13 +73,20 @@ def _fingerprint_path(root: Path, path: Path) -> str:
 
 def build_context_manifest(repo: Path, work_unit: dict[str, Any]) -> dict[str, Any]:
     root = repo.resolve()
+    generation_id = str(work_unit.get("source_generation_id", ""))
+    pointer = root / "research/active-source-generation.json"
+    if not generation_id and pointer.is_file():
+        generation_id = str(json.loads(pointer.read_text(encoding="utf-8"))["generation_id"])
+    source_root = root / "sources/generations" / normalize_relative(generation_id) if generation_id else root
     allowed = work_unit.get("allowed_paths", [])
     if not isinstance(allowed, list) or any(not isinstance(item, str) for item in allowed):
         raise ValueError("agent context allowed_paths must be a list of repository paths")
     paths = []
     for raw in allowed:
         relative = normalize_relative(raw)
-        path = (root / relative).resolve(strict=True)
+        candidates = (source_root / relative, source_root / "target_cf" / relative)
+        selected = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+        path = selected.resolve(strict=True)
         if path != root and root not in path.parents:
             raise ValueError("agent context path escapes the repository")
         paths.append({"path": relative, "fingerprint": _fingerprint_path(root, path)})
@@ -296,7 +320,15 @@ def execute(
     executable = str(execution_snapshot["environment"]["executable"])
     proposal_dir.mkdir(parents=True, exist_ok=False)
     fields = PROPOSAL_FIELDS[operation]
-    item_schema = {"type": "object", "additionalProperties": False, "required": sorted(fields), "properties": {key: {} for key in sorted(fields)}}
+    properties = {
+        key: {"type": "array", "items": {"type": "string"}} if key in STRING_ARRAY_FIELDS
+        else {"type": "array", "items": TARGET_COVERAGE_SCHEMA} if key == "target_coverage"
+        else {"type": "array", "items": EVIDENCE_SCHEMA} if key in {"evidence", "target_evidence"}
+        else {"type": "boolean"} if key == "linkage_proven"
+        else {"type": "string"}
+        for key in sorted(fields)
+    }
+    item_schema = {"type": "object", "additionalProperties": False, "required": sorted(fields), "properties": properties}
     grouped = work_unit.get("kind") == "coordinate-groups" or operation == "mrq.classify-batches"
     schema = {"type": "object", "additionalProperties": False, "required": ["groups"], "properties": {"groups": {"type": "array", "items": item_schema}}} if grouped else item_schema
     schema_path = proposal_dir / "output-schema.json"

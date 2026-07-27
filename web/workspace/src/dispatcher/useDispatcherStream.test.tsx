@@ -131,7 +131,8 @@ test('keeps resync blocked after a failed snapshot until an explicit retry succe
 
   let retry!: Promise<void>;
   act(() => { retry = result.current.refresh(); });
-  await act(async () => vi.advanceTimersByTimeAsync(1000));
+  await flush();
+  await act(async () => vi.advanceTimersByTimeAsync(1001));
   await act(async () => retry);
   expect(result.current.projection.revision).toBe(6);
   expect(result.current.resyncing).toBe(false);
@@ -149,4 +150,54 @@ test('does not reconnect when a cloned bootstrap projection is passed on rerende
   rerender({ initialProjection: structuredClone(snapshot.dispatcher) });
   expect(EventSourceMock.count).toBe(1);
   expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+});
+
+test('resets all stream state and accepts a lower revision after project switch before opening SSE', async () => {
+  const oldProjection = projection(9).dispatcher;
+  vi.mocked(fetch).mockImplementation(async (input) => ({
+    ok: true,
+    json: async () => String(input).includes('project-2')
+      ? { workflow_fingerprint: 'sha256:project-2', dispatcher: { ...snapshot.dispatcher, revision: 1 } }
+      : { workflow_fingerprint: 'sha256:project-1', dispatcher: { ...snapshot.dispatcher, revision: 10 } },
+  } as Response));
+  const { result, rerender } = renderHook(
+    ({ projectId }) => useDispatcherStream({ projectId, initialProjection: oldProjection }),
+    { initialProps: { projectId: 'project-1' } },
+  );
+  act(() => EventSourceMock.instance.emit('workflow', JSON.stringify({ sequence: 4, run_id: 'old-run' })));
+  await flush();
+  expect(result.current.lastEvent?.run_id).toBe('old-run');
+  rerender({ projectId: 'project-2' });
+  expect(result.current.connectionState).toBe('connecting');
+  expect(result.current.lastEvent).toBeNull();
+  expect(result.current.fingerprint).toBe('');
+  expect(result.current.projection.revision).toBe(0);
+  expect(EventSourceMock.count).toBe(1);
+  await act(async () => vi.advanceTimersByTimeAsync(1000));
+  await flush();
+  expect(result.current.projection.revision).toBe(1);
+  expect(result.current.fingerprint).toBe('sha256:project-2');
+  expect(EventSourceMock.count).toBe(2);
+  expect(EventSourceMock.instance.url).toContain('/projects/project-2/events/stream?cursor=0');
+});
+
+test('uses one five-second refresh while SSE is degraded', async () => {
+  renderHook(() => useDispatcherStream({ projectId: 'project-1', initialProjection: snapshot.dispatcher }));
+  act(() => EventSourceMock.instance.emit('error'));
+  await act(async () => vi.advanceTimersByTimeAsync(4_999));
+  expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  await act(async () => vi.advanceTimersByTimeAsync(1));
+  await flush();
+  expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+});
+
+test('reconciles connected active work every thirty seconds', async () => {
+  const active = { ...snapshot.dispatcher, jobs: { job: { state: 'running' } } };
+  renderHook(() => useDispatcherStream({ projectId: 'project-1', initialProjection: active as never }));
+  act(() => EventSourceMock.instance.emit('open'));
+  await act(async () => vi.advanceTimersByTimeAsync(29_999));
+  expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  await act(async () => vi.advanceTimersByTimeAsync(1));
+  await flush();
+  expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
 });

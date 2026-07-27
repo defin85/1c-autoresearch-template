@@ -26,6 +26,7 @@ import {
   FormControl,
   FormControlLabel,
   InputLabel,
+  LinearProgress,
   MenuItem,
   Select,
   Stack,
@@ -36,7 +37,7 @@ import {
   Typography,
 } from "@mui/material";
 import { api, mutationHeaders } from "./api";
-import { PipelineDispatcher } from "./dispatcher/PipelineDispatcher";
+import { PipelineDispatcher, type JournalTarget, type RegistryTarget } from "./dispatcher/PipelineDispatcher";
 import { OfficialSubFlowReference } from "./dispatcher/OfficialSubFlowReference";
 import { EnrichedSubFlowReference } from "./dispatcher/EnrichedSubFlowReference";
 import { ExternalFolderImport } from "./ExternalFolderImport";
@@ -69,9 +70,15 @@ type Event = {
 type AgentProfile = {
   provider: "codex-cli";
   model: string;
-  reasoning_effort: "low" | "medium" | "high" | "xhigh";
+  reasoning_effort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   instructions_version: string;
   environment_preset: "local-read-only";
+};
+type AgentModel = {
+  id: string;
+  name: string;
+  default_reasoning_effort: AgentProfile["reasoning_effort"];
+  reasoning_efforts: AgentProfile["reasoning_effort"][];
 };
 type AgentRole = {
   role_id: string;
@@ -119,6 +126,16 @@ type SourceSetup = {
       tested: boolean;
       profile_id: string;
       platform_path: string;
+      server: string;
+      reference: string;
+      dbms: string;
+      db_server: string;
+      db_name: string;
+      db_user: string;
+      infobase_user: string;
+      client_connection: string;
+      db_password_set: boolean;
+      infobase_password_set: boolean;
       extension_count: number;
       extensions: {
         uuid: string;
@@ -171,8 +188,25 @@ type RoutingPreview = {
   preview_id: string;
   status: "pending" | "running" | "ready" | "failed" | "cancelled";
   routing_plan_fingerprint: string;
-  routing_manifest?: { groups: RoutingGroup[] };
+  routing_manifest?: { groups?: RoutingGroup[] };
   required_tools?: string[];
+  progress?: {
+    phase: "queued" | "probe" | "route";
+    completed: number;
+    total: number;
+    subject: string;
+  };
+  error?: string;
+};
+type AcquisitionRun = {
+  run_id: string;
+  status: "running" | "completed" | "failed" | "cancelled";
+  progress: {
+    phase: "queued" | "connections" | "probe" | "route" | "export" | "publication";
+    completed: number;
+    total: number;
+    subject: string;
+  };
   error?: string;
 };
 type SourceToolInventory = {
@@ -233,12 +267,31 @@ export function RoutingPreviewSummary({
         Состояние: {preview.status}. Требуемые инструменты:{" "}
         {preview.required_tools?.join(", ") || "не определены"}.
       </Alert>
+      {["pending", "running"].includes(preview.status) && (
+        <Box>
+          <LinearProgress
+            variant={preview.progress?.total ? "determinate" : "indeterminate"}
+            value={
+              preview.progress?.total
+                ? (preview.progress.completed / preview.progress.total) * 100
+                : undefined
+            }
+          />
+          <Typography variant="caption">
+            {preview.progress?.phase === "route"
+              ? "Формирование маршрута"
+              : preview.progress?.total
+                ? `Проверено компонентов: ${preview.progress.completed} из ${preview.progress.total}. Текущий: ${preview.progress.subject}`
+                : "Подготовка проверки"}
+          </Typography>
+        </Box>
+      )}
       {preview.status === "failed" && (
         <Alert severity="error">
           {preview.error || "Не удалось построить маршрут."}
         </Alert>
       )}
-      {preview.routing_manifest?.groups.map((group) => (
+      {preview.routing_manifest?.groups?.map((group) => (
         <Card key={group.routing_group_id} variant="outlined">
           <CardContent>
             <Typography variant="subtitle2">
@@ -291,7 +344,7 @@ export function ToolInventory({
     (tool === "designer" && selectedProfile.startsWith("designer+")) ||
     (tool === "v8unpack" &&
       Boolean(
-        routingPreview?.routing_manifest?.groups.some(
+        routingPreview?.routing_manifest?.groups?.some(
           (group) => group.representation_schema === "v8unpack/v1",
         ),
       ))
@@ -468,6 +521,7 @@ function ProjectPicker({ onSelect }: { onSelect: (project: Project) => void }) {
 
 export function AgentProfiles({ project }: { project: Project }) {
   const [items, setItems] = useState<Record<string, AgentProfile>>({});
+  const [models, setModels] = useState<AgentModel[]>([]);
   const [profileId, setProfileId] = useState("local");
   const [model, setModel] = useState("gpt-5.6-sol");
   const [reasoning, setReasoning] =
@@ -500,7 +554,20 @@ export function AgentProfiles({ project }: { project: Project }) {
   );
   useEffect(() => {
     void load();
+    void api<{ models: AgentModel[] }>(
+      `/projects/${project.id}/agent-capabilities`,
+    )
+      .then((value) => {
+        setModels(value.models);
+        if (!value.models.some((item) => item.id === model)) {
+          const first = value.models[0];
+          setModel(first.id);
+          setReasoning(first.default_reasoning_effort);
+        }
+      })
+      .catch((error) => setError((error as Error).message));
   }, [load]);
+  const selectedModel = models.find((item) => item.id === model);
   const selectProfile = (id: string, profile: AgentProfile) => {
     setProfileId(id);
     setModel(profile.model);
@@ -556,11 +623,26 @@ export function AgentProfiles({ project }: { project: Project }) {
           </Stack>
           <Stack spacing={2}>
             <TextField label="Идентификатор профиля" value={profileId} onChange={(event) => setProfileId(event.target.value)} />
-            <TextField label="Модель" value={model} onChange={(event) => setModel(event.target.value)} />
             <FormControl>
-              <InputLabel>Уровень рассуждения</InputLabel>
-              <Select label="Уровень рассуждения" value={reasoning} onChange={(event) => setReasoning(event.target.value as AgentProfile["reasoning_effort"])}>
-                {["low", "medium", "high", "xhigh"].map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
+              <InputLabel id="agent-model-label">Модель</InputLabel>
+              <Select
+                labelId="agent-model-label"
+                label="Модель"
+                value={models.some((item) => item.id === model) ? model : ""}
+                onChange={(event) => {
+                  const selected = models.find((item) => item.id === event.target.value);
+                  if (!selected) return;
+                  setModel(selected.id);
+                  setReasoning(selected.default_reasoning_effort);
+                }}
+              >
+                {models.map((item) => <MenuItem key={item.id} value={item.id}>{item.name}</MenuItem>)}
+              </Select>
+            </FormControl>
+            <FormControl>
+              <InputLabel id="agent-reasoning-label">Уровень рассуждения</InputLabel>
+              <Select labelId="agent-reasoning-label" label="Уровень рассуждения" value={selectedModel?.reasoning_efforts.includes(reasoning) ? reasoning : ""} onChange={(event) => setReasoning(event.target.value as AgentProfile["reasoning_effort"])}>
+                {(selectedModel?.reasoning_efforts || []).map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}
               </Select>
             </FormControl>
             <Accordion disableGutters sx={{ boxShadow: "none", border: 1, borderColor: "divider" }}>
@@ -995,7 +1077,7 @@ export function WorkflowEditor({
   );
 }
 
-function Sources({
+export function Sources({
   project,
   snapshot,
   refreshWorkflow,
@@ -1010,6 +1092,9 @@ function Sources({
   const [profiles, setProfiles] = useState<
     Record<string, Record<string, string>>
   >({});
+  const [editingProfiles, setEditingProfiles] = useState<Record<string, boolean>>(
+    {},
+  );
   const [artifactHashes, setArtifactHashes] = useState<Record<string, string>>(
     {},
   );
@@ -1017,6 +1102,7 @@ function Sources({
   const [roleProfiles, setRoleProfiles] = useState<Record<string, string>>({});
   const [sourcePreview, setSourcePreview] = useState<Record<string, unknown>>();
   const [routingPreview, setRoutingPreview] = useState<RoutingPreview>();
+  const [acquisitionRun, setAcquisitionRun] = useState<AcquisitionRun>();
   const [acquisitionResult, setAcquisitionResult] =
     useState<Record<string, unknown>>();
   const refresh = useCallback(
@@ -1024,6 +1110,28 @@ function Sources({
       api<SourceSetup>(`/projects/${project.id}/source-setup`)
         .then((value) => {
           setSetup(value);
+          setProfiles(
+            Object.fromEntries(
+              Object.entries(value.connection_profiles).map(([id, profile]) => [
+                id,
+                Object.fromEntries(
+                  [
+                    "server",
+                    "reference",
+                    "platform_path",
+                    "db_server",
+                    "db_name",
+                    "db_user",
+                    "infobase_user",
+                    "client_connection",
+                  ].map((field) => [
+                    field,
+                    String(profile[field as keyof typeof profile] || ""),
+                  ]),
+                ),
+              ]),
+            ),
+          );
           setSourceProfile(
             (current) => current || value.infobases.acquisition_profile,
           );
@@ -1081,6 +1189,7 @@ function Sources({
         }),
       });
       await refresh();
+      setEditingProfiles((current) => ({ ...current, [id]: false }));
     } catch (error) {
       setError((error as Error).message);
     } finally {
@@ -1172,7 +1281,7 @@ function Sources({
         `/projects/${project.id}/source-routing-previews`,
         { method: "POST", headers: mutationHeaders() },
       );
-      for (let attempt = 0; attempt < 120; attempt += 1) {
+      for (;;) {
         const current = await api<RoutingPreview>(
           `/projects/${project.id}/source-routing-previews/${created.preview_id}`,
         );
@@ -1180,7 +1289,6 @@ function Sources({
         if (!["pending", "running"].includes(current.status)) return;
         await new Promise((resolve) => window.setTimeout(resolve, 250));
       }
-      setError("Предварительный просмотр не завершился в установленное время.");
     } catch (error) {
       setError((error as Error).message);
     } finally {
@@ -1206,8 +1314,8 @@ function Sources({
     setBusy(true);
     setError("");
     try {
-      const result = await api<Record<string, unknown>>(
-        `/projects/${project.id}/workflow/run-next`,
+      const created = await api<AcquisitionRun>(
+        `/projects/${project.id}/source-acquisition-runs`,
         {
           method: "POST",
           headers: mutationHeaders(),
@@ -1219,7 +1327,18 @@ function Sources({
           }),
         },
       );
-      setAcquisitionResult(result);
+      for (;;) {
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        const current = await api<AcquisitionRun>(
+          `/projects/${project.id}/source-acquisition-runs/${created.run_id}`,
+        );
+        setAcquisitionRun(current);
+        if (current.status === "running") continue;
+        if (current.status === "failed")
+          throw new Error(current.error || "Получение поколения завершилось с ошибкой.");
+        setAcquisitionResult(current);
+        break;
+      }
       await refresh();
       refreshWorkflow();
     } catch (error) {
@@ -1227,6 +1346,17 @@ function Sources({
     } finally {
       setBusy(false);
     }
+  };
+  const cancelAcquisition = async () => {
+    if (!acquisitionRun) return;
+    await api(
+      `/projects/${project.id}/runs/${acquisitionRun.run_id}/cancel`,
+      {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify({ actor: "local-user" }),
+      },
+    );
   };
   if (!setup) return <CircularProgress />;
   const ready = Object.values(setup.infobases.roles).every(
@@ -1392,7 +1522,7 @@ function Sources({
                     >
                       UUID: {item.root_uuid}
                     </Typography>
-                    {current?.tested ? (
+                    {current?.tested && !editingProfiles[id] ? (
                       <Stack spacing={1} mt={1.5}>
                         <Stack
                           direction="row"
@@ -1431,6 +1561,23 @@ function Sources({
                             ))}
                           </Box>
                         )}
+                        <Box component="dl" sx={{ m: 0, "& dt": { fontWeight: 700 }, "& dd": { ml: 0, mb: 1, overflowWrap: "anywhere" } }}>
+                          <Typography component="dt" variant="caption">Каталог платформы 1С</Typography>
+                          <Typography component="dd" variant="body2">{current.platform_path}</Typography>
+                          <Typography component="dt" variant="caption">Подключение 1С</Typography>
+                          <Typography component="dd" variant="body2">{current.client_connection || `/S${current.server}/${current.reference}`}</Typography>
+                          <Typography component="dt" variant="caption">PostgreSQL</Typography>
+                          <Typography component="dd" variant="body2">{current.db_server} / {current.db_name} / {current.db_user}</Typography>
+                          <Typography component="dt" variant="caption">Пользователь 1С</Typography>
+                          <Typography component="dd" variant="body2">{current.infobase_user || "не указан"}</Typography>
+                          <Typography component="dt" variant="caption">Пароли</Typography>
+                          <Typography component="dd" variant="body2">
+                            PostgreSQL: {current.db_password_set ? "сохранён" : "не задан"}; 1С: {current.infobase_password_set ? "сохранён" : "не задан"}
+                          </Typography>
+                        </Box>
+                        <Button onClick={() => setEditingProfiles((value) => ({ ...value, [id]: true }))}>
+                          Изменить параметры
+                        </Button>
                       </Stack>
                     ) : (
                       <Stack spacing={1.5} mt={2}>
@@ -1476,6 +1623,7 @@ function Sources({
                         <TextField
                           type="password"
                           label="Пароль PostgreSQL"
+                          helperText={current?.db_password_set ? "Пароль сохранён. Оставьте поле пустым, чтобы не менять его." : ""}
                           value={field(id, "db_password")}
                           onChange={(event) =>
                             setField(id, "db_password", event.target.value)
@@ -1491,6 +1639,7 @@ function Sources({
                         <TextField
                           type="password"
                           label="Пароль 1С"
+                          helperText={current?.infobase_password_set ? "Пароль сохранён. Оставьте поле пустым, чтобы не менять его." : ""}
                           value={field(id, "infobase_password")}
                           onChange={(event) =>
                             setField(
@@ -1500,9 +1649,16 @@ function Sources({
                             )
                           }
                         />
-                        <Button disabled={busy} onClick={() => void save(id)}>
-                          Проверить и сохранить профиль
-                        </Button>
+                        <Stack direction="row" spacing={1}>
+                          <Button disabled={busy} onClick={() => void save(id)}>
+                            Проверить и сохранить профиль
+                          </Button>
+                          {current?.tested && (
+                            <Button disabled={busy} onClick={() => setEditingProfiles((value) => ({ ...value, [id]: false }))}>
+                              Отмена
+                            </Button>
+                          )}
+                        </Stack>
                       </Stack>
                     )}
                   </CardContent>
@@ -1660,8 +1816,44 @@ function Sources({
             >
               Получить новое поколение
             </Button>
+            {acquisitionRun?.status === "running" && (
+              <Button onClick={() => void cancelAcquisition()}>
+                Отменить получение
+              </Button>
+            )}
           </Stack>
           {routingPreview && <RoutingPreviewSummary preview={routingPreview} />}
+          {acquisitionRun?.status === "running" && (
+            <Alert severity="info">
+              <Stack spacing={1}>
+                <Typography>
+                  Получение поколения: {acquisitionRun.progress.phase}
+                  {acquisitionRun.progress.subject
+                    ? ` · ${acquisitionRun.progress.subject}`
+                    : ""}
+                </Typography>
+                <LinearProgress
+                  variant={
+                    acquisitionRun.progress.total > 0
+                      ? "determinate"
+                      : "indeterminate"
+                  }
+                  value={
+                    acquisitionRun.progress.total > 0
+                      ? (100 * acquisitionRun.progress.completed) /
+                        acquisitionRun.progress.total
+                      : undefined
+                  }
+                />
+                {acquisitionRun.progress.total > 0 && (
+                  <Typography variant="caption">
+                    Выполнено: {acquisitionRun.progress.completed} из{" "}
+                    {acquisitionRun.progress.total}
+                  </Typography>
+                )}
+              </Stack>
+            </Alert>
+          )}
           <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
             <Chip
               title={String(setup.active_source.generation_id || "")}
@@ -1830,7 +2022,7 @@ export function groupEvents(events: Event[]) {
   return runs;
 }
 
-function Events({ project }: { project: Project }) {
+export function Events({ project, target }: { project: Project; target?: JournalTarget }) {
   const [events, setEvents] = useState<Event[]>([]);
   const [filter, setFilter] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -1870,6 +2062,11 @@ function Events({ project }: { project: Project }) {
     const timer = window.setInterval(refresh, 2000);
     return () => clearInterval(timer);
   }, [refresh]);
+  useEffect(() => {
+    if (!target) return;
+    setFilter(target.invocationId || target.runId || "");
+    if (target.runId) setExpanded(new Set([`run:${target.runId}`]));
+  }, [target?.invocationId, target?.runId]);
   const term = filter.toLowerCase();
   const visible = events.filter(
     (event) =>
@@ -2102,8 +2299,8 @@ function Events({ project }: { project: Project }) {
   );
 }
 
-export function Registry({ project }: { project: Project }) {
-  const [name, setName] = useState("diff-inventory");
+export function Registry({ project, target }: { project: Project; target?: RegistryTarget }) {
+  const [name, setName] = useState(target?.registry || "diff-inventory");
   const [offset, setOffset] = useState(0);
   const [page, setPage] = useState<{
     diff_generation_id?: string;
@@ -2113,12 +2310,19 @@ export function Registry({ project }: { project: Project }) {
   const generation = useRef("");
   const [error, setError] = useState("");
   useEffect(() => {
+    if (!target) return;
+    setName(target.registry);
+    setOffset(0);
+    generation.current = "";
+  }, [target?.registry, target?.itemId]);
+  useEffect(() => {
     const expected =
       offset > 0 && generation.current
         ? `&expected_generation=${generation.current}`
         : "";
+    const item = target?.itemId ? `&item_id=${encodeURIComponent(target.itemId)}` : "";
     api<typeof page>(
-      `/projects/${project.id}/registries/${name}?offset=${offset}&limit=100${expected}`,
+      `/projects/${project.id}/registries/${name}?offset=${offset}&limit=100${expected}${item}`,
     )
       .then((value) => {
         generation.current = value.diff_generation_id || "";
@@ -2129,7 +2333,7 @@ export function Registry({ project }: { project: Project }) {
         setPage({ items: [], has_more: false });
         setError(error.message);
       });
-  }, [project.id, name, offset]);
+  }, [project.id, name, offset, target?.itemId]);
   return (
     <Stack spacing={2}>
       {error && <Alert severity="warning">{error}</Alert>}
@@ -2215,6 +2419,8 @@ function Workspace({
   >("dispatcher");
   const [settingsTab, setSettingsTab] = useState<"stages" | "profiles">("stages");
   const [settingsStep, setSettingsStep] = useState<string>();
+  const [journalTarget, setJournalTarget] = useState<JournalTarget>();
+  const [registryTarget, setRegistryTarget] = useState<RegistryTarget>();
   const [error, setError] = useState("");
   const [retryWorkingView, setRetryWorkingView] = useState(false);
   const fetchSnapshot = useCallback(
@@ -2296,8 +2502,8 @@ function Workspace({
                 onOpenSources={() => setView("sources")}
                 onOpenIndexes={() => setView("indexes")}
                 onOpenSettings={(stepId) => { setSettingsStep(stepId); setSettingsTab("stages"); setView("settings"); }}
-                onOpenJournal={() => setView("journal")}
-                onOpenRegistries={() => setView("registries")}
+                onOpenJournal={(target) => { setJournalTarget(target); setView("journal"); }}
+                onOpenRegistry={(target) => { setRegistryTarget(target); setView("registries"); }}
               />
             )}
             {view === "sources" && (
@@ -2327,8 +2533,8 @@ function Workspace({
                 )}
               </Stack>
             )}
-            {view === "journal" && <Events project={project} />}
-            {view === "registries" && <Registry project={project} />}
+            {view === "journal" && <Events project={project} target={journalTarget} />}
+            {view === "registries" && <Registry project={project} target={registryTarget} />}
           </>
         )}
       </Box>
