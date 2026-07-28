@@ -1166,10 +1166,18 @@ def compile_consolidate_graph(
             coordinator_role.get("instruction_supplement", ""), timeout_seconds, cancelled,
         )
         try:
+            noise_by_id = {
+                row["stable_diff_id"]: row
+                for row in snapshot["classifications"]
+                if row["classification"] == "noise_candidate"
+            }
+            approved_noise_ids = result.get("approved_noise", [])
+            if set(approved_noise_ids) != set(noise_by_id):
+                raise ValueError("every noise candidate requires explicit consolidation approval")
             plan = plan_from_groups(
                 snapshot,
                 list(result.get("groups", [])),
-                list(result.get("approved_noise", [])),
+                [noise_by_id[identifier] for identifier in approved_noise_ids],
                 manifest,
             )
             plan_fingerprint, path = store_plan(plan_root, plan)

@@ -30,6 +30,10 @@ def test_extension_decisions_are_strict_normalized_and_deterministic():
         },
     }
     assert tomllib.loads(serialize_infobases(contract).decode())["extension_decisions"] == normalize_extension_decisions([first, second])
+    empty = {**contract, "extension_decisions": []}
+    empty_bytes = serialize_infobases(empty)
+    assert b"extension_decisions = []" in empty_bytes
+    assert serialize_infobases(tomllib.loads(empty_bytes.decode())) == empty_bytes
     invalid = [
         [{"uuid": second["uuid"], "decision": "include", "rationale": "", "extra": ""}],
         [second, second],
@@ -41,6 +45,51 @@ def test_extension_decisions_are_strict_normalized_and_deterministic():
     for value in invalid:
         with pytest.raises(ValueError):
             normalize_extension_decisions(value)
+
+
+def test_legacy_generation_is_readable_but_stale_after_extension_decision(tmp_path: Path) -> None:
+    research = tmp_path / "research"
+    research.mkdir()
+    roles = {
+        role: {
+            "connection_profile": role,
+            "configuration_name": "Cfg",
+            "root_uuid": "00000000-0000-0000-0000-000000000001",
+            "version": version,
+        }
+        for role, version in (("vendor_baseline", "1"), ("target_cf", "1"), ("next_vendor", "2"))
+    }
+    infobases = {
+        "schema_version": "1",
+        "acquisition_profile": "ibcmd+xml-hierarchical/v1",
+        "extension_decisions": [],
+        "roles": roles,
+    }
+    (research / "infobases.toml").write_bytes(serialize_infobases(infobases))
+    (research / "external-artifacts.toml").write_text('schema_version = "1"\nartifacts = []\n', encoding="utf-8")
+    staged = tmp_path / "staged"
+    for role in roles:
+        root = staged / role / "configuration"
+        root.mkdir(parents=True)
+        (root / "Configuration.xml").write_text(role, encoding="utf-8")
+    contract = {
+        "schema_version": "1",
+        "acquisition_profile_id": infobases["acquisition_profile"],
+        "roles": roles,
+        "artifacts": [],
+    }
+    pointer = publish(tmp_path, staged, contract)
+    assert validate_active(tmp_path) == pointer
+
+    infobases["extension_decisions"] = [{
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "decision": "include",
+        "rationale": "",
+    }]
+    (research / "infobases.toml").write_bytes(serialize_infobases(infobases))
+    with pytest.raises(ValueError, match="reacquisition"):
+        validate_active(tmp_path)
+    assert validate_active(tmp_path, candidate=pointer, current=False) == pointer
 
 
 def test_preflight_extension_discovery_bounds_fail_before_identity_export(tmp_path: Path):

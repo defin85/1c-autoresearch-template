@@ -11,7 +11,7 @@ from one_c_autoresearch.sqlite_state import DispatcherStore
 from one_c_autoresearch.workspace_api import create_app
 
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[1] / "templates/research-repo"
 ORIGIN = {"Origin": "http://testserver"}
 
 

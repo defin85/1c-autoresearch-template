@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from one_c_autoresearch.agents import validate_proposal
 from one_c_autoresearch.consolidation import (
     approve_plan,
     ensure_context_payload,
@@ -31,6 +32,28 @@ def _snapshot(count: int = 1, mrq: dict | None = None) -> dict:
     }
 
 
+def _agent_groups(*groups: dict) -> list[dict]:
+    complete = [{
+        "semantic_key": "",
+        "title": "",
+        "stable_diff_ids": [],
+        "supporting_diff_ids": [],
+        "component_keys": [],
+        "source_mrq_ids": [],
+        "evidence": [],
+        "business_meaning": "",
+        "scope": "",
+        "confidence": "",
+        "rationale": "",
+        "split_source_mrq_id": "",
+        **group,
+    } for group in groups]
+    return validate_proposal(
+        "mrq.consolidate", {"groups": complete, "approved_noise": []},
+        {"kind": "consolidation-coordinate"},
+    )["groups"]
+
+
 def test_partition_manifest_and_actual_payload_enforce_context_budget() -> None:
     manifest = partition_manifest(
         [{"record_id": f"DIF-{index}", "record_type": "dif", "stable_diff_id": f"DIF-{index}", "payload": "x" * 3000} for index in range(3)],
@@ -57,8 +80,13 @@ def test_plan_maps_every_meaning_dif_directly_to_mrq() -> None:
 
 
 def test_one_component_hint_can_be_split_into_multiple_ordinary_mrqs() -> None:
+    prior = {
+        "mrq.jsonl": [
+            {"schema_version": "3", "mrq_id": "MRQ-old", "semantic_key": "old"},
+        ],
+    }
     snapshot = {
-        **_snapshot(2),
+        **_snapshot(2, prior),
         "component_groups": [{
             "component_kind": "extension",
             "component_key": "ext",
@@ -67,15 +95,16 @@ def test_one_component_hint_can_be_split_into_multiple_ordinary_mrqs() -> None:
     }
     plan = plan_from_groups(
         snapshot,
-        [
-            {"semantic_key": "first-function", "stable_diff_ids": ["DIF-1"]},
-            {"semantic_key": "second-function", "stable_diff_ids": ["DIF-2"]},
-        ],
+        _agent_groups(
+            {"semantic_key": "first-function", "stable_diff_ids": ["DIF-1"], "split_source_mrq_id": "MRQ-old"},
+            {"semantic_key": "second-function", "stable_diff_ids": ["DIF-2"], "split_source_mrq_id": "MRQ-old"},
+        ),
         [],
         partition_manifest(snapshot["classifications"], 8192),
     )
     assert len(plan["mrq"]["mrq.jsonl"]) == 2
     assert {row["stable_diff_id"] for row in plan["mrq"]["dispositions.jsonl"] if row["primary"]} == {"DIF-1", "DIF-2"}
+    assert plan["lineage"][0]["kind"] == "split"
 
 
 def test_existing_mrqs_can_merge_without_intermediate_entity() -> None:
@@ -88,11 +117,11 @@ def test_existing_mrqs_can_merge_without_intermediate_entity() -> None:
     snapshot = _snapshot(2, prior)
     plan = plan_from_groups(
         snapshot,
-        [{
+        _agent_groups({
             "semantic_key": "merged",
             "stable_diff_ids": ["DIF-1", "DIF-2"],
             "source_mrq_ids": ["MRQ-old-1", "MRQ-old-2"],
-        }],
+        }),
         [],
         partition_manifest(snapshot["classifications"], 8192),
     )
@@ -117,10 +146,10 @@ def test_cross_component_support_requires_explicit_keys_rationale_and_evidence()
         "evidence": [{"path": "target_cf/extensions/ext/a.bsl", "fingerprint": "sha256:" + "1" * 64}],
     }
     other = {"semantic_key": "handler", "stable_diff_ids": ["DIF-2"]}
-    plan = plan_from_groups(snapshot, [group, other], [], partition_manifest(snapshot["classifications"], 8192))
+    plan = plan_from_groups(snapshot, _agent_groups(group, other), [], partition_manifest(snapshot["classifications"], 8192))
     assert any(not row["primary"] and row["stable_diff_id"] == "DIF-2" for row in plan["mrq"]["dispositions.jsonl"])
     with pytest.raises(ValueError, match="cross-component"):
-        plan_from_groups(snapshot, [{**group, "component_keys": []}, other], [], partition_manifest(snapshot["classifications"], 8192))
+        plan_from_groups(snapshot, _agent_groups({**group, "component_keys": []}, other), [], partition_manifest(snapshot["classifications"], 8192))
 
 
 def test_approval_publishes_only_mrq_generation(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

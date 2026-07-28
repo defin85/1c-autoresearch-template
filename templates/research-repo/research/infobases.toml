@@ -1,5 +1,6 @@
 schema_version = "1"
 acquisition_profile = "ibcmd+form-aware/v1"
+extension_decisions = []
 
 [roles.vendor_baseline]
 connection_profile = "local-baseline"

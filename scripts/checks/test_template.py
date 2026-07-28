@@ -17,7 +17,6 @@ MAINTENANCE = {
 ACTIVE_DOCS = {
     "README.md", "AGENTS.md", "docs/agent/repo-map.md", "docs/agent/verification.md",
     "docs/operator/dispatcher-inspector-rollback.md",
-    "docs/operator/extension-source-scope-rollback.md",
 }
 
 
@@ -45,6 +44,13 @@ def normalized_test(path: Path) -> str:
     ).replace(
         '(scaffold / "research/forbidden-authorities.json")',
         '(Path(__file__).resolve().parents[1] / "research/forbidden-authorities.json")',
+    )
+    text = text.replace(
+        'HAS_ACTIVE_SOURCES = (REPO / "research/active-source-generation.json").is_file()\n',
+        "",
+    ).replace(
+        '@pytest.mark.skipif(not HAS_ACTIVE_SOURCES, reason="portable scaffold has no acquired source generation")\n',
+        "",
     )
     return text
 

@@ -7,7 +7,7 @@ from one_c_autoresearch.workflow import AGENT_PHASE_CATALOG, OPERATION_CATALOG, 
 from one_c_autoresearch.mrq import active
 
 
-REPO = Path(__file__).parents[1]
+REPO = Path(__file__).parents[1] / "templates/research-repo"
 HAS_ACTIVE_GENERATION = (REPO / "research/active-generation.json").is_file()
 
 

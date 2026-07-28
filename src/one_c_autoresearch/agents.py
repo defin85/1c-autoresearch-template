@@ -18,7 +18,15 @@ PROPOSAL_FIELDS = {
     "mrq.classify-batches": {"mrq_ids", "basis", "linkage_proven"},
     "mrq.decide-next": {"mrq_id", "decision", "target_evidence", "target_coverage", "residual_gap", "target_solution", "rationale", "acceptance_criteria", "risk", "open_questions"},
 }
-STRING_ARRAY_FIELDS = {"semantic_hints", "stable_diff_ids", "supporting_diff_ids", "mrq_ids", "acceptance_criteria", "open_questions"}
+CONSOLIDATION_GROUP_FIELDS = {
+    "semantic_key", "title", "stable_diff_ids", "supporting_diff_ids",
+    "component_keys", "source_mrq_ids", "evidence", "business_meaning",
+    "scope", "confidence", "rationale", "split_source_mrq_id",
+}
+STRING_ARRAY_FIELDS = {
+    "semantic_hints", "stable_diff_ids", "supporting_diff_ids", "component_keys",
+    "source_mrq_ids", "mrq_ids", "acceptance_criteria", "open_questions",
+}
 EVIDENCE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -274,6 +282,23 @@ def resolve_execution_snapshot(
 
 
 def validate_proposal(operation: str, payload: dict[str, Any], work_unit: dict[str, Any]) -> dict[str, Any]:
+    if operation == "mrq.consolidate":
+        coordinator = work_unit.get("kind") == "consolidation-coordinate"
+        expected = {"groups", "approved_noise"} if coordinator else {"groups"}
+        groups = payload.get("groups")
+        if (
+            set(payload) != expected
+            or not isinstance(groups, list)
+            or any(not isinstance(group, dict) or set(group) != CONSOLIDATION_GROUP_FIELDS for group in groups)
+            or (coordinator and (
+                not isinstance(payload["approved_noise"], list)
+                or any(not isinstance(identifier, str) for identifier in payload["approved_noise"])
+                or payload["approved_noise"] != sorted(set(payload["approved_noise"]))
+            ))
+        ):
+            raise ValueError("consolidation proposal does not match the fixed response schema")
+        reject_secrets(payload, "agent proposal")
+        return payload
     if operation == "mrq.classify-batches":
         fields = PROPOSAL_FIELDS[operation]
         groups = payload.get("groups")
@@ -326,7 +351,7 @@ def execute(
     verify_context_manifest(repo, work_unit, manifest)
     executable = str(execution_snapshot["environment"]["executable"])
     proposal_dir.mkdir(parents=True, exist_ok=False)
-    fields = PROPOSAL_FIELDS[operation]
+    fields = CONSOLIDATION_GROUP_FIELDS if operation == "mrq.consolidate" else PROPOSAL_FIELDS[operation]
     properties = {
         key: {"type": "array", "items": {"type": "string"}} if key in STRING_ARRAY_FIELDS
         else {"type": "array", "items": TARGET_COVERAGE_SCHEMA} if key == "target_coverage"
@@ -337,8 +362,16 @@ def execute(
         for key in sorted(fields)
     }
     item_schema = {"type": "object", "additionalProperties": False, "required": sorted(fields), "properties": properties}
-    grouped = work_unit.get("kind") == "coordinate-groups" or operation == "mrq.classify-batches"
-    schema = {"type": "object", "additionalProperties": False, "required": ["groups"], "properties": {"groups": {"type": "array", "items": item_schema}}} if grouped else item_schema
+    grouped = work_unit.get("kind") == "coordinate-groups" or operation in {"mrq.classify-batches", "mrq.consolidate"}
+    if grouped:
+        schema_properties = {"groups": {"type": "array", "items": item_schema}}
+        required = ["groups"]
+        if operation == "mrq.consolidate" and work_unit.get("kind") == "consolidation-coordinate":
+            schema_properties["approved_noise"] = {"type": "array", "items": {"type": "string"}}
+            required.append("approved_noise")
+        schema = {"type": "object", "additionalProperties": False, "required": required, "properties": schema_properties}
+    else:
+        schema = item_schema
     schema_path = proposal_dir / "output-schema.json"
     output_path = proposal_dir / "proposal.json"
     atomic_json(schema_path, schema)

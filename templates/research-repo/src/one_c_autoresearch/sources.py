@@ -114,12 +114,14 @@ def normalize_extension_decisions(raw: Any) -> list[dict[str, str]]:
 
 
 def serialize_infobases(infobases: dict[str, Any]) -> bytes:
+    decisions = normalize_extension_decisions(infobases.get("extension_decisions", []))
     lines = [
         f'schema_version = {json.dumps(str(infobases.get("schema_version", "1")))}',
         f'acquisition_profile = {json.dumps(str(infobases["acquisition_profile"]))}',
+        *(["extension_decisions = []"] if not decisions else []),
         "",
     ]
-    for decision in normalize_extension_decisions(infobases.get("extension_decisions", [])):
+    for decision in decisions:
         lines.extend((
             "[[extension_decisions]]",
             f'uuid = {json.dumps(decision["uuid"])}',
@@ -993,9 +995,16 @@ def publish(repo: Path, staged_roles: Path, contract: dict[str, Any], normalizer
         return pointer
 
 
-def validate_active(repo: Path, *, deep: bool = False, require_tracked_clean: bool = False, candidate: dict[str, Any] | None = None) -> dict[str, Any]:
+def validate_active(
+    repo: Path,
+    *,
+    deep: bool = False,
+    require_tracked_clean: bool = False,
+    candidate: dict[str, Any] | None = None,
+    current: bool = True,
+) -> dict[str, Any]:
     import subprocess
-    if candidate is None:
+    if candidate is None and current:
         from .stage_recompute import recover_active_publication
 
         recover_active_publication(repo)
@@ -1003,7 +1012,11 @@ def validate_active(repo: Path, *, deep: bool = False, require_tracked_clean: bo
     pointer_path = repo / "research/active-source-generation.json"
     pointer = candidate or json.loads(pointer_path.read_text(encoding="utf-8"))
     if pointer.get("schema_version") == "2":
-        return _validate_active_routed(repo, pointer, deep=deep, require_tracked_clean=require_tracked_clean and candidate is None)
+        return _validate_active_routed(
+            repo, pointer, deep=deep,
+            require_tracked_clean=require_tracked_clean and candidate is None and current,
+            current=current,
+        )
     if pointer.get("schema_version") != "1":
         raise ValueError("unsupported active source schema version")
     generation_id = str(pointer.get("generation_id", ""))
@@ -1034,15 +1047,25 @@ def validate_active(repo: Path, *, deep: bool = False, require_tracked_clean: bo
     preimage = {"schema_version": "1", "acquisition_profile_version": "1", "normalizer_version": pointer["normalizer_version"], "source_contract_sha256": pointer["source_contract_sha256"], "roles": pointer["roles"]}
     if sha256(canonical_json(preimage)) != generation_id:
         raise ValueError("active source generation ID mismatch")
-    current_infobases, current_artifacts = load_contract(repo)
-    current_contract = {"schema_version": "1", "acquisition_profile_id": current_infobases.get("acquisition_profile"), "roles": current_infobases.get("roles", {}), "artifacts": current_artifacts.get("artifacts", [])}
-    active_contract = {**contract, "artifacts": [{key: value for key, value in item.items() if key != "external_artifact_id"} for item in contract.get("artifacts", [])]}
-    if canonical_json(current_contract) != canonical_json(active_contract):
-        raise ValueError("tracked source declarations changed; reacquisition is required")
+    if current:
+        current_infobases, current_artifacts = load_contract(repo)
+        current_contract = {"schema_version": "1", "acquisition_profile_id": current_infobases.get("acquisition_profile"), "roles": current_infobases.get("roles", {}), "artifacts": current_artifacts.get("artifacts", [])}
+        if current_infobases["extension_decisions"]:
+            current_contract["extension_decisions"] = current_infobases["extension_decisions"]
+        active_contract = {**contract, "artifacts": [{key: value for key, value in item.items() if key != "external_artifact_id"} for item in contract.get("artifacts", [])]}
+        if canonical_json(current_contract) != canonical_json(active_contract):
+            raise ValueError("tracked source declarations changed; reacquisition is required")
     return pointer
 
 
-def _validate_active_routed(repo: Path, pointer: dict[str, Any], *, deep: bool, require_tracked_clean: bool) -> dict[str, Any]:
+def _validate_active_routed(
+    repo: Path,
+    pointer: dict[str, Any],
+    *,
+    deep: bool,
+    require_tracked_clean: bool,
+    current: bool,
+) -> dict[str, Any]:
     generation_id = str(pointer.get("generation_id", ""))
     if len(generation_id) != 64 or generation_id != Path(generation_id).name:
         raise ValueError("invalid active source generation ID")
@@ -1161,15 +1184,16 @@ def _validate_active_routed(repo: Path, pointer: dict[str, Any], *, deep: bool, 
     from .source_routing import source_comparison_epoch
     if pointer.get("source_comparison_epoch_fingerprint") != source_comparison_epoch(pointer, manifest):
         raise ValueError("active source comparison epoch mismatch")
-    current_infobases, current_artifacts = load_contract(repo)
-    current_contract = {
-        "schema_version": contract.get("schema_version"),
-        "acquisition_profile_id": current_infobases.get("acquisition_profile"),
-        "roles": current_infobases.get("roles", {}),
-        "artifacts": current_artifacts.get("artifacts", []),
-        "extension_decisions": current_infobases["extension_decisions"],
-    }
-    active_contract = {**contract, "artifacts": [{key: value for key, value in item.items() if key != "external_artifact_id"} for item in contract.get("artifacts", [])]}
-    if canonical_json(current_contract) != canonical_json(active_contract):
-        raise ValueError("tracked source declarations changed; reacquisition is required")
+    if current:
+        current_infobases, current_artifacts = load_contract(repo)
+        current_contract = {
+            "schema_version": contract.get("schema_version"),
+            "acquisition_profile_id": current_infobases.get("acquisition_profile"),
+            "roles": current_infobases.get("roles", {}),
+            "artifacts": current_artifacts.get("artifacts", []),
+            "extension_decisions": current_infobases["extension_decisions"],
+        }
+        active_contract = {**contract, "artifacts": [{key: value for key, value in item.items() if key != "external_artifact_id"} for item in contract.get("artifacts", [])]}
+        if canonical_json(current_contract) != canonical_json(active_contract):
+            raise ValueError("tracked source declarations changed; reacquisition is required")
     return pointer

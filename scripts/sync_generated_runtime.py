@@ -14,7 +14,6 @@ from pathlib import Path
 FILES = (
     "AGENTS.md", "README.md", "pyproject.toml", "uv.lock",
     "docs/operator/dispatcher-inspector-rollback.md",
-    "docs/operator/extension-source-scope-rollback.md",
     "research/workflow.toml", "research/indexing.toml", "research/forbidden-authorities.json",
     "tests/test_external_folder.py", "tests/test_source_routing.py", "tests/test_source_tools.py",
     "tests/test_sources.py", "tests/test_diffs.py", "tests/test_extension_analyzer.py", "tests/test_indexes.py",
@@ -22,6 +21,7 @@ FILES = (
     "tests/test_stage_recompute_api.py", "tests/test_dispatcher.py", "tests/test_dispatcher_api.py",
     "tests/test_dispatcher_inspector_server.py", "tests/test_dispatcher_smoke.py", "tests/test_doctor.py", "tests/test_mrq.py",
     "tests/test_mrq_batches.py", "tests/test_pipeline_graphs.py", "tests/test_workflow.py",
+    "tests/test_contracts.py",
     "tests/test_dif_classifications.py", "tests/test_consolidation.py",
     "tests/test_component_groups.py", "tests/test_service_extension_scope.py",
     "tests/test_decision_generations.py", "tests/test_workflow_migration.py",
@@ -30,13 +30,6 @@ TREES = (
     "src/one_c_autoresearch", "one_c_autoresearch", "research/schemas", "web/workspace",
     "tests/fixtures/source-routing", "tests/fixtures/extension-semantic",
 )
-
-
-def promoted_files() -> tuple[str, ...]:
-    return tuple(
-        path for path in FILES
-        if path.startswith(("docs/operator/", "tests/"))
-    )
 VISUAL_ASSETS = (
     ("openspec/changes/archive/2026-07-25-add-mrq-batch-classification-stage/assets", "web/workspace/e2e/visual-assets/current"),
     ("openspec/changes/archive/2026-07-25-make-dispatcher-new-working-screen/assets", "web/workspace/e2e/visual-assets/legacy"),
@@ -111,7 +104,7 @@ def write_seed(root: Path) -> None:
     (root / "project.toml").write_text('''[project]\nid = "__PROJECT_ID__"\nproduct = "__PRODUCT__"\nbaseline_version = "__BASELINE_VERSION__"\ntarget_version = "__TARGET_VERSION__"\nnext_vendor_version = "__NEXT_VENDOR_VERSION__"\ndescription = "Concrete 1C autoresearch repository."\n\n[mcp]\nenabled = false\nserver = ""\nurl = ""\nservice_root = "mcp"\n\n[web]\nenabled = false\nurl = ""\nusername = ""\ncredential_file = ""\n\n[policy]\nstatic_sources_first = true\nallow_live_infobase_evidence = false\nmark_runtime_data_dependencies = true\ndefault_confidence_for_inference = "medium"\n''', encoding="utf-8")
     research = root / "research"; research.mkdir(exist_ok=True)
     roles = (("vendor_baseline", "baseline", "__BASELINE_VERSION__"), ("target_cf", "target", "__TARGET_VERSION__"), ("next_vendor", "next-vendor", "__NEXT_VENDOR_VERSION__"))
-    lines = ['schema_version = "1"', 'acquisition_profile = "ibcmd+form-aware/v1"', ""]
+    lines = ['schema_version = "1"', 'acquisition_profile = "ibcmd+form-aware/v1"', "extension_decisions = []", ""]
     for role, profile, version in roles: lines.extend((f"[roles.{role}]", f'connection_profile = "local-{profile}"', 'configuration_name = "__PRODUCT__"', 'root_uuid = "00000000-0000-0000-0000-000000000001"', f'version = "{version}"', ""))
     (research / "infobases.toml").write_text("\n".join(lines), encoding="utf-8")
     (research / "external-artifacts.toml").write_text('schema_version = "1"\nartifacts = []\n', encoding="utf-8")
@@ -251,12 +244,12 @@ def sync(
                 for prefix, source, target in promoted
                 for item in change_plan(source, target)
             ]
-            for relative in promoted_files():
-                source, target = staging / relative, package_root / relative
-                if not target.is_file():
-                    plan.append({"status": "A", "path": relative, "hash": file_hash(source)})
-                elif file_hash(source) != file_hash(target):
-                    plan.append({"status": "C", "path": relative, "hash": file_hash(source)})
+            rollback = "docs/operator/dispatcher-inspector-rollback.md"
+            source, target = staging / rollback, package_root / rollback
+            if not target.is_file():
+                plan.append({"status": "A", "path": rollback, "hash": file_hash(source)})
+            elif file_hash(source) != file_hash(target):
+                plan.append({"status": "C", "path": rollback, "hash": file_hash(source)})
             plan.sort(key=lambda item: item["path"])
         fingerprint = plan_fingerprint(reference, destination, staging, plan)
         result = {"fingerprint": fingerprint, "changes": plan}
@@ -276,12 +269,9 @@ def promote_package(scaffold: Path, package_root: Path) -> None:
     target_package = package_root / "src/one_c_autoresearch"
     replace_tree(source_package, target_package)
     replace_tree(scaffold / "web/workspace", package_root / "web/workspace")
-    for relative in promoted_files():
-        target = package_root / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(scaffold / relative, target)
-        if file_hash(scaffold / relative) != file_hash(target):
-            raise RuntimeError(f"promoted file differs: {relative}")
+    rollback = package_root / "docs/operator/dispatcher-inspector-rollback.md"
+    rollback.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(scaffold / "docs/operator/dispatcher-inspector-rollback.md", rollback)
     require_parity(source_package, target_package)
     require_parity(scaffold / "web/workspace", package_root / "web/workspace")
 

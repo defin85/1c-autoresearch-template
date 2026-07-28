@@ -12,7 +12,7 @@ from one_c_autoresearch.sources import draft_fingerprint, extension_scope_status
 from one_c_autoresearch.user_state import load_connections
 
 
-REPO = Path(__file__).parents[1]
+REPO = Path(__file__).parents[1] / "templates/research-repo"
 
 
 def test_source_acquisition_continues_automatic_pipeline(tmp_path: Path, monkeypatch) -> None:

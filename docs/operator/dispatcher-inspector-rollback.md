@@ -16,3 +16,28 @@ database for diagnostics, replace `dispatcher.sqlite` with
 `dispatcher.pre-inspector.sqlite`, and restart the service. Operational history
 created after the backup is lost; repository sources, generations, and
 deliverables are unaffected. Verify ownership and mode `0600` before restart.
+
+## Extension source-scope rollback
+
+Extension decisions live in `research/infobases.toml`. Source, DIF
+classification, consolidation, and decision generations remain immutable.
+
+An older static frontend may be served while the current backend and CLI stay
+running. The older page may not expose extension review, but backend and CLI
+mutation entrypoints still reject an unreviewed discovered UUID. Use
+`one-c-autoresearch source-scope --repo-path <repo>` to inspect the blocker.
+
+Treat a full runtime downgrade as read-only recovery:
+
+1. Stop the workspace server and all dispatcher or acquisition workers.
+2. Do not run mutation commands from a runtime that predates extension-scope
+   enforcement.
+3. Preserve `research/infobases.toml`, every active pointer, and every immutable
+   generation.
+4. Reinstall the enforcing runtime before restarting mutation entrypoints.
+5. Run `source-scope` and `status`, resolve every
+   `extension_scope_required` blocker, reacquire sources, and resume later
+   stages.
+
+Reinstallation does not rewrite prior generations. The tracked decisions and
+immutable pointers remain the recovery boundary.

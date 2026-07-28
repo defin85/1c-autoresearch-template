@@ -45,19 +45,15 @@
 - [x] 5.3 Add deterministic-classification and consolidation tests for whole extension and external-artifact addition/deletion, modified existing components, preservation of individual DIF identities, one-group-to-many-MRQ decomposition, cross-component evidence, and absence of package persistence.
 - [x] 5.4 Add frontend and browser acceptance for empty, included, excluded, dormant, mixed-role, and newly discovered extension sets, including impact text, UUID-associated errors, keyboard operation, and unsaved-state preservation.
 - [x] 5.5 Implement and verify target-first in a concrete research repository, then synchronize only reusable behavior into the template runtime and scaffold.
-- [ ] 5.6 Rebuild static assets and the packaged research template, then run Python, frontend, browser, synchronization, template, doctor, and strict OpenSpec checks.
+- [x] 5.6 Rebuild static assets and the packaged research template, then run Python, frontend, browser, synchronization, template, doctor, and strict OpenSpec checks.
 - [x] 5.7 Verify frontend-only rollback, document full-runtime downgrade as read-only recovery with mutation entrypoints stopped, and prove reinstalling the enforcing runtime resumes from unchanged decisions and immutable generations.
 
 ## Разрывы ревью
 
-<!-- GOAL_CURSOR -->
-- [ ] R1 Подключить реальную операцию `mrq.consolidate`, ее схемы исполнителя и интеграционные проверки рабочего раздела и координатора.
-  - Этап цикла: исправление
-  - Состояние шага: независимое ревью выявило обязательные разрывы перед финальной проверкой
-  - Следующее действие: исправить реальный путь `agents.execute` и подтвердить обе формы результата
-  - Файлы шага: ../sppr-research-ver2/src/one_c_autoresearch/agents.py; ../sppr-research-ver2/src/one_c_autoresearch/dispatcher.py; ../sppr-research-ver2/tests
-- [ ] R2 Восстановить специфичные для корня проверки, ограничить синхронизацию и подтвердить полный набор Python-проверок шаблона.
-- [ ] R3 Объединить инструкции отката с действующим документом и восстановить точный состав документации.
-- [ ] R4 Явно сериализовать `extension_decisions = []` в новом и повторно сохраненном контракте.
-- [ ] R5 Сделать покрытие детерминированных классификаций чувствительным к версии алгоритма и блокировать этап 3 на устаревших строках.
-- [ ] R6 Делать активное поколение schema v1 устаревшим после решения по расширению, сохраняя его только для чтения.
+- [x] R1 Подключить реальную операцию `mrq.consolidate`, ее схемы исполнителя и интеграционные проверки рабочего раздела и координатора.
+- [x] R2 Восстановить специфичные для корня проверки, ограничить синхронизацию и подтвердить полный набор Python-проверок шаблона.
+- [x] R3 Объединить инструкции отката с действующим документом и восстановить точный состав документации.
+- [x] R4 Явно сериализовать `extension_decisions = []` в новом и повторно сохраненном контракте.
+- [x] R5 Сделать покрытие детерминированных классификаций чувствительным к версии алгоритма и блокировать этап 3 на устаревших строках.
+- [x] R6 Делать активное поколение schema v1 устаревшим после решения по расширению, сохраняя его только для чтения.
+- [x] R7 Исправить типы полей схемы `mrq.consolidate` и доказать прохождение merge, split и cross-component результата агента в канонический план.

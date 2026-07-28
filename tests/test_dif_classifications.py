@@ -10,6 +10,7 @@ from one_c_autoresearch.dif_classifications import (
     make_row,
     publish_empty,
     publish_window,
+    remaining_ids,
 )
 
 
@@ -105,3 +106,42 @@ def test_versioned_whole_component_result_can_replace_only_its_prior_result(repo
             [_row("DIF-0000000000000001")],
             expected_generation_id=second["generation_id"],
         )
+
+
+def test_stale_whole_component_version_does_not_satisfy_coverage(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = repository / "research/active-source-generation.json"
+    source.parent.mkdir(exist_ok=True)
+    source.write_text('{"routing_manifest_path":"routing-manifest.json"}', encoding="utf-8")
+    active = publish_empty(repository)
+    first = publish_window(
+        repository,
+        [_row("DIF-0000000000000001", whole_component=True)],
+        expected_generation_id=active["generation_id"],
+    )
+    expected = {
+        "DIF-0000000000000001": {
+            "result": {
+                "kind": "meaning",
+                "semantic_hints": ["component:extension:x", "whole-component:added"],
+                "evidence": [{"path": "a", "fingerprint": FP}],
+                "rationale": "evidence",
+            },
+            "evidence_fingerprint": FP,
+            "result_schema_fingerprint": FP,
+            "profile_fingerprint": FP,
+            "instruction_fingerprint": "sha256:" + "b" * 64,
+            "context_fingerprint": FP,
+        },
+    }
+    monkeypatch.setattr("one_c_autoresearch.component_groups.deterministic_results", lambda *_args: expected)
+    assert remaining_ids(repository) == ["DIF-0000000000000001", "DIF-0000000000000002"]
+    assert coverage(repository)["all_dif_classified"] is False
+    replacement = _row(
+        "DIF-0000000000000001",
+        whole_component=True,
+        instruction="sha256:" + "b" * 64,
+    )
+    publish_window(repository, [replacement], expected_generation_id=first["generation_id"])
+    assert remaining_ids(repository) == ["DIF-0000000000000002"]

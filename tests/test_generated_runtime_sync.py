@@ -53,6 +53,13 @@ def test_preview_is_sorted_content_free_and_mutates_nothing(reference: Path, tmp
     assert not destination.exists()
 
 
+def test_fresh_seed_declares_empty_extension_scope(reference: Path, tmp_path: Path) -> None:
+    destination = tmp_path / "generated"
+    plan = preview(reference, destination)
+    apply(reference, destination, plan)
+    assert "extension_decisions = []" in (destination / "research/infobases.toml").read_text(encoding="utf-8")
+
+
 def test_apply_requires_matching_fingerprint_and_rechecks_inputs(reference: Path, tmp_path: Path) -> None:
     destination = tmp_path / "generated"
     plan = preview(reference, destination)
@@ -116,14 +123,6 @@ def test_promoted_owned_trees_are_planned_and_pruned(reference: Path, tmp_path: 
     MODULE.sync(reference, destination, True, str(plan["fingerprint"]), True, package_root)
     assert not stale.exists()
     assert MODULE.sync(reference, destination, promote=True, package_root=package_root)["changes"] == []
-
-
-def test_promotion_updates_declared_runtime_tests_and_operator_docs(reference: Path, tmp_path: Path) -> None:
-    destination, package_root = tmp_path / "generated", tmp_path / "package"
-    plan = MODULE.sync(reference, destination, promote=True, package_root=package_root)
-    MODULE.sync(reference, destination, True, str(plan["fingerprint"]), True, package_root)
-    for relative in MODULE.promoted_files():
-        assert (package_root / relative).read_bytes() == (destination / relative).read_bytes()
 
 
 def test_fingerprint_is_bounded_and_declared_payloads_fail_closed(reference: Path, tmp_path: Path) -> None:

@@ -193,13 +193,14 @@ def coverage(repo: Path) -> dict[str, int | bool]:
         rows = load_active(repo)["rows"]
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         rows = []
-    classified = {row["stable_diff_id"] for row in rows}
+    current_rows = _current_rows(repo, rows)
+    classified = set(current_rows)
     return {
         "total": len(total_ids),
         "classified": len(classified & total_ids),
         "remaining": len(total_ids - classified),
-        "meaning": sum(row["classification"] == "meaning" for row in rows),
-        "noise_candidate": sum(row["classification"] == "noise_candidate" for row in rows),
+        "meaning": sum(row["classification"] == "meaning" for row in current_rows.values()),
+        "noise_candidate": sum(row["classification"] == "noise_candidate" for row in current_rows.values()),
         "all_dif_classified": classified == total_ids,
     }
 
@@ -258,10 +259,17 @@ def publish_empty(repo: Path, *, expected_generation_id: str | None = None) -> d
 
 def remaining_ids(repo: Path, *, limit: int = 32) -> list[str]:
     active = load_active(repo)["rows"] if (repo / POINTER).is_file() else []
-    classified = {row["stable_diff_id"]: row for row in active}
-    stale: set[str] = set()
+    classified = _current_rows(repo, active)
+    return sorted({row["stable_diff_id"] for row in inventory(repo)} - set(classified))[:limit]
+
+
+def _current_rows(repo: Path, rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    classified = {row["stable_diff_id"]: row for row in rows}
+    source_path = repo / "research/active-source-generation.json"
+    if not source_path.is_file():
+        return classified
     from .component_groups import deterministic_results
-    source = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+    source = json.loads(source_path.read_text(encoding="utf-8"))
     expected = deterministic_results(repo, classified) if source.get("routing_manifest_path") else {}
     for identifier, value in expected.items():
         row = make_row(identifier, value["result"], **{
@@ -272,8 +280,8 @@ def remaining_ids(repo: Path, *, limit: int = 32) -> list[str]:
             )
         })
         if classified.get(identifier) != row:
-            stale.add(identifier)
-    return sorted(({row["stable_diff_id"] for row in inventory(repo)} - set(classified)) | stale)[:limit]
+            classified.pop(identifier, None)
+    return classified
 
 
 def reusable_rows(
