@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 import time
+import tomllib
 import zipfile
 from types import SimpleNamespace
 from pathlib import Path
@@ -10,9 +11,78 @@ from pathlib import Path
 import pytest
 
 from one_c_autoresearch import diffs
-from one_c_autoresearch.contracts import canonical_json, external_id, sha256
-from one_c_autoresearch.sources import LEGACY_PROFILES, NORMALIZER_VERSION, PROFILES, _extract_source_tree, _run_command, _toolchain_versions, acquire, adapter_plan, build_routing_preview, clean_payload, configuration_identity, normalize_payload, preflight_connection, publish, routing_bindings, stream_upload, validate_active, validate_role_contract
+from one_c_autoresearch.contracts import canonical_json, external_id, repository_lock, sha256
+from one_c_autoresearch.sources import LEGACY_PROFILES, NORMALIZER_VERSION, PROFILES, _acquire_verified, _extract_source_tree, _run_command, _toolchain_versions, acquire, adapter_plan, build_routing_preview, clean_payload, configuration_identity, normalize_extension_decisions, normalize_payload, preflight_connection, publish, publish_routed, routing_bindings, serialize_infobases, stream_upload, validate_active, validate_role_contract
 from one_c_autoresearch.service import ApplicationService
+
+
+def test_extension_decisions_are_strict_normalized_and_deterministic():
+    first = {"uuid": "22222222-2222-2222-2222-222222222222", "decision": "exclude", "rationale": "  Техническое  "}
+    second = {"uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "decision": "include", "rationale": ""}
+    assert normalize_extension_decisions([first, second]) == [{**first, "rationale": "Техническое"}, second]
+    contract = {
+        "schema_version": "1",
+        "acquisition_profile": "ibcmd+form-aware/v1",
+        "extension_decisions": [first, second],
+        "roles": {
+            role: {"connection_profile": role, "configuration_name": "Cfg", "root_uuid": "00000000-0000-0000-0000-000000000001", "version": "1"}
+            for role in ("vendor_baseline", "target_cf", "next_vendor")
+        },
+    }
+    assert tomllib.loads(serialize_infobases(contract).decode())["extension_decisions"] == normalize_extension_decisions([first, second])
+    invalid = [
+        [{"uuid": second["uuid"], "decision": "include", "rationale": "", "extra": ""}],
+        [second, second],
+        [{**second, "uuid": second["uuid"].upper()}],
+        [{**second, "decision": "maybe"}],
+        [{**second, "rationale": "unexpected"}],
+        [{**first, "rationale": " "}],
+    ]
+    for value in invalid:
+        with pytest.raises(ValueError):
+            normalize_extension_decisions(value)
+
+
+def test_preflight_extension_discovery_bounds_fail_before_identity_export(tmp_path: Path):
+    connection = {"dbms": "PostgreSQL", "db_server": "localhost", "db_name": "db", "db_user": "u", "db_password": "p", "infobase_user": "u", "infobase_password": "p"}
+    def response(payload: str):
+        def fake_run(command, **_kwargs):
+            if command[-1] == "--version":
+                return SimpleNamespace(returncode=0, stdout="8.3.27.1989", stderr="")
+            if command[1:3] == ["extension", "list"]:
+                return SimpleNamespace(returncode=0, stdout=payload, stderr="")
+            raise AssertionError("identity export must not start after an exhausted bound")
+        return fake_run
+    with pytest.raises(ValueError, match="response-size"):
+        preflight_connection("ibcmd+form-aware/v1", tmp_path, connection, run=response("x" * (1024 * 1024 + 1)))
+    many = "".join(f'name: \"E{index}\"\nactive: yes\n' for index in range(1001))
+    with pytest.raises(ValueError, match="extension-count"):
+        preflight_connection("ibcmd+form-aware/v1", tmp_path, connection, run=response(many))
+
+
+def test_routing_preview_blocks_unreviewed_extension_without_export(tmp_path: Path):
+    research = tmp_path / "research"; research.mkdir()
+    (research / "workflow.toml").write_text("schema_version='1'\n", encoding="utf-8")
+    (research / "external-artifacts.toml").write_text("schema_version='1'\nartifacts=[]\n", encoding="utf-8")
+    (tmp_path / "project.toml").write_text('[project]\nid="p"\nproduct="p"\nbaseline_version="1"\ntarget_version="1"\nnext_vendor_version="2"\n', encoding="utf-8")
+    (research / "infobases.toml").write_text('schema_version="1"\nacquisition_profile="ibcmd+form-aware/v1"\nextension_decisions=[]\n' + "".join(
+        f'[roles.{role}]\nconnection_profile="{role}"\nconfiguration_name="Cfg"\nroot_uuid="00000000-0000-0000-0000-000000000001"\nversion="{version}"\n'
+        for role, version in (("vendor_baseline", "1"), ("target_cf", "1"), ("next_vendor", "2"))
+    ), encoding="utf-8")
+    extension = {"uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "name": "Service", "version": "1", "active": False}
+    profiles = {}
+    for role in ("vendor_baseline", "target_cf", "next_vendor"):
+        profile = {"kind": "server", "server": "localhost", "reference": role, "profile_id": "ibcmd+form-aware/v1", "tested": True, "extensions": [extension] if role == "target_cf" else []}
+        profile["tested_fingerprint"] = "sha256:" + sha256(canonical_json(profile))
+        profiles[role] = profile
+    preview = build_routing_preview(tmp_path, tmp_path, profiles, run=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("export must not start")))
+    assert preview["blockers"] == [{
+        "code": "extension_scope_required",
+        "uuid": extension["uuid"],
+        "roles": preview["extension_scope"]["extensions"][0]["roles"],
+        "action": "review_extension_scope",
+    }]
+    assert preview["routing_manifest"]["groups"] == []
 
 
 def test_exact_form_aware_profiles_and_legacy_internal_adapters(tmp_path: Path):
@@ -139,6 +209,105 @@ def test_acquisition_rejects_exhausted_space_without_pointer_change(tmp_path: Pa
     assert json.loads(pointer.read_text(encoding="utf-8"))["generation_id"] == "prior"
 
 
+def test_routed_publication_rechecks_freshness_inside_repository_lock(tmp_path: Path):
+    staged = tmp_path / "staged"
+    for role in ("vendor_baseline", "target_cf", "next_vendor"):
+        root = staged / role / "configuration"
+        root.mkdir(parents=True)
+        (root / "Configuration.xml").write_text(role, encoding="utf-8")
+    manifest = {"schema_version": "2", "routing_contract_version": "test", "groups": []}
+    manifest["routing_manifest_fingerprint"] = "sha256:" + sha256(canonical_json(manifest))
+    called = False
+
+    def freshness_check():
+        nonlocal called
+        called = True
+        with pytest.raises(RuntimeError, match="writer is busy"):
+            with repository_lock(tmp_path):
+                pass
+        raise RuntimeError("routing_preview_stale")
+
+    with pytest.raises(RuntimeError, match="routing_preview_stale"):
+        publish_routed(
+            tmp_path,
+            staged,
+            {"acquisition_profile_id": "ibcmd+form-aware/v1"},
+            manifest,
+            NORMALIZER_VERSION,
+            None,
+            lambda *_args: "sha256:" + "0" * 64,
+            freshness_check=freshness_check,
+        )
+    assert called
+    assert not (tmp_path / "research/active-source-generation.json").exists()
+    assert not (tmp_path / "sources/generations").exists()
+
+
+def test_preexport_extension_verification_has_one_overall_deadline(tmp_path: Path, monkeypatch):
+    research = tmp_path / "research"
+    research.mkdir()
+    tmp_path.joinpath("project.toml").write_text(
+        '[project]\nid="p"\nproduct="p"\nbaseline_version="1"\ntarget_version="1"\nnext_vendor_version="2"\n',
+        encoding="utf-8",
+    )
+    research.joinpath("workflow.toml").write_text("schema_version='1'\n", encoding="utf-8")
+    research.joinpath("external-artifacts.toml").write_text("schema_version='1'\nartifacts=[]\n", encoding="utf-8")
+    research.joinpath("infobases.toml").write_text(
+        'schema_version="1"\nacquisition_profile="ibcmd+form-aware/v1"\nextension_decisions=[]\n'
+        + "".join(
+            f'[roles.{role}]\nconnection_profile="{role}"\nconfiguration_name="Cfg"\n'
+            'root_uuid="00000000-0000-0000-0000-000000000001"\n'
+            f'version="{"2" if role == "next_vendor" else "1"}"\n'
+            for role in ("vendor_baseline", "target_cf", "next_vendor")
+        ),
+        encoding="utf-8",
+    )
+    profiles = {}
+    for role in ("vendor_baseline", "target_cf", "next_vendor"):
+        profile = {
+            "kind": "server",
+            "server": "localhost",
+            "reference": role,
+            "profile_id": "ibcmd+form-aware/v1",
+            "tested": True,
+            "extensions": [],
+            "configuration": {
+                "uuid": "00000000-0000-0000-0000-000000000001",
+                "name": "Cfg",
+                "version": "2" if role == "next_vendor" else "1",
+            },
+        }
+        profile["tested_fingerprint"] = "sha256:" + sha256(canonical_json(profile))
+        profiles[role] = profile
+    clock = {"value": 0.0}
+    monkeypatch.setattr("one_c_autoresearch.sources.time.monotonic", lambda: clock["value"])
+
+    def slow_preflight(*_args, **kwargs):
+        assert kwargs["timeout_seconds"] <= 1
+        clock["value"] += 0.6
+        return {"extensions": []}
+
+    monkeypatch.setattr("one_c_autoresearch.sources.preflight_connection", slow_preflight)
+    identity_root = tmp_path / "identity"
+    identity_root.mkdir()
+    with pytest.raises(TimeoutError, match="overall-time"):
+        _acquire_verified(
+            tmp_path,
+            tmp_path,
+            profiles,
+            routing_preview={"blockers": []},
+            normalizer_version=NORMALIZER_VERSION,
+            timeout_seconds=1,
+            run=subprocess.run,
+            upload_drafts=None,
+            cancelled=None,
+            progress=None,
+            activate=True,
+            identity_root=identity_root,
+        )
+    assert not (research / "active-source-generation.json").exists()
+
+
 def test_streamed_upload_and_atomic_source_generation(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("one_c_autoresearch.sources.shutil.disk_usage", lambda _: type("D", (), {"free": 2 * 1024**3})())
     drafts = tmp_path / "drafts"; drafts.mkdir()
@@ -164,7 +333,7 @@ def test_external_artifact_declaration_is_closed_and_uses_declared_size(tmp_path
     (tmp_path / "research").mkdir()
     (tmp_path / "research/workflow.toml").write_text("schema_version='1'\n", encoding="utf-8")
     (tmp_path / "project.toml").write_text('[project]\nid="p"\nproduct="p"\nbaseline_version="1"\ntarget_version="1"\nnext_vendor_version="2"\n', encoding="utf-8")
-    (tmp_path / "research/infobases.toml").write_text('schema_version="1"\nacquisition_profile="ibcmd+form-aware/v1"\n' + ''.join(f'[roles.{role}]\nconnection_profile="{role}"\nconfiguration_name="Cfg"\nroot_uuid="00000000-0000-0000-0000-000000000001"\nversion="{version}"\n' for role, version in (("vendor_baseline", "1"), ("target_cf", "1"), ("next_vendor", "2"))), encoding="utf-8")
+    (tmp_path / "research/infobases.toml").write_text('schema_version="1"\nacquisition_profile="ibcmd+form-aware/v1"\nextension_decisions=[{uuid="11111111-1111-1111-1111-111111111111",decision="include",rationale=""}]\n' + ''.join(f'[roles.{role}]\nconnection_profile="{role}"\nconfiguration_name="Cfg"\nroot_uuid="00000000-0000-0000-0000-000000000001"\nversion="{version}"\n' for role, version in (("vendor_baseline", "1"), ("target_cf", "1"), ("next_vendor", "2"))), encoding="utf-8")
     profiles = {role: {"kind": "server", "server": "localhost", "reference": role, "profile_id": "ibcmd+form-aware/v1", "tested": True, "extensions": [], "dbms": "PostgreSQL", "db_server": "localhost", "db_name": role, "db_user": "u", "db_password": "p", "infobase_user": "u", "infobase_password": "p"} for role in ("vendor_baseline", "target_cf", "next_vendor")}
     for profile in profiles.values():
         profile["tested_fingerprint"] = "sha256:" + sha256(canonical_json({key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}}))
@@ -219,7 +388,7 @@ def test_acquire_exports_all_three_roles_before_one_publication(tmp_path: Path, 
     (tmp_path / "research").mkdir()
     (tmp_path / "research/workflow.toml").write_text("schema_version='1'\n", encoding="utf-8")
     (tmp_path / "project.toml").write_text('[project]\nid="p"\nproduct="p"\nbaseline_version="1"\ntarget_version="1"\nnext_vendor_version="2"\n', encoding="utf-8")
-    (tmp_path / "research/infobases.toml").write_text('schema_version="1"\nacquisition_profile="ibcmd+form-aware/v1"\n' + ''.join(f'[roles.{role}]\nconnection_profile="{role}"\nconfiguration_name="Cfg"\nroot_uuid="00000000-0000-0000-0000-000000000001"\nversion="{version}"\n' for role, version in (("vendor_baseline", "1"), ("target_cf", "1"), ("next_vendor", "2"))), encoding="utf-8")
+    (tmp_path / "research/infobases.toml").write_text('schema_version="1"\nacquisition_profile="ibcmd+form-aware/v1"\nextension_decisions=[{uuid="11111111-1111-1111-1111-111111111111",decision="include",rationale=""}]\n' + ''.join(f'[roles.{role}]\nconnection_profile="{role}"\nconfiguration_name="Cfg"\nroot_uuid="00000000-0000-0000-0000-000000000001"\nversion="{version}"\n' for role, version in (("vendor_baseline", "1"), ("target_cf", "1"), ("next_vendor", "2"))), encoding="utf-8")
     (tmp_path / "research/external-artifacts.toml").write_text('schema_version="1"\nartifacts=[]\n', encoding="utf-8")
     extension = {"name": "Extension", "version": "1.0", "active": True, "uuid": "11111111-1111-1111-1111-111111111111"}
     profiles = {role: {"kind": "server", "server": "localhost", "reference": role, "profile_id": "ibcmd+form-aware/v1", "tested": True, "dbms": "PostgreSQL", "db_server": "localhost", "db_name": role, "db_user": "u", "db_password": "p", "infobase_user": "u", "infobase_password": "p", "extensions": [extension], "tool_versions": {"platform": "8.3.27.1989", "exporter": "ibcmd"}} for role in ("vendor_baseline", "target_cf", "next_vendor")}
@@ -234,7 +403,7 @@ def test_acquire_exports_all_three_roles_before_one_publication(tmp_path: Path, 
         if command[1:3] == ["extension", "list"]:
             return SimpleNamespace(returncode=0, stdout='name: "Extension"\nversion: "1.0"\nactive: yes\n', stderr="")
         output = Path(command[-1]); output.mkdir(parents=True)
-        if mode["partial_role"] and ".work" in output.parts and "next_vendor" in output.parts:
+        if mode["partial_role"] and (".work" in output.parts or any(part.startswith("extension-verification-") for part in output.parts)) and "next_vendor" in output.parts:
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
         is_extension = "--extension=Extension" in command
         version = "1.0" if is_extension else "2" if "next_vendor" in " ".join(map(str, command)) else "1"
@@ -273,10 +442,29 @@ def test_acquire_exports_all_three_roles_before_one_publication(tmp_path: Path, 
     monkeypatch.setattr(source_module, "_check_cancelled", original)
     partial_preview = build_routing_preview(tmp_path, Path("/opt/1cv8"), profiles, run=fake_run)
     mode["partial_role"] = True
-    with pytest.raises(ValueError, match="source_export_empty"):
+    with pytest.raises(ValueError, match="exported configuration root is missing"):
         acquire(tmp_path, Path("/opt/1cv8"), profiles, routing_preview=partial_preview, run=fake_run)
     assert pointer_path.read_bytes() == prior
     assert not any((tmp_path / "sources/.staging").iterdir())
+    mode["partial_role"] = False
+    contract_path = tmp_path / "research/infobases.toml"
+    contract_path.write_text(
+        contract_path.read_text(encoding="utf-8").replace(
+            'decision="include",rationale=""',
+            'decision="exclude",rationale="out of scope"',
+        ),
+        encoding="utf-8",
+    )
+    excluded_preview = build_routing_preview(tmp_path, Path("/opt/1cv8"), profiles, run=fake_run)
+    excluded = acquire(tmp_path, Path("/opt/1cv8"), profiles, routing_preview=excluded_preview, run=fake_run)
+    excluded_root = tmp_path / "sources/generations" / excluded["generation_id"]
+    assert not any(item["kind"] == "extension" for item in excluded["components"])
+    assert not any(path.name == extension["uuid"] for path in excluded_root.rglob("*"))
+    diff = diffs.build(tmp_path, excluded)
+    diff_root = tmp_path / "analysis/indexes/generations" / diff["generation_id"]
+    assert extension["uuid"] not in (diff_root / "diff-inventory.csv").read_text(encoding="utf-8")
+    assert extension["uuid"] not in (diff_root / "extension-physical-diff.csv").read_text(encoding="utf-8")
+    assert extension["uuid"] not in (diff_root / "extension-diff.jsonl").read_text(encoding="utf-8")
 
 
 def test_routing_preview_probes_all_roles_and_is_repeatable(tmp_path: Path):

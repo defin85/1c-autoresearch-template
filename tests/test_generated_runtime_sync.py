@@ -118,6 +118,14 @@ def test_promoted_owned_trees_are_planned_and_pruned(reference: Path, tmp_path: 
     assert MODULE.sync(reference, destination, promote=True, package_root=package_root)["changes"] == []
 
 
+def test_promotion_updates_declared_runtime_tests_and_operator_docs(reference: Path, tmp_path: Path) -> None:
+    destination, package_root = tmp_path / "generated", tmp_path / "package"
+    plan = MODULE.sync(reference, destination, promote=True, package_root=package_root)
+    MODULE.sync(reference, destination, True, str(plan["fingerprint"]), True, package_root)
+    for relative in MODULE.promoted_files():
+        assert (package_root / relative).read_bytes() == (destination / relative).read_bytes()
+
+
 def test_fingerprint_is_bounded_and_declared_payloads_fail_closed(reference: Path, tmp_path: Path) -> None:
     destination = tmp_path / "generated"
     before = preview(reference, destination)["fingerprint"]

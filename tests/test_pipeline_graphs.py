@@ -27,6 +27,7 @@ from one_c_autoresearch.pipeline_graphs import (
     build_decide_state,
     build_classify_state,
     build_discover_state,
+    compile_analyze_graph,
     compile_classify_graph,
     compile_discover_graph,
     decide_apply,
@@ -55,12 +56,11 @@ def _bootstrap_repo(tmp_path: Path, customer_diffs: list[dict[str, str]], *, wit
     research = repo / "research"
     research.mkdir(parents=True)
     (repo / "project.toml").write_text('[project]\nid="t"\nproduct="t"\nbaseline_version="1"\ntarget_version="1"\nnext_vendor_version="1"\ndescription="t"\n', encoding="utf-8")
-    scaffold = Path(__file__).resolve().parents[1] / "templates/research-repo"
-    (research / "workflow.toml").write_bytes((scaffold / "research/workflow.toml").read_bytes())
+    (research / "workflow.toml").write_bytes((Path(__file__).resolve().parents[1] / "research/workflow.toml").read_bytes())
     (research / "infobases.toml").write_text('schema_version = "1"\n', encoding="utf-8")
     (research / "external-artifacts.toml").write_text('schema_version = "1"\n', encoding="utf-8")
     (research / "indexing.toml").write_text('schema_version = "1"\nengine = "rlm-tools-bsl"\nengine_version = "1.28.1"\n', encoding="utf-8")
-    (research / "forbidden-authorities.json").write_bytes((scaffold / "research/forbidden-authorities.json").read_bytes())
+    (research / "forbidden-authorities.json").write_bytes((Path(__file__).resolve().parents[1] / "research/forbidden-authorities.json").read_bytes())
     source_id = "a" * 64
     diff_id = "b" * 64
     source_pointer = {
@@ -141,6 +141,79 @@ def _group(identifier: str, stable_diff_ids: list[str]) -> dict[str, Any]:
 def test_fixed_limits_match_design_contract() -> None:
     assert MAX_DIF_WINDOW == 32
     assert MAX_GROUP_CANDIDATES == 64
+
+
+def test_analyze_window_combines_local_and_agent_rows_atomically_without_starting_stage_three(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _bootstrap_repo(tmp_path, [_customer_diff("DIF-LOCAL"), _customer_diff("DIF-AGENT")])
+    store = DispatcherStore(repo, base=tmp_path / "state")
+    store.open()
+    pending = ["DIF-AGENT", "DIF-LOCAL"]
+    published: list[list[dict[str, Any]]] = []
+    agent_calls: list[str] = []
+
+    def publish_empty(_repo, **_kwargs):
+        (repo / "research/active-dif-classification-generation.json").write_text("{}", encoding="utf-8")
+        return {"generation_id": "empty"}
+
+    def publish_window(_repo, rows, **_kwargs):
+        published.append(list(rows))
+        pending.clear()
+        return {"generation_id": "published"}
+
+    monkeypatch.setattr("one_c_autoresearch.dif_classifications.publish_empty", publish_empty)
+    monkeypatch.setattr("one_c_autoresearch.dif_classifications.remaining_ids", lambda _repo: list(pending))
+    monkeypatch.setattr("one_c_autoresearch.dif_classifications.load_active", lambda _repo: {"pointer": {"generation_id": "empty"}})
+    monkeypatch.setattr("one_c_autoresearch.dif_classifications.publish_window", publish_window)
+    monkeypatch.setattr("one_c_autoresearch.dif_classifications.physical_evidence_fingerprints", lambda _repo: {"DIF-AGENT": "sha256:" + "a" * 64})
+    monkeypatch.setattr("one_c_autoresearch.dif_classifications.make_row", lambda identifier, result, **_kwargs: {"stable_diff_id": identifier, "kind": result["kind"]})
+    monkeypatch.setattr("one_c_autoresearch.component_groups.deterministic_results", lambda _repo, _ids: {
+        "DIF-LOCAL": {
+            "result": {"kind": "meaning"},
+            **{key: "sha256:" + "b" * 64 for key in (
+                "evidence_fingerprint", "result_schema_fingerprint", "profile_fingerprint",
+                "instruction_fingerprint", "context_fingerprint",
+            )},
+        },
+    })
+    monkeypatch.setattr("one_c_autoresearch.pipeline_graphs._analyze_work_unit", lambda _repo, identifier: {"id": identifier, "allowed_path_fingerprints": []})
+
+    def analyze(state, identifier, **_kwargs):
+        agent_calls.append(identifier)
+        return {**state, "analyzed": {identifier: {"kind": "meaning"}}}
+
+    monkeypatch.setattr("one_c_autoresearch.pipeline_graphs.discover_analyze_one", analyze)
+    graph = compile_analyze_graph(
+        repo=repo,
+        saver=store.saver,
+        executor=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("wrapped executor is not called directly")),
+        profile={},
+        supplement="",
+        timeout_seconds=60,
+        cancelled=lambda: False,
+        bindings_check=lambda: True,
+    )
+    try:
+        state = graph.invoke(build_discover_state(_bindings(), "run", "thread"), config={"configurable": {"thread_id": "thread"}})
+        assert state["status"] == "completed"
+        assert agent_calls == ["DIF-AGENT"]
+        assert [{row["stable_diff_id"] for row in window} for window in published] == [{"DIF-AGENT", "DIF-LOCAL"}]
+        pending[:] = ["DIF-AGENT", "DIF-LOCAL"]
+        published.clear()
+        monkeypatch.setattr(
+            "one_c_autoresearch.pipeline_graphs.discover_analyze_one",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("agent failed")),
+        )
+        failed = graph.invoke(
+            build_discover_state(_bindings(), "run-2", "thread-2"),
+            config={"configurable": {"thread_id": "thread-2"}},
+        )
+    finally:
+        store.close()
+    assert failed["status"] == "failed"
+    assert published == []
 
 
 def test_discover_is_a_compiled_checkpointed_langgraph(tmp_path: Path) -> None:

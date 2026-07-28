@@ -16,39 +16,48 @@
 
 ## 3. Align The Workspace Contract
 
-<!-- GOAL_CURSOR -->
-- [ ] 3.1 Add a dedicated extension-review section with one UUID row, three role observations, decision control, and conditional rationale.
-  - Этап цикла: реализация
-  - Состояние шага: раздел, полный выбор и доступные UUID-связанные элементы реализованы; требуется связать блокировщик и общий CLI-контракт
-  - Следующее действие: добавить переход от extension_scope_required к точной строке, общий read-only helper и CLI-диагностику
-  - Файлы шага: ../sppr-research-ver2/web/workspace/src/App.tsx; ../sppr-research-ver2/src/one_c_autoresearch/workspace_api.py; ../sppr-research-ver2/src/one_c_autoresearch/cli.py; ../sppr-research-ver2/tests; openspec/changes/add-explicit-extension-source-scope/tasks.md
-- [ ] 3.2 Preview and confirm the exact tracked contract mutation using existing stale-input and idempotency protections.
-- [ ] 3.3 Direct `extension_scope_required` blockers to the extension-review section and preserve unsaved selections during unrelated reconciliation.
-- [ ] 3.4 Rename and explain the external-artifact section as uploaded external files for EPF, ERF, source trees, and other declared files.
-- [ ] 3.5 Expose the same extension-scope readiness and diagnostics through CLI and browser paths.
-- [ ] 3.6 Show include/exclude consequences, keep activation informational, list dormant decisions separately, and provide UUID-associated accessible controls, errors, and keyboard operation.
+- [x] 3.1 Add a dedicated extension-review section with one UUID row, three role observations, decision control, and conditional rationale.
+- [x] 3.2 Preview and confirm the exact tracked contract mutation using existing stale-input and idempotency protections.
+- [x] 3.3 Direct `extension_scope_required` blockers to the extension-review section and preserve unsaved selections during unrelated reconciliation.
+- [x] 3.4 Rename and explain the external-artifact section as uploaded external files for EPF, ERF, source trees, and other declared files.
+- [x] 3.5 Expose the same extension-scope readiness and diagnostics through CLI and browser paths.
+- [x] 3.6 Show include/exclude consequences, keep activation informational, list dormant decisions separately, and provide UUID-associated accessible controls, errors, and keyboard operation.
 
 ## 4. Preserve Generation And DIF Boundaries
 
-- [ ] 4.1 Start a new comparison epoch when an extension decision changes or a new unreviewed UUID is discovered.
-- [ ] 4.2 Keep previous immutable generations readable while rejecting them as current readiness evidence.
-- [ ] 4.3 Prove excluded extensions produce no source component, physical extension row, semantic extension intervention, DIF classification unit, or MRQ input.
-- [ ] 4.4 Prove included extensions retain existing UUID-based physical-to-semantic path closure and target coverage behavior.
-- [ ] 4.5 Derive component kind, component key, whole-component change direction, exact member DIF IDs, evidence, and coverage from canonical source and diff facts without persisting a package entity.
-- [ ] 4.6 Deterministically publish existing-schema `meaning` classifications for every DIF of a wholly added or deleted included extension or declared external-artifact component without an agent call.
-- [ ] 4.7 Reuse existing bounded stage-2 windows: derive eligible rows locally, call the agent only for other window members, publish no partial window on failure, and never auto-start stage 3.
-- [ ] 4.8 Keep ordinary stage-2 classification for DIF of components present on both comparison sides.
-- [ ] 4.9 Supply paged bounded component-grouped context to stage 3 and allow one group to produce one or more ordinary MRQs while preserving exact primary-DIF ownership.
-- [ ] 4.10 Version deterministic classification as `whole-component-meaning/v1`, bind it through existing fingerprints, and resolve added evidence from `target_cf` and deleted evidence from `vendor_baseline`.
-- [ ] 4.11 Treat grouping as a hint that preserves compatible retained MRQs and normal merge, split, supersede, cross-component evidence, and complete closure rules.
-- [ ] 4.12 Prove component grouping preserves every stable member DIF and never creates one synthetic extension-level or external-artifact-level DIF.
+- [x] 4.1 Start a new comparison epoch when an extension decision changes or a new unreviewed UUID is discovered.
+- [x] 4.2 Keep previous immutable generations readable while rejecting them as current readiness evidence.
+- [x] 4.3 Prove excluded extensions produce no source component, physical extension row, semantic extension intervention, DIF classification unit, or MRQ input.
+- [x] 4.4 Prove included extensions retain existing UUID-based physical-to-semantic path closure and target coverage behavior.
+- [x] 4.5 Derive component kind, component key, whole-component change direction, exact member DIF IDs, evidence, and coverage from canonical source and diff facts without persisting a package entity.
+- [x] 4.6 Deterministically publish existing-schema `meaning` classifications for every DIF of a wholly added or deleted included extension or declared external-artifact component without an agent call.
+- [x] 4.7 Reuse existing bounded stage-2 windows: derive eligible rows locally, call the agent only for other window members, publish no partial window on failure, and never auto-start stage 3.
+- [x] 4.8 Keep ordinary stage-2 classification for DIF of components present on both comparison sides.
+- [x] 4.9 Supply paged bounded component-grouped context to stage 3 and allow one group to produce one or more ordinary MRQs while preserving exact primary-DIF ownership.
+- [x] 4.10 Version deterministic classification as `whole-component-meaning/v1`, bind it through existing fingerprints, and resolve added evidence from `target_cf` and deleted evidence from `vendor_baseline`.
+- [x] 4.11 Treat grouping as a hint that preserves compatible retained MRQs and normal merge, split, supersede, cross-component evidence, and complete closure rules.
+- [x] 4.12 Prove component grouping preserves every stable member DIF and never creates one synthetic extension-level or external-artifact-level DIF.
 
 ## 5. Migrate And Verify
 
-- [ ] 5.1 Add legacy-project coverage showing existing generations remain readable and the next acquisition blocks until explicit review.
-- [ ] 5.2 Add role-drift, rename-with-stable-UUID, activation-change, dormant-policy reappearance, stale-preview, pre-export live-drift, bound-exhaustion, and concurrent-edit tests.
-- [ ] 5.3 Add deterministic-classification and consolidation tests for whole extension and external-artifact addition/deletion, modified existing components, preservation of individual DIF identities, one-group-to-many-MRQ decomposition, cross-component evidence, and absence of package persistence.
-- [ ] 5.4 Add frontend and browser acceptance for empty, included, excluded, dormant, mixed-role, and newly discovered extension sets, including impact text, UUID-associated errors, keyboard operation, and unsaved-state preservation.
-- [ ] 5.5 Implement and verify target-first in a concrete research repository, then synchronize only reusable behavior into the template runtime and scaffold.
+- [x] 5.1 Add legacy-project coverage showing existing generations remain readable and the next acquisition blocks until explicit review.
+- [x] 5.2 Add role-drift, rename-with-stable-UUID, activation-change, dormant-policy reappearance, stale-preview, pre-export live-drift, bound-exhaustion, and concurrent-edit tests.
+- [x] 5.3 Add deterministic-classification and consolidation tests for whole extension and external-artifact addition/deletion, modified existing components, preservation of individual DIF identities, one-group-to-many-MRQ decomposition, cross-component evidence, and absence of package persistence.
+- [x] 5.4 Add frontend and browser acceptance for empty, included, excluded, dormant, mixed-role, and newly discovered extension sets, including impact text, UUID-associated errors, keyboard operation, and unsaved-state preservation.
+- [x] 5.5 Implement and verify target-first in a concrete research repository, then synchronize only reusable behavior into the template runtime and scaffold.
 - [ ] 5.6 Rebuild static assets and the packaged research template, then run Python, frontend, browser, synchronization, template, doctor, and strict OpenSpec checks.
-- [ ] 5.7 Verify frontend-only rollback, document full-runtime downgrade as read-only recovery with mutation entrypoints stopped, and prove reinstalling the enforcing runtime resumes from unchanged decisions and immutable generations.
+- [x] 5.7 Verify frontend-only rollback, document full-runtime downgrade as read-only recovery with mutation entrypoints stopped, and prove reinstalling the enforcing runtime resumes from unchanged decisions and immutable generations.
+
+## Разрывы ревью
+
+<!-- GOAL_CURSOR -->
+- [ ] R1 Подключить реальную операцию `mrq.consolidate`, ее схемы исполнителя и интеграционные проверки рабочего раздела и координатора.
+  - Этап цикла: исправление
+  - Состояние шага: независимое ревью выявило обязательные разрывы перед финальной проверкой
+  - Следующее действие: исправить реальный путь `agents.execute` и подтвердить обе формы результата
+  - Файлы шага: ../sppr-research-ver2/src/one_c_autoresearch/agents.py; ../sppr-research-ver2/src/one_c_autoresearch/dispatcher.py; ../sppr-research-ver2/tests
+- [ ] R2 Восстановить специфичные для корня проверки, ограничить синхронизацию и подтвердить полный набор Python-проверок шаблона.
+- [ ] R3 Объединить инструкции отката с действующим документом и восстановить точный состав документации.
+- [ ] R4 Явно сериализовать `extension_decisions = []` в новом и повторно сохраненном контракте.
+- [ ] R5 Сделать покрытие детерминированных классификаций чувствительным к версии алгоритма и блокировать этап 3 на устаревших строках.
+- [ ] R6 Делать активное поколение schema v1 устаревшим после решения по расширению, сохраняя его только для чтения.

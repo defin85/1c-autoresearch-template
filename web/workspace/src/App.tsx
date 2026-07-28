@@ -43,7 +43,7 @@ import { EnrichedSubFlowReference } from "./dispatcher/EnrichedSubFlowReference"
 import { ExternalFolderImport } from "./ExternalFolderImport";
 import type { DispatcherProjection } from "./dispatcher/projection";
 
-type Blocker = { code: string; message: string; action: string };
+type Blocker = { code: string; message: string; action: string; uuid?: string };
 type Gate = {
   id: string;
   state: "blocked" | "ready" | "complete";
@@ -54,6 +54,7 @@ type Snapshot = {
   state: string;
   workflow_fingerprint: string;
   gates: Gate[];
+  extension_scope_blockers?: Blocker[];
   dispatcher?: DispatcherProjection;
 };
 type Project = { id: string; name: string; root: string };
@@ -105,6 +106,16 @@ type ExternalArtifact = {
   external_artifact_id: string;
   uploaded: boolean;
 };
+type ExtensionScopeRow = {
+  uuid: string;
+  decision: "" | "include" | "exclude";
+  rationale: string;
+  dormant: boolean;
+  roles: Record<
+    string,
+    { present: boolean; name: string; version: string; active: boolean }
+  >;
+};
 type SourceSetup = {
   profiles: string[];
   infobases: {
@@ -120,6 +131,13 @@ type SourceSetup = {
     >;
   };
   infobases_fingerprint: string;
+  extension_scope: {
+    extensions: ExtensionScopeRow[];
+    included: string[];
+    excluded: string[];
+    dormant: string[];
+    unreviewed: string[];
+  };
   external_artifacts: { artifacts: ExternalArtifact[] };
   upload_draft_fingerprint: string;
   connection_profiles: Record<
@@ -189,10 +207,11 @@ type RoutingGroup = {
 };
 type RoutingPreview = {
   preview_id: string;
-  status: "pending" | "running" | "ready" | "failed" | "cancelled";
+  status: "pending" | "running" | "ready" | "blocked" | "failed" | "cancelled";
   routing_plan_fingerprint: string;
   routing_manifest?: { groups?: RoutingGroup[] };
   required_tools?: string[];
+  blockers?: { code: string; uuid: string; action: string }[];
   progress?: {
     phase: "queued" | "probe" | "route";
     completed: number;
@@ -261,8 +280,10 @@ function SourceSection({
 
 export function RoutingPreviewSummary({
   preview,
+  onReviewExtension,
 }: {
   preview: RoutingPreview;
+  onReviewExtension?: (uuid: string) => void;
 }) {
   return (
     <>
@@ -294,6 +315,19 @@ export function RoutingPreviewSummary({
           {preview.error || "Не удалось построить маршрут."}
         </Alert>
       )}
+      {preview.blockers?.map((blocker) => (
+        <Alert
+          key={`${blocker.code}:${blocker.uuid}`}
+          severity="warning"
+          action={
+            blocker.action === "review_extension_scope" && onReviewExtension
+              ? <Button color="inherit" onClick={() => onReviewExtension(blocker.uuid)}>Проверить расширение</Button>
+              : undefined
+          }
+        >
+          {blocker.code}: {blocker.uuid}
+        </Alert>
+      ))}
       {preview.routing_manifest?.groups?.map((group) => (
         <Card key={group.routing_group_id} variant="outlined">
           <CardContent>
@@ -1090,10 +1124,12 @@ export function Sources({
   project,
   snapshot,
   refreshWorkflow,
+  initialExtensionUuid,
 }: {
   project: Project;
   snapshot: Snapshot;
   refreshWorkflow: () => void;
+  initialExtensionUuid?: string;
 }) {
   const [setup, setSetup] = useState<SourceSetup>();
   const [error, setError] = useState("");
@@ -1110,15 +1146,46 @@ export function Sources({
   const [sourceProfile, setSourceProfile] = useState("");
   const [roleProfiles, setRoleProfiles] = useState<Record<string, string>>({});
   const [sourcePreview, setSourcePreview] = useState<Record<string, unknown>>();
+  const [extensionDecisions, setExtensionDecisions] = useState<
+    Record<string, { decision: "" | "include" | "exclude"; rationale: string }>
+  >({});
+  const [extensionPreview, setExtensionPreview] =
+    useState<Record<string, unknown>>();
   const [routingPreview, setRoutingPreview] = useState<RoutingPreview>();
   const [acquisitionRun, setAcquisitionRun] = useState<AcquisitionRun>();
   const [acquisitionResult, setAcquisitionResult] =
     useState<Record<string, unknown>>();
+  const refreshSequence = useRef(0);
   const refresh = useCallback(
-    () =>
+    () => {
+      const sequence = ++refreshSequence.current;
+      return (
       api<SourceSetup>(`/projects/${project.id}/source-setup`)
         .then((value) => {
-          setSetup(value);
+          if (sequence !== refreshSequence.current) return;
+          const normalized = {
+            ...value,
+            extension_scope: value.extension_scope || {
+              extensions: [],
+              included: [],
+              excluded: [],
+              dormant: [],
+              unreviewed: [],
+            },
+          };
+          setSetup(normalized);
+          setExtensionDecisions((current) => ({
+            ...Object.fromEntries(
+              normalized.extension_scope.extensions.map((row) => [
+                row.uuid,
+                {
+                  decision: row.decision,
+                  rationale: row.rationale,
+                },
+              ]),
+            ),
+            ...current,
+          }));
           setProfiles(
             Object.fromEntries(
               Object.entries(value.connection_profiles).map(([id, profile]) => [
@@ -1155,12 +1222,22 @@ export function Sources({
                 ),
           );
         })
-        .catch((error) => setError(error.message)),
+        .catch((error) => {
+          if (sequence === refreshSequence.current) setError(error.message);
+        })
+      );
+    },
     [project.id],
   );
   useEffect(() => {
     void refresh();
   }, [refresh]);
+  useEffect(() => {
+    if (!setup || !initialExtensionUuid) return;
+    const row = document.getElementById(`extension-${initialExtensionUuid}`);
+    row?.scrollIntoView({ block: "center" });
+    row?.focus();
+  }, [setup, initialExtensionUuid]);
   const field = (id: string, name: string, fallback = "") =>
     profiles[id]?.[name] ?? fallback;
   const setField = (id: string, name: string, next: string) =>
@@ -1274,6 +1351,79 @@ export function Sources({
       setSourceProfile("");
       setRoleProfiles({});
       setSourcePreview(undefined);
+      await refresh();
+      refreshWorkflow();
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const extensionPayload = (confirm_new_epoch: boolean) => ({
+    extension_decisions: Object.entries(extensionDecisions)
+      .filter(([, value]) => value.decision)
+      .map(([uuid, value]) => ({
+        uuid,
+        decision: value.decision,
+        rationale: value.decision === "exclude" ? value.rationale : "",
+      })),
+    expected_manifest_fingerprint: setup?.infobases_fingerprint,
+    confirm_new_epoch,
+  });
+  const reviewExtensions = async () => {
+    const missingDecision = setup?.extension_scope.extensions.find(
+      (row) => !row.dormant && !extensionDecisions[row.uuid]?.decision,
+    );
+    if (missingDecision) {
+      setError(`Для расширения ${missingDecision.uuid} требуется решение.`);
+      return;
+    }
+    const missingRationale = Object.entries(extensionDecisions).find(
+      ([, value]) => value.decision === "exclude" && !value.rationale.trim(),
+    );
+    if (missingRationale) {
+      setError(`Для исключённого расширения ${missingRationale[0]} требуется обоснование.`);
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const response = await api<Record<string, unknown>>(
+        `/projects/${project.id}/actions`,
+        {
+          method: "POST",
+          headers: mutationHeaders(),
+          body: JSON.stringify({
+            operation: "sources.configure",
+            payload: extensionPayload(false),
+            expected_fingerprint: snapshot.workflow_fingerprint,
+          }),
+        },
+      );
+      setExtensionPreview(response);
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const applyExtensions = async () => {
+    if (!extensionPreview || !window.confirm("Применить просмотренный выбор расширений и начать новую эпоху сравнения?")) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/projects/${project.id}/actions`, {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify({
+          operation: "sources.configure",
+          payload: extensionPayload(true),
+          expected_fingerprint: snapshot.workflow_fingerprint,
+        }),
+      });
+      setExtensionDecisions({});
+      setExtensionPreview(undefined);
+      setRoutingPreview(undefined);
       await refresh();
       refreshWorkflow();
     } catch (error) {
@@ -1719,7 +1869,124 @@ export function Sources({
 
       <SourceSection
         step={3}
-        title="Внешние артефакты"
+        title="Расширения конфигурации"
+        summary={
+          setup.extension_scope.unreviewed.length
+            ? `Требуют решения: ${setup.extension_scope.unreviewed.length}`
+            : `Включено: ${setup.extension_scope.included.length}; исключено: ${setup.extension_scope.excluded.length}`
+        }
+        defaultExpanded={setup.extension_scope.unreviewed.length > 0}
+      >
+        <Stack spacing={2} id="extension-review">
+          <Alert severity="info">
+            Обнаружение расширения не включает его автоматически. Активность — только наблюдаемый признак. Включённое расширение участвует в сравнении; для полностью добавленного или удалённого расширения его отдельные DIF будут признаны смысловыми без вызова агента. Исключённое расширение не экспортируется и не создаёт DIF.
+          </Alert>
+          {setup.extension_scope.extensions.filter((row) => !row.dormant).length === 0 && (
+            <Alert severity="info">В проверенных базах расширения не обнаружены.</Alert>
+          )}
+          {setup.extension_scope.extensions.filter((row) => !row.dormant).map((row) => {
+            const value = extensionDecisions[row.uuid] || { decision: "", rationale: "" };
+            const rationaleId = `extension-${row.uuid}-rationale`;
+            return (
+              <Card
+                id={`extension-${row.uuid}`}
+                key={row.uuid}
+                variant="outlined"
+                tabIndex={-1}
+                aria-labelledby={`extension-${row.uuid}-title`}
+                aria-describedby={`extension-${row.uuid}-observations extension-${row.uuid}-impact`}
+              >
+                <CardContent>
+                  <Typography id={`extension-${row.uuid}-title`} fontWeight={700}>{row.uuid}</Typography>
+                  <Box id={`extension-${row.uuid}-observations`}>
+                    {Object.entries(row.roles).map(([role, observation]) => (
+                      <Typography key={role} variant="body2">
+                        {roleLabels[role] || role}: {observation.present
+                          ? `${observation.name} ${observation.version}; ${observation.active ? "активно (информационно)" : "неактивно (информационно)"}`
+                          : "отсутствует"}
+                      </Typography>
+                    ))}
+                  </Box>
+                  <Box component="label" sx={{ display: "block", mt: 1.5 }}>
+                    <Typography component="span" variant="body2">Решение для расширения {row.uuid}</Typography>
+                    <select
+                      aria-label={`Решение для расширения ${row.uuid}`}
+                      aria-describedby={`extension-${row.uuid}-impact`}
+                      value={value.decision}
+                      onChange={(event) => {
+                        const decision = event.currentTarget.value as "" | "include" | "exclude";
+                        setExtensionDecisions((current) => ({
+                          ...current,
+                          [row.uuid]: { decision, rationale: decision === "include" ? "" : value.rationale },
+                        }));
+                        setExtensionPreview(undefined);
+                      }}
+                      style={{ display: "block", width: "100%", marginTop: 4, padding: 8 }}
+                    >
+                      <option value="">Не выбрано</option>
+                      <option value="include">Включить в исследование</option>
+                      <option value="exclude">Исключить из исследования</option>
+                    </select>
+                  </Box>
+                  <Typography id={`extension-${row.uuid}-impact`} variant="body2" sx={{ mt: 1 }}>
+                    {value.decision === "include"
+                      ? "Расширение войдёт в сравнение; при полном добавлении или удалении его DIF будут признаны смысловыми детерминированно."
+                      : value.decision === "exclude"
+                        ? "Расширение не будет опубликовано в поколении исходников и не создаст DIF."
+                        : "Выберите включение или исключение; активность расширения не определяет решение."}
+                  </Typography>
+                  {value.decision === "exclude" && (
+                    <TextField
+                      id={rationaleId}
+                      fullWidth
+                      required
+                      sx={{ mt: 1.5 }}
+                      label={`Обоснование исключения для расширения ${row.uuid}`}
+                      inputProps={{ "aria-label": `Обоснование исключения для расширения ${row.uuid}` }}
+                      value={value.rationale}
+                      error={!value.rationale.trim()}
+                      helperText={!value.rationale.trim() ? "Укажите проверяемую причину исключения." : ""}
+                      onChange={(event) => {
+                        setExtensionDecisions((current) => ({
+                          ...current,
+                          [row.uuid]: { ...value, rationale: event.target.value },
+                        }));
+                        setExtensionPreview(undefined);
+                      }}
+                    />
+                  )}
+                </CardContent>
+              </Card>
+            );
+          })}
+          {setup.extension_scope.extensions.some((row) => row.dormant) && (
+            <Card variant="outlined">
+              <CardContent>
+                <Typography fontWeight={700}>Ранее принятые решения</Typography>
+                {setup.extension_scope.extensions.filter((row) => row.dormant).map((row) => (
+                  <Typography key={row.uuid} variant="body2">
+                    {row.uuid}: {row.decision === "include" ? "включать" : "исключать"} — сейчас не обнаружено
+                  </Typography>
+                ))}
+              </CardContent>
+            </Card>
+          )}
+          <Stack direction="row" spacing={1}>
+            <Button disabled={busy} onClick={() => void reviewExtensions()}>Просмотреть выбор</Button>
+            <Button disabled={busy || !extensionPreview} variant="contained" onClick={() => void applyExtensions()}>Применить выбор</Button>
+          </Stack>
+          {extensionPreview && (
+            <Alert severity="warning">
+              Будет начата новая эпоха сравнения.
+              <Box component="pre" sx={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(extensionPreview, null, 2)}</Box>
+            </Alert>
+          )}
+        </Stack>
+      </SourceSection>
+
+      <SourceSection
+        step={4}
+        title="Загруженные внешние файлы"
         summary={
           artifacts.length
             ? `${uploadedCount} из ${artifacts.length} файлов загружено`
@@ -1739,7 +2006,7 @@ export function Sources({
           />
           {artifacts.length === 0 && (
             <Alert severity="info">
-              В отслеживаемом контракте внешние артефакты не объявлены.
+              В отслеживаемом контракте загруженные внешние файлы не объявлены. Этот раздел предназначен для EPF, ERF, деревьев исходников и других явно объявленных файлов; расширения выбираются отдельно.
             </Alert>
           )}
           {artifacts.map((artifact) => (
@@ -1796,7 +2063,7 @@ export function Sources({
       </SourceSection>
 
       <SourceSection
-        step={4}
+        step={5}
         title="Проверка и получение"
         summary={routeStatus}
         defaultExpanded
@@ -1831,7 +2098,16 @@ export function Sources({
               </Button>
             )}
           </Stack>
-          {routingPreview && <RoutingPreviewSummary preview={routingPreview} />}
+            {routingPreview && (
+              <RoutingPreviewSummary
+                preview={routingPreview}
+                onReviewExtension={(uuid) => {
+                  const row = document.getElementById(`extension-${uuid}`);
+                  row?.scrollIntoView({ block: "center" });
+                  row?.focus();
+                }}
+              />
+            )}
           {acquisitionRun?.status === "running" && (
             <Alert severity="info">
               <Stack spacing={1}>
@@ -2430,6 +2706,7 @@ function Workspace({
   const [settingsStep, setSettingsStep] = useState<string>();
   const [journalTarget, setJournalTarget] = useState<JournalTarget>();
   const [registryTarget, setRegistryTarget] = useState<RegistryTarget>();
+  const [sourceExtensionTarget, setSourceExtensionTarget] = useState<string>();
   const [error, setError] = useState("");
   const [retryWorkingView, setRetryWorkingView] = useState(false);
   const fetchSnapshot = useCallback(
@@ -2508,7 +2785,10 @@ function Workspace({
                 projectId={project.id}
                 initialProjection={snapshot.dispatcher}
                 initialFingerprint={snapshot.workflow_fingerprint}
-                onOpenSources={() => setView("sources")}
+                onOpenSources={() => {
+                  setSourceExtensionTarget(snapshot.extension_scope_blockers?.[0]?.uuid);
+                  setView("sources");
+                }}
                 onOpenIndexes={() => setView("indexes")}
                 onOpenSettings={(stepId) => { setSettingsStep(stepId); setSettingsTab("stages"); setView("settings"); }}
                 onOpenJournal={(target) => { setJournalTarget(target); setView("journal"); }}
@@ -2520,6 +2800,7 @@ function Workspace({
                 project={project}
                 snapshot={snapshot}
                 refreshWorkflow={refresh}
+                initialExtensionUuid={sourceExtensionTarget}
               />
             )}
             {view === "indexes" && (

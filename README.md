@@ -85,6 +85,7 @@ The active root documentation surface is exactly:
 - `docs/agent/repo-map.md`
 - `docs/agent/verification.md`
 - `docs/operator/dispatcher-inspector-rollback.md`
+- `docs/operator/extension-source-scope-rollback.md`
 
 Historical OpenSpec archives are retained as non-executable design history.
 Customer sources, credentials, generated indexes, and deliverables belong only

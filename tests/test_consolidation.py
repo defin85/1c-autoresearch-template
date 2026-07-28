@@ -56,6 +56,28 @@ def test_plan_maps_every_meaning_dif_directly_to_mrq() -> None:
     assert {row["mrq_id"] for row in plan["mrq"]["dispositions.jsonl"]} == {plan["mrq"]["mrq.jsonl"][0]["mrq_id"]}
 
 
+def test_one_component_hint_can_be_split_into_multiple_ordinary_mrqs() -> None:
+    snapshot = {
+        **_snapshot(2),
+        "component_groups": [{
+            "component_kind": "extension",
+            "component_key": "ext",
+            "stable_diff_ids": ["DIF-1", "DIF-2"],
+        }],
+    }
+    plan = plan_from_groups(
+        snapshot,
+        [
+            {"semantic_key": "first-function", "stable_diff_ids": ["DIF-1"]},
+            {"semantic_key": "second-function", "stable_diff_ids": ["DIF-2"]},
+        ],
+        [],
+        partition_manifest(snapshot["classifications"], 8192),
+    )
+    assert len(plan["mrq"]["mrq.jsonl"]) == 2
+    assert {row["stable_diff_id"] for row in plan["mrq"]["dispositions.jsonl"] if row["primary"]} == {"DIF-1", "DIF-2"}
+
+
 def test_existing_mrqs_can_merge_without_intermediate_entity() -> None:
     prior = {
         "mrq.jsonl": [
@@ -76,6 +98,29 @@ def test_existing_mrqs_can_merge_without_intermediate_entity() -> None:
     )
     assert plan["outcomes"]["merged"] == ["MRQ-old-1", "MRQ-old-2"]
     assert plan["lineage"][0]["domain"] == "mrq"
+
+
+def test_cross_component_support_requires_explicit_keys_rationale_and_evidence() -> None:
+    snapshot = {
+        **_snapshot(2),
+        "component_groups": [
+            {"component_kind": "extension", "component_key": "ext", "stable_diff_ids": ["DIF-1"]},
+            {"component_kind": "external_artifact", "component_key": "file", "stable_diff_ids": ["DIF-2"]},
+        ],
+    }
+    group = {
+        "semantic_key": "integration",
+        "stable_diff_ids": ["DIF-1"],
+        "supporting_diff_ids": ["DIF-2"],
+        "component_keys": ["extension:ext", "external_artifact:file"],
+        "rationale": "The extension calls the uploaded handler.",
+        "evidence": [{"path": "target_cf/extensions/ext/a.bsl", "fingerprint": "sha256:" + "1" * 64}],
+    }
+    other = {"semantic_key": "handler", "stable_diff_ids": ["DIF-2"]}
+    plan = plan_from_groups(snapshot, [group, other], [], partition_manifest(snapshot["classifications"], 8192))
+    assert any(not row["primary"] and row["stable_diff_id"] == "DIF-2" for row in plan["mrq"]["dispositions.jsonl"])
+    with pytest.raises(ValueError, match="cross-component"):
+        plan_from_groups(snapshot, [{**group, "component_keys": []}, other], [], partition_manifest(snapshot["classifications"], 8192))
 
 
 def test_approval_publishes_only_mrq_generation(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

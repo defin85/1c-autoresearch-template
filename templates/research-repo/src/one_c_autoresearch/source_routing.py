@@ -89,16 +89,54 @@ def analyze_forms(root: Path, component_id: str) -> dict[str, Any]:
 
 def component_members(contract: dict[str, Any], connections: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     members = []
+    included = {item["uuid"] for item in contract.get("extension_decisions", []) if item["decision"] == "include"}
     for role in ROLES:
         profile = connections[contract["roles"][role]["connection_profile"]]
         members.append({"routing_group_id": "configuration", "role": role, "component_id": f"{role}:configuration", "kind": "configuration", "name": None})
         for extension in profile.get("extensions", []):
             uuid = str(extension["uuid"]).lower()
+            if uuid not in included:
+                continue
             members.append({"routing_group_id": f"extension:{uuid}", "role": role, "component_id": f"{role}:extension:{uuid}", "kind": "extension", "name": extension["name"], "extension": extension})
     for artifact in contract.get("artifacts", []):
         identifier = artifact.get("external_artifact_id") or external_id(artifact["kind"], artifact["semantic_key"])
         members.append({"routing_group_id": f"external:{identifier}", "role": artifact["role"], "component_id": f"{artifact['role']}:external:{identifier}", "kind": artifact["kind"], "name": identifier, "artifact": artifact})
     return sorted(members, key=lambda item: (item["routing_group_id"], ROLES.index(item["role"])))
+
+
+def extension_scope(contract: dict[str, Any], connections: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    decisions = {item["uuid"]: item for item in contract.get("extension_decisions", [])}
+    observed: dict[str, dict[str, dict[str, Any]]] = {}
+    for role in ROLES:
+        profile = connections[contract["roles"][role]["connection_profile"]]
+        for extension in profile.get("extensions", []):
+            uuid = str(extension["uuid"]).lower()
+            observed.setdefault(uuid, {})[role] = {
+                "present": True,
+                "name": str(extension["name"]),
+                "version": str(extension.get("version", "")),
+                "active": bool(extension["active"]),
+            }
+    rows = []
+    for uuid in sorted(set(observed) | set(decisions)):
+        decision = decisions.get(uuid)
+        rows.append({
+            "uuid": uuid,
+            "decision": decision["decision"] if decision else "",
+            "rationale": decision["rationale"] if decision else "",
+            "dormant": uuid not in observed,
+            "roles": {
+                role: observed.get(uuid, {}).get(role, {"present": False, "name": "", "version": "", "active": False})
+                for role in ROLES
+            },
+        })
+    return {
+        "extensions": rows,
+        "included": [row["uuid"] for row in rows if row["decision"] == "include" and not row["dormant"]],
+        "excluded": [row["uuid"] for row in rows if row["decision"] == "exclude" and not row["dormant"]],
+        "dormant": [row["uuid"] for row in rows if row["dormant"]],
+        "unreviewed": [row["uuid"] for row in rows if not row["decision"] and not row["dormant"]],
+    }
 
 
 def plan_groups(members: Iterable[dict[str, Any]], exporter: str, tool_versions: dict[str, str]) -> dict[str, Any]:
@@ -187,6 +225,7 @@ def source_comparison_epoch(pointer: dict[str, Any], routing_manifest: dict[str,
         "schema_version": "2",
         "acquisition_profile_version": "1",
         "normalizer_version": pointer["normalizer_version"],
+        "source_contract_fingerprint": pointer.get("source_contract_fingerprint", ""),
         "routing_contract_version": routing_manifest["routing_contract_version"],
         "groups": groups,
     }

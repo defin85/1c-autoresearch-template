@@ -922,6 +922,9 @@ def compile_analyze_graph(
                     "blocker": {"code": "dispatcher.bindings.stale", "message": "active generations changed during analysis", "action": "dif.classify-next"},
                 }
             abort = Event()
+            from .component_groups import deterministic_results
+            deterministic = deterministic_results(repo, pending)
+            agent_pending = [identifier for identifier in pending if identifier not in deterministic]
 
             def branch(identifier: str) -> tuple[AnalyzeResult, dict[str, Any]]:
                 unit = _analyze_work_unit(repo, identifier)
@@ -956,10 +959,10 @@ def compile_analyze_graph(
                     ))
                 return result, unit
 
-            if register_work:
-                register_work("analyze-dif", "analyzer", pending)
+            if register_work and agent_pending:
+                register_work("analyze-dif", "analyzer", agent_pending)
             results, errors, stopped = _bounded_map(
-                pending,
+                agent_pending,
                 max_concurrency=policy["max_concurrency"],
                 slot_count=role["count"],
                 function=branch,
@@ -985,6 +988,13 @@ def compile_analyze_graph(
             rows = []
             evidence_fingerprints = physical_evidence_fingerprints(repo)
             for identifier in pending:
+                if identifier in deterministic:
+                    local = deterministic[identifier]
+                    rows.append(make_row(identifier, local["result"], **{key: local[key] for key in (
+                        "evidence_fingerprint", "result_schema_fingerprint", "profile_fingerprint",
+                        "instruction_fingerprint", "context_fingerprint",
+                    )}))
+                    continue
                 result, unit = results[identifier]
                 rows.append(make_row(
                     identifier,

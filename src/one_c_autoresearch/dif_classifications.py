@@ -25,6 +25,15 @@ def _fingerprint(value: Any) -> str:
     return "sha256:" + sha256(canonical_json(value))
 
 
+def _whole_component(row: dict[str, Any]) -> bool:
+    hints = row.get("semantic_hints", [])
+    return (
+        row.get("classification") == "meaning"
+        and any(str(item).startswith("component:") for item in hints)
+        and any(str(item).startswith("whole-component:") for item in hints)
+    )
+
+
 def _bindings(repo: Path) -> dict[str, str]:
     source = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
     diff = validate_diff(repo)
@@ -212,7 +221,8 @@ def publish_window(
         merged = {row["stable_diff_id"]: row for row in active["rows"]}
         if set(merged) & {row["stable_diff_id"] for row in incoming}:
             for row in incoming:
-                if row["stable_diff_id"] in merged and merged[row["stable_diff_id"]] != row:
+                prior = merged.get(row["stable_diff_id"])
+                if prior is not None and prior != row and not (_whole_component(prior) and _whole_component(row)):
                     raise ValueError("classified DIF cannot be replaced")
         merged.update((row["stable_diff_id"], row) for row in incoming)
         accumulated = sorted(merged.values(), key=lambda row: row["stable_diff_id"])
@@ -247,8 +257,23 @@ def publish_empty(repo: Path, *, expected_generation_id: str | None = None) -> d
 
 
 def remaining_ids(repo: Path, *, limit: int = 32) -> list[str]:
-    classified = {row["stable_diff_id"] for row in load_active(repo)["rows"]} if (repo / POINTER).is_file() else set()
-    return sorted({row["stable_diff_id"] for row in inventory(repo)} - classified)[:limit]
+    active = load_active(repo)["rows"] if (repo / POINTER).is_file() else []
+    classified = {row["stable_diff_id"]: row for row in active}
+    stale: set[str] = set()
+    from .component_groups import deterministic_results
+    source = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+    expected = deterministic_results(repo, classified) if source.get("routing_manifest_path") else {}
+    for identifier, value in expected.items():
+        row = make_row(identifier, value["result"], **{
+            key: value[key]
+            for key in (
+                "evidence_fingerprint", "result_schema_fingerprint", "profile_fingerprint",
+                "instruction_fingerprint", "context_fingerprint",
+            )
+        })
+        if classified.get(identifier) != row:
+            stale.add(identifier)
+    return sorted(({row["stable_diff_id"] for row in inventory(repo)} - set(classified)) | stale)[:limit]
 
 
 def reusable_rows(

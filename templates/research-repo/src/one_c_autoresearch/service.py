@@ -23,7 +23,33 @@ class ApplicationService:
         workflow.validate_workflow(self.repo)
 
     def snapshot(self, *, deep: bool = True) -> dict[str, Any]:
-        return workflow.status(self.repo, deep=deep)
+        snapshot = workflow.status(self.repo, deep=deep)
+        if not self.connections:
+            return snapshot
+        scope = sources.extension_scope_status(self.repo, self.connections)
+        snapshot["extension_scope_blockers"] = scope["blockers"]
+        if scope["ready"] or snapshot["gates"][0]["state"] != "complete":
+            return snapshot
+        snapshot["gates"][1] = {
+            "id": "sources-acquired",
+            "state": "ready",
+            "blockers": [
+                {
+                    **blocker,
+                    "message": f"extension {blocker['uuid']} requires an explicit include or exclude decision",
+                }
+                for blocker in scope["blockers"]
+            ],
+        }
+        for gate in snapshot["gates"][2:]:
+            gate["state"] = "blocked"
+            gate["blockers"] = [{
+                "code": "predecessor.blocked",
+                "message": "a predecessor gate is incomplete",
+                "action": "",
+            }]
+        snapshot["state"] = "ready"
+        return snapshot
 
     def registry(
         self,
@@ -92,6 +118,14 @@ class ApplicationService:
 
     def next(self) -> dict[str, Any] | None:
         snapshot = self.snapshot()
+        if snapshot.get("extension_scope_blockers"):
+            blocker = snapshot["extension_scope_blockers"][0]
+            return {
+                "gate_id": "sources-acquired",
+                "action": blocker["action"],
+                "blocker": blocker,
+                "workflow_fingerprint": snapshot["workflow_fingerprint"],
+            }
         canonical = workflow.next_work(self.repo)
         if canonical and canonical["action"] in {"mrq.discover-next", "mrq.decide-next"}:
             required = [item["component_id"] for item in indexes.discover(self.repo)]
@@ -125,6 +159,17 @@ class ApplicationService:
         current = workflow.state_fingerprint(self.repo)
         if expected_fingerprint != current:
             raise RuntimeError("stale workflow fingerprint")
+        if (
+            self.connections
+            and operation not in {"sources.configure", "sources.acquire"}
+            and not (staged is not None and staged.get("source"))
+        ):
+            blockers = sources.extension_scope_status(self.repo, self.connections)["blockers"]
+            if blockers:
+                raise RuntimeError(json.dumps({
+                    "code": "extension_scope_required",
+                    "blockers": blockers,
+                }, ensure_ascii=False, sort_keys=True))
         self._expected_fingerprint = expected_fingerprint
         self._cancelled = cancelled
         self._staged = staged
@@ -212,6 +257,24 @@ class ApplicationService:
             from .external_folder import PreviewStore
             store = PreviewStore(self.repo, self.upload_drafts.parent / "external-folder-previews", self.upload_drafts)
             return {"operation": "sources.configure", "comparison_epoch_changed": False, **store.confirm(payload["external_artifact_preview_id"], payload["selected_entries"], workflow_fingerprint=self._expected_fingerprint, expected_declaration_fingerprint=payload["expected_declaration_fingerprint"], expected_draft_fingerprint=payload["expected_draft_fingerprint"])}
+        extension_keys = {"extension_decisions", "expected_manifest_fingerprint", "confirm_new_epoch"}
+        if set(payload) == extension_keys:
+            path = self.repo / "research/infobases.toml"
+            if payload["expected_manifest_fingerprint"] != "sha256:" + sha256(path.read_bytes()):
+                raise RuntimeError("stale source setup fingerprint")
+            bindings, _artifacts = sources.load_contract(self.repo)
+            bindings["extension_decisions"] = sources.normalize_extension_decisions(payload["extension_decisions"])
+            candidate = sources.serialize_infobases(bindings)
+            result = {
+                "operation": "sources.configure",
+                "manifest_fingerprint": "sha256:" + sha256(candidate),
+                "extension_decisions": bindings["extension_decisions"],
+                "comparison_epoch_changed": candidate != path.read_bytes(),
+            }
+            if payload["confirm_new_epoch"] is not True:
+                return {**result, "preview": True}
+            atomic_bytes(path, candidate)
+            return {**result, "preview": False}
         if set(payload) != {"acquisition_profile", "connection_profiles", "expected_manifest_fingerprint", "confirm_new_epoch"} or payload["acquisition_profile"] not in sources.PROFILES:
             raise ValueError("invalid source setup patch")
         path = self.repo / "research/infobases.toml"
@@ -223,11 +286,10 @@ class ApplicationService:
         import re
         if tuple(roles) != sources.ROLES or set(profiles) != set(sources.ROLES) or any(not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value) is None for value in profiles.values()):
             raise ValueError("exactly three safe connection-profile bindings are required")
-        lines = ['schema_version = "1"', f'acquisition_profile = {json.dumps(payload["acquisition_profile"])}', ""]
+        bindings["acquisition_profile"] = payload["acquisition_profile"]
         for role in sources.ROLES:
-            item = roles[role]
-            lines.extend((f"[roles.{role}]", f'connection_profile = {json.dumps(profiles[role])}', f'configuration_name = {json.dumps(item["configuration_name"], ensure_ascii=False)}', f'root_uuid = {json.dumps(item["root_uuid"])}', f'version = {json.dumps(item["version"])}', ""))
-        atomic_bytes(path, ("\n".join(lines)).encode())
+            roles[role]["connection_profile"] = profiles[role]
+        atomic_bytes(path, sources.serialize_infobases(bindings))
         return {"operation": "sources.configure", "manifest_fingerprint": "sha256:" + sha256(path.read_bytes()), "comparison_epoch_changed": True}
 
     def _ensure_indexes(self, payload: dict[str, Any]) -> dict[str, Any]:

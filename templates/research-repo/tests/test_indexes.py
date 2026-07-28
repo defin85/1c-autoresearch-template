@@ -8,7 +8,6 @@ from one_c_autoresearch import indexes
 
 
 REPO = Path(__file__).parents[1]
-HAS_ACTIVE_SOURCES = (REPO / "research/active-source-generation.json").is_file()
 
 
 def test_index_executable_is_found_above_nested_project(tmp_path: Path, monkeypatch) -> None:
@@ -42,7 +41,6 @@ def test_next_work_indexes_every_source_component_before_research(tmp_path: Path
     assert work["work_unit"]["component_ids"] == ["b", "a"]
 
 
-@pytest.mark.skipif(not HAS_ACTIVE_SOURCES, reason="portable scaffold has no acquired source generation")
 def test_components_are_generation_bound_and_never_role_parents(tmp_path: Path):
     rows = indexes.discover(REPO)
     assert [row["component_id"] for row in rows] == sorted(row["component_id"] for row in rows)
@@ -59,14 +57,12 @@ def test_components_are_generation_bound_and_never_role_parents(tmp_path: Path):
         indexes.canonical_evidence(REPO, "target_cf:configuration", "../rlm-snippet")
 
 
-@pytest.mark.skipif(not HAS_ACTIVE_SOURCES, reason="portable scaffold has no acquired source generation")
 def test_routed_pointer_metadata_avoids_source_tree_scan(monkeypatch):
     monkeypatch.setattr(indexes, "_component_fingerprint", lambda _path: (_ for _ in ()).throw(AssertionError("source tree scanned")))
     rows = indexes.discover(REPO)
     assert all(row["fingerprint"].startswith("sha256:") and row["bsl_file_count"] >= 0 for row in rows)
 
 
-@pytest.mark.skipif(not HAS_ACTIVE_SOURCES, reason="portable scaffold has no acquired source generation")
 def test_index_ensure_reuses_ready_state_and_rebuild_is_confirmed(tmp_path: Path):
     first = indexes.ensure(REPO, lambda *_: {"ready": True}, state_root=tmp_path)
     assert all(row["status"] in {"ready", "not_indexable"} for row in first)

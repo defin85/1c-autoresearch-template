@@ -14,6 +14,7 @@ from pathlib import Path
 FILES = (
     "AGENTS.md", "README.md", "pyproject.toml", "uv.lock",
     "docs/operator/dispatcher-inspector-rollback.md",
+    "docs/operator/extension-source-scope-rollback.md",
     "research/workflow.toml", "research/indexing.toml", "research/forbidden-authorities.json",
     "tests/test_external_folder.py", "tests/test_source_routing.py", "tests/test_source_tools.py",
     "tests/test_sources.py", "tests/test_diffs.py", "tests/test_extension_analyzer.py", "tests/test_indexes.py",
@@ -22,12 +23,20 @@ FILES = (
     "tests/test_dispatcher_inspector_server.py", "tests/test_dispatcher_smoke.py", "tests/test_doctor.py", "tests/test_mrq.py",
     "tests/test_mrq_batches.py", "tests/test_pipeline_graphs.py", "tests/test_workflow.py",
     "tests/test_dif_classifications.py", "tests/test_consolidation.py",
+    "tests/test_component_groups.py", "tests/test_service_extension_scope.py",
     "tests/test_decision_generations.py", "tests/test_workflow_migration.py",
 )
 TREES = (
     "src/one_c_autoresearch", "one_c_autoresearch", "research/schemas", "web/workspace",
     "tests/fixtures/source-routing", "tests/fixtures/extension-semantic",
 )
+
+
+def promoted_files() -> tuple[str, ...]:
+    return tuple(
+        path for path in FILES
+        if path.startswith(("docs/operator/", "tests/"))
+    )
 VISUAL_ASSETS = (
     ("openspec/changes/archive/2026-07-25-add-mrq-batch-classification-stage/assets", "web/workspace/e2e/visual-assets/current"),
     ("openspec/changes/archive/2026-07-25-make-dispatcher-new-working-screen/assets", "web/workspace/e2e/visual-assets/legacy"),
@@ -242,12 +251,12 @@ def sync(
                 for prefix, source, target in promoted
                 for item in change_plan(source, target)
             ]
-            rollback = "docs/operator/dispatcher-inspector-rollback.md"
-            plan += [
-                {**item, "path": rollback}
-                for item in change_plan(staging / "docs/operator", package_root / "docs/operator")
-                if item["path"] == "dispatcher-inspector-rollback.md"
-            ]
+            for relative in promoted_files():
+                source, target = staging / relative, package_root / relative
+                if not target.is_file():
+                    plan.append({"status": "A", "path": relative, "hash": file_hash(source)})
+                elif file_hash(source) != file_hash(target):
+                    plan.append({"status": "C", "path": relative, "hash": file_hash(source)})
             plan.sort(key=lambda item: item["path"])
         fingerprint = plan_fingerprint(reference, destination, staging, plan)
         result = {"fingerprint": fingerprint, "changes": plan}
@@ -267,9 +276,12 @@ def promote_package(scaffold: Path, package_root: Path) -> None:
     target_package = package_root / "src/one_c_autoresearch"
     replace_tree(source_package, target_package)
     replace_tree(scaffold / "web/workspace", package_root / "web/workspace")
-    rollback = package_root / "docs/operator/dispatcher-inspector-rollback.md"
-    rollback.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(scaffold / "docs/operator/dispatcher-inspector-rollback.md", rollback)
+    for relative in promoted_files():
+        target = package_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(scaffold / relative, target)
+        if file_hash(scaffold / relative) != file_hash(target):
+            raise RuntimeError(f"promoted file differs: {relative}")
     require_parity(source_package, target_package)
     require_parity(scaffold / "web/workspace", package_root / "web/workspace")
 

@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from one_c_autoresearch.contracts import canonical_json
-from one_c_autoresearch.source_routing import analyze_forms, component_members, plan_groups, source_comparison_epoch
+from one_c_autoresearch.source_routing import analyze_forms, component_members, extension_scope, plan_groups, source_comparison_epoch
 
 
 MANAGED = b'<Form xmlns="http://v8.1c.ru/8.3/xcf/logform"><Title>A</Title></Form>'
@@ -90,10 +90,12 @@ def test_external_routes_and_epoch_excludes_probe_fingerprints():
     plan = plan_groups(members, "designer", {"platform": "8.5.4.1306", "converter": "v8unpack 1.2.6"})
     assert plan["groups"][0]["exporter"] == "verified-upload"
     assert plan["groups"][0]["routing_reason"] == "binary_container_requires_v8unpack"
-    pointer = {"normalizer_version": "3"}
+    pointer = {"normalizer_version": "3", "source_contract_fingerprint": "sha256:" + "1" * 64}
     first = source_comparison_epoch(pointer, plan)
     plan["groups"][0]["probe_fingerprints"] = ["sha256:" + "a" * 64]
     assert source_comparison_epoch(pointer, plan) == first
+    pointer["source_contract_fingerprint"] = "sha256:" + "2" * 64
+    assert source_comparison_epoch(pointer, plan) != first
 
 
 def test_component_members_group_extensions_by_uuid_and_external_by_ext_id():
@@ -103,7 +105,7 @@ def test_component_members_group_extensions_by_uuid_and_external_by_ext_id():
         "target_cf": {"extensions": []},
         "next_vendor": {"extensions": [{"uuid": "11111111-1111-1111-1111-111111111111", "name": "Renamed"}]},
     }
-    contract = {"roles": roles, "artifacts": [{"role": "target_cf", "kind": "epf", "semantic_key": "Отчёт", "external_artifact_id": "EXT-ABC"}]}
+    contract = {"roles": roles, "extension_decisions": [{"uuid": "11111111-1111-1111-1111-111111111111", "decision": "include", "rationale": ""}], "artifacts": [{"role": "target_cf", "kind": "epf", "semantic_key": "Отчёт", "external_artifact_id": "EXT-ABC"}]}
     members = component_members(contract, connections)
     extension = [item for item in members if item["routing_group_id"].startswith("extension:")]
     assert {item["role"] for item in extension} == {"vendor_baseline", "next_vendor"}
@@ -113,3 +115,36 @@ def test_component_members_group_extensions_by_uuid_and_external_by_ext_id():
     plan = plan_groups(extension, "ibcmd", {"platform": "8.3.27.1989", "converter": "v8unpack 1.2.6"})
     assert plan["groups"][0]["representation_schema"] == "v8unpack/v1"
     assert canonical_json(plan) == canonical_json(plan_groups(extension, "ibcmd", {"platform": "8.3.27.1989", "converter": "v8unpack 1.2.6"}))
+
+
+def test_extension_scope_filters_members_and_preserves_dormant_decisions():
+    roles = {role: {"connection_profile": role} for role in ("vendor_baseline", "target_cf", "next_vendor")}
+    connections = {
+        "vendor_baseline": {"extensions": [{"uuid": "11111111-1111-1111-1111-111111111111", "name": "A", "version": "1", "active": False}]},
+        "target_cf": {"extensions": [{"uuid": "22222222-2222-2222-2222-222222222222", "name": "B", "version": "2", "active": True}]},
+        "next_vendor": {"extensions": []},
+    }
+    contract = {
+        "roles": roles,
+        "artifacts": [],
+        "extension_decisions": [
+            {"uuid": "11111111-1111-1111-1111-111111111111", "decision": "include", "rationale": ""},
+            {"uuid": "33333333-3333-3333-3333-333333333333", "decision": "exclude", "rationale": "old"},
+        ],
+    }
+    scope = extension_scope(contract, connections)
+    assert scope["included"] == ["11111111-1111-1111-1111-111111111111"]
+    assert scope["unreviewed"] == ["22222222-2222-2222-2222-222222222222"]
+    assert scope["dormant"] == ["33333333-3333-3333-3333-333333333333"]
+    assert [item["routing_group_id"] for item in component_members(contract, connections) if item["kind"] == "extension"] == ["extension:11111111-1111-1111-1111-111111111111"]
+    connections["vendor_baseline"]["extensions"][0].update(name="Renamed", version="9", active=True)
+    assert extension_scope(contract, connections)["included"] == scope["included"]
+    connections["vendor_baseline"]["extensions"] = [{
+        "uuid": "33333333-3333-3333-3333-333333333333",
+        "name": "Returned",
+        "version": "3",
+        "active": True,
+    }]
+    returned = extension_scope(contract, connections)
+    assert "33333333-3333-3333-3333-333333333333" in returned["excluded"]
+    assert "33333333-3333-3333-3333-333333333333" not in returned["dormant"]

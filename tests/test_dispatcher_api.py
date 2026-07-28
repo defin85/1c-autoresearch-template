@@ -20,7 +20,7 @@ from one_c_autoresearch.workflow import _latest_operation_zone
 from one_c_autoresearch.workspace_api import create_app
 
 
-REPO = Path(__file__).resolve().parents[1] / "templates/research-repo"
+REPO = Path(__file__).resolve().parents[1]
 
 
 def _test_execution_snapshot(_repo, run_id, operation, step, profiles, work_unit):

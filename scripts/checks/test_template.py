@@ -17,6 +17,7 @@ MAINTENANCE = {
 ACTIVE_DOCS = {
     "README.md", "AGENTS.md", "docs/agent/repo-map.md", "docs/agent/verification.md",
     "docs/operator/dispatcher-inspector-rollback.md",
+    "docs/operator/extension-source-scope-rollback.md",
 }
 
 

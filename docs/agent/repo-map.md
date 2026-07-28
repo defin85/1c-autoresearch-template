@@ -33,6 +33,7 @@ Only these files are active root documentation:
 - `docs/agent/repo-map.md`
 - `docs/agent/verification.md`
 - `docs/operator/dispatcher-inspector-rollback.md`
+- `docs/operator/extension-source-scope-rollback.md`
 
 OpenSpec archives are retained as non-executable history and excluded from
 active-contract scans.

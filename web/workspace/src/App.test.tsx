@@ -158,6 +158,23 @@ test("saved infobase connection parameters are visible and editable without expo
       },
     },
     infobases_fingerprint: "sha256:manifest",
+    extension_scope: {
+      extensions: [{
+        uuid: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        decision: "",
+        rationale: "",
+        dormant: false,
+        roles: {
+          vendor_baseline: { present: true, name: "Service", version: "1", active: false },
+          target_cf: { present: false, name: "", version: "", active: false },
+          next_vendor: { present: false, name: "", version: "", active: false },
+        },
+      }],
+      included: [],
+      excluded: [],
+      dormant: [],
+      unreviewed: ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"],
+    },
     external_artifacts: { artifacts: [] },
     upload_draft_fingerprint: "sha256:draft",
     connection_profiles: {
@@ -184,17 +201,27 @@ test("saved infobase connection parameters are visible and editable without expo
     active_source: {},
     active_diff: {},
   };
-  vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string) =>
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string, init?: RequestInit) =>
     Promise.resolve({
       ok: true,
-      json: async () => url.endsWith("/source-setup") ? setup : ({ complete: true, tools: [] }),
+      json: async () => url.endsWith("/source-setup")
+        ? setup
+        : url.endsWith("/actions") && init?.method === "POST"
+          ? { operation: "sources.configure", preview: true, comparison_epoch_changed: true }
+          : ({ complete: true, tools: [] }),
     }),
   ));
+  const scrollIntoView = vi.fn();
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+    configurable: true,
+    value: scrollIntoView,
+  });
   render(
     <Sources
       project={{ id: "p", name: "p", root: "/repo" }}
       snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
       refreshWorkflow={() => {}}
+      initialExtensionUuid="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     />,
   );
   fireEvent.click(await screen.findByRole("button", { name: /Подключения к базам/ }));
@@ -206,6 +233,27 @@ test("saved infobase connection parameters are visible and editable without expo
   expect(screen.getByLabelText("Имя базы 1С")).toHaveValue("example");
   expect(screen.getByLabelText("Пароль PostgreSQL")).toHaveValue("");
   expect(screen.getAllByText(/Пароль сохранён/)).toHaveLength(2);
+  const extensionSection = screen.getByRole("button", { name: /Расширения конфигурации/ });
+  if (extensionSection.getAttribute("aria-expanded") !== "true") fireEvent.click(extensionSection);
+  expect(screen.getByText("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")).toBeInTheDocument();
+  await waitFor(() => {
+    expect(document.activeElement).toHaveAttribute(
+      "id",
+      "extension-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    );
+    expect(scrollIntoView).toHaveBeenCalled();
+  });
+  fireEvent.change(screen.getByRole("combobox", { name: "Решение для расширения aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" }), {
+    target: { value: "exclude" },
+  });
+  await waitFor(() => expect(screen.getByRole("combobox", { name: "Решение для расширения aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" })).toHaveValue("exclude"));
+  const rationale = await screen.findByLabelText("Обоснование исключения для расширения aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+  expect(rationale).toBeRequired();
+  fireEvent.change(rationale, { target: { value: "Техническое" } });
+  expect(rationale).toHaveValue("Техническое");
+  fireEvent.click(screen.getByRole("button", { name: "Просмотреть выбор" }));
+  expect(await screen.findByText("Будет начата новая эпоха сравнения.")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Применить выбор" })).toBeEnabled();
 });
 
 test("agent profile explains the read-only environment and persists it", async () => {

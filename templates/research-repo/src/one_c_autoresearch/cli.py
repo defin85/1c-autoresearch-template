@@ -28,6 +28,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--repo-path", default=".")
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
+    commands.add_parser("source-scope")
     commands.add_parser("next")
     registry = commands.add_parser("registry")
     registry.add_argument("name", choices=("diff-inventory", "target-coverage", "mrq", "extension-diff", "extension-dependencies", "extension-path-coverage", "extension-physical-diff"))
@@ -82,6 +83,9 @@ def main(argv: list[str] | None = None) -> int:
         value = execute(repo, journal["migration_id"], workflow_v4=workflow_bytes)
     elif args.command == "status":
         value = service.snapshot()
+    elif args.command == "source-scope":
+        from .sources import extension_scope_status
+        value = extension_scope_status(repo, service.connections)
     elif args.command == "next":
         value = service.next()
     elif args.command == "registry":

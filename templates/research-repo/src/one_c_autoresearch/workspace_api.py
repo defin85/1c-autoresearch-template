@@ -326,11 +326,20 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
     @app.get("/api/v1/projects/{project_id}/workflow")
     def snapshot(project_id: str):
+        from .user_state import load_connections
         from .workflow import attach_dispatcher
-        return attach_dispatcher(ApplicationService(repo(project_id)).snapshot(deep=False), repo(project_id), operational)
+        project = repo(project_id)
+        return attach_dispatcher(
+            ApplicationService(project, connections=load_connections(project, operational)).snapshot(deep=False),
+            project,
+            operational,
+        )
 
     @app.get("/api/v1/projects/{project_id}/workflow/next")
-    def next_work(project_id: str): return ApplicationService(repo(project_id)).next()
+    def next_work(project_id: str):
+        from .user_state import load_connections
+        project = repo(project_id)
+        return ApplicationService(project, connections=load_connections(project, operational)).next()
 
     @app.get("/api/v1/projects/{project_id}/workflow/configuration")
     def workflow_configuration(project_id: str): return ApplicationService(repo(project_id)).workflow_configuration()
@@ -465,6 +474,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
     @app.get("/api/v1/projects/{project_id}/dispatcher")
     def dispatcher_projection(project_id: str):
+        from .user_state import load_connections
         project = repo(project_id)
         from .sqlite_state import DispatcherStore
         try:
@@ -476,7 +486,11 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             raise HTTPException(503, "dispatcher operational store unavailable")
         from .workflow import attach_dispatcher
         try:
-            snapshot = attach_dispatcher(ApplicationService(project).snapshot(deep=False), project, operational)
+            snapshot = attach_dispatcher(
+                ApplicationService(project, connections=load_connections(project, operational)).snapshot(deep=False),
+                project,
+                operational,
+            )
         except sqlite3.DatabaseError:
             raise HTTPException(503, "dispatcher operational store unavailable")
         return snapshot.get("dispatcher", {"schema_version": "1", "revision": 0, "fresh_at": "", "circuits": [], "jobs": {}})
@@ -1546,7 +1560,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
     @app.get("/api/v1/projects/{project_id}/source-setup")
     def source_setup(project_id: str):
-        from .sources import PROFILES, current_profile_test, draft_fingerprint, load_contract
+        from .sources import PROFILES, current_profile_test, draft_fingerprint, extension_scope_status, load_contract
         from .contracts import external_id
         infobases, artifacts = load_contract(repo(project_id))
         from .user_state import load_connections
@@ -1571,7 +1585,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         declared = [{**item, "external_artifact_id": external_id(item["kind"], item["semantic_key"]), "uploaded": (drafts / item["role"] / external_id(item["kind"], item["semantic_key"]) / item["filename"]).is_file()} for item in artifacts.get("artifacts", [])]
         project = repo(project_id)
         pointer = lambda name: json.loads((project / "research" / name).read_text(encoding="utf-8")) if (project / "research" / name).is_file() else {}
-        return {"profiles": sorted(PROFILES), "infobases": infobases, "infobases_fingerprint": "sha256:" + sha256((project / "research/infobases.toml").read_bytes()), "external_artifacts": {"schema_version": artifacts.get("schema_version"), "artifacts": declared}, "upload_draft_fingerprint": draft_fingerprint(drafts), "connection_profiles": summaries, "active_source": pointer("active-source-generation.json"), "active_diff": pointer("active-diff-generation.json")}
+        scope_status = extension_scope_status(project, available)
+        return {"profiles": sorted(PROFILES), "infobases": infobases, "infobases_fingerprint": scope_status["infobases_fingerprint"], "extension_scope": scope_status["extension_scope"], "extension_scope_ready": scope_status["ready"], "extension_scope_blockers": scope_status["blockers"], "external_artifacts": {"schema_version": artifacts.get("schema_version"), "artifacts": declared}, "upload_draft_fingerprint": draft_fingerprint(drafts), "connection_profiles": summaries, "active_source": pointer("active-source-generation.json"), "active_diff": pointer("active-diff-generation.json")}
 
     @app.get("/api/v1/projects/{project_id}/source-tools")
     def source_tools(project_id: str):
@@ -1646,7 +1661,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 finish({
                     **record,
                     **value,
-                    "status": "ready",
+                    "status": "blocked" if value.get("blockers") else "ready",
                     "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
                 })
             except InterruptedError:
@@ -1716,11 +1731,9 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 if configuration["version"] != binding["version"]:
                     raise ValueError(f"infobase version does not match declared role: {role}")
                 binding.update(configuration_name=configuration["name"], root_uuid=configuration["uuid"])
-            lines = ['schema_version = "1"', f'acquisition_profile = {json.dumps(infobases["acquisition_profile"])}', ""]
-            for role, binding in infobases["roles"].items():
-                lines.extend((f"[roles.{role}]", f'connection_profile = {json.dumps(binding["connection_profile"])}', f'configuration_name = {json.dumps(binding["configuration_name"], ensure_ascii=False)}', f'root_uuid = {json.dumps(binding["root_uuid"])}', f'version = {json.dumps(binding["version"])}', ""))
+            from .sources import serialize_infobases
             from .contracts import atomic_bytes
-            atomic_bytes(project / "research/infobases.toml", "\n".join(lines).encode())
+            atomic_bytes(project / "research/infobases.toml", serialize_infobases(infobases))
         values[profile_id] = profile; save_connections(project, values, operational)
         return {"profile_id": profile_id, "available": True, "kind": profile["kind"], "tested": True, "acquisition_profile": profile.get("profile_id"), "extension_count": len(profile.get("extensions", []))}
 

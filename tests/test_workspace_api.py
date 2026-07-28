@@ -8,10 +8,11 @@ from fastapi.testclient import TestClient
 
 from one_c_autoresearch.workspace_api import create_app
 from one_c_autoresearch.contracts import external_id
-from one_c_autoresearch.sources import draft_fingerprint
+from one_c_autoresearch.sources import draft_fingerprint, extension_scope_status
+from one_c_autoresearch.user_state import load_connections
 
 
-REPO = Path(__file__).parents[1] / "templates/research-repo"
+REPO = Path(__file__).parents[1]
 
 
 def test_source_acquisition_continues_automatic_pipeline(tmp_path: Path, monkeypatch) -> None:
@@ -311,6 +312,10 @@ def test_api_uses_repository_snapshot_and_typed_actions(tmp_path: Path, monkeypa
         saved = client.put(f"/api/v1/projects/{project['id']}/connection-profiles/local-baseline", json={"profile": profile}, headers=headers | {"Idempotency-Key": "profile-1"})
         assert saved.status_code == 200
         setup = client.get(f"/api/v1/projects/{project['id']}/source-setup").json()
+        scope_status = extension_scope_status(REPO, load_connections(REPO, tmp_path / "state"))
+        assert setup["extension_scope"] == scope_status["extension_scope"]
+        assert setup["extension_scope_ready"] == scope_status["ready"]
+        assert setup["extension_scope_blockers"] == scope_status["blockers"]
         assert setup["profiles"] == ["designer+form-aware/v1", "ibcmd+form-aware/v1"]
         assert setup["connection_profiles"]["local-baseline"]["available"] is True
         assert setup["connection_profiles"]["local-baseline"]["reference"] == "baseline"

@@ -30,7 +30,11 @@ const NEW_REQUIRED_LINKS = [
   ['batch-output', 'mrq-queue'], ['mrq-queue', 'researcher-1'], ['researcher-1', 'target-db'], ['target-db', 'results'],
 ] as const;
 
-async function openFixture(page: Page, initialProjection: DispatcherProjection = saturatedProjection) {
+async function openFixture(
+  page: Page,
+  initialProjection: DispatcherProjection = saturatedProjection,
+  sourceSetup?: Record<string, unknown>,
+) {
   let projection = initialProjection;
   let workflowRequests = 0;
   let failingWorkflowRequests = 0;
@@ -89,7 +93,16 @@ async function openFixture(page: Page, initialProjection: DispatcherProjection =
     return route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify({ schema_version: '1', state: 'ready', workflow_fingerprint: 'sha256:fixture', gates: [], dispatcher: projection }),
+      body: JSON.stringify({
+        schema_version: '1',
+        state: 'ready',
+        workflow_fingerprint: 'sha256:fixture',
+        gates: [],
+        extension_scope_blockers: (
+          ((sourceSetup?.extension_scope as { unreviewed?: string[] } | undefined)?.unreviewed) || []
+        ).map((uuid) => ({ code: 'extension_scope_required', message: 'review required', action: 'review_extension_scope', uuid })),
+        dispatcher: projection,
+      }),
     });
   });
   await page.route('**/api/v1/projects/fixture/dispatcher/**', async (route) => {
@@ -139,10 +152,11 @@ async function openFixture(page: Page, initialProjection: DispatcherProjection =
   await page.route('**/api/v1/projects/fixture/source-setup', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({
+    body: JSON.stringify(sourceSetup || {
       profiles: [],
       infobases: { acquisition_profile: '', roles: {} },
       infobases_fingerprint: 'sha256:fixture',
+      extension_scope: { extensions: [], included: [], excluded: [], dormant: [], unreviewed: [] },
       external_artifacts: { artifacts: [] },
       upload_draft_fingerprint: 'sha256:fixture',
       connection_profiles: {},
@@ -735,4 +749,69 @@ test('the dispatcher uses contextual and compact navigation with a fresh return 
   await returnTo();
   expect(ledger.workflowRequests()).toBe(7);
   expect(pageErrors.filter(message => message !== 'project bookmark not found')).toEqual([]);
+});
+
+test('extension review covers included, excluded, dormant, mixed-role and keyboard states', async ({ page }) => {
+  const present = (name: string, active = false) => ({ present: true, name, version: '1', active });
+  const absent = { present: false, name: '', version: '', active: false };
+  const rows = [
+    {
+      uuid: '11111111-1111-1111-1111-111111111111',
+      decision: 'include', rationale: '', dormant: false,
+      roles: { vendor_baseline: present('Included'), target_cf: present('Included', true), next_vendor: absent },
+    },
+    {
+      uuid: '22222222-2222-2222-2222-222222222222',
+      decision: 'exclude', rationale: 'Out of scope', dormant: false,
+      roles: { vendor_baseline: absent, target_cf: present('Excluded'), next_vendor: absent },
+    },
+    {
+      uuid: '33333333-3333-3333-3333-333333333333',
+      decision: 'exclude', rationale: 'Dormant policy', dormant: true,
+      roles: { vendor_baseline: absent, target_cf: absent, next_vendor: absent },
+    },
+    {
+      uuid: '44444444-4444-4444-4444-444444444444',
+      decision: '', rationale: '', dormant: false,
+      roles: { vendor_baseline: absent, target_cf: present('New'), next_vendor: present('Renamed', true) },
+    },
+  ];
+  await openFixture(page, saturatedProjection, {
+    profiles: [],
+    infobases: { acquisition_profile: '', roles: {} },
+    infobases_fingerprint: 'sha256:fixture',
+    extension_scope: {
+      extensions: rows,
+      included: [rows[0].uuid],
+      excluded: [rows[1].uuid],
+      dormant: [rows[2].uuid],
+      unreviewed: [rows[3].uuid],
+    },
+    external_artifacts: { artifacts: [] },
+    upload_draft_fingerprint: 'sha256:fixture',
+    connection_profiles: {},
+    active_source: {},
+    active_diff: {},
+  });
+  await page.getByRole('navigation', { name: 'Этапы диспетчера' }).getByRole('button', { name: 'Подготовка различий' }).click();
+  await page.getByRole('button', { name: 'Настроить источники' }).click();
+  await expect(page.locator(`#extension-${rows[3].uuid}`)).toBeFocused();
+  await expect(page.getByText('Ранее принятые решения')).toBeVisible();
+  await expect(page.getByText(/Новая версия поставщика: Renamed 1; активно/)).toBeVisible();
+  const decision = page.getByRole('combobox', { name: `Решение для расширения ${rows[3].uuid}` });
+  await decision.focus();
+  await decision.selectOption('exclude');
+  const rationale = page.getByLabel(`Обоснование исключения для расширения ${rows[3].uuid}`);
+  await decision.press('Tab');
+  await expect(rationale).toBeFocused();
+  await rationale.fill('Not part of this research');
+  await expect(page.getByText('Расширение не будет опубликовано в поколении исходников и не создаст DIF.').last()).toBeVisible();
+});
+
+test('empty extension discovery is distinct from uploaded external files', async ({ page }) => {
+  await openFixture(page);
+  await page.getByRole('button', { name: 'Источники', exact: true }).click();
+  await page.getByRole('button', { name: /Расширения конфигурации/ }).click();
+  await expect(page.getByText('В проверенных базах расширения не обнаружены.')).toBeVisible();
+  await expect(page.getByText('В контракте нет внешних файлов')).toBeVisible();
 });

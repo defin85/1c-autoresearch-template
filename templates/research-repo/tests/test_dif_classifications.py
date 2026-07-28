@@ -16,14 +16,19 @@ from one_c_autoresearch.dif_classifications import (
 FP = "sha256:" + "a" * 64
 
 
-def _row(identifier: str, kind: str = "meaning") -> dict:
+def _row(identifier: str, kind: str = "meaning", *, whole_component: bool = False, instruction: str = FP) -> dict:
     return make_row(
         identifier,
-        {"kind": kind, "semantic_hints": [], "evidence": [{"path": "a", "fingerprint": FP}], "rationale": "evidence"},
+        {
+            "kind": kind,
+            "semantic_hints": ["component:extension:x", "whole-component:added"] if whole_component else [],
+            "evidence": [{"path": "a", "fingerprint": FP}],
+            "rationale": "evidence",
+        },
         evidence_fingerprint=FP,
         result_schema_fingerprint=FP,
         profile_fingerprint=FP,
-        instruction_fingerprint=FP,
+        instruction_fingerprint=instruction,
         context_fingerprint=FP,
     )
 
@@ -78,3 +83,25 @@ def test_stale_or_partial_window_does_not_move_pointer(repository: Path) -> None
         bad["evidence"] = []
         publish_window(repository, [bad], expected_generation_id=active["generation_id"])
     assert (repository / "research/active-dif-classification-generation.json").read_bytes() == before
+
+
+def test_versioned_whole_component_result_can_replace_only_its_prior_result(repository: Path) -> None:
+    active = publish_empty(repository)
+    first = publish_window(
+        repository,
+        [_row("DIF-0000000000000001", whole_component=True)],
+        expected_generation_id=active["generation_id"],
+    )
+    replacement = _row(
+        "DIF-0000000000000001",
+        whole_component=True,
+        instruction="sha256:" + "b" * 64,
+    )
+    second = publish_window(repository, [replacement], expected_generation_id=first["generation_id"])
+    assert second["generation_id"] != first["generation_id"]
+    with pytest.raises(ValueError, match="cannot be replaced"):
+        publish_window(
+            repository,
+            [_row("DIF-0000000000000001")],
+            expected_generation_id=second["generation_id"],
+        )

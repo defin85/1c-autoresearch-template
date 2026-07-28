@@ -193,6 +193,7 @@ def input_snapshot(repo: Path) -> dict[str, Any]:
     classification = load_classifications(repo)
     current = load_active(repo)
     pointer = classification["pointer"]
+    from .component_groups import derive
     return {
         "source_generation_id": pointer["source_generation_id"],
         "diff_generation_id": pointer["diff_generation_id"],
@@ -202,12 +203,48 @@ def input_snapshot(repo: Path) -> dict[str, Any]:
         "classifications": classification["rows"],
         "prior_consolidation": current["pointer"],
         "mrq": current["mrq"],
+        "component_groups": derive(repo),
     }
 
 
 def normalized_records(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    membership = {
+        identifier: {
+            "component_kind": group["component_kind"],
+            "component_key": group["component_key"],
+            "component_direction": group["direction"],
+        }
+        for group in snapshot.get("component_groups", [])
+        for identifier in group["stable_diff_ids"]
+    }
     return [
-        *[{"record_id": row["stable_diff_id"], "record_type": "dif", **row} for row in snapshot["classifications"]],
+        *[{"record_id": row["stable_diff_id"], "record_type": "dif", **row, **membership.get(row["stable_diff_id"], {})} for row in snapshot["classifications"]],
+        *[{
+            "record_id": f"component:{group['component_kind']}:{group['component_key']}",
+            "record_type": "component_summary",
+            "component_kind": group["component_kind"],
+            "component_key": group["component_key"],
+            "component_direction": group["direction"],
+            "member_count": len(group["stable_diff_ids"]),
+            "member_fingerprint": fingerprint(group["stable_diff_ids"]),
+            "page_count": len(group["stable_diff_ids"]),
+        } for group in snapshot.get("component_groups", [])],
+        *[
+            {
+                "record_id": f"component-page:{group['component_kind']}:{group['component_key']}:{index}",
+                "record_type": "component_page",
+                "component_kind": group["component_kind"],
+                "component_key": group["component_key"],
+                "component_direction": group["direction"],
+                "page_index": index,
+                "page_count": len(group["stable_diff_ids"]),
+                "stable_diff_ids": [identifier],
+                "evidence": group["evidence"].get(identifier, []),
+                "target_coverage": group["target_coverage"].get(identifier),
+            }
+            for group in snapshot.get("component_groups", [])
+            for index, identifier in enumerate(group["stable_diff_ids"])
+        ],
         *[
             {
                 "record_id": row["mrq_id"],
@@ -252,7 +289,7 @@ def partition_manifest(records: list[dict[str, Any]], input_context_tokens: int,
             "index": index,
             "fingerprint": fingerprint(rows),
             "count": len(rows),
-            "record_ids": [row.get("record_id", row["stable_diff_id"]) for row in rows],
+            "record_ids": [row["record_id"] if "record_id" in row else row["stable_diff_id"] for row in rows],
             "stable_diff_ids": [
                 row["stable_diff_id"] for row in rows
                 if row.get("record_type", "dif") == "dif"
@@ -324,11 +361,38 @@ def plan_from_groups(
     merged_sources: set[str] = set()
     merge_targets: set[str] = set()
     split_targets: dict[str, list[str]] = {}
+    component_membership = {
+        identifier: f"{group['component_kind']}:{group['component_key']}"
+        for group in snapshot.get("component_groups", [])
+        for identifier in group["stable_diff_ids"]
+    }
     for group in sorted(groups, key=lambda row: str(row.get("semantic_key", ""))):
         semantic_key = str(group.get("semantic_key", "")).strip()
         members = sorted(set(group.get("stable_diff_ids", [])))
         if not semantic_key or not members or any(member not in meaning or member in assigned for member in members):
             raise ValueError("invalid or overlapping consolidation group")
+        supporting = sorted(set(group.get("supporting_diff_ids", [])) - set(members))
+        if any(identifier not in classified for identifier in supporting):
+            raise ValueError("unknown supporting DIF")
+        component_keys = sorted({
+            component_membership[identifier]
+            for identifier in members + supporting
+            if identifier in component_membership
+        })
+        if len(component_keys) > 1:
+            evidence = group.get("evidence", [])
+            if (
+                group.get("component_keys") != component_keys
+                or not str(group.get("rationale", "")).strip()
+                or not evidence
+                or any(
+                    not isinstance(item, dict)
+                    or not str(item.get("path", "")).strip()
+                    or not str(item.get("fingerprint", "")).startswith("sha256:")
+                    for item in evidence
+                )
+            ):
+                raise ValueError("cross-component group requires exact component keys, rationale, and evidence")
         mrq_id = content_id("MRQ-", {"schema_version": "3", "semantic_key": semantic_key})
         prior_row = prior_by_semantic.get(semantic_key)
         mrqs.append(
@@ -345,6 +409,16 @@ def plan_from_groups(
         )
         for member in members:
             dispositions.append({"schema_version": "3", "mrq_id": mrq_id, "stable_diff_id": member, "primary": True})
+            for index, evidence in enumerate(classified[member]["evidence"]):
+                evidence_rows.append({
+                    "schema_version": "3",
+                    "evidence_id": content_id("EVD-", {"mrq": mrq_id, "dif": member, "index": index, "evidence": evidence}),
+                    "mrq_id": mrq_id,
+                    "stable_diff_id": member,
+                    "payload": evidence,
+                })
+        for member in supporting:
+            dispositions.append({"schema_version": "3", "mrq_id": mrq_id, "stable_diff_id": member, "primary": False})
             for index, evidence in enumerate(classified[member]["evidence"]):
                 evidence_rows.append({
                     "schema_version": "3",
