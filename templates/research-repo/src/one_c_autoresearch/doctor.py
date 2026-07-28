@@ -34,7 +34,11 @@ def legacy_failures(repo: Path, manifest: dict[str, Any], tracked: list[str]) ->
         if relative.startswith("openspec/") or not path.is_file() or path.stat().st_size > 2_000_000 or path.suffix.lower() not in {".py", ".tsx", ".ts"}:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        for token in manifest.get("command_tokens", []) + manifest.get("route_tokens", []) + manifest.get("registration_tokens", []):
+        command_tokens = manifest.get("command_tokens", []) if relative.endswith("/cli.py") else []
+        for token in command_tokens:
+            if f'add_parser("{token}")' in text or f"add_parser('{token}')" in text:
+                failures.append({"code": "legacy.command-token", "path": relative, "message": f"forbidden command token: {token}"})
+        for token in manifest.get("route_tokens", []) + manifest.get("registration_tokens", []):
             if any(literal in text for literal in (f'"{token}"', f"'{token}'", f'/{token}')):
                 failures.append({"code": "legacy.command-token", "path": relative, "message": f"forbidden command token: {token}"})
     return failures

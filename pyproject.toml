@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "one-c-autoresearch"
-version = "0.2.0"
+version = "0.3.0"
 description = "Portable tooling for 1C autoresearch repositories."
 requires-python = ">=3.11"
 
@@ -16,7 +16,7 @@ one-c-autoresearch = "one_c_autoresearch.cli:main"
 one-c-autoresearch-workspace = "one_c_autoresearch.workspace_api:main"
 
 [tool.setuptools.package-data]
-one_c_autoresearch = ["workspace_static/**/*", "workspace_assets/*.zip"]
+one_c_autoresearch = ["workspace_static/**/*"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -24,3 +24,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests", "scripts/checks"]
 pythonpath = ["src"]
+markers = [
+  "smoke: end-to-end tests that require a real codex CLI and active repository state; skipped by default",
+]
+addopts = "-m 'not smoke' --import-mode=importlib"

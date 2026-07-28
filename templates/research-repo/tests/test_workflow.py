@@ -20,7 +20,7 @@ def test_active_agent_job_overrides_ready_gate_state():
 def test_fixed_graph_and_next_unit_matches_first_ready_gate():
     manifest = validate_workflow(REPO)
     assert manifest["schema_version"] == "4"
-    assert manifest["tool_version"] == "0.2.0"
+    assert manifest["tool_version"] == "0.3.0"
     assert len(manifest["gates"]) == 8
     assert len(manifest["jobs"]) == 9
     assert len(OPERATION_CATALOG) == 10
@@ -45,7 +45,7 @@ def test_graph_edits_fail_closed(tmp_path: Path):
     (tmp_path / "research/workflow.toml").write_text(text.replace('needs = ["configure"]', 'needs = ["configure"]\ndisabled = true', 1), encoding="utf-8")
     with pytest.raises(ValueError, match="fixed jobs"):
         validate_workflow(tmp_path)
-    (tmp_path / "research/workflow.toml").write_text(text.replace('tool_version = "0.2.0"', 'tool_version = "0.2.0"\nremote_action = true'), encoding="utf-8")
+    (tmp_path / "research/workflow.toml").write_text(text.replace('tool_version = "0.3.0"', 'tool_version = "0.3.0"\nremote_action = true'), encoding="utf-8")
     with pytest.raises(ValueError, match="top-level"):
         validate_workflow(tmp_path)
     unsafe = text.replace('operation_version = "1", timeout_seconds = 1800 }]', 'operation_version = "2", timeout_seconds = 1800, shell = "true", executable_path = "/bin/sh" }]', 1)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,8 @@ VISUAL_ASSETS = (
 IGNORED_PARTS = {"__pycache__", ".pytest_cache", ".venv", "node_modules", "test-results", ".artifacts", ".playwright-cli", ".git"}
 FORBIDDEN_SUFFIXES = {".cf", ".cfe", ".epf", ".erf", ".dt", ".pyc", ".pyo"}
 FORBIDDEN_TEXT = (re.compile(r"/run/" + r"media/"), re.compile(r"/home/[A-Za-z0-9._-]+/"), re.compile(r"sppr", re.I))
+CUSTOMER_PATHS = ("sources/generations", "analysis/indexes/generations", "analysis/migration-requirements/generations")
+SECRET_NAMES = re.compile(r"(?i)(?:^\.env$|credential|secret|private[_-]?key)")
 
 
 def allowed(path: Path) -> bool:
@@ -44,6 +47,55 @@ def copy_tree(source: Path, destination: Path) -> None:
     for path in sorted(source.rglob("*")):
         if not path.is_file() or not allowed(path.relative_to(source)): continue
         target = destination / path.relative_to(source); target.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(path, target)
+
+
+def file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def tree_hashes(root: Path) -> dict[str, str]:
+    if not root.exists():
+        return {}
+    return {
+        path.relative_to(root).as_posix(): file_hash(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and allowed(path.relative_to(root))
+    }
+
+
+def selected_reference_files(reference: Path) -> list[Path]:
+    paths = [reference / relative for relative in FILES]
+    for relative in TREES:
+        root = reference / relative
+        if root.exists():
+            paths.extend(path for path in root.rglob("*") if path.is_file() and not (set(path.relative_to(root).parts) & IGNORED_PARTS))
+    for source, _target in VISUAL_ASSETS:
+        root = reference / source
+        if root.exists():
+            paths.extend(path for path in root.rglob("*") if path.is_file() and not (set(path.relative_to(root).parts) & IGNORED_PARTS))
+    return sorted(set(paths), key=lambda path: path.relative_to(reference).as_posix())
+
+
+def selected_reference_hashes(reference: Path) -> dict[str, str]:
+    return {
+        path.relative_to(reference).as_posix(): file_hash(path)
+        for path in selected_reference_files(reference)
+        if path.is_file() and allowed(path.relative_to(reference))
+    }
+
+
+def validate_reference(reference: Path) -> None:
+    if not (reference / "research/workflow.toml").is_file() or not (reference / "src/one_c_autoresearch/service.py").is_file():
+        raise ValueError("reference does not implement the canonical runtime")
+    for relative in CUSTOMER_PATHS:
+        root = reference / relative
+        if root.exists() and any(path.is_file() and path.name != ".gitkeep" for path in root.rglob("*")):
+            raise ValueError(f"reference contains customer data: {relative}")
+    for path in selected_reference_files(reference):
+        if path.suffix.lower() in FORBIDDEN_SUFFIXES:
+            raise ValueError(f"reference contains forbidden binary payload: {path.relative_to(reference).as_posix()}")
+        if SECRET_NAMES.search(path.name):
+            raise ValueError(f"reference contains credential-like payload: {path.relative_to(reference).as_posix()}")
 
 
 def write_seed(root: Path) -> None:
@@ -105,53 +157,131 @@ def sanitize(root: Path, reference: Path) -> None:
         path.write_text(text, encoding="utf-8", newline="\n")
 
 
-def sync(reference: Path, destination: Path, replace: bool) -> None:
+def build_staging(reference: Path, staging: Path) -> None:
+    validate_reference(reference)
+    staging.mkdir()
+    for relative in FILES:
+        source = reference / relative
+        if not source.is_file(): raise FileNotFoundError(relative)
+        target = staging / relative; target.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(source, target)
+    for relative in TREES: copy_tree(reference / relative, staging / relative)
+    for source, target in VISUAL_ASSETS: copy_tree(reference / source, staging / target)
+    write_seed(staging); sanitize(staging, reference)
+    manifest = sorted(path.relative_to(staging).as_posix() for path in staging.rglob("*") if path.is_file())
+    (staging / "research/runtime-sync-manifest.json").write_text(json.dumps({"schema_version": "1", "paths": manifest}, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def change_plan(staged: Path, destination: Path) -> list[dict[str, str]]:
+    before, after = tree_hashes(destination), tree_hashes(staged)
+    plan = []
+    for path in sorted(before.keys() | after.keys()):
+        if path not in before:
+            plan.append({"status": "A", "path": path, "hash": after[path]})
+        elif path not in after:
+            plan.append({"status": "D", "path": path, "hash": before[path]})
+        elif before[path] != after[path]:
+            plan.append({"status": "C", "path": path, "hash": after[path]})
+    return plan
+
+
+def plan_fingerprint(reference: Path, destination: Path, staged: Path, plan: list[dict[str, str]]) -> str:
+    payload = {
+        "reference": str(reference),
+        "destination": str(destination),
+        "reference_files": selected_reference_hashes(reference),
+        "staged_manifest": tree_hashes(staged),
+        "changes": plan,
+    }
+    return "sha256:" + hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def parity_errors(expected: Path, actual: Path) -> list[str]:
+    plan = change_plan(expected, actual)
+    return [f"{item['status']} {item['path']}" for item in plan]
+
+
+def require_parity(expected: Path, actual: Path) -> None:
+    errors = parity_errors(expected, actual)
+    if errors:
+        raise RuntimeError("derived tree parity is incomplete:\n" + "\n".join(errors))
+
+
+def replace_tree(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(source, destination)
+
+
+def sync(
+    reference: Path,
+    destination: Path,
+    apply: bool = False,
+    expected_fingerprint: str = "",
+    promote: bool = False,
+    package_root: Path | None = None,
+) -> dict[str, object]:
     reference = reference.resolve(); destination = destination.resolve()
-    if not (reference / "research/workflow.toml").is_file() or not (reference / "src/one_c_autoresearch/service.py").is_file(): raise ValueError("reference does not implement the canonical runtime")
-    if destination.exists() and any(destination.iterdir()) and not replace: raise RuntimeError("destination is not empty; pass --replace after reviewing the exact target")
+    package_root = (package_root or Path(__file__).resolve().parents[1]).resolve()
+    approved = Path(__file__).resolve().parents[1] / "templates/research-repo"
+    generated = (destination / "research/runtime-sync-manifest.json").is_file()
+    if destination != approved.resolve() and destination.exists() and any(destination.iterdir()) and not generated:
+        raise RuntimeError("destination is non-empty and is not the approved canonical scaffold")
     with tempfile.TemporaryDirectory(prefix="one-c-generated-runtime-") as temporary:
-        staging = Path(temporary) / "research-repo"; staging.mkdir()
-        for relative in FILES:
-            source = reference / relative
-            if not source.is_file(): raise FileNotFoundError(relative)
-            target = staging / relative; target.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(source, target)
-        for relative in TREES: copy_tree(reference / relative, staging / relative)
-        for source, target in VISUAL_ASSETS: copy_tree(reference / source, staging / target)
-        write_seed(staging); sanitize(staging, reference)
-        manifest = sorted(path.relative_to(staging).as_posix() for path in staging.rglob("*") if path.is_file())
-        (staging / "research/runtime-sync-manifest.json").write_text(json.dumps({"schema_version": "1", "paths": manifest}, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-        if destination.exists(): shutil.rmtree(destination)
-        shutil.copytree(staging, destination)
+        staging = Path(temporary) / "research-repo"
+        build_staging(reference, staging)
+        plan = change_plan(staging, destination)
+        if promote:
+            plan = [{**item, "path": f"templates/research-repo/{item['path']}"} for item in plan]
+            promoted = (
+                ("src/one_c_autoresearch", staging / "src/one_c_autoresearch", package_root / "src/one_c_autoresearch"),
+                ("web/workspace", staging / "web/workspace", package_root / "web/workspace"),
+            )
+            plan += [
+                {**item, "path": f"{prefix}/{item['path']}"}
+                for prefix, source, target in promoted
+                for item in change_plan(source, target)
+            ]
+            rollback = "docs/operator/dispatcher-inspector-rollback.md"
+            plan += [
+                {**item, "path": rollback}
+                for item in change_plan(staging / "docs/operator", package_root / "docs/operator")
+                if item["path"] == "dispatcher-inspector-rollback.md"
+            ]
+            plan.sort(key=lambda item: item["path"])
+        fingerprint = plan_fingerprint(reference, destination, staging, plan)
+        result = {"fingerprint": fingerprint, "changes": plan}
+        if not apply:
+            return result
+        if not expected_fingerprint or expected_fingerprint != fingerprint:
+            raise RuntimeError("plan fingerprint mismatch; generate a new preview")
+        replace_tree(staging, destination)
+        require_parity(staging, destination)
+        if promote:
+            promote_package(destination, package_root)
+        return result
 
 
 def promote_package(scaffold: Path, package_root: Path) -> None:
     source_package = scaffold / "src/one_c_autoresearch"
     target_package = package_root / "src/one_c_autoresearch"
-    preserved = {"__init__.py", "cli.py", "doctor.py"}
-    shutil.rmtree(target_package / "workspace_static", ignore_errors=True)
-    for path in sorted(source_package.rglob("*")):
-        relative = path.relative_to(source_package)
-        if not path.is_file() or not allowed(relative) or relative.as_posix() in preserved:
-            continue
-        target = target_package / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target)
-    target_web = package_root / "web/workspace"
-    if target_web.exists():
-        shutil.rmtree(target_web)
-    shutil.copytree(scaffold / "web/workspace", target_web, ignore=shutil.ignore_patterns(*IGNORED_PARTS))
+    replace_tree(source_package, target_package)
+    replace_tree(scaffold / "web/workspace", package_root / "web/workspace")
     rollback = package_root / "docs/operator/dispatcher-inspector-rollback.md"
     rollback.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(scaffold / "docs/operator/dispatcher-inspector-rollback.md", rollback)
+    require_parity(source_package, target_package)
+    require_parity(scaffold / "web/workspace", package_root / "web/workspace")
 
 
 def main() -> int:
     package_root = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(); parser.add_argument("--reference", required=True); parser.add_argument("--destination", default=str(package_root / "templates/research-repo")); parser.add_argument("--replace", action="store_true"); parser.add_argument("--promote-package", action="store_true"); args = parser.parse_args()
+    parser = argparse.ArgumentParser(); parser.add_argument("--reference", required=True); parser.add_argument("--destination", default=str(package_root / "templates/research-repo")); parser.add_argument("--apply", action="store_true"); parser.add_argument("--expected-fingerprint", default=""); parser.add_argument("--promote-package", action="store_true"); args = parser.parse_args()
     destination = Path(args.destination)
-    sync(Path(args.reference), destination, args.replace)
-    if args.promote_package:
-        promote_package(destination, package_root)
+    result = sync(Path(args.reference), destination, args.apply, args.expected_fingerprint, args.promote_package, package_root)
+    for item in result["changes"]:
+        print(item["status"], item["path"], item["hash"])
+    print(result["fingerprint"])
     return 0
 
 

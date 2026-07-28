@@ -3,4 +3,4 @@
 from pathlib import Path
 
 __path__.append(str(Path(__file__).parents[1] / "src/one_c_autoresearch"))
-__version__ = "0.2.0"
+__version__ = "0.3.0"

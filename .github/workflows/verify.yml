@@ -24,19 +24,62 @@ jobs:
         with:
           tool: ripgrep
 
+      - name: Install Python test dependencies
+        run: python -m pip install '.[workspace]' pytest build
+
       - name: Test template contract
-        run: python -m one_c_autoresearch checks template
+        run: python scripts/checks/test_template.py
 
       - name: Test doctor smoke scenarios
-        run: python -m one_c_autoresearch checks doctor
+        run: python scripts/checks/test_doctor.py
 
-      - name: Run doctor
-        run: python -m one_c_autoresearch doctor --json --deep --strict
+      - name: Test canonical repository
+        run: python scripts/checks/test_research_repo.py --repo-path templates/research-repo
+
+      - name: Build release artifacts
+        run: |
+          python -m build
+          python scripts/build_workspace_template.py
+
+      - name: Run Python tests
+        run: python -m pytest -q
 
       - name: Test managed workspace runtime
         if: runner.os != 'Windows'
         working-directory: templates/research-repo
         run: pip install '.[workspace]' httpx pytest && pytest -q tests/test_dispatcher.py tests/test_dispatcher_api.py tests/test_dispatcher_smoke.py tests/test_mrq_batches.py tests/test_pipeline_graphs.py tests/test_workflow.py
+
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: astral-sh/setup-uv@v6
+      - run: python -m pip install '.[workspace]' pytest build
+      - name: Build exact 0.2.0 baseline
+        shell: bash
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/baseline" a7ca2e03d7b7fc4e5245634b574df37a799f55b7
+          grep -q 'version = "0.2.0"' "$RUNNER_TEMP/baseline/pyproject.toml"
+          uv build --wheel --out-dir "$RUNNER_TEMP/baseline-dist" "$RUNNER_TEMP/baseline"
+          baseline=$(find "$RUNNER_TEMP/baseline-dist" -name 'one_c_autoresearch-0.2.0-*.whl' -print -quit)
+          echo "ONE_C_AUTORESEARCH_020_WHEEL=$baseline" >> "$GITHUB_ENV"
+          echo "ONE_C_AUTORESEARCH_020_SHA256=$(sha256sum "$baseline" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+      - name: Build 0.3.0 distributions
+        run: |
+          python -m build
+          python scripts/build_workspace_template.py
+      - name: Verify clean and upgrade installations
+        run: python -m pytest -q tests/test_template_release.py
+      - name: Verify fresh generated repository deeply
+        run: python scripts/checks/test_doctor.py --deep
 
   workspace-frontend:
     runs-on: ubuntu-latest
@@ -57,3 +100,4 @@ jobs:
       - run: npm run test:e2e
         working-directory: web/workspace
       - run: python scripts/build_workspace_template.py
+      - run: test -f dist/research-template.zip

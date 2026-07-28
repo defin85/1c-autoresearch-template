@@ -1,9 +1,6 @@
-from __future__ import annotations
+"""Repository-local loader for the src-layout package."""
 
 from pathlib import Path
 
-_src_package = Path(__file__).resolve().parents[1] / "src" / "one_c_autoresearch"
-if _src_package.exists():
-    __path__.append(str(_src_package))
-
-__version__ = "0.2.0"
+__path__.append(str(Path(__file__).parents[1] / "src/one_c_autoresearch"))
+__version__ = "0.3.0"

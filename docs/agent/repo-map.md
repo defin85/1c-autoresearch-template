@@ -1,69 +1,54 @@
 # Agent Repo Map
 
-This repository is a reusable template for concrete 1C autoresearch repositories. Keep customer source dumps, generated indexes, and deliverables out of this template.
+This repository has one project runtime and one small repository-local
+maintenance boundary.
 
-Reusable contour implementations are in `src/one_c_autoresearch/`:
-`configuration_source_parser.py`, `custom_metadata_inventory.py`,
-`customization_registry.py`, `migration_requirements.py`,
-`parallel_research.py`, and `manual_cleanup_commands/`. Generated repository
-scaffolds and agent entry points are under `templates/research-repo/`.
+## Ownership
 
-## Top-Level Map
+| Path | Authority |
+| --- | --- |
+| `templates/research-repo/` | Canonical portable generated repository. |
+| `src/one_c_autoresearch/` | Installable canonical runtime; normalized two-way parity with the scaffold is required. |
+| `web/workspace/` | Canonical workspace source. |
+| `src/one_c_autoresearch/workspace_static/` | Compiled workspace package assets; never hand-edit. |
+| `scripts/sync_generated_runtime.py` | Preview and fingerprint deterministic owned-tree replacement. |
+| `scripts/build_workspace_template.py` | Build the separate deterministic `dist/research-template.zip`. |
+| `scripts/bootstrap/new_research_repo.py` | Copy the validated scaffold into an empty destination. |
+| `scripts/checks/test_template.py` | Root/scaffold parity and forbidden-authority gate. |
+| `scripts/checks/test_doctor.py` | Fresh-bootstrap smoke gate. |
+| `scripts/checks/test_research_repo.py` | Delegate to a target repository's canonical doctor. |
+| `tests/test_generated_runtime_sync.py` | Root-only synchronization coverage. |
+| `tests/test_template_release.py` | Root-only package and release coverage. |
 
-| Path | Purpose | Edit When |
-| --- | --- | --- |
-| `AGENTS.md` | Mandatory repository rules for Codex and other agents. | Global agent behavior, safety boundaries, or verification entry points change. |
-| `README.md` | Human and agent overview of the template contract. | Public workflow, bootstrap usage, layout, or high-level process changes. |
-| `project.example.toml` | Example manifest for concrete research repositories. | Manifest schema or source/MCP/web policy changes. |
-| `docs/agent/` | Agent navigation, repo map, and verification runbook. | Codex onboarding or repeatable agent workflows change. |
-| `docs/method/` | Reusable 1C analysis methodology and evidence pack schema. | Evidence levels, queue design, output contract, or analysis method changes. |
-| `scripts/bootstrap/` | Creates concrete research repositories from `templates/research-repo/`. | Bootstrap arguments, template copying, or token replacement changes. |
-| `scripts/checks/` | Template and generated-repo validation tests. | Validation rules, smoke tests, or doctor expectations change. |
-| `scripts/doctor.py` | Primary health check for both template and research repositories. | Repository contract, queue validation, manifest policy, or automation output changes. |
-| `src/one_c_autoresearch/autopilot.py` | Autopilot customization-map scaffold helpers and artifact headers. | Final-map artifact contract or scaffold behavior changes. |
-| `src/one_c_autoresearch/final_gate.py` | Reverse-map normalization layer for publishable final diff and feature maps. | Final claims need new downgrade/blocking rules. |
-| `src/one_c_autoresearch/reverse_map.py` | Reverse functional mapping scaffold, coverage seeding, and workitem continuation helpers. | Fact-to-intent reverse engineering workflow changes. |
-| `src/one_c_autoresearch/subject_cards.py` | Iterative subject-card discovery, registry, seeding, refinement, and validation. | The analyst-owned card pipeline changes. |
-| `src/one_c_autoresearch/functional_gaps.py` | One-card-per-pass migration gap cards with hypotheses, checks, and review artifacts. | Migration gap workflow changes. |
-| `src/one_c_autoresearch/workspace*.py` | Optional managed workspace API, durable state, run manager, and wrapper. | Browser control-plane, security, event, or long-operation behavior changes. |
-| `web/workspace/` | React-admin setup wizard and project workspace source. | Browser workflow, forms, monitoring, or accessibility changes. |
-| `src/one_c_autoresearch/workspace_static/` | Deterministic compiled workspace assets shipped in the wheel. | Rebuild after frontend changes; do not hand-edit. |
-| `templates/research-repo/` | Files copied into a concrete research repository. | Concrete project layout, queue workflow, or generated repo instructions change. |
-| `examples/` | Small examples of intended command shapes. | User-facing examples need to reflect current bootstrap arguments. |
+No other root maintenance script or root-only test is part of the supported
+surface. Generated runtime tests are synchronized from the verified canonical
+target.
+
+## Active Documentation
+
+Only these files are active root documentation:
+
+- `README.md`
+- `AGENTS.md`
+- `docs/agent/repo-map.md`
+- `docs/agent/verification.md`
+- `docs/operator/dispatcher-inspector-rollback.md`
+
+OpenSpec archives are retained as non-executable history and excluded from
+active-contract scans.
 
 ## Change Routing
 
-| Change Area | Read First | Likely Files | Verification |
-| --- | --- | --- | --- |
-| Template documentation | `AGENTS.md`, `README.md`, `docs/agent/index.md` | `README.md`, `docs/agent/*`, `docs/method/*` | `python -m one_c_autoresearch checks template`, `python -m one_c_autoresearch doctor` |
-| Bootstrap behavior | `README.md`, `scripts/bootstrap/new_research_repo.py` | `scripts/bootstrap/new_research_repo.py`, `templates/research-repo/*` | `python -m one_c_autoresearch checks doctor` |
-| Research repo contract | `templates/research-repo/AGENTS.md`, `templates/research-repo/project.toml` | `templates/research-repo/*`, `scripts/checks/test_research_repo.py`, `scripts/doctor.py` | `python -m one_c_autoresearch checks research --repo-path <target-repo>` |
-| Queue workflow | `docs/method/queue-design.md`, `templates/research-repo/analysis/queue/*` | Queue docs, queue scripts, queue skill | `python -m one_c_autoresearch checks doctor`, generated repo doctor |
-| Autopilot customization map | `docs/method/autopilot-customization-map.md` | `src/one_c_autoresearch/autopilot.py`, `src/one_c_autoresearch/final_gate.py`, `src/one_c_autoresearch/doctor.py`, `templates/research-repo/analysis/indexes/*`, `templates/research-repo/outputs/*` | `python -m one_c_autoresearch checks doctor`, generated repo doctor with `autopilot.enabled=true` |
-| Physical clean comparison | `docs/method/physical-clean-comparison.md` | `docs/method/autopilot-customization-map.md`, `templates/research-repo/analysis/clean-comparison/*`, `templates/research-repo/outputs/*`, `src/one_c_autoresearch/doctor.py` | `python -m one_c_autoresearch checks template`, generated repo doctor |
-| Reverse functional map | `docs/method/reverse-functional-map.md` | `src/one_c_autoresearch/reverse_map.py`, `src/one_c_autoresearch/doctor.py`, `templates/research-repo/analysis/reverse-map/*` | `python -m one_c_autoresearch checks doctor`, generated repo doctor |
-| Infobase evidence loop | `docs/method/autopilot-customization-map.md`, `docs/method/reverse-functional-map.md` | `src/one_c_autoresearch/reverse_map.py`, `src/one_c_autoresearch/doctor.py`, `src/one_c_autoresearch/review_dashboard.py`, `templates/research-repo/analysis/reverse-map/infobase-checks.csv` | `python -m one_c_autoresearch checks template`, generated repo doctor |
-| Subject cards | `templates/research-repo/analysis/subject-cards/README.md` | `src/one_c_autoresearch/subject_cards.py`, `src/one_c_autoresearch/review_dashboard.py`, `src/one_c_autoresearch/doctor.py`, `templates/research-repo/analysis/subject-cards/*` | `python -m one_c_autoresearch checks doctor`, generated repo subject-card commands |
-| Functional gaps | `templates/research-repo/analysis/functional-gaps/README.md` | `src/one_c_autoresearch/functional_gaps.py`, `src/one_c_autoresearch/doctor.py`, `templates/research-repo/analysis/functional-gaps/*` | `python -m one_c_autoresearch checks doctor`, `python -m one_c_autoresearch functional-gap validate --card <slug>` |
-| Manifest/MCP/web policy | `project.example.toml`, `templates/research-repo/project.toml` | Manifests, `src/one_c_autoresearch/doctor.py`, research `AGENTS.md`, optional `.codex/1c-mcp.toml` checks | `python -m one_c_autoresearch doctor --json --deep`, targeted doctor smoke tests |
-| Agent instructions | `AGENTS.md`, `docs/agent/index.md` | Root and template `AGENTS.md`, `docs/agent/*`, `.agents/skills/*` | `python -m one_c_autoresearch checks template`, generated repo validation |
-| Managed workspace | `openspec/changes/add-managed-autoresearch-workspace-ui/`, `docs/agent/verification.md` | `src/one_c_autoresearch/workspace*.py`, `web/workspace/*`, compiled assets | workspace Python tests, frontend typecheck/test/build, package startup smoke |
+| Change | Start Here | Verify |
+| --- | --- | --- |
+| Canonical runtime or CLI | Verified target, then `templates/research-repo/src/` | Target tests, normalized two-way parity, forbidden scans |
+| Workspace | `templates/research-repo/web/workspace/` and `web/workspace/` | Frontend tests, typecheck, build, browser acceptance |
+| Synchronization | `scripts/sync_generated_runtime.py` | Preview/apply, input drift, stale-file, interruption and convergence tests |
+| Bootstrap | `scripts/bootstrap/new_research_repo.py` | Empty/non-empty destination tests and fresh-repository verification |
+| Packaging | `pyproject.toml`, `scripts/build_workspace_template.py` | Wheel, sdist, separate archive and clean/upgrade install scans |
+| Verification contract | `docs/agent/verification.md` | Ubuntu, Windows, and macOS CI where supported |
 
-## System Of Record
-
-- `AGENTS.md`: mandatory behavior and safety rules.
-- `docs/agent/repo-map.md`: where to look and what to edit.
-- `docs/agent/verification.md`: canonical verification matrix.
-- `docs/method/1c-autoresearch-process.md`: analysis method and feature output contract.
-- `docs/method/evidence-pack-schema.md`: canonical feature pack CSV headers and file contract.
-- `docs/method/autopilot-customization-map.md`: end-to-end final customization-map contract and doctor-gated completion rules.
-- `docs/method/physical-clean-comparison.md`: deterministic physical cleanup, refinement ledger, and intermediate analyst dashboard contract.
-- `docs/method/reverse-functional-map.md`: long-running fact-to-intent reverse mapping continuation contract.
-- `docs/method/queue-design.md`: queue semantics and worker rules.
-- `templates/research-repo/analysis/subject-cards/`: generated subject-card contract.
-- `templates/research-repo/analysis/functional-gaps/`: generated one-card-per-pass functional-gap contract.
-- `templates/research-repo/`: generated research repository contract.
-
-For generated research repositories, `.codex/1c-mcp.toml` is an optional local manifest. When it exists, it must match the MCP server, URL, and service root declared in `project.toml`.
-
-Prefer updating the system-of-record document first, then update short references elsewhere.
+Release `0.3.0` deliberately removes the legacy queue, `CUS`, subject-card,
+reverse-map, functional-gap, manual-cleanup, old dashboard, and
+compatibility-reader surfaces. Do not add adapters. Consumers needing those
+interfaces stay on `0.2.0`.

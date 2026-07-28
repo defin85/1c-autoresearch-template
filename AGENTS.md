@@ -1,51 +1,58 @@
 # Repo Instructions
 
-This repository is a clean template for reproducible 1C autoresearch projects.
+This repository maintains the canonical runtime and generator for reproducible
+1C autoresearch repositories.
 
 ## Scope
 
-- Keep this repo free of customer-specific source dumps, generated indexes, XLSX reports, and one-off analysis artifacts.
-- Put reusable process assets here: methodology, templates, queue scripts, validation scripts, and example scaffolds.
-- Create customer/project-specific research repositories from `templates/research-repo/`.
+- Keep customer sources, credentials, generated indexes, and deliverables out.
+- Treat `templates/research-repo/` as the canonical generated-repository
+  surface and keep the installable runtime in two-way parity with it.
+- Do not restore legacy queue, `CUS`, subject-card, reverse-map,
+  functional-gap, manual-cleanup, old dashboard, or compatibility-reader
+  authorities. `0.2.0` is the last compatible legacy release.
+- Never import, convert, overwrite, or delete customer evidence during
+  generation, synchronization, verification, upgrade, or rollback.
 
 ## Language
 
 - Keep reusable template docs and scripts in English.
-- Project instances may contain Russian business terms, 1C object names, and customer-facing outputs.
+- Project instances may contain Russian business terms and 1C object names.
 
-## Editing Rules
+## Owned Maintenance Surface
 
-- For changes discovered while working on `sppr-research`, implement and verify
-  the behavior there first, then port only the customer-independent part into
-  this template.
-- Do not copy real `cf`, `cfe`, infobase data, or customer deliverables into this template.
-- Prefer additive changes to the template contract.
-- Keep queue schemas backward-compatible: add optional fields instead of changing existing meanings.
-- Scripts must be safe by default and fail before overwriting non-empty target directories.
+Only these repository-local maintenance scripts are supported:
 
-## Agent Navigation
+- `scripts/sync_generated_runtime.py`
+- `scripts/build_workspace_template.py`
+- `scripts/bootstrap/new_research_repo.py`
+- `scripts/checks/test_template.py`
+- `scripts/checks/test_doctor.py`
+- `scripts/checks/test_research_repo.py`
 
-- Use `docs/agent/repo-map.md` as the map of entry points, ownership, and change routing.
-- Use `docs/agent/verification.md` as the canonical verification matrix.
-- Use `docs/method/1c-autoresearch-process.md`, `docs/method/queue-design.md`, `docs/method/physical-clean-comparison.md`, and `docs/method/reverse-functional-map.md` as the reusable analysis methodology.
-- Keep short command snippets in this file aligned with `docs/agent/verification.md`.
+They must stay outside the runtime distribution and generated repositories.
+Synchronization is preview-first and may apply only an unchanged,
+fingerprinted plan. Bootstrap must reject non-empty destinations.
 
-## Verification
+The active root documentation surface is exactly `README.md`, `AGENTS.md`,
+`docs/agent/repo-map.md`, `docs/agent/verification.md`, and
+`docs/operator/dispatcher-inspector-rollback.md`. OpenSpec archives are
+non-executable history.
 
-Run after template changes:
+## Navigation And Verification
 
-```bash
-python -m one_c_autoresearch checks template
-python -m one_c_autoresearch checks doctor
-python -m one_c_autoresearch doctor --json --deep --strict
-```
-
-Run after creating a concrete research repo:
+- Read `docs/agent/repo-map.md` for ownership and change routing.
+- Read `docs/agent/verification.md` for the release matrix.
 
 ```bash
-python -m one_c_autoresearch checks research --repo-path <target-repo>
-python -m one_c_autoresearch doctor --repo-path <target-repo>
+python scripts/checks/test_template.py
+python scripts/checks/test_doctor.py
+python scripts/checks/test_research_repo.py --repo-path <target-repo>
+pytest -q
 ```
+
+`dist/research-template.zip` is a separate release artifact, never runtime
+package data.
 
 ## Goal Cursor
 

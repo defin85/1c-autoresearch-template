@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<MetaDataObject>
-  <HTTPService uuid="service-1">
-    <Properties>
-      <Name>Интеграция</Name>
-    </Properties>
-  </HTTPService>
-</MetaDataObject>

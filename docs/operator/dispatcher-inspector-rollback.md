@@ -1,5 +1,9 @@
 # Dispatcher inspector database upgrade and rollback
 
+This is the only active operator document in the `0.3.0` template. It applies
+to the canonical dispatcher and invocation inspector; it does not restore any
+legacy dashboard or state authority.
+
 The dispatcher database is disposable operational state, but its upgrade is
 backed up once before inspector columns are added. The service uses SQLite's
 online backup API, which includes committed WAL content, and writes
