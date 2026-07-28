@@ -7,21 +7,21 @@
 
 ## 2. Make Routing Fail Closed
 
-<!-- GOAL_CURSOR -->
-- [ ] 2.1 Compute the union of extension UUIDs from all three current tested connection profiles with per-role name, version, activation, and presence facts.
-  - Этап цикла: реализация
-  - Состояние шага: контракт и отпечатки реализованы и проверены; реализуется полный fail-closed маршрут и свежая проверка перед экспортом
-  - Следующее действие: завершить ограниченную живую проверку, переиспользование приватного staging и проверки отсутствия публикации исключённых расширений
-  - Файлы шага: ../sppr-research-ver2/src/one_c_autoresearch/sources.py; ../sppr-research-ver2/src/one_c_autoresearch/source_routing.py; ../sppr-research-ver2/tests/test_sources.py; openspec/changes/add-explicit-extension-source-scope/tasks.md
-- [ ] 2.2 Return a typed `extension_scope_required` blocker for every discovered UUID without a tracked decision.
-- [ ] 2.3 Filter extension component membership to explicit `include` decisions before acquisition, indexing, and comparison.
-- [ ] 2.4 Publish excluded and dormant extension summaries in route preview while keeping excluded payloads out of source generations.
-- [ ] 2.5 Revalidate profile enumeration, workflow, and contract fingerprints under the existing mutation lock before acquisition.
-- [ ] 2.6 Repeat bounded live extension enumeration and private UUID-verification staging for all three roles immediately before export; reuse only verified included payloads, delete excluded or failed staging, and on drift publish nothing and require refreshed review.
+- [x] 2.1 Compute the union of extension UUIDs from all three current tested connection profiles with per-role name, version, activation, and presence facts.
+- [x] 2.2 Return a typed `extension_scope_required` blocker for every discovered UUID without a tracked decision.
+- [x] 2.3 Filter extension component membership to explicit `include` decisions before acquisition, indexing, and comparison.
+- [x] 2.4 Publish excluded and dormant extension summaries in route preview while keeping excluded payloads out of source generations.
+- [x] 2.5 Revalidate profile enumeration, workflow, and contract fingerprints under the existing mutation lock before acquisition.
+- [x] 2.6 Repeat bounded live extension enumeration and private UUID-verification staging for all three roles immediately before export; reuse only verified included payloads, delete excluded or failed staging, and on drift publish nothing and require refreshed review.
 
 ## 3. Align The Workspace Contract
 
+<!-- GOAL_CURSOR -->
 - [ ] 3.1 Add a dedicated extension-review section with one UUID row, three role observations, decision control, and conditional rationale.
+  - Этап цикла: реализация
+  - Состояние шага: раздел, полный выбор и доступные UUID-связанные элементы реализованы; требуется связать блокировщик и общий CLI-контракт
+  - Следующее действие: добавить переход от extension_scope_required к точной строке, общий read-only helper и CLI-диагностику
+  - Файлы шага: ../sppr-research-ver2/web/workspace/src/App.tsx; ../sppr-research-ver2/src/one_c_autoresearch/workspace_api.py; ../sppr-research-ver2/src/one_c_autoresearch/cli.py; ../sppr-research-ver2/tests; openspec/changes/add-explicit-extension-source-scope/tasks.md
 - [ ] 3.2 Preview and confirm the exact tracked contract mutation using existing stale-input and idempotency protections.
 - [ ] 3.3 Direct `extension_scope_required` blockers to the extension-review section and preserve unsaved selections during unrelated reconciliation.
 - [ ] 3.4 Rename and explain the external-artifact section as uploaded external files for EPF, ERF, source trees, and other declared files.
