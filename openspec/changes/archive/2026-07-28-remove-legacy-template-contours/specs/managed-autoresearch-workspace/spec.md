@@ -3,7 +3,7 @@
 ### Requirement: Preserve CLI and repository compatibility
 The managed workspace SHALL use the canonical generated-repository artifact formats and supported runtime operations, and its absence or disablement SHALL not prevent canonical CLI operation or invalidate a canonical generated repository. Compatibility SHALL NOT include removed queue, `CUS`, subject-card, reverse-map, functional-gap, manual-cleanup, old dashboard, or compatibility-reader surfaces.
 
-#### Scenario: Open an existing canonical research repository
+#### Scenario: Open an existing research repository
 - **WHEN** a repository using the supported canonical workflow is registered
 - **THEN** the UI derives its stages from canonical artifacts and requests only missing UI-specific configuration.
 

@@ -232,35 +232,24 @@ The system SHALL maintain a browser queue of approvals and manual decisions with
 - **WHEN** the repository mutation or verification for an approval fails
 - **THEN** the approval remains unapplied, the stage stays blocked, and the UI reports the failure without presenting the SQLite audit record as canonical truth
 
-### Requirement: Expose existing dashboards as isolated results
-The system SHALL expose generated clean-comparison, review, and functional-gap dashboards as read-only stage results through iframe sandboxing without `allow-same-origin`, and SHALL not grant them control API, parent navigation, or secret access. HTML that cannot run in that sandbox SHALL be available only as an attachment download, not executable same-origin content.
-
-#### Scenario: Open a generated dashboard
-- **WHEN** a user opens a valid dashboard artifact for the registered project
-- **THEN** the server resolves it inside the project boundary and displays it without converting it into workflow state
-
-#### Scenario: Dashboard path escapes the project
-- **WHEN** an artifact request resolves outside the registered project root
-- **THEN** the server rejects the request and returns no file content
-
-#### Scenario: Dashboard requires a weaker sandbox
-- **WHEN** a generated dashboard cannot render without same-origin privileges or parent navigation
-- **THEN** the UI offers an attachment download and does not weaken the sandbox
-
 ### Requirement: Preserve CLI and repository compatibility
-The managed workspace SHALL use existing canonical artifact formats and supported package operations, and its absence or disablement SHALL not prevent CLI operation or invalidate an existing generated repository.
+The managed workspace SHALL use the canonical generated-repository artifact formats and supported runtime operations, and its absence or disablement SHALL not prevent canonical CLI operation or invalidate a canonical generated repository. Compatibility SHALL NOT include removed queue, `CUS`, subject-card, reverse-map, functional-gap, manual-cleanup, old dashboard, or compatibility-reader surfaces.
 
 #### Scenario: Open an existing research repository
-- **WHEN** a compatible repository created before the managed workspace is registered
-- **THEN** the UI derives its stages from existing artifacts and requests only missing UI-specific configuration
+- **WHEN** a repository using the supported canonical workflow is registered
+- **THEN** the UI derives its stages from canonical artifacts and requests only missing UI-specific configuration.
+
+#### Scenario: Open a repository that depends on removed authorities
+- **WHEN** a repository requires a removed legacy path, command, route, module, or state authority
+- **THEN** the workspace MUST reject it as unsupported without importing, converting, deleting, or mutating its evidence.
 
 #### Scenario: Remove the optional UI runtime
 - **WHEN** the optional web dependencies and user-scope UI state are removed
-- **THEN** canonical research files and CLI workflows remain usable
+- **THEN** canonical research files and canonical CLI workflows remain usable.
 
 #### Scenario: Concurrent external edit precedes configuration save
 - **WHEN** `project.toml` no longer matches the fingerprint shown in the browser preview
-- **THEN** the service rejects the save, preserves the external edit, and requires a refreshed preview
+- **THEN** the service rejects the save, preserves the external edit, and requires a refreshed preview.
 
 ### Requirement: Verify security, recovery, and responsiveness
 The implementation SHALL include automated API, frontend, and browser checks for operation allowlisting, path confinement, secret redaction, event order and replay, cancellation, restart reconciliation, polling fallback, stable component state, and a complete fixture workflow.
