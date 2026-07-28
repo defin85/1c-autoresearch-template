@@ -201,14 +201,18 @@ test("saved infobase connection parameters are visible and editable without expo
     active_source: {},
     active_diff: {},
   };
+  let finishReview!: (value: { ok: boolean; json: () => Promise<Record<string, unknown>> }) => void;
+  const reviewRequest = new Promise<{ ok: boolean; json: () => Promise<Record<string, unknown>> }>(
+    (resolve) => { finishReview = resolve; },
+  );
   vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string, init?: RequestInit) =>
-    Promise.resolve({
+    url.endsWith("/actions") && init?.method === "POST"
+      ? reviewRequest
+      : Promise.resolve({
       ok: true,
       json: async () => url.endsWith("/source-setup")
         ? setup
-        : url.endsWith("/actions") && init?.method === "POST"
-          ? { operation: "sources.configure", preview: true, comparison_epoch_changed: true }
-          : ({ complete: true, tools: [] }),
+        : ({ complete: true, tools: [] }),
     }),
   ));
   const scrollIntoView = vi.fn();
@@ -252,6 +256,11 @@ test("saved infobase connection parameters are visible and editable without expo
   fireEvent.change(rationale, { target: { value: "Техническое" } });
   expect(rationale).toHaveValue("Техническое");
   fireEvent.click(screen.getByRole("button", { name: "Просмотреть выбор" }));
+  expect(await screen.findByText("Проверяется выбор…")).toBeInTheDocument();
+  finishReview({
+    ok: true,
+    json: async () => ({ operation: "sources.configure", preview: true, comparison_epoch_changed: true }),
+  });
   expect(await screen.findByText("Будет начата новая эпоха сравнения.")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Применить выбор" })).toBeEnabled();
 });

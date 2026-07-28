@@ -387,6 +387,7 @@ function SplitStageProgress({ circuitId, projection }: { circuitId: 'analyze-dif
 
 export function DispatcherPanel({ projectId, projection, fingerprint, selection, refreshToken = 0, onSelect, onClose, onOpenSources, onOpenIndexes, onOpenSettings, onOpenJournal, onOpenRegistry, readOnly = false }: { projectId: string; projection: DispatcherProjection; fingerprint: string; selection: DispatcherSelection | null; refreshToken?: number; onSelect?: (selection: DispatcherSelection, initiator: HTMLElement) => void; onClose: () => void; readOnly?: boolean } & ContextActions) {
   const [busy, setBusy] = useState(false);
+  const [pendingAction, setPendingAction] = useState('');
   const [outcome, setOutcome] = useState<DispatcherOutcome | null>(null);
   const [plan, setPlan] = useState<RecomputePlan | null>(null);
   const [confirmations, setConfirmations] = useState<string[]>([]);
@@ -438,6 +439,12 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
   const run = useCallback(async (action: 'start' | 'stop' | 'resume' | 'cancel', extra: DispatcherActionPayload = {}) => {
     if (!job) return;
     setBusy(true);
+    setPendingAction({
+      start: 'Запускается задание…',
+      stop: 'Запрашивается мягкая остановка…',
+      resume: 'Возобновляется задание…',
+      cancel: 'Отменяется задание…',
+    }[action]);
     setError('');
     try {
       const body = action === 'stop' ? extra : { actor: 'local-user', ...extra };
@@ -446,6 +453,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : 'dispatcher action failed');
     } finally {
+      setPendingAction('');
       setBusy(false);
     }
   }, [job, projectId, fingerprint]);
@@ -455,6 +463,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
     const candidate = retryCandidates.find((item) => item.run_id === predecessorRunId);
     const bindings = (candidate?.input_fingerprints || lease?.summary?.bindings || {}) as Record<string, string>;
     setBusy(true);
+    setPendingAction('Запускается явный повтор…');
     setError('');
     try {
       setOutcome(await postDispatcherAction(projectId, job, 'retry', {
@@ -472,6 +481,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : 'Явный повтор отклонён как несовместимый');
     } finally {
+      setPendingAction('');
       setBusy(false);
     }
   }, [fingerprint, job, lease, policySource, predecessorRunId, projectId, retryCandidates]);
@@ -479,6 +489,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
   const approve = useCallback(async () => {
     if (!job || !pendingApproval) return;
     setBusy(true);
+    setPendingAction('Одобряется предложение…');
     setError('');
     try {
       const action = job === 'consolidate-mrq' ? 'approve-consolidation' : 'approve-decision';
@@ -491,12 +502,14 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : 'approval failed');
     } finally {
+      setPendingAction('');
       setBusy(false);
     }
   }, [job, pendingApproval, projectId, fingerprint]);
 
   const previewRecompute = useCallback(async () => {
     setBusy(true);
+    setPendingAction('Строится план пересчёта…');
     setError('');
     setPlan(null);
     setConfirmations([]);
@@ -510,6 +523,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : 'Не удалось построить план пересчёта');
     } finally {
+      setPendingAction('');
       setBusy(false);
     }
   }, [fingerprint, projectId]);
@@ -517,6 +531,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
   const startRecompute = useCallback(async () => {
     if (!plan || confirmations.length !== (plan.required_confirmations ?? []).length) return;
     setBusy(true);
+    setPendingAction('Запускается пересчёт…');
     setError('');
     try {
       const result = await api<RecomputeRun>(`/projects/${projectId}/stage-recompute/runs`, {
@@ -534,6 +549,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : 'Не удалось запустить пересчёт');
     } finally {
+      setPendingAction('');
       setBusy(false);
     }
   }, [confirmations, fingerprint, plan, projectId]);
@@ -542,6 +558,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
     const runId = String(recomputeLease?.summary?.run_id || recomputeRun?.run_id || '');
     if (!runId) return;
     setBusy(true);
+    setPendingAction('Отменяется пересчёт…');
     setError('');
     try {
       setRecomputeRun(await api<RecomputeRun>(`/projects/${projectId}/stage-recompute/runs/${encodeURIComponent(runId)}/cancel`, {
@@ -552,6 +569,7 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : 'Не удалось отменить пересчёт');
     } finally {
+      setPendingAction('');
       setBusy(false);
     }
   }, [projectId, recomputeLease, recomputeRun]);
@@ -567,6 +585,12 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
     <Paper component="aside" role="complementary" aria-label="Сведения диспетчера" elevation={8} className="nodrag nowheel" sx={{ position: 'absolute', zIndex: 5, right: 16, bottom: 16, width: 500, maxWidth: 'calc(100% - 32px)', maxHeight: 'calc(100% - 32px)', overflowY: 'auto', p: 2 }}>
     <Stack spacing={1.4}>
       {error && <Alert severity="error">{error}</Alert>}
+      {pendingAction && (
+        <Stack direction="row" spacing={1} alignItems="center" role="status" aria-live="polite">
+          <CircularProgress size={18} />
+          <Typography variant="body2">{pendingAction}</Typography>
+        </Stack>
+      )}
       <Stack direction="row" alignItems="center"><Typography ref={headingRef} tabIndex={-1} component="h2" variant="subtitle1" fontWeight={700} flex={1}>{title}</Typography><Button size="small" onClick={onClose}>Закрыть</Button></Stack>
       {inspection.loading && <LinearProgress aria-label="Загрузка сведений" />}
       {inspection.error && <Alert severity="warning">{inspection.error}</Alert>}

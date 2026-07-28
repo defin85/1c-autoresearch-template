@@ -476,6 +476,7 @@ function ProjectPicker({ onSelect }: { onSelect: (project: Project) => void }) {
   const [name, setName] = useState("");
   const [root, setRoot] = useState("");
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
   const refresh = () => {
     void api<Project[]>("/projects")
       .then(setProjects)
@@ -483,6 +484,7 @@ function ProjectPicker({ onSelect }: { onSelect: (project: Project) => void }) {
   };
   useEffect(refresh, []);
   const save = async () => {
+    setSaving(true);
     try {
       const project = await api<Project>("/projects", {
         method: "POST",
@@ -494,6 +496,8 @@ function ProjectPicker({ onSelect }: { onSelect: (project: Project) => void }) {
       onSelect(project);
     } catch (error) {
       setError((error as Error).message);
+    } finally {
+      setSaving(false);
     }
   };
   return (
@@ -547,9 +551,10 @@ function ProjectPicker({ onSelect }: { onSelect: (project: Project) => void }) {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setOpen(false)}>Отмена</Button>
-          <Button variant="contained" onClick={save}>
+          <Button variant="contained" disabled={saving} onClick={save}>
             Открыть
           </Button>
+          {saving && <CircularProgress size={18} aria-label="Открытие репозитория" />}
         </DialogActions>
       </Dialog>
     </Box>
@@ -567,6 +572,7 @@ export function AgentProfiles({ project }: { project: Project }) {
   const [environment, setEnvironment] =
     useState<AgentProfile["environment_preset"]>("local-read-only");
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
   const load = useCallback(
     () =>
       api<{ items: Record<string, AgentProfile> }>(
@@ -613,6 +619,7 @@ export function AgentProfiles({ project }: { project: Project }) {
     setEnvironment(profile.environment_preset);
   };
   const save = async () => {
+    setSaving(true);
     try {
       setError("");
       await api(`/projects/${project.id}/agent-profiles/${profileId}`, {
@@ -631,6 +638,8 @@ export function AgentProfiles({ project }: { project: Project }) {
       await load();
     } catch (error) {
       setError((error as Error).message);
+    } finally {
+      setSaving(false);
     }
   };
   return (
@@ -711,9 +720,15 @@ export function AgentProfiles({ project }: { project: Project }) {
                 </Stack>
               </AccordionDetails>
             </Accordion>
-            <Button variant="contained" disabled={!profileId.trim()} onClick={() => void save()}>
+            <Button variant="contained" disabled={saving || !profileId.trim()} onClick={() => void save()}>
               Проверить и сохранить профиль
             </Button>
+            {saving && (
+              <Stack direction="row" spacing={1} alignItems="center" role="status" aria-live="polite">
+                <CircularProgress size={18} />
+                <Typography variant="body2">Проверяется и сохраняется профиль…</Typography>
+              </Stack>
+            )}
           </Stack>
         </Box>
       </CardContent>
@@ -788,6 +803,7 @@ export function WorkflowEditor({
     parameters: Record<string, unknown>;
   }>();
   const [error, setError] = useState("");
+  const [pendingAction, setPendingAction] = useState<"preview" | "apply">();
   const [agentProfiles, setAgentProfiles] = useState<
     Record<string, AgentProfile>
   >({});
@@ -872,6 +888,7 @@ export function WorkflowEditor({
     );
   };
   const showPreview = async () => {
+    setPendingAction("preview");
     try {
       setError("");
       const selectedParameters = parameters();
@@ -890,9 +907,12 @@ export function WorkflowEditor({
       setPreview({ response, parameters: selectedParameters });
     } catch (error) {
       setError((error as Error).message);
+    } finally {
+      setPendingAction(undefined);
     }
   };
   const apply = async () => {
+    setPendingAction("apply");
     try {
       setError("");
       await api(`/projects/${project.id}/actions`, {
@@ -913,6 +933,8 @@ export function WorkflowEditor({
       refresh();
     } catch (error) {
       setError((error as Error).message);
+    } finally {
+      setPendingAction(undefined);
     }
   };
   if (!configuration || !current) return <CircularProgress />;
@@ -1069,18 +1091,26 @@ export function WorkflowEditor({
           </Accordion>
           <Stack direction="row" spacing={1}>
             <Button
-              disabled={hasMissingProfiles}
+              disabled={Boolean(pendingAction) || hasMissingProfiles}
               onClick={() => void showPreview()}
             >
               Предварительный просмотр
             </Button>
             <Button
-              disabled={!preview}
+              disabled={Boolean(pendingAction) || !preview}
               variant="contained"
               onClick={() => void apply()}
             >
               Применить просмотренное изменение
             </Button>
+            {pendingAction && (
+              <Stack direction="row" spacing={1} alignItems="center" role="status" aria-live="polite">
+                <CircularProgress size={18} />
+                <Typography variant="body2">
+                  {pendingAction === "preview" ? "Строится предварительный просмотр…" : "Применяется изменение…"}
+                </Typography>
+              </Stack>
+            )}
           </Stack>
           {preview && (
             <Card variant="outlined" aria-label="Просмотр политики фаз">
@@ -1151,6 +1181,8 @@ export function Sources({
   >({});
   const [extensionPreview, setExtensionPreview] =
     useState<Record<string, unknown>>();
+  const [extensionAction, setExtensionAction] = useState<"review" | "apply">();
+  const [sourceAction, setSourceAction] = useState("");
   const [routingPreview, setRoutingPreview] = useState<RoutingPreview>();
   const [acquisitionRun, setAcquisitionRun] = useState<AcquisitionRun>();
   const [acquisitionResult, setAcquisitionResult] =
@@ -1248,6 +1280,7 @@ export function Sources({
   const save = async (id: string) => {
     const value = profiles[id] || {};
     setBusy(true);
+    setSourceAction("Проверяется и сохраняется подключение…");
     setError("");
     try {
       await api(`/projects/${project.id}/connection-profiles/${id}`, {
@@ -1279,6 +1312,7 @@ export function Sources({
     } catch (error) {
       setError((error as Error).message);
     } finally {
+      setSourceAction("");
       setBusy(false);
     }
   };
@@ -1296,6 +1330,7 @@ export function Sources({
       return;
     }
     setBusy(true);
+    setSourceAction(`Загружается ${artifact.filename}…`);
     setError("");
     try {
       const query = new URLSearchParams({
@@ -1319,6 +1354,7 @@ export function Sources({
     } catch (error) {
       setError((error as Error).message);
     } finally {
+      setSourceAction("");
       setBusy(false);
     }
   };
@@ -1331,6 +1367,7 @@ export function Sources({
     )
       return;
     setBusy(true);
+    setSourceAction("Применяются назначения источников…");
     setError("");
     try {
       await api(`/projects/${project.id}/actions`, {
@@ -1356,6 +1393,7 @@ export function Sources({
     } catch (error) {
       setError((error as Error).message);
     } finally {
+      setSourceAction("");
       setBusy(false);
     }
   };
@@ -1386,6 +1424,7 @@ export function Sources({
       return;
     }
     setBusy(true);
+    setExtensionAction("review");
     setError("");
     try {
       const response = await api<Record<string, unknown>>(
@@ -1404,12 +1443,14 @@ export function Sources({
     } catch (error) {
       setError((error as Error).message);
     } finally {
+      setExtensionAction(undefined);
       setBusy(false);
     }
   };
   const applyExtensions = async () => {
     if (!extensionPreview || !window.confirm("Применить просмотренный выбор расширений и начать новую эпоху сравнения?")) return;
     setBusy(true);
+    setExtensionAction("apply");
     setError("");
     try {
       await api(`/projects/${project.id}/actions`, {
@@ -1429,6 +1470,7 @@ export function Sources({
     } catch (error) {
       setError((error as Error).message);
     } finally {
+      setExtensionAction(undefined);
       setBusy(false);
     }
   };
@@ -1551,6 +1593,12 @@ export function Sources({
   return (
     <Stack spacing={2}>
       {error && <Alert severity="error">{error}</Alert>}
+      {sourceAction && (
+        <Stack direction="row" spacing={1} alignItems="center" role="status" aria-live="polite">
+          <CircularProgress size={18} />
+          <Typography variant="body2">{sourceAction}</Typography>
+        </Stack>
+      )}
       <Box>
         <Typography variant="h5" fontWeight={750}>
           Источники
@@ -1974,6 +2022,14 @@ export function Sources({
           <Stack direction="row" spacing={1}>
             <Button disabled={busy} onClick={() => void reviewExtensions()}>Просмотреть выбор</Button>
             <Button disabled={busy || !extensionPreview} variant="contained" onClick={() => void applyExtensions()}>Применить выбор</Button>
+            {extensionAction && (
+              <Stack direction="row" spacing={1} alignItems="center" role="status" aria-live="polite">
+                <CircularProgress size={18} />
+                <Typography variant="body2">
+                  {extensionAction === "review" ? "Проверяется выбор…" : "Применяется выбор…"}
+                </Typography>
+              </Stack>
+            )}
           </Stack>
           {extensionPreview && (
             <Alert severity="warning">
@@ -2184,6 +2240,7 @@ function Indexes({
   const [selected, setSelected] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pendingMode, setPendingMode] = useState<"ensure" | "rebuild">();
   const refresh = useCallback(
     () =>
       api<{ items: SourceIndex[] }>(`/projects/${project.id}/indexes`)
@@ -2203,6 +2260,7 @@ function Indexes({
     )
       return;
     setBusy(true);
+    setPendingMode(mode);
     setError("");
     try {
       await api(`/projects/${project.id}/actions`, {
@@ -2222,6 +2280,7 @@ function Indexes({
     } catch (error) {
       setError((error as Error).message);
     } finally {
+      setPendingMode(undefined);
       setBusy(false);
     }
   };
@@ -2248,6 +2307,14 @@ function Indexes({
           Перестроить с подтверждением
         </Button>
       </Stack>
+      {pendingMode && (
+        <Stack direction="row" spacing={1} alignItems="center" role="status" aria-live="polite">
+          <CircularProgress size={18} />
+          <Typography variant="body2">
+            {pendingMode === "ensure" ? "Проверяются и создаются индексы…" : "Перестраиваются индексы…"}
+          </Typography>
+        </Stack>
+      )}
       {items.map((item) => (
         <Card key={item.component_id} variant="outlined">
           <CardContent>
