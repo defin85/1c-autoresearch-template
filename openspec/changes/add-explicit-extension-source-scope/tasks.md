@@ -1,13 +1,18 @@
 ## 1. Extend The Tracked Source Contract
 
-- [ ] 1.1 Add canonical extension decision records to the infobase contract with UUID, `include` or `exclude`, and required exclusion rationale.
-- [ ] 1.2 Validate malformed or duplicate UUIDs, unsupported decisions, empty exclusion rationales, and deterministic serialization.
-- [ ] 1.3 Include normalized extension decisions in source-contract, preview, workflow, and comparison-epoch fingerprints.
-- [ ] 1.4 Preserve dormant decisions for UUIDs not currently discovered without creating routing members.
+- [x] 1.1 Add canonical extension decision records to the infobase contract with UUID, `include` or `exclude`, and required exclusion rationale.
+- [x] 1.2 Validate malformed or duplicate UUIDs, unsupported decisions, empty exclusion rationales, and deterministic serialization.
+- [x] 1.3 Include normalized extension decisions in source-contract, preview, workflow, and comparison-epoch fingerprints.
+- [x] 1.4 Preserve dormant decisions for UUIDs not currently discovered without creating routing members.
 
 ## 2. Make Routing Fail Closed
 
+<!-- GOAL_CURSOR -->
 - [ ] 2.1 Compute the union of extension UUIDs from all three current tested connection profiles with per-role name, version, activation, and presence facts.
+  - Этап цикла: реализация
+  - Состояние шага: контракт и отпечатки реализованы и проверены; реализуется полный fail-closed маршрут и свежая проверка перед экспортом
+  - Следующее действие: завершить ограниченную живую проверку, переиспользование приватного staging и проверки отсутствия публикации исключённых расширений
+  - Файлы шага: ../sppr-research-ver2/src/one_c_autoresearch/sources.py; ../sppr-research-ver2/src/one_c_autoresearch/source_routing.py; ../sppr-research-ver2/tests/test_sources.py; openspec/changes/add-explicit-extension-source-scope/tasks.md
 - [ ] 2.2 Return a typed `extension_scope_required` blocker for every discovered UUID without a tracked decision.
 - [ ] 2.3 Filter extension component membership to explicit `include` decisions before acquisition, indexing, and comparison.
 - [ ] 2.4 Publish excluded and dormant extension summaries in route preview while keeping excluded payloads out of source generations.
