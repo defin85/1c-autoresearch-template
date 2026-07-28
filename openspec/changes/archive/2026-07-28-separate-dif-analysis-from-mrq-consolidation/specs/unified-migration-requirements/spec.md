@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Form MRQ directly from complete DIF classifications
 The system SHALL form the complete MRQ graph directly from the active complete DIF-classification generation and the complete prior MRQ graph.

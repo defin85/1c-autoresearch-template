@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from argparse import Namespace
 import json
 from pathlib import Path
+import subprocess
 
+from one_c_autoresearch import checks
 from one_c_autoresearch.doctor import Doctor, run_doctor
 
 
@@ -36,3 +39,24 @@ def test_doctor_resolves_manifest_paths_from_repository_root(tmp_path: Path) -> 
     result = run_doctor(root, mode="research", deep=True)
     check = next(item for item in result["checks"] if item["id"] == "manifest.paths.exists.target_cf")
     assert check["status"] == "ok"
+
+
+def test_checks_research_uses_canonical_repo_doctor(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    (root / "research").mkdir(parents=True)
+    (root / "research/workflow.toml").touch()
+    (root / "src/one_c_autoresearch").mkdir(parents=True)
+    (root / "src/one_c_autoresearch/service.py").touch()
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(checks.subprocess, "run", run)
+
+    assert checks.test_research_repo(Namespace(repo_path=root)) == 0
+    command, kwargs = calls[0]
+    assert command[-3:] == ["--repo-path", str(root), "doctor"]
+    assert kwargs["cwd"] == root
+    assert kwargs["env"]["PYTHONPATH"] == str(root / "src")

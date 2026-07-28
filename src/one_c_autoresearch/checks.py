@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import html as html_lib
 import json
+import os
 import re
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -338,6 +340,15 @@ def test_canonical_template(root: Path) -> int:
 
 def test_research_repo(args: argparse.Namespace) -> int:
     root = Path(args.repo_path).resolve()
+    if (root / "research/workflow.toml").is_file() and (root / "src/one_c_autoresearch/service.py").is_file():
+        environment = {**os.environ, "PYTHONPATH": str(root / "src")}
+        result = subprocess.run(
+            [sys.executable, "-m", "one_c_autoresearch", "--repo-path", str(root), "doctor"],
+            cwd=root,
+            env=environment,
+            check=False,
+        )
+        return result.returncode
     errors: list[str] = []
     test_review_dashboard_subject_bf_metrics(root, errors)
     test_review_dashboard_language(root, errors)
