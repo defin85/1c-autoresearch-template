@@ -1,6 +1,11 @@
 ## 1. Define The Backend Contract
 
+<!-- GOAL_CURSOR -->
 - [ ] 1.1 Add schema-version-2 indexing configuration with an ordered approved-backend list and closed capability routes.
+  - Этап цикла: реализация
+  - Состояние шага: проверяются текущие контракты индексации и точки синхронизации target-first
+  - Следующее действие: сопоставить требования change с кодом целевого репозитория и определить минимальные общие границы реализации
+  - Файлы шага: openspec/changes/add-pluggable-source-search-backends/tasks.md
 - [ ] 1.2 Define fixed adapter, capability, pre-build target-identity, promoted instance-identity, normalized-hit, routing-decision, and bounded diagnostic schemas.
 - [ ] 1.3 Keep component discovery and canonical file navigation common and independent from backend adapters.
 - [ ] 1.4 Include an opaque repository-instance fingerprint in every state key and distinguish backend `component_relative_path` from existing logical evidence paths.
