@@ -3,9 +3,9 @@
 <!-- GOAL_CURSOR -->
 - [ ] 1.1 Add schema-version-2 indexing configuration with an ordered approved-backend list and closed capability routes.
   - Этап цикла: реализация
-  - Состояние шага: проверяются текущие контракты индексации и точки синхронизации target-first
-  - Следующее действие: сопоставить требования change с кодом целевого репозитория и определить минимальные общие границы реализации
-  - Файлы шага: openspec/changes/add-pluggable-source-search-backends/tasks.md
+  - Состояние шага: базовый контракт и ограниченный source_search реализованы в целевом репозитории; закрываются жизненный цикл адаптеров и реальные запросы
+  - Следующее действие: реализовать ограниченный запуск, проверку BSL Analyzer, приватное зеркало и маршрутизацию запросов к готовым индексам
+  - Файлы шага: openspec/changes/add-pluggable-source-search-backends/tasks.md, /run/media/egor/D6B64A72B64A52E3/Projects/OneC/Presail/sppr-research-ver2/src/one_c_autoresearch/indexes.py, /run/media/egor/D6B64A72B64A52E3/Projects/OneC/Presail/sppr-research-ver2/src/one_c_autoresearch/source_search.py, /run/media/egor/D6B64A72B64A52E3/Projects/OneC/Presail/sppr-research-ver2/src/one_c_autoresearch/source_search_bridge.py
 - [ ] 1.2 Define fixed adapter, capability, pre-build target-identity, promoted instance-identity, normalized-hit, routing-decision, and bounded diagnostic schemas.
 - [ ] 1.3 Keep component discovery and canonical file navigation common and independent from backend adapters.
 - [ ] 1.4 Include an opaque repository-instance fingerprint in every state key and distinguish backend `component_relative_path` from existing logical evidence paths.
