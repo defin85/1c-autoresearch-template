@@ -18,6 +18,13 @@ from pathlib import Path
 from threading import Event
 from typing import Any, Callable, Iterable, Literal, TypedDict
 
+from .agents import (
+    CONSOLIDATION_REDUCED_FIELDS,
+    CONTEXT_CONTRACT_VERSION,
+    CONTEXT_ESTIMATOR_VERSION,
+    CONTEXT_SELECTION_POLICIES,
+    proposal_schema,
+)
 from .contracts import canonical_json, sha256
 from .mrq_batches import MAX_BATCH_SIZE, MRQBatch, batch_id, load_active, publish as publish_batches, source_mrq_payload, stable_windows
 
@@ -258,19 +265,29 @@ def _bounded_map(
 
 
 def _result_envelope(state: dict[str, Any], phase_id: str, role_id: str, work_unit: dict[str, Any], result: Any, instruction_version: str = "") -> dict[str, Any]:
+    operation = "mrq.decide-next" if phase_id == "research-target" else "mrq.classify-batches" if phase_id == "classify-batches" else "dif.classify-next" if state.get("job_id") == "analyze-dif" else "mrq.consolidate" if state.get("job_id") == "consolidate-mrq" else "mrq.discover-next"
     compatibility = {
-        "operation": "mrq.decide-next" if phase_id == "research-target" else "dif.classify-next" if state.get("job_id") == "analyze-dif" else "mrq.consolidate" if state.get("job_id") == "consolidate-mrq" else "mrq.discover-next",
+        "operation": operation,
         "phase_id": phase_id,
         "role_id": role_id,
         "work_unit": work_unit,
         "allowed_paths": sorted(work_unit.get("allowed_paths", [])),
+        "selected_path_manifest": work_unit.get("allowed_path_fingerprints", []),
+        "context_contract_version": CONTEXT_CONTRACT_VERSION,
+        "context_estimator_version": CONTEXT_ESTIMATOR_VERSION,
+        "selection_policy_version": CONTEXT_SELECTION_POLICIES[(phase_id, role_id)],
+        "execution_snapshot_fingerprint": state.get("execution_snapshot_fingerprint", ""),
+        "instruction_supplement": state.get("instruction_supplement", ""),
         "base_instruction_version": instruction_version,
-        "response_schema": f"{phase_id}-{role_id}/v1",
+        "response_schema_fingerprint": "sha256:" + sha256(
+            canonical_json(proposal_schema(operation, work_unit))
+        ),
         "validator_version": "agent-phase-result/v1",
     }
     return {
         "source_run_id": state["run_id"],
         "source_execution_snapshot_fingerprint": state.get("execution_snapshot_fingerprint", ""),
+        "compatibility": compatibility,
         "compatibility_fingerprint": "sha256:" + sha256(canonical_json(compatibility)),
         "result_fingerprint": "sha256:" + sha256(canonical_json(result)),
         "result": result,
@@ -282,7 +299,27 @@ def _compatible_cached(
     expected: dict[str, Any],
     required_origin: dict[str, str] | None = None,
 ) -> Any | None:
-    if not isinstance(envelope, dict) or envelope.get("compatibility_fingerprint") != expected["compatibility_fingerprint"]:
+    if not isinstance(envelope, dict):
+        return None
+    if envelope.get("compatibility_fingerprint") != expected["compatibility_fingerprint"]:
+        source = envelope.get("compatibility")
+        target = expected["compatibility"]
+        field = "legacy_result_metadata"
+        if isinstance(source, dict):
+            field = next(
+                (
+                    key for key in (
+                        "context_contract_version", "context_estimator_version",
+                        "selection_policy_version", "selected_path_manifest",
+                        "execution_snapshot_fingerprint", "base_instruction_version",
+                        "instruction_supplement", "response_schema_fingerprint",
+                        "work_unit",
+                    )
+                    if source.get(key) != target.get(key)
+                ),
+                "compatibility_fingerprint",
+            )
+        expected["reuse_incompatibility"] = {"field": field}
         return None
     if required_origin and (
         envelope.get("source_run_id") != required_origin.get("source_run_id")
@@ -619,6 +656,7 @@ def compile_classify_graph(
     save_result: Callable[[str, dict[str, Any]], None] | None = None,
     register_work: Callable[[str, str, list[str]], None] | None = None,
     reuse_work: Callable[[str, str, str], None] | None = None,
+    record_work: Callable[[str, str, str, str, str, dict[str, Any]], None] | None = None,
 ):
     """Компилирует последовательную классификацию стабильных окон MRQ."""
 
@@ -646,14 +684,6 @@ def compile_classify_graph(
             if not bindings_check() or source_mrq_payload(repo)[1] != fingerprint:
                 return {**state, "source_mrq_fingerprint": fingerprint, "batches": [batch.canonical_payload() for batch in batches], "status": "stale", "blocker": {"code": "dispatcher.bindings.stale", "message": "active generations changed during classification", "action": "mrq.classify-batches"}}
             result_name = f"classify-batches:window:{index}"
-            cached = load_result(result_name) if load_result else None
-            if cached is not None:
-                if cached.get("source_mrq_fingerprint") != fingerprint:
-                    raise ValueError("cached classifier result has a stale source MRQ fingerprint")
-                batches.extend(_validated_window_batches(window, cached.get("response", {})))
-                if reuse_work:
-                    reuse_work("classify-batches", "classifier", f"window:{index}")
-                continue
             work_unit = {
                 "id": f"window:{index}",
                 "kind": "mrq-batch-window",
@@ -661,10 +691,33 @@ def compile_classify_graph(
                 "mrqs": window,
                 "allowed_paths": sorted({evidence["path"] for record in window for evidence in record["source_evidence"]}),
             }
+            expected = _result_envelope(
+                state, "classify-batches", "classifier", work_unit, None,
+                str(classifier_profile.get("instructions_version", "")),
+            )
+            cached = _compatible_cached(
+                load_result(result_name) if load_result else None,
+                expected,
+                state.get("required_reuse_origin"),
+            )
+            if cached is not None:
+                batches.extend(_validated_window_batches(window, cached))
+                if reuse_work:
+                    reuse_work("classify-batches", "classifier", f"window:{index}")
+                continue
+            if record_work and expected.get("reuse_incompatibility"):
+                record_work(
+                    "classify-batches", "classifier", f"window:{index}",
+                    "provider", "queued",
+                    {"reuse": {"status": "incompatible", **expected["reuse_incompatibility"]}},
+                )
             response = executor(repo, classifier_profile, "mrq.classify-batches", work_unit, classifier_supplement, timeout_seconds, cancelled)
             batches.extend(_validated_window_batches(window, response))
             if save_result:
-                save_result(result_name, {"source_mrq_fingerprint": fingerprint, "response": response})
+                save_result(result_name, _result_envelope(
+                    state, "classify-batches", "classifier", work_unit, response,
+                    str(classifier_profile.get("instructions_version", "")),
+                ))
         if source_mrq_payload(repo)[1] != fingerprint:
             return {**state, "source_mrq_fingerprint": fingerprint, "batches": [batch.canonical_payload() for batch in batches], "status": "stale", "blocker": {"code": "dispatcher.bindings.stale", "message": "active generations changed during classification", "action": "mrq.classify-batches"}}
         try:
@@ -881,6 +934,7 @@ def compile_analyze_graph(
     save_result: Callable[[str, dict[str, Any]], None] | None = None,
     register_work: Callable[[str, str, list[str]], None] | None = None,
     reuse_work: Callable[[str, str, str], None] | None = None,
+    record_work: Callable[[str, str, str, str, str, dict[str, Any]], None] | None = None,
 ):
     """Классифицирует весь инвентарь окнами по 32, не формируя MRQ."""
 
@@ -925,6 +979,30 @@ def compile_analyze_graph(
             from .component_groups import deterministic_results
             deterministic = deterministic_results(repo, pending)
             agent_pending = [identifier for identifier in pending if identifier not in deterministic]
+            if register_work:
+                register_work("analyze-dif", "analyzer", pending)
+            if record_work:
+                for identifier in sorted(deterministic):
+                    local = deterministic[identifier]
+                    record_work(
+                        "analyze-dif",
+                        "analyzer",
+                        identifier,
+                        "deterministic",
+                        "completed",
+                        {
+                            "contract_version": "context-envelope/v1",
+                            "algorithm_version": local.get(
+                                "algorithm_version",
+                                "whole-component-meaning/v1",
+                            ),
+                            "decision_fingerprint": local.get(
+                                "context_fingerprint", ""
+                            ),
+                            "affected_dif_count": 1,
+                            "origin_counts": {"dif": 1},
+                        },
+                    )
 
             def branch(identifier: str) -> tuple[AnalyzeResult, dict[str, Any]]:
                 unit = _analyze_work_unit(repo, identifier)
@@ -941,6 +1019,11 @@ def compile_analyze_graph(
                     if reuse_work:
                         reuse_work("analyze-dif", "analyzer", identifier)
                     return cached, unit
+                if record_work and expected.get("reuse_incompatibility"):
+                    record_work(
+                        "analyze-dif", "analyzer", identifier, "provider", "queued",
+                        {"reuse": {"status": "incompatible", **expected["reuse_incompatibility"]}},
+                    )
                 local = discover_analyze_one(
                     state, identifier, executor=executor, repo=repo,
                     profile=selected_profile, supplement=role.get("instruction_supplement", ""),
@@ -959,8 +1042,6 @@ def compile_analyze_graph(
                     ))
                 return result, unit
 
-            if register_work and agent_pending:
-                register_work("analyze-dif", "analyzer", agent_pending)
             results, errors, stopped = _bounded_map(
                 agent_pending,
                 max_concurrency=policy["max_concurrency"],
@@ -1067,13 +1148,14 @@ def compile_consolidate_graph(
         if not bindings_check():
             return {**state, "status": "stale", "blocker": {"code": "dispatcher.bindings.stale", "message": "active generations changed", "action": "mrq.consolidate"}}
         snapshot = input_snapshot(repo)
-        context_tokens = profiles["coordinator"].get("input_context_tokens")
+        grouper_tokens = profiles["grouper"].get("input_context_tokens")
+        coordinator_tokens = profiles["coordinator"].get("input_context_tokens")
         try:
             records = normalized_records(snapshot)
             manifest = partition_manifest(
                 records,
-                context_tokens,
-                estimator_version=str(profiles["coordinator"].get("context_estimator_version", "utf8-v1")),
+                grouper_tokens,
+                estimator_version=str(profiles["grouper"].get("context_estimator_version", "utf8-v1")),
             )
         except ValueError:
             return {
@@ -1108,7 +1190,7 @@ def compile_consolidate_graph(
         worker_payloads = {work_id: worker_payload(work_id) for work_id in work_ids}
         try:
             for payload in worker_payloads.values():
-                ensure_context_payload(payload, context_tokens)
+                ensure_context_payload(payload, grouper_tokens)
         except ValueError:
             return {
                 **state,
@@ -1140,43 +1222,289 @@ def compile_consolidate_graph(
             return {**state, "status": "failed", "blocker": {"code": "dispatcher.agent.failed", "message": f"{len(errors)} consolidation branches failed", "action": "mrq.consolidate", "branches": errors}}
         if set(proposals) != set(work_ids):
             return {**state, "status": "failed", "blocker": {"code": "consolidation.coverage", "message": "partition comparison coverage is incomplete", "action": "mrq.consolidate"}}
-        if register_work:
-            register_work("form-mrq", "coordinator", ["global-plan"])
-        coordinator_payload = {
-            "id": "global-plan", "kind": "consolidation-coordinate",
-            "partition_manifest": manifest,
-            "partition_proposals": [proposals[key] for key in sorted(proposals)],
-            "allowed_paths": [],
-        }
         try:
-            ensure_context_payload(coordinator_payload, context_tokens)
-        except ValueError:
-            return {
-                **state,
-                "status": "failed",
-                "blocker": {
-                    "code": "consolidation.context_capacity",
-                    "message": "bounded reduction output exceeds verified coordinator context",
-                    "action": "profiles.verify",
-                },
-            }
-        result = executor(
-            repo, profiles["coordinator"], "mrq.consolidate",
-            coordinator_payload,
-            coordinator_role.get("instruction_supplement", ""), timeout_seconds, cancelled,
-        )
-        try:
+            candidate_rows: dict[str, dict[str, Any]] = {}
+            for work_id in sorted(proposals):
+                for group in proposals[work_id].get("groups", []):
+                    candidate_id = "CAND-" + sha256(canonical_json({
+                        "algorithm": "hierarchical-consolidation/v1",
+                        "source_work_id": work_id,
+                        "group": group,
+                    }))
+                    if candidate_id in candidate_rows:
+                        raise ValueError("duplicate hierarchical candidate identity")
+                    candidate_rows[candidate_id] = {
+                        "candidate_id": candidate_id,
+                        "source_work_id": work_id,
+                        "group": group,
+                    }
+            if not candidate_rows and any(
+                row["classification"] == "meaning"
+                for row in snapshot["classifications"]
+            ):
+                raise ValueError("hierarchical consolidation produced no meaning candidates")
+
+            candidate_ids = sorted(candidate_rows)
+            page_size = 4
+            pages = [
+                candidate_ids[index:index + page_size]
+                for index in range(0, len(candidate_ids), page_size)
+            ]
+            link_payloads: dict[str, dict[str, Any]] = {}
+            expected_relations: dict[str, set[tuple[str, str]]] = {}
+            for left_index, left_page in enumerate(pages):
+                for right_index in range(left_index, len(pages)):
+                    right_page = pages[right_index]
+                    relations = {
+                        tuple(sorted((left, right)))
+                        for left in left_page
+                        for right in right_page
+                        if left != right
+                    }
+                    if not relations:
+                        continue
+                    work_id = f"links:{left_index}:{right_index}"
+                    expected_relations[work_id] = relations
+                    link_payloads[work_id] = {
+                        "id": work_id,
+                        "kind": "consolidation-link-page",
+                        "left_candidates": [
+                            {
+                                "candidate_id": identifier,
+                                "description": {
+                                    key: candidate_rows[identifier]["group"].get(key)
+                                    for key in (
+                                        "semantic_key", "title", "business_meaning",
+                                        "scope", "confidence", "component_keys",
+                                    )
+                                },
+                                "membership_fingerprint": "sha256:" + sha256(
+                                    canonical_json({
+                                        key: candidate_rows[identifier]["group"].get(key, [])
+                                        for key in ("stable_diff_ids", "supporting_diff_ids")
+                                    })
+                                ),
+                            }
+                            for identifier in left_page
+                        ],
+                        "right_candidates": [
+                            {
+                                "candidate_id": identifier,
+                                "description": {
+                                    key: candidate_rows[identifier]["group"].get(key)
+                                    for key in (
+                                        "semantic_key", "title", "business_meaning",
+                                        "scope", "confidence", "component_keys",
+                                    )
+                                },
+                                "membership_fingerprint": "sha256:" + sha256(
+                                    canonical_json({
+                                        key: candidate_rows[identifier]["group"].get(key, [])
+                                        for key in ("stable_diff_ids", "supporting_diff_ids")
+                                    })
+                                ),
+                            }
+                            for identifier in right_page
+                        ],
+                        "expected_relation_count": len(relations),
+                        "allowed_paths": [],
+                    }
+            if register_work and link_payloads:
+                register_work(
+                    "form-mrq", "coordinator", sorted(link_payloads)
+                )
+            link_results: dict[str, dict[str, Any]] = {}
+            for work_id in sorted(link_payloads):
+                link_results[work_id] = executor(
+                    repo,
+                    profiles["coordinator"],
+                    "mrq.consolidate",
+                    link_payloads[work_id],
+                    coordinator_role.get("instruction_supplement", ""),
+                    timeout_seconds,
+                    cancelled,
+                )
+
+            parent = {identifier: identifier for identifier in candidate_ids}
+
+            def root(identifier: str) -> str:
+                while parent[identifier] != identifier:
+                    parent[identifier] = parent[parent[identifier]]
+                    identifier = parent[identifier]
+                return identifier
+
+            decisions: dict[tuple[str, str], str] = {}
+            for work_id, expected in expected_relations.items():
+                links = link_results[work_id].get("links", [])
+                actual: dict[tuple[str, str], str] = {}
+                for link in links:
+                    relation = tuple(sorted((
+                        str(link["left_candidate_id"]),
+                        str(link["right_candidate_id"]),
+                    )))
+                    if relation not in expected or relation in actual:
+                        raise ValueError("unknown or duplicate hierarchical candidate relation")
+                    actual[relation] = str(link["decision"])
+                if set(actual) != expected:
+                    raise ValueError("hierarchical candidate relation coverage is incomplete")
+                for relation, decision in actual.items():
+                    if relation in decisions and decisions[relation] != decision:
+                        raise ValueError("contradictory hierarchical candidate relation")
+                    decisions[relation] = decision
+                    if decision == "merge":
+                        left_root, right_root = root(relation[0]), root(relation[1])
+                        if left_root != right_root:
+                            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+            components: dict[str, list[str]] = {}
+            for identifier in candidate_ids:
+                components.setdefault(root(identifier), []).append(identifier)
+
+            def combine_group(
+                left: dict[str, Any],
+                right: dict[str, Any],
+                description: dict[str, Any],
+            ) -> dict[str, Any]:
+                stable = sorted(set(left.get("stable_diff_ids", [])) | set(right.get("stable_diff_ids", [])))
+                supporting = sorted(
+                    (set(left.get("supporting_diff_ids", [])) | set(right.get("supporting_diff_ids", [])))
+                    - set(stable)
+                )
+                evidence_by_key = {
+                    canonical_json(item): item
+                    for item in [*left.get("evidence", []), *right.get("evidence", [])]
+                }
+                return {
+                    **description,
+                    "stable_diff_ids": stable,
+                    "supporting_diff_ids": supporting,
+                    "component_keys": sorted(set(left.get("component_keys", [])) | set(right.get("component_keys", []))),
+                    "source_mrq_ids": sorted(set(left.get("source_mrq_ids", [])) | set(right.get("source_mrq_ids", []))),
+                    "evidence": [evidence_by_key[key] for key in sorted(evidence_by_key)],
+                }
+
+            final_groups: list[dict[str, Any]] = []
+            reduction_calls = 0
+            for component_index, identifiers in enumerate(
+                sorted(components.values(), key=lambda rows: rows[0])
+            ):
+                aggregates = [{
+                    "aggregate_id": identifier,
+                    "group": candidate_rows[identifier]["group"],
+                } for identifier in sorted(identifiers)]
+                round_index = 0
+                while len(aggregates) > 1:
+                    next_round: list[dict[str, Any]] = []
+                    work_payloads = []
+                    for pair_index in range(0, len(aggregates), 2):
+                        if pair_index + 1 == len(aggregates):
+                            next_round.append(aggregates[pair_index])
+                            continue
+                        left, right = aggregates[pair_index:pair_index + 2]
+                        work_id = f"reduce:{component_index}:{round_index}:{pair_index // 2}"
+                        work_payloads.append((work_id, left, right, {
+                            "id": work_id,
+                            "kind": "consolidation-reduce-pair",
+                            "left": {
+                                "aggregate_id": left["aggregate_id"],
+                                "description": {
+                                    key: left["group"].get(key, "")
+                                    for key in sorted(CONSOLIDATION_REDUCED_FIELDS)
+                                },
+                            },
+                            "right": {
+                                "aggregate_id": right["aggregate_id"],
+                                "description": {
+                                    key: right["group"].get(key, "")
+                                    for key in sorted(CONSOLIDATION_REDUCED_FIELDS)
+                                },
+                            },
+                            "allowed_paths": [],
+                        }))
+                    if register_work and work_payloads:
+                        register_work(
+                            "form-mrq", "coordinator",
+                            [row[0] for row in work_payloads],
+                        )
+                    for work_id, left, right, payload in work_payloads:
+                        reduced = executor(
+                            repo,
+                            profiles["coordinator"],
+                            "mrq.consolidate",
+                            payload,
+                            coordinator_role.get("instruction_supplement", ""),
+                            timeout_seconds,
+                            cancelled,
+                        )["group"]
+                        group = combine_group(left["group"], right["group"], reduced)
+                        aggregate_id = "AGG-" + sha256(canonical_json({
+                            "algorithm": "hierarchical-consolidation/v1",
+                            "children": sorted((left["aggregate_id"], right["aggregate_id"])),
+                            "description": reduced,
+                        }))
+                        next_round.append({
+                            "aggregate_id": aggregate_id,
+                            "group": group,
+                        })
+                        reduction_calls += 1
+                    aggregates = sorted(next_round, key=lambda row: row["aggregate_id"])
+                    round_index += 1
+                if aggregates:
+                    final_groups.append(aggregates[0]["group"])
+
             noise_by_id = {
                 row["stable_diff_id"]: row
                 for row in snapshot["classifications"]
                 if row["classification"] == "noise_candidate"
             }
-            approved_noise_ids = result.get("approved_noise", [])
-            if set(approved_noise_ids) != set(noise_by_id):
-                raise ValueError("every noise candidate requires explicit consolidation approval")
+            grouped_ids = {
+                identifier
+                for group in final_groups
+                for identifier in group.get("stable_diff_ids", [])
+            }
+            pending_noise = sorted(set(noise_by_id) - grouped_ids)
+            approved_noise_ids: list[str] = []
+            noise_calls = 0
+            for page_index in range(0, len(pending_noise), 16):
+                identifiers = pending_noise[page_index:page_index + 16]
+                work_id = f"noise:{page_index // 16}"
+                if register_work:
+                    register_work("form-mrq", "coordinator", [work_id])
+                response = executor(
+                    repo,
+                    profiles["coordinator"],
+                    "mrq.consolidate",
+                    {
+                        "id": work_id,
+                        "kind": "consolidation-noise-page",
+                        "noise_candidates": [
+                            noise_by_id[identifier] for identifier in identifiers
+                        ],
+                        "allowed_paths": [],
+                    },
+                    coordinator_role.get("instruction_supplement", ""),
+                    timeout_seconds,
+                    cancelled,
+                )
+                by_id = {
+                    str(row["stable_diff_id"]): row
+                    for row in response.get("decisions", [])
+                }
+                if set(by_id) != set(identifiers):
+                    raise ValueError("hierarchical noise coverage is incomplete")
+                rejected = [
+                    identifier for identifier in identifiers
+                    if by_id[identifier]["decision"] != "approve"
+                ]
+                if rejected:
+                    raise ValueError(
+                        f"{len(rejected)} noise candidates require meaning-group coverage"
+                    )
+                approved_noise_ids.extend(identifiers)
+                noise_calls += 1
             plan = plan_from_groups(
                 snapshot,
-                list(result.get("groups", [])),
+                final_groups,
                 [noise_by_id[identifier] for identifier in approved_noise_ids],
                 manifest,
             )
@@ -1196,7 +1524,17 @@ def compile_consolidate_graph(
                     **{name: len(plan["outcomes"][name]) for name in plan["outcomes"]},
                     "partition_count": len(manifest["partitions"]),
                     "pair_count": len(manifest["pairs"]),
-                    "planned_invocation_count": manifest["planned_invocation_count"],
+                    "candidate_count": len(candidate_rows),
+                    "candidate_page_count": len(pages),
+                    "link_page_pair_count": len(link_payloads),
+                    "reduction_call_count": reduction_calls,
+                    "noise_page_count": noise_calls,
+                    "planned_invocation_count": (
+                        manifest["planned_invocation_count"]
+                        + len(link_payloads)
+                        + reduction_calls
+                        + noise_calls
+                    ),
                 },
             },
             "blocker": {
@@ -1210,239 +1548,6 @@ def compile_consolidate_graph(
     graph.add_node("consolidate-all", run)
     graph.add_edge(START, "consolidate-all")
     graph.add_edge("consolidate-all", END)
-    return graph.compile(checkpointer=saver)
-
-
-def compile_discover_graph(
-    *,
-    repo: Path,
-    saver: Any,
-    executor: Callable[..., dict[str, Any]],
-    profile: dict[str, Any],
-    supplement: str,
-    timeout_seconds: int,
-    cancelled: Callable[[], bool],
-    bindings_check: Callable[[], bool],
-    phase_policies: dict[str, dict[str, Any]] | None = None,
-    profiles_by_role: dict[str, dict[str, Any]] | None = None,
-    load_result: Callable[[str], dict[str, Any] | None] | None = None,
-    save_result: Callable[[str, dict[str, Any]], None] | None = None,
-    register_work: Callable[[str, str, list[str]], None] | None = None,
-    reuse_work: Callable[[str, str, str], None] | None = None,
-    approved_noise: list[dict[str, Any]] | None = None,
-):
-    """Компилирует реальный LangGraph для ``discover-mrq``.
-
-    Один рабочий поток сразу анализирует DIF и, если он смысловой, передаёт
-    его в предварительную группировку. Пул ограничен четырьмя вызовами; ошибка
-    ветви не повторяется автоматически и сохраняется как блокирующий исход.
-    """
-
-    from langgraph.graph import END, START, StateGraph
-    policies = phase_policies or {
-        "analyze-dif": {"max_concurrency": 4, "roles": [{"role_id": "analyzer", "count": 4, "instruction_supplement": supplement}]},
-        "form-mrq": {"max_concurrency": 4, "roles": [{"role_id": "coordinator", "count": 1, "instruction_supplement": ""}, {"role_id": "grouper", "count": 4, "instruction_supplement": supplement}]},
-    }
-    role_profiles = profiles_by_role or {"analyzer": profile, "grouper": profile, "coordinator": profile}
-    role_supplements = {role["role_id"]: role.get("instruction_supplement", "") for policy in policies.values() for role in policy["roles"]}
-
-    def select(state: DiscoverState) -> DiscoverState:
-        return discover_select_window(state, repo=repo)
-
-    def analyze(state: DiscoverState) -> DiscoverState:
-        if cancelled():
-            return {**state, "status": "resumable", "blocker": {"code": "dispatcher.soft_stopped", "message": "dispatcher was stopped", "action": "mrq.discover-next"}}
-        abort = Event()
-        phase_cancelled = lambda: cancelled() or abort.is_set()
-
-        def branch(identifier: str) -> AnalyzeResult:
-            work_unit = _analyze_work_unit(repo, identifier)
-            expected = _result_envelope(state, "analyze-dif", "analyzer", work_unit, None, str(role_profiles["analyzer"].get("instructions_version", "")))
-            cached = _compatible_cached(load_result(f"analyze-dif:{identifier}") if load_result else None, expected, state.get("required_reuse_origin"))
-            if cached is not None:
-                if reuse_work:
-                    reuse_work("analyze-dif", "analyzer", identifier)
-                return cached
-            local = discover_analyze_one(
-                state,
-                identifier,
-                executor=executor,
-                repo=repo,
-                profile=role_profiles["analyzer"],
-                supplement=role_supplements["analyzer"],
-                timeout_seconds=timeout_seconds,
-                cancelled=phase_cancelled,
-                bindings_check=bindings_check,
-            )
-            result = local.get("analyzed", {}).get(identifier)
-            if result is None:
-                raise RuntimeError(str(local.get("blocker") or "analysis did not produce a result"))
-            if save_result:
-                save_result(f"analyze-dif:{identifier}", _result_envelope(state, "analyze-dif", "analyzer", work_unit, result, str(role_profiles["analyzer"].get("instructions_version", ""))))
-            return result
-
-        analyze_policy = policies["analyze-dif"]
-        analyzed = dict(state.get("analyzed", {}))
-        pending = [identifier for identifier in state.get("window", []) if identifier not in analyzed]
-        if register_work:
-            register_work("analyze-dif", "analyzer", pending)
-        branch_results, errors, stopped = _bounded_map(
-            pending,
-            max_concurrency=analyze_policy["max_concurrency"],
-            slot_count=next(role["count"] for role in analyze_policy["roles"] if role["role_id"] == "analyzer"),
-            function=branch,
-            cancelled=phase_cancelled,
-            bindings_check=bindings_check,
-            cancel_active=abort.set,
-        )
-        envelopes = dict(state.get("analyze_results", {}))
-        for identifier, result in branch_results.items():
-            analyzed[identifier] = result
-            envelopes[identifier] = _result_envelope(state, "analyze-dif", "analyzer", _analyze_work_unit(repo, identifier), result, str(role_profiles["analyzer"].get("instructions_version", "")))
-        meanings = sorted(identifier for identifier, result in analyzed.items() if result["kind"] == "meaning")
-        noise = sorted(identifier for identifier, result in analyzed.items() if result["kind"] == "noise")
-        if stopped:
-            return {**state, "analyzed": analyzed, "analyze_results": envelopes, "meanings": meanings, "noise": noise, "status": "resumable", "blocker": {"code": "dispatcher.soft_stopped", "message": "dispatcher was stopped", "action": "mrq.discover-next"}}
-        if errors:
-            return {**state, "analyzed": analyzed, "analyze_results": envelopes, "meanings": meanings, "noise": noise, "status": "failed", "blocker": {"code": "dispatcher.agent.failed", "message": f"{len(errors)} agent branches failed; explicit retry is required", "action": "mrq.discover-next", "branches": errors}}
-        return {**state, "analyzed": analyzed, "analyze_results": envelopes, "meanings": meanings, "noise": noise}
-
-    def group(state: DiscoverState) -> DiscoverState:
-        if state.get("status") in {"failed", "stale", "resumable"}:
-            return state
-        group_policy = policies["form-mrq"]
-        groups = dict(state.get("preliminary_groups", {}))
-        abort = Event()
-        phase_cancelled = lambda: cancelled() or abort.is_set()
-
-        def regroup(anchor: str) -> GroupProposal:
-            work_unit = _group_work_unit(state, anchor, repo)
-            expected = _result_envelope(state, "form-mrq", "grouper", work_unit, None, str(role_profiles["grouper"].get("instructions_version", "")))
-            cached = _compatible_cached(load_result(f"form-mrq:{anchor}") if load_result else None, expected, state.get("required_reuse_origin"))
-            if cached is not None:
-                if reuse_work:
-                    reuse_work("form-mrq", "grouper", anchor)
-                return cached
-            result = discover_preliminary_group(state, anchor, executor=executor, repo=repo, profile=role_profiles["grouper"], supplement=role_supplements["grouper"], timeout_seconds=timeout_seconds, cancelled=phase_cancelled)["preliminary_groups"][anchor]
-            if save_result:
-                save_result(f"form-mrq:{anchor}", _result_envelope(state, "form-mrq", "grouper", work_unit, result, str(role_profiles["grouper"].get("instructions_version", ""))))
-            return result
-
-        anchors = [identifier for identifier in state.get("meanings", []) if identifier not in groups]
-        if register_work:
-            register_work("form-mrq", "grouper", anchors)
-        group_results, group_errors, stopped = _bounded_map(
-            anchors,
-            max_concurrency=group_policy["max_concurrency"],
-            slot_count=next(role["count"] for role in group_policy["roles"] if role["role_id"] == "grouper"),
-            function=regroup,
-            cancelled=phase_cancelled,
-            bindings_check=bindings_check,
-            cancel_active=abort.set,
-        )
-        groups.update(group_results)
-        envelopes = dict(state.get("form_mrq_results", {}))
-        for anchor, result in group_results.items():
-            unit = _group_work_unit(state, anchor, repo)
-            envelopes[anchor] = _result_envelope(state, "form-mrq", "grouper", unit, result, str(role_profiles["grouper"].get("instructions_version", "")))
-        if stopped:
-            return {**state, "preliminary_groups": groups, "form_mrq_results": envelopes, "status": "resumable", "blocker": {"code": "dispatcher.soft_stopped", "message": "dispatcher was stopped", "action": "mrq.discover-next"}}
-        if group_errors:
-            return {**state, "preliminary_groups": groups, "form_mrq_results": envelopes, "status": "failed", "blocker": {"code": "dispatcher.agent.failed", "message": f"{len(group_errors)} grouping branches failed; explicit retry is required", "action": "mrq.discover-next", "branches": group_errors}}
-        return {**state, "preliminary_groups": groups, "form_mrq_results": envelopes}
-
-    def coordinate(state: DiscoverState) -> DiscoverState:
-        if state.get("status") in {"failed", "stale", "resumable"}:
-            return state
-        customer = {row["stable_diff_id"] for row in _read_diff_inventory(repo)} - _owned_diff_ids(repo)
-        if customer - (set(state.get("meanings", [])) | set(state.get("noise", []))):
-            return {**state, "barrier_open": False, "status": "blocked", "blocker": {"code": "dispatcher.barrier.unclassified", "message": "customer DIF remain unclassified", "action": "mrq.discover-next"}}
-        proposals = [state["preliminary_groups"][key] for key in sorted(state.get("preliminary_groups", {}))]
-        input_fingerprints = [state["analyze_results"][key]["result_fingerprint"] for key in sorted(state.get("analyze_results", {}))]
-        input_fingerprints += [state["form_mrq_results"][key]["result_fingerprint"] for key in sorted(state.get("form_mrq_results", {}))]
-        allowed_paths = sorted({str(item.get("path")) for proposal in proposals for item in proposal.get("evidence", []) if item.get("path")})
-        work_unit = {
-            "id": state.get("work_unit_id", "discover-mrq"),
-            "kind": "coordinate-groups",
-            "input_fingerprints": input_fingerprints,
-            "meaning_diff_ids": state.get("meanings", []),
-            "noise_diff_ids": state.get("noise", []),
-            "group_proposals": proposals,
-            "allowed_paths": allowed_paths,
-        }
-        from .agents import build_context_manifest
-        work_unit = {**work_unit, "allowed_path_fingerprints": build_context_manifest(repo, work_unit)["paths"]}
-        if register_work:
-            register_work("form-mrq", "coordinator", [str(work_unit["id"])])
-        expected = _result_envelope(state, "form-mrq", "coordinator", work_unit, None, str(role_profiles["coordinator"].get("instructions_version", "")))
-        cached = _compatible_cached(load_result("form-mrq:coordinate") if load_result else None, expected, state.get("required_reuse_origin"))
-        if cached is not None:
-            if reuse_work:
-                reuse_work("form-mrq", "coordinator", str(work_unit["id"]))
-            groups = cached
-        else:
-            payload = executor(repo, role_profiles["coordinator"], "mrq.discover-next", work_unit, role_supplements["coordinator"], timeout_seconds, cancelled)
-            groups = payload["groups"]
-            if save_result:
-                save_result("form-mrq:coordinate", _result_envelope(state, "form-mrq", "coordinator", work_unit, groups, str(role_profiles["coordinator"].get("instructions_version", ""))))
-        keyed = {str(group.get("semantic_key") or group.get("stable_diff_ids", ["group"])[0]): group for group in groups}
-        return {**state, "preliminary_groups": keyed, "status": "running", "blocker": None}
-
-    def review_noise(state: DiscoverState) -> DiscoverState:
-        if state.get("status") in {"failed", "stale", "resumable"}:
-            return state
-        return discover_review_noise(
-            state,
-            repo=repo,
-            approved_noise_ids=(item["stable_diff_id"] for item in (approved_noise or [])),
-        )
-
-    def barrier(state: DiscoverState) -> DiscoverState:
-        if state.get("status") in {"failed", "stale", "resumable"}:
-            return state
-        return discover_barrier(state, repo=repo)
-
-    def prepare(state: DiscoverState) -> DiscoverState:
-        if not state.get("barrier_open"):
-            return state
-        prepared = discover_batch_from_groups(state, approved_noise)
-        return {**prepared, "status": "blocked", "blocker": {"code": "approval.source_batch", "message": "source MRQ batch requires explicit local-user approval", "action": "mrq.publish-source-batch"}}
-
-    graph = StateGraph(DiscoverState)
-    graph.add_node("select-window", select)
-    graph.add_node("analyze-dif", analyze)
-    graph.add_node("form-mrq", group)
-    graph.add_node("review-noise", review_noise)
-    graph.add_node("coordinate-groups", coordinate)
-    graph.add_node("coverage-barrier", barrier)
-    graph.add_node("prepare-approval", prepare)
-    graph.add_edge(START, "select-window")
-    graph.add_edge("select-window", "analyze-dif")
-    graph.add_edge("analyze-dif", "form-mrq")
-    graph.add_conditional_edges(
-        "form-mrq",
-        lambda state: (
-            "select-window"
-            if state.get("status") not in {"failed", "stale", "resumable"}
-            and any(
-                row["stable_diff_id"] not in _owned_diff_ids(repo) | set(state.get("analyzed", {}))
-                for row in _read_diff_inventory(repo)
-            )
-            else "review-noise"
-        ),
-        {
-            "select-window": "select-window",
-            "review-noise": "review-noise",
-        },
-    )
-    graph.add_conditional_edges(
-        "review-noise",
-        lambda state: "end" if state.get("status") == "blocked" else "coordinate-groups",
-        {"end": END, "coordinate-groups": "coordinate-groups"},
-    )
-    graph.add_edge("coordinate-groups", "coverage-barrier")
-    graph.add_edge("coverage-barrier", "prepare-approval")
-    graph.add_edge("prepare-approval", END)
     return graph.compile(checkpointer=saver)
 
 
@@ -1462,6 +1567,7 @@ def compile_decide_graph(
     save_result: Callable[[str, dict[str, Any]], None] | None = None,
     register_work: Callable[[str, str, list[str]], None] | None = None,
     reuse_work: Callable[[str, str, str], None] | None = None,
+    record_work: Callable[[str, str, str, str, str, dict[str, Any]], None] | None = None,
 ):
     """Компилирует LangGraph исследования цели до границы одобрения."""
 
@@ -1499,6 +1605,11 @@ def compile_decide_graph(
                 if reuse_work:
                     reuse_work("research-target", "researcher", mrq_id)
                 return cached
+            if record_work and expected.get("reuse_incompatibility"):
+                record_work(
+                    "research-target", "researcher", mrq_id, "provider", "queued",
+                    {"reuse": {"status": "incompatible", **expected["reuse_incompatibility"]}},
+                )
             result = decide_research_one(state, mrq_id, executor=executor, repo=repo, profile=researcher_profile, supplement=researcher_supplement, timeout_seconds=timeout_seconds, cancelled=phase_cancelled, bindings_check=bindings_check)
             if save_result and result.get("decision_proposal"):
                 save_result(f"research-target:{mrq_id}", _result_envelope(state, "research-target", "researcher", work_unit, result, str(researcher_profile.get("instructions_version", ""))))

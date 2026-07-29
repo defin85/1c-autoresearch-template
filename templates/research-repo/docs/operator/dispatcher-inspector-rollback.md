@@ -6,14 +6,21 @@ online backup API, which includes committed WAL content, and writes
 `dispatcher.pre-inspector.sqlite` beside `dispatcher.sqlite` with mode `0600`.
 Only the local repository owner may read or restore that file.
 
+Before the context-envelope columns are added, the same procedure creates
+`dispatcher.pre-context-envelope.sqlite` with mode `0600`. This second backup
+is the rollback point for the context contract and includes the earlier
+inspector schema.
+
 The migration is additive and idempotent. Serving an older frontend against the
 new backend is supported: it ignores the additional projection fields and
 events. Do not run an older backend against the upgraded database because old
 positional invocation inserts are incompatible with the added columns.
 
 To roll back the backend, stop the workspace service, preserve the current
-database for diagnostics, replace `dispatcher.sqlite` with
-`dispatcher.pre-inspector.sqlite`, and restart the service. Operational history
+database for diagnostics, replace `dispatcher.sqlite` with the backup made
+immediately before the version being removed
+(`dispatcher.pre-context-envelope.sqlite` for this change), and restart the
+service. Operational history
 created after the backup is lost; repository sources, generations, and
 deliverables are unaffected. Verify ownership and mode `0600` before restart.
 

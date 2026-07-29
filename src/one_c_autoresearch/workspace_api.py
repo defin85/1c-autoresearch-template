@@ -69,6 +69,35 @@ def _event_cursor(value: str, scope: dict[str, str]) -> int:
     return sequence
 
 
+def _context_cursor(value: str, scope: dict[str, str]) -> int:
+    cursor = _decode_dispatcher_cursor(value)
+    offset = cursor.get("offset")
+    if (
+        set(cursor) != {"scope", "offset"}
+        or cursor.get("scope") != scope
+        or isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset < 0
+    ):
+        raise ValueError("dispatcher context cursor scope mismatch")
+    return offset
+
+
+def _public_invocation(value: dict[str, Any]) -> dict[str, Any]:
+    result = dict(value)
+    provenance = result.pop("context_provenance", [])
+    result.pop("context_diagnostics", None)
+    result["context_provenance_count"] = (
+        len(provenance) if isinstance(provenance, list) else 0
+    )
+    if result.get("result_ref"):
+        result["result_ref"] = {
+            "kind": "node-result",
+            "id": result["result_ref"],
+        }
+    return result
+
+
 def _safe_result_summary(payload: dict[str, Any]) -> dict[str, Any]:
     from .events import redact
     envelope = payload.get("envelope")
@@ -506,17 +535,25 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         run_id: str = "",
         history_limit: int = 20,
         event_limit: int = 50,
+        context_limit: int = 50,
         history_cursor: str = "",
         event_cursor: str = "",
+        context_cursor: str = "",
     ):
         if kind not in {"invocation", "slot"}:
             raise ValueError("invalid dispatcher inspection kind")
-        if not 1 <= history_limit <= 100 or not 1 <= event_limit <= 200:
+        if (
+            not 1 <= history_limit <= 100
+            or not 1 <= event_limit <= 200
+            or not 1 <= context_limit <= 100
+        ):
             raise ValueError("invalid dispatcher inspection limit")
         if history_cursor:
             _decode_dispatcher_cursor(history_cursor)
         if event_cursor:
             _decode_dispatcher_cursor(event_cursor)
+        if context_cursor:
+            _decode_dispatcher_cursor(context_cursor)
         if kind == "invocation":
             if not invocation_id or any((phase_id, role_id, slot_id, run_id)):
                 raise ValueError("invocation inspection requires only invocation_id")
@@ -591,6 +628,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                     (item for item in history if item["status"] == "running"),
                     history[0] if history else None,
                 )
+            history = [_public_invocation(item) for item in history]
 
             event_items: list[dict[str, Any]] = []
             events_available = bool(invocation and run_id)
@@ -711,11 +749,55 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 else "none"
             )
             public_invocation = dict(invocation) if invocation else None
-            if public_invocation and public_invocation.get("result_ref"):
-                public_invocation["result_ref"] = {
-                    "kind": "node-result",
-                    "id": public_invocation["result_ref"],
+            context = {
+                "available": False,
+                "summary": None,
+                "prepared_input_fingerprint": None,
+                "envelope_fingerprint": None,
+                "provenance": {
+                    "items": [],
+                    "truncated": False,
+                    "next_cursor": None,
+                },
+            }
+            if invocation and invocation.get("context_envelope_fingerprint"):
+                context_scope = {
+                    "project_id": project_id,
+                    "invocation_id": str(invocation["invocation_id"]),
                 }
+                offset = (
+                    _context_cursor(context_cursor, context_scope)
+                    if context_cursor
+                    else 0
+                )
+                provenance = invocation.get("context_provenance") or []
+                page = provenance[offset:offset + context_limit]
+                truncated = offset + len(page) < len(provenance)
+                context = {
+                    "available": True,
+                    "summary": invocation.get("context_diagnostics") or {},
+                    "prepared_input_fingerprint": invocation.get(
+                        "prepared_input_fingerprint"
+                    ),
+                    "envelope_fingerprint": invocation.get(
+                        "context_envelope_fingerprint"
+                    ),
+                    "provenance": {
+                        "items": page,
+                        "truncated": truncated,
+                        "next_cursor": (
+                            _encode_dispatcher_cursor({
+                                "scope": context_scope,
+                                "offset": offset + len(page),
+                            })
+                            if truncated
+                            else None
+                        ),
+                    },
+                }
+            public_invocation = (
+                _public_invocation(invocation) if invocation else None
+            )
             return {
                 "kind": kind,
                 "observed_at": datetime.now(timezone.utc).isoformat(),
@@ -732,6 +814,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 "execution_identity_available": execution_available,
                 "execution_identity": execution_identity,
                 "result": result,
+                "context": context,
                 "history": {
                     "available": bool(run_id),
                     "items": history,

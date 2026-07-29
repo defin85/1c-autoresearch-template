@@ -29,7 +29,7 @@ from one_c_autoresearch.pipeline_graphs import (
     build_discover_state,
     compile_analyze_graph,
     compile_classify_graph,
-    compile_discover_graph,
+    compile_consolidate_graph,
     decide_apply,
     decide_research_one,
     decide_select_mrq,
@@ -216,120 +216,6 @@ def test_analyze_window_combines_local_and_agent_rows_atomically_without_startin
     assert published == []
 
 
-def test_discover_is_a_compiled_checkpointed_langgraph(tmp_path: Path) -> None:
-    repo = _bootstrap_repo(tmp_path, [_customer_diff("DIF-AAAA")])
-    store = DispatcherStore(repo, base=tmp_path / "state")
-    store.open()
-
-    def executor(_repo, _profile, _op, work_unit, _supplement, _timeout, _cancelled):
-        if work_unit.get("kind") == "coordinate-groups":
-            return {"groups": work_unit["group_proposals"]}
-        identifier = work_unit["id"]
-        return {
-            "semantic_key": "invoice-change",
-            "title": "Invoice change",
-            "stable_diff_ids": [identifier],
-            "supporting_diff_ids": [],
-            "evidence": [{"path": "Catalogs/Invoices/a.bsl", "fingerprint": "sha256:" + "a" * 64, "stable_diff_id": identifier}],
-            "business_meaning": "M",
-            "scope": "S",
-            "confidence": "high",
-            "rationale": "R",
-        }
-
-    try:
-        graph = compile_discover_graph(repo=repo, saver=store.saver, executor=executor, profile={}, supplement="", timeout_seconds=60, cancelled=lambda: False, bindings_check=lambda: True)
-        state = graph.invoke(build_discover_state(_bindings(), "run-1", "thread-1"), config={"configurable": {"thread_id": "thread-1"}})
-        assert state["status"] == "blocked"
-        assert state["blocker"]["code"] == "approval.source_batch"
-        assert state["batch_proposals"][0]["stable_diff_ids"] == ["DIF-AAAA"]
-        assert store.saver.get_tuple({"configurable": {"thread_id": "thread-1"}}) is not None
-    finally:
-        store.close()
-
-
-def test_discover_reuses_completed_branch_results_after_checkpoint_loss(tmp_path: Path) -> None:
-    repo = _bootstrap_repo(tmp_path, [_customer_diff("DIF-AAAA")])
-    store = DispatcherStore(repo, base=tmp_path / "state")
-    store.open()
-    cached: dict[str, dict[str, Any]] = {}
-    calls = 0
-
-    def executor(_repo, _profile, _op, work_unit, _supplement, _timeout, _cancelled):
-        nonlocal calls
-        calls += 1
-        if work_unit.get("kind") == "coordinate-groups":
-            return {"groups": work_unit["group_proposals"]}
-        return {"semantic_key": "invoice-change", "title": "Invoice change", "stable_diff_ids": [work_unit["id"]], "supporting_diff_ids": [], "evidence": [{"path": "Catalogs/Invoices/a.bsl", "fingerprint": "sha256:" + "a" * 64}], "business_meaning": "M", "scope": "S", "confidence": "high", "rationale": "R"}
-
-    arguments = dict(repo=repo, saver=store.saver, executor=executor, profile={}, supplement="", timeout_seconds=60, cancelled=lambda: False, bindings_check=lambda: True, load_result=cached.get, save_result=lambda key, value: cached.__setitem__(key, value))
-    try:
-        graph = compile_discover_graph(**arguments)
-        initial = build_discover_state(_bindings(), "run-1", "thread-1")
-        graph.invoke(initial, config={"configurable": {"thread_id": "thread-1"}})
-        first_calls = calls
-        assert first_calls > 0
-        assert set(cached) == {"analyze-dif:DIF-AAAA", "form-mrq:DIF-AAAA", "form-mrq:coordinate"}
-        assert all({"source_run_id", "source_execution_snapshot_fingerprint", "compatibility_fingerprint", "result_fingerprint", "result"} <= set(value) for value in cached.values())
-        store.saver.delete_thread("thread-1")
-        graph.invoke(initial, config={"configurable": {"thread_id": "thread-1"}})
-        assert calls == first_calls
-    finally:
-        store.close()
-
-
-def test_discover_replaces_early_groups_with_one_complete_late_group(tmp_path: Path) -> None:
-    repo = _bootstrap_repo(tmp_path, [_customer_diff("DIF-AAAA"), _customer_diff("DIF-BBBB")])
-    store = DispatcherStore(repo, base=tmp_path / "state")
-    store.open()
-    candidate_sizes: list[int] = []
-
-    def executor(_repo, _profile, _op, work_unit, _supplement, _timeout, _cancelled):
-        if work_unit.get("kind") == "coordinate-groups":
-            groups = work_unit["group_proposals"]
-            merged = {**groups[0], "stable_diff_ids": sorted({item for group in groups for item in group["stable_diff_ids"]})}
-            return {"groups": [merged]}
-        identifiers = work_unit.get("candidate_diff_ids", [work_unit["id"]])
-        if work_unit.get("kind") == "preliminary-group":
-            candidate_sizes.append(len(identifiers))
-        return {"semantic_key": "one-group", "title": "One group", "stable_diff_ids": identifiers, "supporting_diff_ids": [], "evidence": [{"path": "Catalogs/Invoices/a.bsl", "fingerprint": "sha256:" + "a" * 64}], "business_meaning": "M", "scope": "S", "confidence": "high", "rationale": "R"}
-
-    try:
-        graph = compile_discover_graph(repo=repo, saver=store.saver, executor=executor, profile={}, supplement="", timeout_seconds=60, cancelled=lambda: False, bindings_check=lambda: True)
-        state = graph.invoke(build_discover_state(_bindings(), "run-1", "thread-1"), config={"configurable": {"thread_id": "thread-1"}})
-        assert 2 in candidate_sizes
-        assert len(state["batch_proposals"]) == 1
-        assert state["batch_proposals"][0]["stable_diff_ids"] == ["DIF-AAAA", "DIF-BBBB"]
-    finally:
-        store.close()
-
-
-def test_discover_partial_agent_failure_is_not_retried_automatically(tmp_path: Path) -> None:
-    repo = _bootstrap_repo(tmp_path, [_customer_diff("DIF-AAAA"), _customer_diff("DIF-BBBB")])
-    store = DispatcherStore(repo, base=tmp_path / "state")
-    store.open()
-    calls: dict[str, int] = {}
-
-    def executor(_repo, _profile, _op, work_unit, _supplement, _timeout, _cancelled):
-        identifier = work_unit["id"]
-        calls[identifier] = calls.get(identifier, 0) + 1
-        if work_unit.get("kind") == "coordinate-groups":
-            return {"groups": work_unit["group_proposals"]}
-        if identifier == "DIF-BBBB":
-            raise RuntimeError("agent failed")
-        return {"semantic_key": identifier, "title": identifier, "stable_diff_ids": [identifier], "supporting_diff_ids": [], "evidence": [{"path": "Catalogs/Invoices/a.bsl", "fingerprint": "sha256:" + "a" * 64}], "business_meaning": "M", "scope": "S", "confidence": "high", "rationale": "R"}
-
-    try:
-        graph = compile_discover_graph(repo=repo, saver=store.saver, executor=executor, profile={}, supplement="", timeout_seconds=60, cancelled=lambda: False, bindings_check=lambda: True)
-        state = graph.invoke(build_discover_state(_bindings(), "run-1", "thread-1"), config={"configurable": {"thread_id": "thread-1"}})
-        assert state["status"] == "failed"
-        assert state["blocker"]["code"] == "dispatcher.agent.failed"
-        assert calls["DIF-BBBB"] == 1
-        assert "DIF-AAAA" in state["analyzed"]
-    finally:
-        store.close()
-
-
 def test_bounded_map_has_no_implicit_total_20_and_respects_requested_limit() -> None:
     lock = threading.Lock()
     ready = threading.Barrier(24)
@@ -413,121 +299,24 @@ def test_reuse_snapshot_requires_matching_result_origin() -> None:
             "source_execution_snapshot_fingerprint": "sha256:old-snapshot",
         },
     ) is None
-
-
-def test_soft_stop_drains_running_work_and_never_calls_coordinator(tmp_path: Path) -> None:
-    repo = _bootstrap_repo(tmp_path, [_customer_diff("DIF-AAAA"), _customer_diff("DIF-BBBB")])
-    store = DispatcherStore(repo, base=tmp_path / "state")
-    store.open()
-    stopped = False
-    coordinator_calls = 0
-
-    def executor(_repo, _profile, _op, work_unit, _supplement, _timeout, _cancelled):
-        nonlocal stopped, coordinator_calls
-        if work_unit.get("kind") == "coordinate-groups":
-            coordinator_calls += 1
-            return {"groups": []}
-        stopped = True
-        return {"semantic_key": work_unit["id"], "title": work_unit["id"], "stable_diff_ids": [work_unit["id"]], "supporting_diff_ids": [], "evidence": [{"path": "Catalogs/Invoices/a.bsl", "fingerprint": "sha256:" + "a" * 64}], "business_meaning": "M", "scope": "S", "confidence": "high", "rationale": "R"}
-
-    try:
-        policies = {
-            "analyze-dif": {"max_concurrency": 1, "roles": [{"role_id": "analyzer", "count": 1, "instruction_supplement": ""}]},
-            "form-mrq": {"max_concurrency": 1, "roles": [{"role_id": "coordinator", "count": 1, "instruction_supplement": ""}, {"role_id": "grouper", "count": 1, "instruction_supplement": ""}]},
-        }
-        graph = compile_discover_graph(repo=repo, saver=store.saver, executor=executor, profile={}, supplement="", timeout_seconds=60, cancelled=lambda: stopped, bindings_check=lambda: True, phase_policies=policies)
-        state = graph.invoke(build_discover_state(_bindings(), "run-1", "thread-stop"), config={"configurable": {"thread_id": "thread-stop"}})
-        assert state["status"] == "resumable"
-        assert coordinator_calls == 0
-        assert list(state["analyzed"]) == ["DIF-AAAA"]
-    finally:
-        store.close()
-
-
-def test_discover_uses_independent_analyze_and_group_limits_for_twenty_units(tmp_path: Path) -> None:
-    diffs = [_customer_diff(f"DIF-{index:04d}") for index in range(20)]
-    repo = _bootstrap_repo(tmp_path, diffs)
-    store = DispatcherStore(repo, base=tmp_path / "state")
-    store.open()
-    lock = threading.Lock()
-    active = {"analyze": 0, "group": 0}
-    peak = {"analyze": 0, "group": 0}
-
-    def executor(_repo, _profile, _op, work_unit, _supplement, _timeout, _cancelled):
-        if work_unit.get("kind") == "coordinate-groups":
-            return {"groups": work_unit["group_proposals"]}
-        phase = "group" if work_unit.get("kind") == "preliminary-group" else "analyze"
-        with lock:
-            active[phase] += 1
-            peak[phase] = max(peak[phase], active[phase])
-        time.sleep(0.005)
-        with lock:
-            active[phase] -= 1
-        identifier = work_unit["id"]
-        return {"semantic_key": identifier, "title": identifier, "stable_diff_ids": [identifier], "supporting_diff_ids": [], "evidence": [{"path": "Catalogs/Invoices/a.bsl", "fingerprint": "sha256:" + "a" * 64}], "business_meaning": "M", "scope": "S", "confidence": "high", "rationale": "R"}
-
-    policies = {
-        "analyze-dif": {"max_concurrency": 7, "roles": [{"role_id": "analyzer", "count": 9, "instruction_supplement": ""}]},
-        "form-mrq": {"max_concurrency": 3, "roles": [{"role_id": "coordinator", "count": 1, "instruction_supplement": ""}, {"role_id": "grouper", "count": 5, "instruction_supplement": ""}]},
+    mismatch = {
+        "compatibility_fingerprint": "sha256:new",
+        "compatibility": {
+            "context_contract_version": "context-envelope/v1",
+            "context_estimator_version": "old-estimator",
+        },
     }
-    try:
-        graph = compile_discover_graph(repo=repo, saver=store.saver, executor=executor, profile={}, supplement="", timeout_seconds=60, cancelled=lambda: False, bindings_check=lambda: True, phase_policies=policies)
-        state = graph.invoke(build_discover_state(_bindings(), "run-20", "thread-20"), config={"configurable": {"thread_id": "thread-20"}})
-        assert state["status"] == "blocked"
-        assert peak == {"analyze": 7, "group": 3}
-        assert len(state["analyze_results"]) == len(state["form_mrq_results"]) == 20
-    finally:
-        store.close()
-
-
-def test_discover_advances_across_multiple_windows_before_coordinator(tmp_path: Path) -> None:
-    diffs = [_customer_diff(f"DIF-{index:04d}") for index in range(40)]
-    repo = _bootstrap_repo(tmp_path, diffs)
-    store = DispatcherStore(repo, base=tmp_path / "state")
-    store.open()
-    analyzed: list[str] = []
-    coordinator_calls = 0
-
-    def executor(_repo, _profile, _op, work_unit, _supplement, _timeout, _cancelled):
-        nonlocal coordinator_calls
-        if work_unit.get("kind") == "coordinate-groups":
-            coordinator_calls += 1
-            return {"groups": work_unit["group_proposals"]}
-        identifier = work_unit["id"]
-        if work_unit.get("kind") != "preliminary-group":
-            analyzed.append(identifier)
-        return {
-            "semantic_key": identifier,
-            "title": identifier,
-            "stable_diff_ids": [identifier],
-            "supporting_diff_ids": [],
-            "evidence": [{"path": "Catalogs/Invoices/a.bsl", "fingerprint": "sha256:" + "a" * 64}],
-            "business_meaning": "M",
-            "scope": "S",
-            "confidence": "high",
-            "rationale": "R",
-        }
-
-    try:
-        graph = compile_discover_graph(
-            repo=repo,
-            saver=store.saver,
-            executor=executor,
-            profile={},
-            supplement="",
-            timeout_seconds=60,
-            cancelled=lambda: False,
-            bindings_check=lambda: True,
-        )
-        state = graph.invoke(
-            build_discover_state(_bindings(), "run-40", "thread-40"),
-            config={"configurable": {"thread_id": "thread-40", "recursion_limit": 30}},
-        )
-        assert state["status"] == "blocked"
-        assert len(set(analyzed)) == 40
-        assert coordinator_calls == 1
-    finally:
-        store.close()
+    source = {
+        "compatibility_fingerprint": "sha256:old",
+        "compatibility": {
+            "context_contract_version": "context-envelope/v1",
+            "context_estimator_version": "utf8-v1",
+        },
+    }
+    assert _compatible_cached(source, mismatch) is None
+    assert mismatch["reuse_incompatibility"] == {
+        "field": "context_estimator_version",
+    }
 
 
 # -- этапы discover-mrq ---------------------------------------------------
@@ -729,75 +518,6 @@ def test_noise_requires_explicit_approval_before_coordinator(tmp_path: Path) -> 
     assert prepared["approved_noise_ids"] == ["DIF-AAAA"]
 
 
-def test_discover_graph_never_calls_coordinator_before_noise_approval(tmp_path: Path) -> None:
-    repo = _bootstrap_repo(tmp_path, [_customer_diff("DIF-AAAA")])
-    store = DispatcherStore(repo, base=tmp_path / "state")
-    store.open()
-    calls: list[str] = []
-
-    def executor(_repo, _profile, _operation, work_unit, _supplement, _timeout, _cancelled):
-        calls.append(str(work_unit.get("kind")))
-        if work_unit.get("kind") == "coordinate-groups":
-            raise AssertionError("coordinator ran before noise approval")
-        return {
-            "semantic_key": "",
-            "title": "",
-            "stable_diff_ids": [work_unit["id"]],
-            "supporting_diff_ids": [],
-            "evidence": [{"path": "Catalogs/Invoices/a.bsl", "fingerprint": "sha256:" + "a" * 64}],
-            "business_meaning": "",
-            "scope": "",
-            "confidence": "high",
-            "rationale": "technical",
-        }
-
-    try:
-        graph = compile_discover_graph(repo=repo, saver=store.saver, executor=executor, profile={}, supplement="", timeout_seconds=60, cancelled=lambda: False, bindings_check=lambda: True)
-        state = graph.invoke(build_discover_state(_bindings(), "run-1", "thread-1"), config={"configurable": {"thread_id": "thread-1"}})
-        assert state["status"] == "blocked"
-        assert state["blocker"]["code"] == "approval.noise"
-        assert "coordinate-groups" not in calls
-        reviewed = [{
-            "stable_diff_id": "DIF-AAAA",
-            "actor": "local-user",
-            "rationale": "technical",
-            "evidence": [{"path": "Catalogs/Invoices/a.bsl", "fingerprint": "sha256:" + "a" * 64}],
-            "timestamp": "2026-07-23T00:00:00+00:00",
-        }]
-
-        def approved_executor(_repo, _profile, _operation, work_unit, _supplement, _timeout, _cancelled):
-            if work_unit.get("kind") == "coordinate-groups":
-                return {"groups": []}
-            return {
-                "semantic_key": "",
-                "title": "",
-                "stable_diff_ids": [work_unit["id"]],
-                "supporting_diff_ids": [],
-                "evidence": reviewed[0]["evidence"],
-                "business_meaning": "",
-                "scope": "",
-                "confidence": "high",
-                "rationale": "technical",
-            }
-
-        graph = compile_discover_graph(
-            repo=repo,
-            saver=store.saver,
-            executor=approved_executor,
-            profile={},
-            supplement="",
-            timeout_seconds=60,
-            cancelled=lambda: False,
-            bindings_check=lambda: True,
-            approved_noise=reviewed,
-        )
-        resumed = graph.invoke(build_discover_state(_bindings(), "run-2", "thread-2"), config={"configurable": {"thread_id": "thread-2"}})
-        assert resumed["blocker"]["code"] == "approval.source_batch"
-        assert resumed["approved_noise"] == reviewed
-    finally:
-        store.close()
-
-
 def test_publish_batch_invokes_internal_operation(tmp_path: Path) -> None:
     diffs = [_customer_diff("DIF-AAAA")]
     repo = _bootstrap_repo(tmp_path, diffs)
@@ -889,6 +609,104 @@ def test_classify_resume_reuses_completed_windows(tmp_path: Path) -> None:
         assert reused == ["window:0"]
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("missing_links", [False, True])
+def test_consolidation_uses_page_links_and_binary_reduction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_links: bool,
+) -> None:
+    repo = _bootstrap_repo(tmp_path, [_customer_diff("DIF-1")])
+    store = DispatcherStore(repo, base=tmp_path / "state")
+    store.open()
+    snapshot = {
+        "classifications": [{"stable_diff_id": "DIF-1", "classification": "meaning"}],
+        "prior_consolidation": {},
+    }
+    monkeypatch.setattr("one_c_autoresearch.dif_classifications.coverage", lambda _repo: {
+        "all_dif_classified": True, "remaining": 0,
+    })
+    monkeypatch.setattr("one_c_autoresearch.consolidation.input_snapshot", lambda _repo: snapshot)
+    monkeypatch.setattr("one_c_autoresearch.consolidation.normalized_records", lambda _snapshot: [
+        {"record_id": "DIF-1", "stable_diff_id": "DIF-1"},
+    ])
+    monkeypatch.setattr("one_c_autoresearch.consolidation.partition_manifest", lambda *_args, **_kwargs: {
+        "partitions": [{"record_ids": ["DIF-1"]}],
+        "pairs": [{"left": 0, "right": 0}],
+        "planned_invocation_count": 2,
+    })
+    captured = {}
+    monkeypatch.setattr(
+        "one_c_autoresearch.consolidation.plan_from_groups",
+        lambda _snapshot, groups, noise, _manifest: captured.update(
+            groups=groups, noise=noise
+        ) or {"outcomes": {"new": ["MRQ-1"]}},
+    )
+    monkeypatch.setattr(
+        "one_c_autoresearch.consolidation.store_plan",
+        lambda *_args: ("sha256:plan", tmp_path / "plan.json"),
+    )
+    kinds = []
+
+    def executor(_repo, _profile, _operation, unit, *_args):
+        kinds.append(unit["kind"])
+        if unit["kind"] == "consolidation-link-page":
+            if missing_links:
+                return {"links": []}
+            candidates = {
+                row["candidate_id"]
+                for key in ("left_candidates", "right_candidates")
+                for row in unit[key]
+            }
+            left, right = sorted(candidates)
+            return {"links": [{
+                "left_candidate_id": left,
+                "right_candidate_id": right,
+                "decision": "merge",
+                "rationale": "same",
+            }]}
+        if unit["kind"] == "consolidation-reduce-pair":
+            return {"group": {
+                "semantic_key": "orders", "title": "Orders",
+                "business_meaning": "Orders", "scope": "Documents",
+                "confidence": "high", "rationale": "same",
+                "split_source_mrq_id": "",
+            }}
+        return {"groups": [{
+            "semantic_key": unit["id"], "title": "Orders",
+            "stable_diff_ids": ["DIF-1"], "supporting_diff_ids": [],
+            "component_keys": [], "source_mrq_ids": [], "evidence": [],
+            "business_meaning": "Orders", "scope": "Documents",
+            "confidence": "high", "rationale": "same",
+            "split_source_mrq_id": "",
+        }]}
+
+    profile = {
+        "input_context_tokens": 8192,
+        "context_estimator_version": "utf8-v1",
+    }
+    try:
+        result = compile_consolidate_graph(
+            repo=repo, saver=store.saver, executor=executor, profile=profile,
+            profiles_by_role={"grouper": profile, "coordinator": profile},
+            supplement="", timeout_seconds=60, cancelled=lambda: False,
+            bindings_check=lambda: True, plan_root=tmp_path,
+        ).invoke(
+            build_discover_state(
+                {**_bindings("consolidate"), "job_id": "consolidate-mrq"},
+                "run", "thread",
+            ),
+            config={"configurable": {"thread_id": "thread"}},
+        )
+    finally:
+        store.close()
+    assert result["blocker"]["code"] == (
+        "consolidation.plan_storage" if missing_links
+        else "approval.consolidation"
+    )
+    assert kinds.count("consolidation-link-page") == 1
+    assert kinds.count("consolidation-reduce-pair") == (0 if missing_links else 1)
+    if not missing_links:
+        assert captured["groups"][0]["stable_diff_ids"] == ["DIF-1"]
 
 
 def test_classify_stops_before_next_window_when_source_fingerprint_changes(tmp_path: Path) -> None:

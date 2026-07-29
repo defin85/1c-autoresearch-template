@@ -576,7 +576,7 @@ test.each([
       />,
     );
     expect(container).toHaveTextContent(
-      `Управляемые: ${form_counts.managed}; обычные: ${form_counts.ordinary}; неопределённые: ${form_counts.inconclusive}`,
+      `Формы в группе, сумма по компонентам — управляемые: ${form_counts.managed}; обычные: ${form_counts.ordinary}; неопределённые: ${form_counts.inconclusive}`,
     );
     expect(container).toHaveTextContent(routing_reason);
     if (absent_roles.length)

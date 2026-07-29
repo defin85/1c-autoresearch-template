@@ -191,6 +191,9 @@ def test_legacy_migration_creates_consistent_private_backup_once(tmp_path: Path)
         assert store.invocation("legacy")["status"] == "completed"
     backup = path.with_suffix(".pre-inspector.sqlite")
     assert backup.is_file() and backup.stat().st_mode & 0o777 == 0o600
+    context_backup = path.with_suffix(".pre-context-envelope.sqlite")
+    assert context_backup.is_file()
+    assert context_backup.stat().st_mode & 0o777 == 0o600
     with sqlite3.connect(backup) as saved:
         assert saved.execute(
             "SELECT status FROM dispatcher_invocations WHERE invocation_id='legacy'"
@@ -199,14 +202,17 @@ def test_legacy_migration_creates_consistent_private_backup_once(tmp_path: Path)
             row[1] for row in saved.execute("PRAGMA table_info(dispatcher_invocations)")
         }
     backup_bytes = backup.read_bytes()
+    context_backup_bytes = context_backup.read_bytes()
     with DispatcherStore(repo, tmp_path / "state") as store:
         assert store.invocation("legacy")["status"] == "completed"
     assert backup.read_bytes() == backup_bytes
+    assert context_backup.read_bytes() == context_backup_bytes
     rollback = Path(
         "docs/operator/dispatcher-inspector-rollback.md"
     ).read_text(encoding="utf-8")
     assert "older frontend" in rollback
     assert "older backend" in rollback
+    assert "dispatcher.pre-context-envelope.sqlite" in rollback
     assert "Operational history created after the backup is lost" in rollback.replace(
         "\n", " "
     )
@@ -375,6 +381,73 @@ def test_empty_retained_events_are_truncated_without_next_cursor(tmp_path: Path)
             "kind": "node-result",
             "id": "opaque-result",
         }
+
+
+def test_context_diagnostics_are_bounded_paged_and_legacy_safe(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    provenance = [
+        {
+            "item_key": f"fact:{index}",
+            "item_kind": "fact",
+            "selection_reason": "stage_policy",
+            "origin_kind": "work_unit",
+            "origin_ref": "DIF-1",
+            "fingerprint": f"sha256:{index}",
+        }
+        for index in range(3)
+    ]
+    with TestClient(create_app(state, [REPO], testing=True)) as client:
+        project = _bookmark(client)
+        event_store = EventStore(state / "projects", project["id"])
+        fingerprint = _run(event_store, "run-context")
+        with DispatcherStore(REPO, state) as store:
+            token = store.acquire_lease(
+                "discover-mrq", "thread", "DIF-1", "test", None,
+                run_id="run-context",
+            )
+            invocation = store.start_invocation(
+                "discover-mrq", "run-context", "analyze-dif", "analyzer",
+                "DIF-1", 1, token,
+                execution_snapshot_fingerprint=fingerprint,
+                profile_id="local",
+                context_manifest_fingerprint="sha256:manifest",
+                context_envelope_fingerprint="sha256:envelope",
+                prepared_input_fingerprint="sha256:input",
+                context_provenance=provenance,
+                context_diagnostics={
+                    "contract_version": "context-envelope/v1",
+                    "prepared_input_bytes": 1200,
+                    "headroom_bytes": 400,
+                },
+            )
+        response = client.get(
+            f"/api/v1/projects/{project['id']}/dispatcher/inspect",
+            params={
+                "kind": "invocation",
+                "invocation_id": invocation["invocation_id"],
+                "context_limit": 2,
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["context"]["available"] is True
+        assert payload["context"]["summary"]["prepared_input_bytes"] == 1200
+        assert len(payload["context"]["provenance"]["items"]) == 2
+        assert payload["context"]["provenance"]["truncated"] is True
+        assert "context_provenance" not in payload["invocation"]
+        cursor = payload["context"]["provenance"]["next_cursor"]
+        page = client.get(
+            f"/api/v1/projects/{project['id']}/dispatcher/inspect",
+            params={
+                "kind": "invocation",
+                "invocation_id": invocation["invocation_id"],
+                "context_limit": 2,
+                "context_cursor": cursor,
+            },
+        )
+        assert [row["item_key"] for row in page.json()["context"]["provenance"]["items"]] == ["fact:2"]
 
 
 def test_inspection_drains_outbox_and_rejects_typed_cursor_mismatch(

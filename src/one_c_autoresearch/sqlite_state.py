@@ -49,6 +49,23 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _decode_context_columns(row: dict[str, Any]) -> dict[str, Any]:
+    for key, empty in (
+        ("context_provenance", []),
+        ("context_diagnostics", {}),
+    ):
+        encoded = row.get(key)
+        if not encoded:
+            row[key] = empty
+            continue
+        try:
+            decoded = json.loads(str(encoded))
+        except json.JSONDecodeError:
+            decoded = empty
+        row[key] = decoded if isinstance(decoded, type(empty)) else empty
+    return row
+
+
 def _terminalize_rows(
     cur,
     invocation_ids: list[str],
@@ -309,6 +326,10 @@ def _ensure_dispatcher_tables(conn) -> None:
             "execution_snapshot_fingerprint": "TEXT",
             "profile_id": "TEXT",
             "context_manifest_fingerprint": "TEXT",
+            "context_envelope_fingerprint": "TEXT",
+            "prepared_input_fingerprint": "TEXT",
+            "context_provenance": "TEXT",
+            "context_diagnostics": "TEXT",
             "finished_at": "TEXT",
             "error_code": "TEXT",
             "error_summary": "TEXT",
@@ -318,6 +339,14 @@ def _ensure_dispatcher_tables(conn) -> None:
             if name not in invocation_columns:
                 cur.execute(
                     f"ALTER TABLE dispatcher_invocations ADD COLUMN {name} {column_type}"
+                )
+        phase_columns = {
+            row[1] for row in cur.execute("PRAGMA table_info(dispatcher_phase_work)")
+        }
+        for name in ("execution_kind", "source_result_ref", "context_diagnostics"):
+            if name not in phase_columns:
+                cur.execute(
+                    f"ALTER TABLE dispatcher_phase_work ADD COLUMN {name} TEXT"
                 )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS dispatcher_invocation_history "
@@ -350,6 +379,15 @@ def _acquire_saver(repo: Path, base: Path | None = None):
         }
         if columns and "execution_snapshot_fingerprint" not in columns:
             backup = path.with_suffix(".pre-inspector.sqlite")
+            if not backup.exists():
+                destination = sqlite3.connect(backup)
+                try:
+                    saver.conn.backup(destination)
+                finally:
+                    destination.close()
+                backup.chmod(0o600)
+        if columns and "context_envelope_fingerprint" not in columns:
+            backup = path.with_suffix(".pre-context-envelope.sqlite")
             if not backup.exists():
                 destination = sqlite3.connect(backup)
                 try:
@@ -1436,6 +1474,10 @@ class DispatcherStore:
         execution_snapshot_fingerprint: str = "",
         profile_id: str = "",
         context_manifest_fingerprint: str = "",
+        context_envelope_fingerprint: str = "",
+        prepared_input_fingerprint: str = "",
+        context_provenance: list[dict[str, Any]] | None = None,
+        context_diagnostics: dict[str, Any] | None = None,
     ) -> dict[str, str] | None:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
@@ -1452,12 +1494,29 @@ class DispatcherStore:
                 slot_id = f"{phase_id}:{role_id}:{ordinal}"
                 now = _now_iso()
                 cur.execute(
+                    "SELECT context_diagnostics FROM dispatcher_phase_work "
+                    "WHERE run_id = ? AND phase_id = ? AND role_id = ? AND work_unit_id = ?",
+                    (run_id, phase_id, role_id, work_unit_id),
+                )
+                prior_row = cur.fetchone()
+                prior_diagnostics = (
+                    json.loads(prior_row[0])
+                    if prior_row and prior_row[0]
+                    else {}
+                )
+                merged_diagnostics = {
+                    **prior_diagnostics,
+                    **(context_diagnostics or {}),
+                }
+                cur.execute(
                     "INSERT INTO dispatcher_invocations "
                     "(invocation_id, job_id, run_id, phase_id, role_id, "
                     "work_unit_id, slot_id, status, created_at, updated_at, "
                     "execution_snapshot_fingerprint, profile_id, "
-                    "context_manifest_fingerprint) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)",
+                    "context_manifest_fingerprint, context_envelope_fingerprint, "
+                    "prepared_input_fingerprint, context_provenance, "
+                    "context_diagnostics) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         invocation_id,
                         job_id,
@@ -1471,12 +1530,26 @@ class DispatcherStore:
                         execution_snapshot_fingerprint or None,
                         profile_id or None,
                         context_manifest_fingerprint or None,
+                        context_envelope_fingerprint or None,
+                        prepared_input_fingerprint or None,
+                        canonical_json(context_provenance or []).decode(),
+                        canonical_json(merged_diagnostics).decode(),
                     ),
                 )
                 cur.execute(
-                    "UPDATE dispatcher_phase_work SET status = 'running', invocation_id = ?, updated_at = ? "
+                    "UPDATE dispatcher_phase_work SET status = 'running', "
+                    "execution_kind = 'provider', context_diagnostics = ?, "
+                    "invocation_id = ?, updated_at = ? "
                     "WHERE run_id = ? AND phase_id = ? AND role_id = ? AND work_unit_id = ?",
-                    (invocation_id, now, run_id, phase_id, role_id, work_unit_id),
+                    (
+                        canonical_json(merged_diagnostics).decode(),
+                        invocation_id,
+                        now,
+                        run_id,
+                        phase_id,
+                        role_id,
+                        work_unit_id,
+                    ),
                 )
                 payload = {
                     "transition_key": f"invocation:{invocation_id}:started",
@@ -1612,15 +1685,19 @@ class DispatcherStore:
             cur = self.conn.cursor()
             try:
                 cur.execute(
-                    "SELECT job_id, run_id, phase_id, role_id, work_unit_id, status, invocation_id, updated_at "
+                    "SELECT job_id, run_id, phase_id, role_id, work_unit_id, status, invocation_id, updated_at, "
+                    "execution_kind, source_result_ref, context_diagnostics "
                     "FROM dispatcher_phase_work WHERE run_id = ? ORDER BY phase_id, role_id, work_unit_id",
                     (run_id,),
                 )
                 rows = cur.fetchall()
             finally:
                 cur.close()
-        keys = ("job_id", "run_id", "phase_id", "role_id", "work_unit_id", "status", "invocation_id", "updated_at")
-        return [dict(zip(keys, row, strict=True)) for row in rows]
+        keys = ("job_id", "run_id", "phase_id", "role_id", "work_unit_id", "status", "invocation_id", "updated_at", "execution_kind", "source_result_ref", "context_diagnostics")
+        return [
+            _decode_context_columns(dict(zip(keys, row, strict=True)))
+            for row in rows
+        ]
 
     def complete_reused_work(
         self,
@@ -1630,20 +1707,72 @@ class DispatcherStore:
         role_id: str,
         work_unit_id: str,
         lease_token: str,
+        *,
+        source_result_ref: str = "",
+        context_diagnostics: dict[str, Any] | None = None,
     ) -> bool:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
                 cur.execute(
-                    "UPDATE dispatcher_phase_work SET status = 'completed', updated_at = ? "
+                    "UPDATE dispatcher_phase_work SET status = 'completed', "
+                    "execution_kind = 'reused', source_result_ref = ?, "
+                    "context_diagnostics = ?, updated_at = ? "
                     "WHERE run_id = ? AND phase_id = ? AND role_id = ? AND work_unit_id = ? "
                     "AND status IN ('queued', 'completed') AND EXISTS "
                     "(SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?)",
-                    (_now_iso(), run_id, phase_id, role_id, work_unit_id, job_id, lease_token),
+                    (
+                        source_result_ref or None,
+                        canonical_json(context_diagnostics or {}).decode(),
+                        _now_iso(),
+                        run_id,
+                        phase_id,
+                        role_id,
+                        work_unit_id,
+                        job_id,
+                        lease_token,
+                    ),
                 )
                 return cur.rowcount == 1
             finally:
                 cur.close()
+
+    def record_phase_context(
+        self,
+        job_id: str,
+        run_id: str,
+        phase_id: str,
+        role_id: str,
+        work_unit_id: str,
+        lease_token: str,
+        *,
+        execution_kind: str,
+        status: str,
+        context_diagnostics: dict[str, Any],
+    ) -> bool:
+        if execution_kind not in {"provider", "deterministic", "preflight_failed"}:
+            raise ValueError("invalid phase execution kind")
+        with repository_lock(self.repo), self._lock, self.conn:
+            changed = self.conn.execute(
+                "UPDATE dispatcher_phase_work SET status = ?, execution_kind = ?, "
+                "context_diagnostics = ?, updated_at = ? "
+                "WHERE run_id = ? AND phase_id = ? AND role_id = ? "
+                "AND work_unit_id = ? AND EXISTS "
+                "(SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?)",
+                (
+                    status,
+                    execution_kind,
+                    canonical_json(context_diagnostics).decode(),
+                    _now_iso(),
+                    run_id,
+                    phase_id,
+                    role_id,
+                    work_unit_id,
+                    job_id,
+                    lease_token,
+                ),
+            ).rowcount
+        return changed == 1
 
     def cancel_queued_work(self, job_id: str, run_id: str, lease_token: str) -> int:
         """Терминально закрывает невыданные единицы после ошибки фазы."""
@@ -1777,15 +1906,18 @@ class DispatcherStore:
                 where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
                 cur.execute(
                     "SELECT invocation_id, job_id, run_id, phase_id, role_id, work_unit_id, slot_id, status, created_at, updated_at, "
-                    "execution_snapshot_fingerprint, profile_id, context_manifest_fingerprint, finished_at, error_code, error_summary, result_ref "
+                    "execution_snapshot_fingerprint, profile_id, context_manifest_fingerprint, "
+                    "context_envelope_fingerprint, prepared_input_fingerprint, "
+                    "context_provenance, context_diagnostics, "
+                    "finished_at, error_code, error_summary, result_ref "
                     f"FROM dispatcher_invocations{where} ORDER BY created_at DESC, invocation_id DESC LIMIT ?",
                     (*parameters, limit),
                 )
                 rows = cur.fetchall()
             finally:
                 cur.close()
-        keys = ("invocation_id", "job_id", "run_id", "phase_id", "role_id", "work_unit_id", "slot_id", "status", "created_at", "updated_at", "execution_snapshot_fingerprint", "profile_id", "context_manifest_fingerprint", "finished_at", "error_code", "error_summary", "result_ref")
-        return [dict(zip(keys, row, strict=True)) for row in rows]
+        keys = ("invocation_id", "job_id", "run_id", "phase_id", "role_id", "work_unit_id", "slot_id", "status", "created_at", "updated_at", "execution_snapshot_fingerprint", "profile_id", "context_manifest_fingerprint", "context_envelope_fingerprint", "prepared_input_fingerprint", "context_provenance", "context_diagnostics", "finished_at", "error_code", "error_summary", "result_ref")
+        return [_decode_context_columns(dict(zip(keys, row, strict=True))) for row in rows]
 
     def invocation(self, invocation_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -1793,7 +1925,9 @@ class DispatcherStore:
                 "SELECT invocation_id, job_id, run_id, phase_id, role_id, "
                 "work_unit_id, slot_id, status, created_at, updated_at, "
                 "execution_snapshot_fingerprint, profile_id, "
-                "context_manifest_fingerprint, finished_at, error_code, "
+                "context_manifest_fingerprint, context_envelope_fingerprint, "
+                "prepared_input_fingerprint, context_provenance, "
+                "context_diagnostics, finished_at, error_code, "
                 "error_summary, result_ref FROM dispatcher_invocations "
                 "WHERE invocation_id = ?",
                 (invocation_id,),
@@ -1804,10 +1938,12 @@ class DispatcherStore:
             "invocation_id", "job_id", "run_id", "phase_id", "role_id",
             "work_unit_id", "slot_id", "status", "created_at", "updated_at",
             "execution_snapshot_fingerprint", "profile_id",
-            "context_manifest_fingerprint", "finished_at", "error_code",
+            "context_manifest_fingerprint", "context_envelope_fingerprint",
+            "prepared_input_fingerprint", "context_provenance",
+            "context_diagnostics", "finished_at", "error_code",
             "error_summary", "result_ref",
         )
-        return dict(zip(keys, row, strict=True))
+        return _decode_context_columns(dict(zip(keys, row, strict=True)))
 
     def invocation_history(
         self,
@@ -1830,7 +1966,9 @@ class DispatcherStore:
                 "SELECT invocation_id, job_id, run_id, phase_id, role_id, "
                 "work_unit_id, slot_id, status, created_at, updated_at, "
                 "execution_snapshot_fingerprint, profile_id, "
-                "context_manifest_fingerprint, finished_at, error_code, "
+                "context_manifest_fingerprint, context_envelope_fingerprint, "
+                "prepared_input_fingerprint, context_provenance, "
+                "context_diagnostics, finished_at, error_code, "
                 "error_summary, result_ref FROM dispatcher_invocations "
                 "WHERE run_id = ? AND phase_id = ? AND role_id = ? AND slot_id = ?"
                 + before_clause
@@ -1841,10 +1979,12 @@ class DispatcherStore:
             "invocation_id", "job_id", "run_id", "phase_id", "role_id",
             "work_unit_id", "slot_id", "status", "created_at", "updated_at",
             "execution_snapshot_fingerprint", "profile_id",
-            "context_manifest_fingerprint", "finished_at", "error_code",
+            "context_manifest_fingerprint", "context_envelope_fingerprint",
+            "prepared_input_fingerprint", "context_provenance",
+            "context_diagnostics", "finished_at", "error_code",
             "error_summary", "result_ref",
         )
-        return [dict(zip(keys, row, strict=True)) for row in rows]
+        return [_decode_context_columns(dict(zip(keys, row, strict=True))) for row in rows]
 
     def invocation_count(self, run_id: str, phase_id: str, role_id: str) -> int:
         with self._lock:
@@ -1869,7 +2009,9 @@ class DispatcherStore:
                 "SELECT invocation_id, job_id, run_id, phase_id, role_id, "
                 "work_unit_id, slot_id, status, created_at, updated_at, "
                 "execution_snapshot_fingerprint, profile_id, "
-                "context_manifest_fingerprint, finished_at, error_code, "
+                "context_manifest_fingerprint, context_envelope_fingerprint, "
+                "prepared_input_fingerprint, context_provenance, "
+                "context_diagnostics, finished_at, error_code, "
                 "error_summary, result_ref, "
                 "ROW_NUMBER() OVER (PARTITION BY slot_id "
                 "ORDER BY created_at DESC, invocation_id DESC) AS row_number "
@@ -1883,12 +2025,16 @@ class DispatcherStore:
             "invocation_id", "job_id", "run_id", "phase_id", "role_id",
             "work_unit_id", "slot_id", "status", "created_at", "updated_at",
             "execution_snapshot_fingerprint", "profile_id",
-            "context_manifest_fingerprint", "finished_at", "error_code",
+            "context_manifest_fingerprint", "context_envelope_fingerprint",
+            "prepared_input_fingerprint", "context_provenance",
+            "context_diagnostics", "finished_at", "error_code",
             "error_summary", "result_ref",
         )
         result: dict[str, dict[str, dict[str, Any] | None]] = {}
         for row in rows:
-            invocation = dict(zip(keys, row[: len(keys)], strict=True))
+            invocation = _decode_context_columns(
+                dict(zip(keys, row[: len(keys)], strict=True))
+            )
             slot = result.setdefault(
                 invocation["slot_id"], {"current": None, "latest": None}
             )

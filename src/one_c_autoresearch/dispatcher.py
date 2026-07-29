@@ -440,6 +440,8 @@ class DispatcherCoordinator:
                 raise RuntimeError("execution snapshot fingerprint differs from the lease")
             if snapshot.get("application_version") != "one-c-autoresearch/0.2":
                 raise RuntimeError("workflow_contract_stale")
+            if snapshot.get("schema_version") == "1":
+                raise RuntimeError("legacy_execution_snapshot_requires_current_policy_retry")
             from .agents import validate_execution_snapshot
             validate_execution_snapshot(self.repo, snapshot)
             snap_work = snapshot.get("work_unit", {})
@@ -448,9 +450,17 @@ class DispatcherCoordinator:
         except (KeyError, RuntimeError, ValueError) as exc:
             outcome = self.mark_stale(job_id, emit_events=emit_events)
             outcome.blocker = {
-                "code": "workflow_contract_stale" if str(exc) == "workflow_contract_stale" else "dispatcher.snapshot.stale",
+                "code": (
+                    "dispatcher.snapshot.legacy_restart_required"
+                    if str(exc) == "legacy_execution_snapshot_requires_current_policy_retry"
+                    else "workflow_contract_stale"
+                    if str(exc) == "workflow_contract_stale"
+                    else "dispatcher.snapshot.stale"
+                ),
                 "message": str(exc),
-                "action": job_id,
+                "action": "retry-current-policy"
+                if str(exc) == "legacy_execution_snapshot_requires_current_policy_retry"
+                else job_id,
             }
             return outcome
         lease_token = self.store.resume_lease(
@@ -728,7 +738,12 @@ class DispatcherCoordinator:
         self._stop_background(outcome.job_id)
 
     def _run_graph(self, outcome: DispatcherOutcome, bindings: DispatcherBindings, profile: dict[str, Any], phase_policies: dict[str, dict[str, Any]], profiles_by_role: dict[str, dict[str, Any]], timeout_seconds: int) -> None:
-        from .agents import build_context_manifest, execute as agent_execute, validate_execution_snapshot
+        from .agents import (
+            build_context_manifest,
+            execute as agent_execute,
+            prepare_context_envelope,
+            validate_execution_snapshot,
+        )
         from .pipeline_graphs import build_classify_state, build_decide_state, build_discover_state, compile_analyze_graph, compile_classify_graph, compile_consolidate_graph, compile_decide_graph
 
         stop_event = self._stop_events[outcome.job_id]
@@ -763,7 +778,12 @@ class DispatcherCoordinator:
                 phase_id, role_id = "research-target", "researcher"
             elif operation == "mrq.classify-batches":
                 phase_id, role_id = "classify-batches", "classifier"
-            elif operation == "mrq.consolidate" and work_unit.get("kind") == "consolidation-coordinate":
+            elif operation == "mrq.consolidate" and work_unit.get("kind") in {
+                "consolidation-coordinate",
+                "consolidation-link-page",
+                "consolidation-reduce-pair",
+                "consolidation-noise-page",
+            }:
                 phase_id, role_id = "form-mrq", "coordinator"
             elif operation == "mrq.consolidate":
                 phase_id, role_id = "form-mrq", "grouper"
@@ -781,6 +801,41 @@ class DispatcherCoordinator:
                 for role in policy["roles"]
                 if role["role_id"] == role_id
             )
+            try:
+                prepared_context = prepare_context_envelope(
+                    repo,
+                    selected_profile,
+                    operation,
+                    phase_id,
+                    role_id,
+                    work_unit,
+                    supplement,
+                    execution_snapshot,
+                    context_manifest,
+                )
+            except ValueError as exc:
+                from .events import redact
+                message = str(redact(str(exc)))
+                self.store.record_phase_context(
+                    outcome.job_id,
+                    outcome.run_id,
+                    phase_id,
+                    role_id,
+                    str(work_unit.get("id", "")),
+                    self._lease_tokens[outcome.job_id],
+                    execution_kind="preflight_failed",
+                    status="failed",
+                    context_diagnostics={
+                        "contract_version": "context-envelope/v1",
+                        "error_code": (
+                            "agent.context_capacity"
+                            if "capacity" in message
+                            else "agent.context_validation"
+                        ),
+                        "error_summary": message,
+                    },
+                )
+                raise
             invocation = self.store.start_invocation(
                 outcome.job_id,
                 outcome.run_id,
@@ -795,6 +850,14 @@ class DispatcherCoordinator:
                 profile_id=profile_id,
                 context_manifest_fingerprint="sha256:"
                 + sha256(canonical_json(context_manifest)),
+                context_envelope_fingerprint=str(
+                    prepared_context["envelope"]["envelope_fingerprint"]
+                ),
+                prepared_input_fingerprint=str(
+                    prepared_context["envelope"]["prepared_input_fingerprint"]
+                ),
+                context_provenance=prepared_context["provenance"],
+                context_diagnostics=prepared_context["diagnostics"],
             )
             if invocation is None:
                 raise RuntimeError("dispatcher lease or logical slot is unavailable")
@@ -812,6 +875,7 @@ class DispatcherCoordinator:
                     cancelled,
                     execution_snapshot,
                     context_manifest,
+                    prepared_context,
                 )
             except InterruptedError:
                 self.store.terminalize_invocation(
@@ -898,6 +962,17 @@ class DispatcherCoordinator:
                 raise RuntimeError("dispatcher lease was fenced before phase work derivation")
 
         def reuse_work(phase_id: str, role_id: str, work_unit_id: str) -> None:
+            result_name = (
+                "form-mrq:coordinate"
+                if role_id == "coordinator"
+                else f"research-target:{work_unit_id}"
+                if role_id == "researcher"
+                else f"classify-batches:{work_unit_id}"
+                if role_id == "classifier"
+                else f"form-mrq:{work_unit_id}"
+                if role_id == "grouper"
+                else f"analyze-dif:{work_unit_id}"
+            )
             if not self.store.complete_reused_work(
                 outcome.job_id,
                 outcome.run_id,
@@ -905,8 +980,34 @@ class DispatcherCoordinator:
                 role_id,
                 work_unit_id,
                 self._lease_tokens[outcome.job_id],
+                source_result_ref=result_key(result_name),
+                context_diagnostics={
+                    "contract_version": "context-envelope/v1",
+                    "reuse_status": "compatible",
+                },
             ):
                 raise RuntimeError("dispatcher lease was fenced before compatible result reuse")
+
+        def record_work(
+            phase_id: str,
+            role_id: str,
+            work_unit_id: str,
+            execution_kind: str,
+            status: str,
+            diagnostics: dict[str, Any],
+        ) -> None:
+            if not self.store.record_phase_context(
+                outcome.job_id,
+                outcome.run_id,
+                phase_id,
+                role_id,
+                work_unit_id,
+                self._lease_tokens[outcome.job_id],
+                execution_kind=execution_kind,
+                status=status,
+                context_diagnostics=diagnostics,
+            ):
+                raise RuntimeError("dispatcher lease was fenced before phase context persistence")
 
         common = {
             "repo": self.repo,
@@ -921,6 +1022,7 @@ class DispatcherCoordinator:
             "save_result": save_result,
             "register_work": register_work,
             "reuse_work": reuse_work,
+            "record_work": record_work,
         }
         required_reuse_origin: dict[str, str] | None = None
         if execution_snapshot.get("policy_source") == "reuse-snapshot":

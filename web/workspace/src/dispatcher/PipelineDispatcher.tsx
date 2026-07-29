@@ -113,6 +113,13 @@ interface DispatcherInspection {
   invocation?: Record<string, unknown>;
   history?: InspectionPage<Record<string, unknown>>;
   events?: InspectionPage<Record<string, unknown>>;
+  context?: {
+    available: boolean;
+    summary?: Record<string, unknown> | null;
+    prepared_input_fingerprint?: string | null;
+    envelope_fingerprint?: string | null;
+    provenance: InspectionPage<Record<string, unknown>>;
+  };
   result?: Record<string, unknown>;
   availability?: Record<string, unknown>;
 }
@@ -253,7 +260,15 @@ function useDispatcherInspection(projectId: string, selection: DispatcherSelecti
           return {
             ...cache,
             [key]: current
-              ? { ...value, history: merge(current.history, value.history), events: merge(current.events, value.events) }
+              ? {
+                ...value,
+                history: merge(current.history, value.history),
+                events: merge(current.events, value.events),
+                context: value.context && current.context ? {
+                  ...value.context,
+                  provenance: merge(current.context.provenance, value.context.provenance) ?? value.context.provenance,
+                } : value.context,
+              }
               : value,
           };
         });
@@ -274,16 +289,19 @@ function useDispatcherInspection(projectId: string, selection: DispatcherSelecti
   }, [selection && selectionKey(selection)]);
   useEffect(() => () => pageControllerRef.current?.abort(), []);
   const resolved = activeKeyRef.current ? resolvedByKey[activeKeyRef.current] : undefined;
-  const loadPage = useCallback(async (section: 'history' | 'events') => {
+  const loadPage = useCallback(async (section: 'history' | 'events' | 'context') => {
     if (!selection || (selection.kind !== 'slot' && selection.kind !== 'invocation') || !resolved) return;
-    const cursor = resolved[section]?.next_cursor;
+    const cursor = section === 'context'
+      ? resolved.context?.provenance.next_cursor
+      : resolved[section]?.next_cursor;
     if (!cursor) return;
     pageControllerRef.current?.abort();
     const controller = new AbortController();
     pageControllerRef.current = controller;
     const request = ++pageRequestRef.current;
     const activeKey = `${projectId}:${selectionKey(selection)}`;
-    const params = new URLSearchParams({ kind: selection.kind, [section === 'events' ? 'event_cursor' : 'history_cursor']: cursor });
+    const cursorName = section === 'events' ? 'event_cursor' : section === 'context' ? 'context_cursor' : 'history_cursor';
+    const params = new URLSearchParams({ kind: selection.kind, [cursorName]: cursor });
     if (selection.kind === 'invocation') params.set('invocation_id', selection.invocationId);
     else {
       params.set('phase_id', selection.phaseId);
@@ -300,10 +318,23 @@ function useDispatcherInspection(projectId: string, selection: DispatcherSelecti
           ...cache,
           [activeKey]: {
           ...current,
-          [section]: {
-            ...page[section],
-            items: [...(current[section]?.items ?? []), ...(page[section]?.items ?? [])],
-          },
+          ...(section === 'context' ? {
+            context: page.context && current.context ? {
+              ...page.context,
+              provenance: {
+                ...page.context.provenance,
+                items: [
+                  ...current.context.provenance.items,
+                  ...page.context.provenance.items,
+                ],
+              },
+            } : current.context,
+          } : {
+            [section]: {
+              ...page[section],
+              items: [...(current[section]?.items ?? []), ...(page[section]?.items ?? [])],
+            },
+          }),
         },
         } : cache;
       });
@@ -614,9 +645,30 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
           {!inspection.resolved.events.available && !inspection.resolved.events.items.length && <Typography color="text.secondary">События недоступны</Typography>}
         </Stack>}
         {inspection.resolved?.result && <><Typography variant="subtitle2" mt={1}>Результат</Typography><DetailRows value={inspection.resolved.result} /></>}
+        {inspection.resolved?.context && <Stack component="section" spacing={0.5} mt={1}>
+          <Typography variant="subtitle2">Контекст вызова</Typography>
+          {!inspection.resolved.context.available
+            ? <Typography color="text.secondary">Диагностика контекста недоступна для прежнего вызова</Typography>
+            : <>
+              <DetailRows value={{
+                prepared_input_fingerprint: inspection.resolved.context.prepared_input_fingerprint,
+                envelope_fingerprint: inspection.resolved.context.envelope_fingerprint,
+                ...(inspection.resolved.context.summary ?? {}),
+              }} />
+              <Typography variant="subtitle2">
+                Происхождение ({inspection.resolved.context.provenance.items.length}
+                {inspection.resolved.context.provenance.truncated ? ', показано частично' : ''})
+              </Typography>
+              {inspection.resolved.context.provenance.items.map((item, index) =>
+                <Paper variant="outlined" sx={{ p: 0.7 }} key={String(item.item_key ?? index)}>
+                  <DetailRows value={item} />
+                </Paper>)}
+            </>}
+        </Stack>}
         <Stack direction="row" spacing={1}>
           {inspection.resolved?.history?.next_cursor && <Button onClick={() => void inspection.loadPage('history')}>Ещё история</Button>}
           {inspection.resolved?.events?.next_cursor && <Button onClick={() => void inspection.loadPage('events')}>Ещё события</Button>}
+          {inspection.resolved?.context?.provenance.next_cursor && <Button onClick={() => void inspection.loadPage('context')}>Ещё происхождение</Button>}
         </Stack>
         {selection.kind === 'invocation' && onOpenJournal && <Button onClick={() => onOpenJournal({ invocationId: selection.invocationId, runId: selection.runId })}>Открыть в журнале</Button>}
       </Paper>}

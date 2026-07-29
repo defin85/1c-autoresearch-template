@@ -58,7 +58,9 @@ def _start(coordinator: DispatcherCoordinator, job_id: str, bindings: Dispatcher
         executable.chmod(0o700)
     work_unit = {"id": bindings.work_unit_id, "allowed_paths": []}
     snapshot = {
-        "schema_version": "1",
+        "schema_version": "2",
+        "context_contract_version": "context-envelope/v1",
+        "context_estimator_version": "utf8-v1",
         "run_id": run_id,
         "operation": "dif.classify-next" if job_id == "analyze-dif" else "mrq.decide-next",
         "operation_version": "2",
@@ -235,6 +237,37 @@ def test_resume_marks_old_workflow_contract_stale(tmp_path: Path) -> None:
             "message": "workflow_contract_stale",
             "action": "analyze-dif",
         }
+    finally:
+        coordinator.close()
+        store.close()
+
+
+def test_resume_requires_current_policy_retry_for_schema_v1(tmp_path: Path) -> None:
+    from one_c_autoresearch.contracts import canonical_json, sha256
+
+    coordinator, store, event_store = _coordinator(tmp_path)
+    try:
+        bindings = _fake_bindings()
+        started = _start(coordinator, "analyze-dif", bindings)
+        coordinator.soft_stop("analyze-dif")
+        run = event_store.run_snapshot(started.run_id)
+        run["execution_snapshot"]["schema_version"] = "1"
+        run["execution_snapshot"].pop("context_contract_version")
+        run["execution_snapshot"].pop("context_estimator_version")
+        fingerprint = "sha256:" + sha256(canonical_json(run["execution_snapshot"]))
+        run["execution_snapshot_fingerprint"] = fingerprint
+        path = event_store.root / "runs" / f"{sha256(started.run_id.encode())}.json"
+        path.write_text(json.dumps(run), encoding="utf-8")
+        with store.conn:
+            store.conn.execute(
+                "UPDATE dispatcher_leases SET execution_snapshot_fingerprint = ? WHERE job_id = ?",
+                (fingerprint, "analyze-dif"),
+            )
+
+        outcome = coordinator.resume("analyze-dif", bindings)
+        assert outcome.status == "stale"
+        assert outcome.blocker["code"] == "dispatcher.snapshot.legacy_restart_required"
+        assert outcome.blocker["action"] == "retry-current-policy"
     finally:
         coordinator.close()
         store.close()

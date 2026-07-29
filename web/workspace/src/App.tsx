@@ -335,7 +335,8 @@ export function RoutingPreviewSummary({
               {group.routing_group_id}
             </Typography>
             <Typography>
-              Управляемые: {group.form_counts.managed}; обычные:{" "}
+              Формы в группе, сумма по компонентам — управляемые:{" "}
+              {group.form_counts.managed}; обычные:{" "}
               {group.form_counts.ordinary}; неопределённые:{" "}
               {group.form_counts.inconclusive}
             </Typography>

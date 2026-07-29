@@ -250,6 +250,12 @@ def sync(
                 plan.append({"status": "A", "path": rollback, "hash": file_hash(source)})
             elif file_hash(source) != file_hash(target):
                 plan.append({"status": "C", "path": rollback, "hash": file_hash(source)})
+            for relative in (path for path in FILES if path.startswith("tests/")):
+                source, target = staging / relative, package_root / relative
+                if not target.is_file():
+                    plan.append({"status": "A", "path": relative, "hash": file_hash(source)})
+                elif file_hash(source) != file_hash(target):
+                    plan.append({"status": "C", "path": relative, "hash": file_hash(source)})
             plan.sort(key=lambda item: item["path"])
         fingerprint = plan_fingerprint(reference, destination, staging, plan)
         result = {"fingerprint": fingerprint, "changes": plan}
@@ -272,6 +278,19 @@ def promote_package(scaffold: Path, package_root: Path) -> None:
     rollback = package_root / "docs/operator/dispatcher-inspector-rollback.md"
     rollback.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(scaffold / "docs/operator/dispatcher-inspector-rollback.md", rollback)
+    for relative in (path for path in FILES if path.startswith("tests/")):
+        target = package_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(scaffold / relative, target)
+        text = target.read_text(encoding="utf-8")
+        text = text.replace(
+            "REPO = Path(__file__).resolve().parents[1]\n",
+            'REPO = Path(__file__).resolve().parents[1] / "templates/research-repo"\n',
+        ).replace(
+            '(Path(__file__).resolve().parents[1] / "research/',
+            '(Path(__file__).resolve().parents[1] / "templates/research-repo" / "research/',
+        )
+        target.write_text(text, encoding="utf-8")
     require_parity(source_package, target_package)
     require_parity(scaffold / "web/workspace", package_root / "web/workspace")
 

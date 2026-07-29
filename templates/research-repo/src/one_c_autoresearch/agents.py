@@ -39,6 +39,29 @@ TARGET_COVERAGE_SCHEMA = {
     "required": ["customer_diff_id", "target_diff_ids", "coverage_status", "evidence_ref", "notes"],
     "properties": {key: {"type": "string"} for key in ("customer_diff_id", "target_diff_ids", "coverage_status", "evidence_ref", "notes")},
 }
+CONTEXT_CONTRACT_VERSION = "context-envelope/v1"
+CONTEXT_ESTIMATOR_VERSION = "utf8-v1"
+STRUCTURED_RESPONSE_RESERVE_TOKENS = 4096
+STRUCTURED_RESPONSE_RESERVE_BYTES = 8192
+MAX_RESPONSE_STRING = 72
+MAX_RESPONSE_ITEMS = 2
+MAX_RESPONSE_GROUPS = 4
+MAX_RESPONSE_PAGE_ITEMS = 16
+CONTEXT_SELECTION_POLICIES = {
+    ("analyze-dif", "analyzer"): "dif-analysis/v1",
+    ("form-mrq", "grouper"): "mrq-consolidation-leaf/v1",
+    ("form-mrq", "coordinator"): "mrq-consolidation-hierarchy/v1",
+    ("classify-batches", "classifier"): "mrq-classification-window/v1",
+    ("research-target", "researcher"): "target-research/v1",
+}
+CONSOLIDATION_LINK_FIELDS = {
+    "left_candidate_id", "right_candidate_id", "decision", "rationale",
+}
+CONSOLIDATION_REDUCED_FIELDS = {
+    "semantic_key", "title", "business_meaning", "scope", "confidence",
+    "rationale", "split_source_mrq_id",
+}
+CONSOLIDATION_NOISE_FIELDS = {"stable_diff_id", "decision", "rationale"}
 ENVIRONMENT_PRESET_VERSION = "local-read-only/v2"
 ENVIRONMENT_KEYS = (
     "PATH", "HOME", "CODEX_HOME", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
@@ -62,6 +85,324 @@ def instruction_fingerprint(version: str) -> str:
     except KeyError as exc:
         raise ValueError(f"unsupported agent instruction version: {version}") from exc
     return "sha256:" + sha256(text.encode()).hexdigest()
+
+
+def _bounded_string() -> dict[str, Any]:
+    return {"type": "string", "maxLength": MAX_RESPONSE_STRING}
+
+
+def proposal_schema(operation: str, work_unit: dict[str, Any]) -> dict[str, Any]:
+    """Builds the fixed bounded response schema before context budgeting."""
+
+    if operation == "mrq.consolidate":
+        kind = work_unit.get("kind")
+        if kind == "consolidation-link-page":
+            item = {
+                "type": "object",
+                "additionalProperties": False,
+                "required": sorted(CONSOLIDATION_LINK_FIELDS),
+                "properties": {
+                    "left_candidate_id": _bounded_string(),
+                    "right_candidate_id": _bounded_string(),
+                    "decision": {
+                        **_bounded_string(),
+                        "enum": ["merge", "keep_separate"],
+                    },
+                    "rationale": _bounded_string(),
+                },
+            }
+            return {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["links"],
+                "properties": {
+                    "links": {
+                        "type": "array",
+                        "maxItems": MAX_RESPONSE_PAGE_ITEMS,
+                        "items": item,
+                    }
+                },
+            }
+        if kind == "consolidation-reduce-pair":
+            return {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["group"],
+                "properties": {
+                    "group": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": sorted(CONSOLIDATION_REDUCED_FIELDS),
+                        "properties": {
+                            key: _bounded_string()
+                            for key in sorted(CONSOLIDATION_REDUCED_FIELDS)
+                        },
+                    }
+                },
+            }
+        if kind == "consolidation-noise-page":
+            item = {
+                "type": "object",
+                "additionalProperties": False,
+                "required": sorted(CONSOLIDATION_NOISE_FIELDS),
+                "properties": {
+                    "stable_diff_id": _bounded_string(),
+                    "decision": {
+                        **_bounded_string(),
+                        "enum": ["approve", "reject"],
+                    },
+                    "rationale": _bounded_string(),
+                },
+            }
+            return {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["decisions"],
+                "properties": {
+                    "decisions": {
+                        "type": "array",
+                        "maxItems": MAX_RESPONSE_PAGE_ITEMS,
+                        "items": item,
+                    }
+                },
+            }
+    fields = CONSOLIDATION_GROUP_FIELDS if operation == "mrq.consolidate" else PROPOSAL_FIELDS[operation]
+    properties = {
+        key: {
+            "type": "array",
+            "maxItems": MAX_RESPONSE_ITEMS,
+            "items": _bounded_string(),
+        } if key in STRING_ARRAY_FIELDS
+        else {
+            "type": "array",
+            "maxItems": MAX_RESPONSE_ITEMS,
+            "items": {
+                **TARGET_COVERAGE_SCHEMA,
+                "properties": {
+                    name: _bounded_string()
+                    for name in TARGET_COVERAGE_SCHEMA["properties"]
+                },
+            },
+        } if key == "target_coverage"
+        else {
+            "type": "array",
+            "maxItems": MAX_RESPONSE_ITEMS,
+            "items": {
+                **EVIDENCE_SCHEMA,
+                "properties": {
+                    name: _bounded_string()
+                    for name in EVIDENCE_SCHEMA["properties"]
+                },
+            },
+            **({"minItems": 1} if key == "evidence" else {}),
+        } if key in {"evidence", "target_evidence"}
+        else {"type": "boolean"} if key == "linkage_proven"
+        else {**_bounded_string(), "enum": ["meaning", "noise"]} if key == "classification"
+        else _bounded_string()
+        for key in sorted(fields)
+    }
+    item_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": sorted(fields),
+        "properties": properties,
+    }
+    grouped = work_unit.get("kind") == "coordinate-groups" or operation in {
+        "mrq.classify-batches",
+        "mrq.consolidate",
+    }
+    if not grouped:
+        return item_schema
+    schema_properties = {
+        "groups": {
+            "type": "array",
+            "maxItems": MAX_RESPONSE_GROUPS,
+            "items": item_schema,
+        }
+    }
+    required = ["groups"]
+    if operation == "mrq.consolidate" and work_unit.get("kind") == "consolidation-coordinate":
+        schema_properties["approved_noise"] = {
+            "type": "array",
+            "maxItems": MAX_RESPONSE_ITEMS,
+            "items": _bounded_string(),
+        }
+        required.append("approved_noise")
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": required,
+        "properties": schema_properties,
+    }
+
+
+def _context_provenance(
+    work_unit: dict[str, Any],
+    manifest: dict[str, Any],
+) -> list[dict[str, str]]:
+    identifier = str(work_unit.get("id", ""))
+    kind = str(work_unit.get("kind", "work-unit"))
+    if not identifier:
+        raise ValueError("agent context subject has no stable item key")
+    rows = [{
+        "item_key": f"{kind}:{identifier}",
+        "item_kind": "subject",
+        "selection_reason": "primary_subject",
+        "origin_kind": "work_unit",
+        "origin_ref": identifier,
+        "fingerprint": "sha256:" + sha256(canonical_json(work_unit)).hexdigest(),
+    }]
+    ignored = {"id", "kind", "allowed_paths", "allowed_path_fingerprints"}
+    for key in sorted(set(work_unit) - ignored):
+        rows.append({
+            "item_key": f"{kind}:{identifier}:fact:{key}",
+            "item_kind": "fact",
+            "selection_reason": "stage_policy",
+            "origin_kind": "work_unit",
+            "origin_ref": identifier,
+            "fingerprint": "sha256:" + sha256(canonical_json(work_unit[key])).hexdigest(),
+        })
+    for item in manifest["paths"]:
+        rows.append({
+            "item_key": f"path:{item['path']}",
+            "item_kind": "evidence",
+            "selection_reason": "selected_path",
+            "origin_kind": "repository_path",
+            "origin_ref": item["path"],
+            "fingerprint": item["fingerprint"],
+        })
+    return rows
+
+
+def _render_prepared_input(
+    profile: dict[str, Any],
+    operation: str,
+    provider_context: dict[str, Any],
+    supplement: str,
+) -> str:
+    instruction_version = str(profile["instructions_version"])
+    return (
+        f"{INSTRUCTION_CATALOG[instruction_version]} "
+        f"Operation: {operation}. Instruction version: {instruction_version}. "
+        f"Context envelope: {canonical_json(provider_context).decode('utf-8')}. "
+        f"Supplement: {supplement}"
+    )
+
+
+def prepare_context_envelope(
+    repo: Path,
+    profile: dict[str, Any],
+    operation: str,
+    phase_id: str,
+    role_id: str,
+    work_unit: dict[str, Any],
+    supplement: str,
+    execution_snapshot: dict[str, Any],
+    context_manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Freezes, budgets, and fingerprints one provider-bound context."""
+
+    manifest = context_manifest or build_context_manifest(repo, work_unit)
+    verify_context_manifest(repo, work_unit, manifest)
+    try:
+        policy_version = CONTEXT_SELECTION_POLICIES[(phase_id, role_id)]
+    except KeyError as exc:
+        raise ValueError("agent context selection policy is unsupported") from exc
+    provenance = _context_provenance(work_unit, manifest)
+    provider_context = {
+        "contract_version": CONTEXT_CONTRACT_VERSION,
+        "stage": phase_id,
+        "role": role_id,
+        "work_unit": {
+            "id": str(work_unit.get("id", "")),
+            "kind": str(work_unit.get("kind", "")),
+        },
+        "bindings": {
+            **{
+                key: str(value or "")
+                for key, value in sorted(
+                    (execution_snapshot.get("subject_bindings") or {}).items()
+                )
+            },
+            "context_manifest_fingerprint": "sha256:"
+            + sha256(canonical_json(manifest)).hexdigest(),
+            "profile_capability_fingerprint": str(
+                profile.get("capability_fingerprint", "")
+            ),
+            "instruction_fingerprint": instruction_fingerprint(
+                str(profile["instructions_version"])
+            ),
+        },
+        "payload": work_unit,
+        "selection": {
+            "policy_version": policy_version,
+            "ordering": "canonical-json",
+            "included_count": len(provenance),
+            "candidate_count": len(provenance),
+            "excluded": [],
+            "budget_truncation_count": 0,
+        },
+        "provenance": provenance,
+        "allowed_paths": manifest["paths"],
+    }
+    schema = proposal_schema(operation, work_unit)
+    prompt = _render_prepared_input(
+        profile, operation, provider_context, supplement
+    )
+    prepared_bytes = canonical_json({
+        "adapter": "structured-output/v1",
+        "prompt": prompt,
+        "response_schema": schema,
+    })
+    if profile.get("context_estimator_version") != CONTEXT_ESTIMATOR_VERSION:
+        raise ValueError("agent context estimator is unsupported")
+    capacity = profile.get("input_context_tokens")
+    if not isinstance(capacity, int) or capacity <= STRUCTURED_RESPONSE_RESERVE_TOKENS:
+        raise ValueError("agent context capacity is unavailable")
+    if not str(profile.get("capability_fingerprint", "")).startswith("sha256:"):
+        raise ValueError("agent profile capability fingerprint is unavailable")
+    allowance = (capacity - STRUCTURED_RESPONSE_RESERVE_TOKENS) * 2
+    headroom = allowance - len(prepared_bytes)
+    if headroom < 0:
+        raise ValueError("agent.context_capacity")
+    budget = {
+        "estimator_version": CONTEXT_ESTIMATOR_VERSION,
+        "context_window_tokens": capacity,
+        "structured_response_reserve_tokens": STRUCTURED_RESPONSE_RESERVE_TOKENS,
+        "structured_response_reserve_bytes": STRUCTURED_RESPONSE_RESERVE_BYTES,
+        "prepared_input_bytes": len(prepared_bytes),
+        "input_allowance_bytes": allowance,
+        "headroom_bytes": headroom,
+    }
+    prepared_input_fingerprint = "sha256:" + sha256(prepared_bytes).hexdigest()
+    envelope = {
+        **provider_context,
+        "budget": budget,
+        "prepared_input_fingerprint": prepared_input_fingerprint,
+    }
+    envelope["envelope_fingerprint"] = "sha256:" + sha256(
+        canonical_json(envelope)
+    ).hexdigest()
+    diagnostics = {
+        "contract_version": CONTEXT_CONTRACT_VERSION,
+        "selection_policy_version": policy_version,
+        **budget,
+        "included_count": len(provenance),
+        "origin_counts": {
+            origin: sum(row["origin_kind"] == origin for row in provenance)
+            for origin in sorted({row["origin_kind"] for row in provenance})
+        },
+        "policy_exclusions": [],
+        "budget_truncation_count": 0,
+    }
+    return {
+        "envelope": envelope,
+        "provider_context": provider_context,
+        "prompt": prompt,
+        "response_schema": schema,
+        "provenance": provenance,
+        "diagnostics": diagnostics,
+    }
 
 
 def _fingerprint_path(root: Path, path: Path) -> str:
@@ -179,8 +520,13 @@ def codex_environment_available() -> bool:
 def validate_execution_snapshot(repo: Path, snapshot: dict[str, Any]) -> None:
     """Проверяет, что сохранённый снимок всё ещё воспроизводим локально."""
 
-    if snapshot.get("schema_version") != "1" or snapshot.get("environment", {}).get("preset") != "local-read-only":
+    if snapshot.get("schema_version") not in {"1", "2"} or snapshot.get("environment", {}).get("preset") != "local-read-only":
         raise RuntimeError("agent execution snapshot is unsupported")
+    if snapshot.get("schema_version") == "2" and (
+        snapshot.get("context_contract_version") != CONTEXT_CONTRACT_VERSION
+        or snapshot.get("context_estimator_version") != CONTEXT_ESTIMATOR_VERSION
+    ):
+        raise RuntimeError("agent context contract in the execution snapshot is unsupported")
     verify_execution_environment(snapshot)
     instructions = snapshot.get("instructions")
     if not isinstance(instructions, dict):
@@ -242,7 +588,9 @@ def resolve_execution_snapshot(
                 raise ValueError("unsupported agent environment preset")
             safe_profiles[name] = dict(profile)
     snapshot = {
-        "schema_version": "1",
+        "schema_version": "2",
+        "context_contract_version": CONTEXT_CONTRACT_VERSION,
+        "context_estimator_version": CONTEXT_ESTIMATOR_VERSION,
         "run_id": run_id,
         "operation": operation,
         "operation_version": step["operation_version"],
@@ -283,6 +631,47 @@ def resolve_execution_snapshot(
 
 def validate_proposal(operation: str, payload: dict[str, Any], work_unit: dict[str, Any]) -> dict[str, Any]:
     if operation == "mrq.consolidate":
+        kind = work_unit.get("kind")
+        if kind == "consolidation-link-page":
+            links = payload.get("links")
+            if (
+                set(payload) != {"links"}
+                or not isinstance(links, list)
+                or any(
+                    not isinstance(link, dict)
+                    or set(link) != CONSOLIDATION_LINK_FIELDS
+                    or link.get("decision") not in {"merge", "keep_separate"}
+                    for link in links
+                )
+            ):
+                raise ValueError("consolidation link response does not match the fixed schema")
+            reject_secrets(payload, "agent proposal")
+            return payload
+        if kind == "consolidation-reduce-pair":
+            group = payload.get("group")
+            if (
+                set(payload) != {"group"}
+                or not isinstance(group, dict)
+                or set(group) != CONSOLIDATION_REDUCED_FIELDS
+            ):
+                raise ValueError("consolidation reduction response does not match the fixed schema")
+            reject_secrets(payload, "agent proposal")
+            return payload
+        if kind == "consolidation-noise-page":
+            decisions = payload.get("decisions")
+            if (
+                set(payload) != {"decisions"}
+                or not isinstance(decisions, list)
+                or any(
+                    not isinstance(decision, dict)
+                    or set(decision) != CONSOLIDATION_NOISE_FIELDS
+                    or decision.get("decision") not in {"approve", "reject"}
+                    for decision in decisions
+                )
+            ):
+                raise ValueError("consolidation noise response does not match the fixed schema")
+            reject_secrets(payload, "agent proposal")
+            return payload
         coordinator = work_unit.get("kind") == "consolidation-coordinate"
         expected = {"groups", "approved_noise"} if coordinator else {"groups"}
         groups = payload.get("groups")
@@ -339,6 +728,7 @@ def execute(
     cancelled: callable,
     execution_snapshot: dict[str, Any] | None = None,
     context_manifest: dict[str, Any] | None = None,
+    prepared_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if execution_snapshot is None:
         execution_snapshot = resolve_execution_snapshot(repo, "standalone", operation, {"operation_version": "2", "timeout_seconds": timeout_seconds, "agent_phases": [{"roles": [{"agent_profile": "selected"}]}]}, {"selected": profile}, work_unit)
@@ -351,36 +741,37 @@ def execute(
     verify_context_manifest(repo, work_unit, manifest)
     executable = str(execution_snapshot["environment"]["executable"])
     proposal_dir.mkdir(parents=True, exist_ok=False)
-    fields = CONSOLIDATION_GROUP_FIELDS if operation == "mrq.consolidate" else PROPOSAL_FIELDS[operation]
-    properties = {
-        key: {"type": "array", "items": {"type": "string"}} if key in STRING_ARRAY_FIELDS
-        else {"type": "array", "items": TARGET_COVERAGE_SCHEMA} if key == "target_coverage"
-        else {"type": "array", "items": EVIDENCE_SCHEMA, **({"minItems": 1} if key == "evidence" else {})} if key in {"evidence", "target_evidence"}
-        else {"type": "boolean"} if key == "linkage_proven"
-        else {"type": "string", "enum": ["meaning", "noise"]} if key == "classification"
-        else {"type": "string"}
-        for key in sorted(fields)
-    }
-    item_schema = {"type": "object", "additionalProperties": False, "required": sorted(fields), "properties": properties}
-    grouped = work_unit.get("kind") == "coordinate-groups" or operation in {"mrq.classify-batches", "mrq.consolidate"}
-    if grouped:
-        schema_properties = {"groups": {"type": "array", "items": item_schema}}
-        required = ["groups"]
-        if operation == "mrq.consolidate" and work_unit.get("kind") == "consolidation-coordinate":
-            schema_properties["approved_noise"] = {"type": "array", "items": {"type": "string"}}
-            required.append("approved_noise")
-        schema = {"type": "object", "additionalProperties": False, "required": required, "properties": schema_properties}
-    else:
-        schema = item_schema
+    schema = proposal_schema(operation, work_unit)
     schema_path = proposal_dir / "output-schema.json"
     output_path = proposal_dir / "proposal.json"
     atomic_json(schema_path, schema)
-    instruction_version = str(profile["instructions_version"])
-    prompt = (
-        f"{INSTRUCTION_CATALOG[instruction_version]} "
-        f"Operation: {operation}. Instruction version: {instruction_version}. "
-        f"Work unit: {canonical_json(work_unit).decode('utf-8')}. Supplement: {supplement}"
-    )
+    if prepared_context is None:
+        phase_id, role_id = (
+            ("research-target", "researcher")
+            if operation == "mrq.decide-next"
+            else ("classify-batches", "classifier")
+            if operation == "mrq.classify-batches"
+            else ("form-mrq", "coordinator")
+            if operation == "mrq.consolidate"
+            and work_unit.get("kind") == "consolidation-coordinate"
+            else ("form-mrq", "grouper")
+            if operation == "mrq.consolidate"
+            else ("analyze-dif", "analyzer")
+        )
+        prepared_context = prepare_context_envelope(
+            repo,
+            profile,
+            operation,
+            phase_id,
+            role_id,
+            work_unit,
+            supplement,
+            execution_snapshot,
+            manifest,
+        )
+    if prepared_context["response_schema"] != schema:
+        raise RuntimeError("agent response schema changed after context preflight")
+    prompt = str(prepared_context["prompt"])
     if profile.get("environment_preset") != "local-read-only":
         raise ValueError("unsupported agent environment preset")
     command = [executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only", "--color", "never", "--cd", str(repo), "--model", profile["model"], "--config", f'model_reasoning_effort="{profile["reasoning_effort"]}"', "--output-schema", str(schema_path), "--output-last-message", str(output_path), "-"]
@@ -396,4 +787,6 @@ def execute(
         raise RuntimeError("local agent did not return a valid proposal") from exc
     validate_execution_snapshot(repo, execution_snapshot)
     verify_context_manifest(repo, work_unit, manifest)
+    if len(canonical_json(payload)) > STRUCTURED_RESPONSE_RESERVE_BYTES:
+        raise ValueError("agent structured response exceeds reserved capacity")
     return validate_proposal(operation, payload, work_unit)

@@ -152,6 +152,52 @@ test('server-projected idle slot and invocation open exact inspector resources',
   await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes('kind=invocation') && String(url).includes('invocation_id=i-1'))).toBe(true));
 });
 
+test('invocation inspector shows prepared context budget and provenance', async () => {
+  vi.mocked(fetch).mockImplementation((input) => {
+    const url = String(input);
+    if (url.includes('/dispatcher/inspect?')) return Promise.resolve({
+      ok: true,
+      json: async () => ({
+        invocation: { invocation_id: 'i-1' },
+        history: { items: [] },
+        events: { items: [] },
+        context: {
+          available: true,
+          prepared_input_fingerprint: 'sha256:input',
+          envelope_fingerprint: 'sha256:envelope',
+          summary: {
+            contract_version: 'context-envelope/v1',
+            prepared_input_bytes: 1200,
+            headroom_bytes: 400,
+            budget_truncation_count: 0,
+          },
+          provenance: {
+            items: [{
+              item_key: 'customer-diff:DIF-1',
+              item_kind: 'subject',
+              selection_reason: 'primary_subject',
+              origin_kind: 'work_unit',
+              origin_ref: 'DIF-1',
+              fingerprint: 'sha256:subject',
+            }],
+            truncated: false,
+            next_cursor: null,
+          },
+        },
+      }),
+    } as Response);
+    return Promise.resolve({ ok: true, json: async () => ({ events: [], next_cursor: 0, resync_required: false }) } as Response);
+  });
+  const projection = snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection;
+  render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:fixture"
+    selection={{ kind: 'invocation', circuitId: 'analyze-dif', phaseId: 'analyze-dif', roleId: 'analyzer', slotId: 'analyzer-1', invocationId: 'i-1' }}
+    onClose={() => {}} />);
+  expect(await screen.findByText('Контекст вызова')).toBeInTheDocument();
+  expect(screen.getByText('context-envelope/v1')).toBeInTheDocument();
+  expect(screen.getByText('customer-diff:DIF-1')).toBeInTheDocument();
+  expect(screen.getByText('1200')).toBeInTheDocument();
+});
+
 test.each([
   [{ kind: 'role', circuitId: 'analyze-dif', phaseId: 'analyze-dif', roleId: 'analyzer' } as const, 'Профиль: local'],
   [{ kind: 'queue', circuitId: 'analyze-dif', queueId: 'dif-queue' } as const, 'Всего: 75'],
