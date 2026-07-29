@@ -34,7 +34,9 @@ def _test_execution_snapshot(_repo, run_id, operation, step, profiles, work_unit
         "application_version": "one-c-autoresearch/0.2", "subject_bindings": {
             "source_generation_id": str((pointers.get("source") or {}).get("generation_id", "")),
             "diff_generation_id": str((pointers.get("diff") or {}).get("generation_id", "")),
-            "canonical_generation_id": str((pointers.get("mrq") or {}).get("mrq_generation_id", "")),
+            "canonical_generation_id": str(
+                (pointers.get("mrq") or {}).get("mrq_generation_id") or ""
+            ),
         }, "policy_source": "current-policy", "work_unit": work_unit, "context_manifest": {
             "schema_version": "1", "work_unit_id": work_unit["id"],
             "work_unit_fingerprint": "sha256:" + "0" * 64, "paths": [],

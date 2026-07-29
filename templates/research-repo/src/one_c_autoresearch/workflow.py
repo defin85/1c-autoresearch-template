@@ -63,7 +63,7 @@ _CATALOG = {
     "project.validate": {"executor": "application", "effect": "read", "paths": ["project.toml", "research/"], "artifacts": ["workflow-snapshot"], "validator": "doctor", "retryable": [], "approval_required": False},
     "sources.acquire": {"executor": "application", "effect": "write", "paths": ["sources/generations/", "research/active-source-generation.json"], "artifacts": ["source-generation"], "validator": "sources.validate", "retryable": [], "approval_required": True},
     "diff.build": {"executor": "application", "effect": "write", "paths": ["analysis/indexes/generations/", "research/active-diff-generation.json"], "artifacts": ["diff-generation"], "validator": "diff.validate", "retryable": ["transient_io"], "approval_required": False},
-    "indexes.build": {"executor": "rlm-tools-bsl", "effect": "user-scope-write", "paths": ["sources/generations/"], "artifacts": ["source-index"], "validator": "indexes.validate", "retryable": [], "approval_required": False},
+    "indexes.build": {"executor": "source-index-adapters", "effect": "user-scope-write", "paths": [], "artifacts": ["operational-source-index"], "validator": "indexes.validate", "retryable": [], "approval_required": False},
     "dif.classify-next": {"executor": "agent", "effect": "proposal", "paths": ["analysis/dif-classifications/generations/", "research/active-dif-classification-generation.json"], "artifacts": ["dif-classification-generation"], "validator": "dif.classification", "retryable": [], "approval_required": False},
     "mrq.consolidate": {"executor": "agent", "effect": "proposal", "paths": ["analysis/migration-requirements/generations/", "research/active-consolidation-generation.json"], "artifacts": ["consolidation-plan"], "validator": "mrq.validate", "retryable": [], "approval_required": True},
     "mrq.classify-batches": {"executor": "agent", "effect": "proposal", "paths": ["analysis/migration-requirements/batch-generations/", "research/active-consolidation-generation.json"], "artifacts": ["mrq-batch-generation"], "validator": "mrq-batches-ready", "retryable": [], "approval_required": False},
@@ -76,7 +76,7 @@ OPERATION_CATALOG = {
         "version": "1",
         "parameters": sorted(PARAMETERS[operation]),
         **entry,
-        **({"fixed_inputs": {"mode": "ensure", "selector": "all"}, "run_inputs": {"mode": ["ensure", "rebuild"], "selector": "all|component_ids"}} if operation == "indexes.build" else {}),
+        **({"fixed_inputs": {"mode": "ensure", "selector": "all"}, "run_inputs": {"mode": ["ensure", "validate", "rebuild"], "selector": "all|component_ids|backend_ids"}} if operation == "indexes.build" else {}),
     }
     for operation, entry in _CATALOG.items()
 }
@@ -1046,7 +1046,10 @@ def _dispatcher_items(
             and row["stable_diff_id"] not in previously_owned
         ]
         meaning_difs = [row for row in customer if classifications.get(row["stable_diff_id"]) == "meaning" or transient.get(row["stable_diff_id"]) == "meaning"]
-        unassigned_meaning_difs = [row for row in meaning_difs if row["stable_diff_id"] not in previously_owned]
+        unassigned_meaning_difs = [
+            row for row in meaning_difs
+            if row["stable_diff_id"] not in previously_owned
+        ]
         noise_difs = [row for row in customer if classifications.get(row["stable_diff_id"]) == "noise_candidate" or transient.get(row["stable_diff_id"]) == "noise"]
         proposals = [row for row in operational if row.get("kind") == "approval" and row.get("consumed_at") is None]
         decision_rows: list[dict[str, Any]] = []
@@ -1058,7 +1061,10 @@ def _dispatcher_items(
                 allowed_mrq_ids={row["mrq_id"] for row in active_mrqs},
             )["decisions.jsonl"]
         decision_by_mrq = {row["mrq_id"]: row["decision"] for row in decision_rows}
-        pending_mrqs = [row for row in active_mrqs if row["mrq_id"] not in decision_by_mrq]
+        pending_mrqs = [
+            row for row in active_mrqs
+            if row["mrq_id"] not in decision_by_mrq
+        ]
         decisions = [
             {**row, "migration_decision": decision_by_mrq[row["mrq_id"]]}
             for row in active_mrqs if row["mrq_id"] in decision_by_mrq

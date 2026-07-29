@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -43,6 +43,22 @@ INVOCATION_ERROR_CODES = {
     "environment_unavailable",
     "internal_error",
 }
+
+
+class SourceSearchBudgetError(RuntimeError):
+    def __init__(
+        self,
+        limit: str,
+        limit_value: int | float,
+        consumed: int | float,
+        requested: int | float,
+    ):
+        super().__init__("source_search.budget_exhausted")
+        self.code = "source_search.budget_exhausted"
+        self.limit = limit
+        self.limit_value = limit_value
+        self.consumed = consumed
+        self.requested = requested
 
 
 def _now_iso() -> str:
@@ -102,6 +118,18 @@ def _terminalize_rows(
         if cur.rowcount != 1:
             continue
         changed += 1
+        if status in {"cancelled", "interrupted"}:
+            cur.execute(
+                "UPDATE source_search_invocations SET admission_state = 'closed', "
+                "updated_at = ? WHERE invocation_id = ? AND admission_state = 'open'",
+                (now, invocation_id),
+            )
+            cur.execute(
+                "UPDATE source_search_calls SET status = ?, error_code = ?, "
+                "actual_results = 0, actual_returned_bytes = 0, actual_backend_seconds = 0, "
+                "finished_at = ? WHERE invocation_id = ? AND status = 'reserved'",
+                (status, f"source_search.{status}", now, invocation_id),
+            )
         cur.execute(
             "UPDATE dispatcher_phase_work SET status = ?, updated_at = ? "
             "WHERE invocation_id = ? AND status = 'running'",
@@ -267,6 +295,46 @@ def _ensure_dispatcher_tables(conn) -> None:
                 created_at TEXT NOT NULL,
                 delivered_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS source_search_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                policy_fingerprint TEXT NOT NULL,
+                policy TEXT NOT NULL,
+                capability_verifier TEXT NOT NULL,
+                admission_state TEXT NOT NULL,
+                last_error_code TEXT,
+                last_error_details TEXT,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS source_search_calls (
+                invocation_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                query_hmac TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                scope_fingerprint TEXT NOT NULL,
+                route_fingerprint TEXT,
+                fallback_reason TEXT,
+                adapter_id TEXT,
+                adapter_version TEXT,
+                capability_fingerprint TEXT,
+                index_fingerprint TEXT,
+                result_manifest_fingerprint TEXT,
+                reserved_query_bytes INTEGER NOT NULL,
+                reserved_results INTEGER NOT NULL,
+                reserved_returned_bytes INTEGER NOT NULL,
+                reserved_backend_seconds REAL NOT NULL,
+                actual_results INTEGER,
+                actual_returned_bytes INTEGER,
+                actual_backend_seconds REAL,
+                status TEXT NOT NULL,
+                error_code TEXT,
+                created_at TEXT NOT NULL,
+                finished_at TEXT,
+                PRIMARY KEY (invocation_id, call_id),
+                UNIQUE (invocation_id, ordinal)
+            );
             CREATE TABLE IF NOT EXISTS dispatcher_phase_work (
                 job_id TEXT NOT NULL,
                 run_id TEXT NOT NULL,
@@ -340,6 +408,25 @@ def _ensure_dispatcher_tables(conn) -> None:
                 cur.execute(
                     f"ALTER TABLE dispatcher_invocations ADD COLUMN {name} {column_type}"
                 )
+        search_invocation_columns = {
+            row[1] for row in cur.execute("PRAGMA table_info(source_search_invocations)")
+        }
+        if "expires_at" not in search_invocation_columns:
+            cur.execute(
+                "ALTER TABLE source_search_invocations ADD COLUMN expires_at TEXT NOT NULL "
+                "DEFAULT '1970-01-01T00:00:00+00:00'"
+            )
+        for name in ("last_error_code", "last_error_details"):
+            if name not in search_invocation_columns:
+                cur.execute(
+                    f"ALTER TABLE source_search_invocations ADD COLUMN {name} TEXT"
+                )
+        search_call_columns = {
+            row[1] for row in cur.execute("PRAGMA table_info(source_search_calls)")
+        }
+        for name in ("fallback_reason", "adapter_id", "adapter_version", "capability_fingerprint"):
+            if name not in search_call_columns:
+                cur.execute(f"ALTER TABLE source_search_calls ADD COLUMN {name} TEXT")
         phase_columns = {
             row[1] for row in cur.execute("PRAGMA table_info(dispatcher_phase_work)")
         }
@@ -1460,6 +1547,432 @@ class DispatcherStore:
             finally:
                 cur.close()
         return copied
+
+    def configure_source_search(
+        self,
+        invocation_id: str,
+        policy: dict[str, Any],
+        capability_verifier: str,
+        expires_at: str | None = None,
+    ) -> None:
+        from .source_search import POLICY_VERSION
+        if (
+            policy.get("schema_version") != POLICY_VERSION
+            or not str(policy.get("policy_fingerprint", "")).startswith("sha256:")
+            or not str(capability_verifier).startswith("sha256:")
+        ):
+            raise ValueError("invalid source-search invocation binding")
+        encoded = canonical_json(policy).decode()
+        now_value = datetime.now(timezone.utc)
+        now = now_value.isoformat()
+        expiry = expires_at or (
+            now_value + timedelta(seconds=int(policy["max_backend_seconds"]) + 300)
+        ).isoformat()
+        if datetime.fromisoformat(expiry) <= now_value:
+            raise ValueError("source-search capability expiry is invalid")
+        with repository_lock(self.repo), self._lock, self.conn:
+            prior = self.conn.execute(
+                "SELECT policy, capability_verifier, expires_at FROM source_search_invocations "
+                "WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            if prior is not None:
+                if prior != (encoded, capability_verifier, expiry):
+                    raise RuntimeError("source-search invocation is already bound")
+                return
+            self.conn.execute(
+                "INSERT INTO source_search_invocations "
+                "(invocation_id, policy_fingerprint, policy, capability_verifier, "
+                "admission_state, expires_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
+                (
+                    invocation_id,
+                    policy["policy_fingerprint"],
+                    encoded,
+                    capability_verifier,
+                    expiry,
+                    now,
+                    now,
+                ),
+            )
+
+    def reserve_source_search_call(
+        self,
+        invocation_id: str,
+        call_id: str,
+        capability_verifier: str,
+        *,
+        query_hmac: str,
+        capability: str,
+        query_bytes: int,
+        requested_results: int,
+        requested_returned_bytes: int,
+        requested_backend_seconds: float,
+    ) -> dict[str, Any]:
+        if not call_id or len(call_id) > 200 or not query_hmac:
+            raise ValueError("source_search.invalid_request")
+        with repository_lock(self.repo), self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT policy, capability_verifier, admission_state, expires_at "
+                "FROM source_search_invocations WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            if row is None or row[1] != capability_verifier:
+                raise PermissionError("source_search.authentication_failed")
+            if row[2] != "open":
+                raise RuntimeError("source_search.invocation_terminal")
+            if datetime.fromisoformat(str(row[3])) <= datetime.now(timezone.utc):
+                self.conn.execute(
+                    "UPDATE source_search_invocations SET admission_state = 'expired', "
+                    "updated_at = ? WHERE invocation_id = ?",
+                    (_now_iso(), invocation_id),
+                )
+                raise RuntimeError("source_search.capability_expired")
+            policy = json.loads(row[0])
+            if capability not in {
+                __import__("one_c_autoresearch.source_search", fromlist=["OPERATIONS"]).OPERATIONS[operation]
+                for operation in policy["operations"]
+            }:
+                raise ValueError("source_search.operation_forbidden")
+            def exhausted(
+                name: str,
+                limit_value: int | float,
+                consumed: int | float,
+                requested: int | float,
+            ) -> SourceSearchBudgetError:
+                error = SourceSearchBudgetError(
+                    name, limit_value, consumed, requested,
+                )
+                self.conn.execute(
+                    "UPDATE source_search_invocations SET last_error_code = ?, "
+                    "last_error_details = ?, updated_at = ? WHERE invocation_id = ?",
+                    (
+                        error.code,
+                        canonical_json({
+                            "limit": name,
+                            "limit_value": limit_value,
+                            "consumed": consumed,
+                            "requested": requested,
+                        }).decode(),
+                        _now_iso(),
+                        invocation_id,
+                    ),
+                )
+                self.conn.commit()
+                return error
+
+            per_call = (
+                ("max_query_bytes", policy["max_query_bytes"], query_bytes),
+                ("max_results_per_call", policy["max_results_per_call"], requested_results),
+                (
+                    "max_returned_bytes_per_call",
+                    policy["max_returned_bytes_per_call"],
+                    requested_returned_bytes,
+                ),
+                (
+                    "per_call_deadline_seconds",
+                    policy["per_call_deadline_seconds"],
+                    requested_backend_seconds,
+                ),
+            )
+            for name, limit_value, requested in per_call:
+                if requested <= 0 or requested > limit_value:
+                    raise exhausted(name, limit_value, 0, requested)
+            duplicate = self.conn.execute(
+                "SELECT 1 FROM source_search_calls WHERE invocation_id = ? AND call_id = ?",
+                (invocation_id, call_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise RuntimeError("source_search.replay")
+            totals = self.conn.execute(
+                "SELECT COUNT(*), "
+                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN 1 ELSE 0 END), 0), "
+                "COALESCE(SUM(reserved_query_bytes), 0), "
+                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_results "
+                "ELSE COALESCE(actual_results, 0) END), 0), "
+                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_returned_bytes "
+                "ELSE COALESCE(actual_returned_bytes, 0) END), 0), "
+                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_backend_seconds "
+                "ELSE COALESCE(actual_backend_seconds, 0) END), 0), "
+                "COALESCE(MAX(ordinal), 0) "
+                "FROM source_search_calls WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            checks = (
+                ("max_calls", policy["max_calls"], totals[0], 1),
+                ("max_concurrent_calls", policy["max_concurrent_calls"], totals[1], 1),
+                ("max_total_query_bytes", policy["max_total_query_bytes"], totals[2], query_bytes),
+                ("max_total_results", policy["max_total_results"], totals[3], requested_results),
+                (
+                    "max_total_returned_bytes",
+                    policy["max_total_returned_bytes"],
+                    totals[4],
+                    requested_returned_bytes,
+                ),
+            )
+            for name, limit_value, consumed, requested in checks:
+                if consumed + requested > limit_value:
+                    raise exhausted(name, limit_value, consumed, requested)
+            remaining_seconds = policy["max_backend_seconds"] - totals[5]
+            if remaining_seconds <= 0:
+                raise exhausted(
+                    "max_backend_seconds",
+                    policy["max_backend_seconds"],
+                    totals[5],
+                    requested_backend_seconds,
+                )
+            reserved_backend_seconds = min(requested_backend_seconds, remaining_seconds)
+            ordinal = int(totals[6]) + 1
+            now = _now_iso()
+            self.conn.execute(
+                "INSERT INTO source_search_calls "
+                "(invocation_id, call_id, ordinal, query_hmac, capability, scope_fingerprint, "
+                "reserved_query_bytes, reserved_results, reserved_returned_bytes, "
+                "reserved_backend_seconds, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?)",
+                (
+                    invocation_id,
+                    call_id,
+                    ordinal,
+                    query_hmac,
+                    capability,
+                    policy["scope_fingerprint"],
+                    query_bytes,
+                    requested_results,
+                    requested_returned_bytes,
+                    reserved_backend_seconds,
+                    now,
+                ),
+            )
+            return {
+                "ordinal": ordinal,
+                "deadline_seconds": reserved_backend_seconds,
+                "policy_fingerprint": policy["policy_fingerprint"],
+            }
+
+    def settle_source_search_call(
+        self,
+        invocation_id: str,
+        call_id: str,
+        *,
+        status: str,
+        route_fingerprint: str = "",
+        fallback_reason: str = "",
+        adapter_id: str = "",
+        adapter_version: str = "",
+        capability_fingerprint: str = "",
+        index_fingerprint: str = "",
+        result_manifest_fingerprint: str = "",
+        result_count: int = 0,
+        returned_bytes: int = 0,
+        backend_seconds: float = 0,
+        error_code: str = "",
+    ) -> bool:
+        if status not in {"completed", "failed", "cancelled", "interrupted"}:
+            raise ValueError("invalid source-search terminal status")
+        with repository_lock(self.repo), self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT reserved_results, reserved_returned_bytes, reserved_backend_seconds "
+                "FROM source_search_calls WHERE invocation_id = ? AND call_id = ? "
+                "AND status = 'reserved'",
+                (invocation_id, call_id),
+            ).fetchone()
+            if row is None:
+                return False
+            if (
+                result_count < 0 or result_count > row[0]
+                or returned_bytes < 0 or returned_bytes > row[1]
+                or backend_seconds < 0 or backend_seconds > row[2]
+            ):
+                raise ValueError("source_search.settlement_exceeds_reservation")
+            cur = self.conn.execute(
+                "UPDATE source_search_calls SET status = ?, route_fingerprint = ?, fallback_reason = ?, "
+                "adapter_id = ?, adapter_version = ?, capability_fingerprint = ?, "
+                "index_fingerprint = ?, result_manifest_fingerprint = ?, "
+                "actual_results = ?, actual_returned_bytes = ?, actual_backend_seconds = ?, "
+                "error_code = ?, finished_at = ? "
+                "WHERE invocation_id = ? AND call_id = ? AND status = 'reserved'",
+                (
+                    status,
+                    route_fingerprint or None,
+                    fallback_reason or None,
+                    adapter_id or None,
+                    adapter_version or None,
+                    capability_fingerprint or None,
+                    index_fingerprint or None,
+                    result_manifest_fingerprint or None,
+                    result_count,
+                    returned_bytes,
+                    backend_seconds,
+                    error_code or None,
+                    _now_iso(),
+                    invocation_id,
+                    call_id,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def close_source_search(self, invocation_id: str, terminal_status: str = "interrupted") -> int:
+        if terminal_status not in {"cancelled", "interrupted"}:
+            raise ValueError("invalid source-search close status")
+        now = _now_iso()
+        with repository_lock(self.repo), self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE source_search_invocations SET admission_state = 'closed', "
+                "updated_at = ? WHERE invocation_id = ? AND admission_state = 'open'",
+                (now, invocation_id),
+            )
+            cur = self.conn.execute(
+                "UPDATE source_search_calls SET status = ?, error_code = ?, "
+                "actual_results = 0, actual_returned_bytes = 0, actual_backend_seconds = 0, "
+                "finished_at = ? WHERE invocation_id = ? AND status = 'reserved'",
+                (terminal_status, f"source_search.{terminal_status}", now, invocation_id),
+            )
+            return cur.rowcount
+
+    def source_search_admission_open(self, invocation_id: str) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT admission_state, expires_at FROM source_search_invocations "
+                "WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+        return bool(
+            row
+            and row[0] == "open"
+            and datetime.fromisoformat(str(row[1])) > datetime.now(timezone.utc)
+        )
+
+    def complete_source_search(self, invocation_id: str) -> None:
+        now = _now_iso()
+        with repository_lock(self.repo), self._lock, self.conn:
+            reserved = self.conn.execute(
+                "SELECT COUNT(*) FROM source_search_calls "
+                "WHERE invocation_id = ? AND status = 'reserved'",
+                (invocation_id,),
+            ).fetchone()[0]
+            if reserved:
+                raise RuntimeError("source_search.calls_in_flight")
+            self.conn.execute(
+                "UPDATE source_search_invocations SET admission_state = 'completed', "
+                "updated_at = ? WHERE invocation_id = ? AND admission_state = 'open'",
+                (now, invocation_id),
+            )
+
+    def source_search_ledger(self, invocation_id: str, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        if offset < 0 or not 1 <= limit <= 200:
+            raise ValueError("invalid source-search ledger page")
+        with self._lock:
+            invocation = self.conn.execute(
+                "SELECT policy_fingerprint, policy, admission_state, expires_at, "
+                "last_error_code, last_error_details "
+                "FROM source_search_invocations WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            if invocation is None:
+                raise KeyError("source-search invocation not found")
+            rows = self.conn.execute(
+                "SELECT ordinal, query_hmac, capability, scope_fingerprint, "
+                "route_fingerprint, fallback_reason, adapter_id, adapter_version, capability_fingerprint, "
+                "index_fingerprint, result_manifest_fingerprint, "
+                "actual_results, actual_returned_bytes, actual_backend_seconds, status, "
+                "error_code, created_at, finished_at FROM source_search_calls "
+                "WHERE invocation_id = ? ORDER BY ordinal LIMIT ? OFFSET ?",
+                (invocation_id, limit + 1, offset),
+            ).fetchall()
+        keys = (
+            "ordinal", "query_hmac", "capability", "scope_fingerprint",
+            "route_fingerprint", "fallback_reason", "adapter_id", "adapter_version",
+            "capability_fingerprint", "index_fingerprint", "result_manifest_fingerprint",
+            "result_count", "returned_bytes", "backend_seconds", "status",
+            "error_code", "created_at", "finished_at",
+        )
+        with self._lock:
+            totals = self.conn.execute(
+                "SELECT COUNT(*), "
+                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN 1 ELSE 0 END), 0), "
+                "COALESCE(SUM(COALESCE(actual_results, 0)), 0), "
+                "COALESCE(SUM(COALESCE(actual_returned_bytes, 0)), 0), "
+                "COALESCE(SUM(COALESCE(actual_backend_seconds, 0)), 0) "
+                "FROM source_search_calls WHERE invocation_id = ?",
+                (invocation_id,),
+            ).fetchone()
+            all_rows = self.conn.execute(
+                "SELECT ordinal, query_hmac, capability, scope_fingerprint, "
+                "route_fingerprint, fallback_reason, adapter_id, adapter_version, capability_fingerprint, "
+                "index_fingerprint, result_manifest_fingerprint, "
+                "actual_results, actual_returned_bytes, status, error_code "
+                "FROM source_search_calls WHERE invocation_id = ? ORDER BY ordinal",
+                (invocation_id,),
+            ).fetchall()
+        items = [dict(zip(keys, row)) for row in rows[:limit]]
+        policy = json.loads(invocation[1])
+        status_counts: dict[str, int] = {}
+        routes: dict[tuple[str, str, str], int] = {}
+        for row in all_rows:
+            status = str(row[13])
+            status_counts[status] = status_counts.get(status, 0) + 1
+            route = (str(row[2]), str(row[6] or ""), str(row[5] or ""))
+            routes[route] = routes.get(route, 0) + 1
+        ledger_fingerprint = "sha256:" + sha256(canonical_json(all_rows))
+        return {
+            "schema_version": "source-search-ledger/v1",
+            "policy_fingerprint": invocation[0],
+            "scope_fingerprint": policy["scope_fingerprint"],
+            "admission_state": invocation[2],
+            "expires_at": invocation[3],
+            "operations": policy["operations"],
+            "scope": {
+                "component_count": len(policy.get("component_ids", [])),
+                "path_count": len(policy.get("logical_path_prefixes", [])),
+                "fingerprint": policy["scope_fingerprint"],
+            },
+            "configured_limits": {
+                key: policy[key]
+                for key in (
+                    "max_calls", "max_concurrent_calls",
+                    "per_call_deadline_seconds", "max_backend_seconds",
+                    "max_query_bytes", "max_total_query_bytes",
+                    "max_results_per_call", "max_total_results",
+                    "max_returned_bytes_per_call", "max_total_returned_bytes",
+                )
+            },
+            "capacity_reserve_bytes": __import__(
+                "one_c_autoresearch.source_search",
+                fromlist=["dynamic_reserve_bytes"],
+            ).dynamic_reserve_bytes(policy),
+            "usage": {
+                "calls": totals[0],
+                "in_flight": totals[1],
+                "results": totals[2],
+                "returned_bytes": totals[3],
+                "backend_seconds": totals[4],
+            },
+            "status_counts": status_counts,
+            "route_summaries": [
+                {
+                    "capability": capability,
+                    "selected_backend_id": backend,
+                    "fallback_reason": fallback or None,
+                    "calls": count,
+                }
+                for (capability, backend, fallback), count in sorted(routes.items())
+            ],
+            "last_error": (
+                {
+                    "code": invocation[4],
+                    **json.loads(invocation[5]),
+                    "recovery": "start_new_invocation",
+                }
+                if invocation[4] and invocation[5]
+                else None
+            ),
+            "ledger_complete": totals[1] == 0,
+            "reconciled": totals[1] == 0,
+            "ledger_fingerprint": ledger_fingerprint,
+            "items": items,
+            "next_offset": offset + limit if len(rows) > limit else None,
+        }
 
     def start_invocation(
         self,

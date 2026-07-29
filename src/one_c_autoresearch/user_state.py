@@ -81,14 +81,18 @@ def agent_profiles_path(repo: Path, base: Path | None = None) -> Path:
 
 def _validate_agent_profiles(values: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     from .agents import INSTRUCTION_CATALOG
+    from .source_search import validate_profile_policy
 
     for name, profile in values.items():
         if "environment_preset" not in profile:
             raise ValueError(f"invalid user-scope agent profile: {name}; environment_preset is required, resave the profile")
         required = {"provider", "model", "reasoning_effort", "instructions_version", "environment_preset"}
         capability = {"input_context_tokens", "context_estimator_version", "capability_fingerprint"}
-        if not name or not required <= set(profile) or set(profile) - required - capability or profile["provider"] != "codex-cli" or profile["reasoning_effort"] not in {"low", "medium", "high", "xhigh", "max", "ultra"} or profile["instructions_version"] not in INSTRUCTION_CATALOG or profile["environment_preset"] != "local-read-only" or not str(profile["model"]).strip():
+        optional = {"source_search"}
+        if not name or not required <= set(profile) or set(profile) - required - capability - optional or profile["provider"] != "codex-cli" or profile["reasoning_effort"] not in {"low", "medium", "high", "xhigh", "max", "ultra"} or profile["instructions_version"] not in INSTRUCTION_CATALOG or profile["environment_preset"] != "local-read-only" or not str(profile["model"]).strip():
             raise ValueError(f"invalid user-scope agent profile: {name}")
+        if "source_search" in profile:
+            validate_profile_policy(profile["source_search"])
     return values
 
 

@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -354,6 +355,11 @@ def prepare_context_envelope(
         "prompt": prompt,
         "response_schema": schema,
     })
+    from .source_search import dynamic_reserve_bytes
+    search_policy = (execution_snapshot.get("source_search_policies") or {}).get(
+        f"{phase_id}:{role_id}"
+    )
+    dynamic_bytes = dynamic_reserve_bytes(search_policy) if search_policy else 0
     if profile.get("context_estimator_version") != CONTEXT_ESTIMATOR_VERSION:
         raise ValueError("agent context estimator is unsupported")
     capacity = profile.get("input_context_tokens")
@@ -362,7 +368,7 @@ def prepare_context_envelope(
     if not str(profile.get("capability_fingerprint", "")).startswith("sha256:"):
         raise ValueError("agent profile capability fingerprint is unavailable")
     allowance = (capacity - STRUCTURED_RESPONSE_RESERVE_TOKENS) * 2
-    headroom = allowance - len(prepared_bytes)
+    headroom = allowance - len(prepared_bytes) - dynamic_bytes
     if headroom < 0:
         raise ValueError("agent.context_capacity")
     budget = {
@@ -371,6 +377,7 @@ def prepare_context_envelope(
         "structured_response_reserve_tokens": STRUCTURED_RESPONSE_RESERVE_TOKENS,
         "structured_response_reserve_bytes": STRUCTURED_RESPONSE_RESERVE_BYTES,
         "prepared_input_bytes": len(prepared_bytes),
+        "dynamic_search_reserve_bytes": dynamic_bytes,
         "input_allowance_bytes": allowance,
         "headroom_bytes": headroom,
     }
@@ -541,6 +548,15 @@ def validate_execution_snapshot(repo: Path, snapshot: dict[str, Any]) -> None:
     }
     if instructions != expected_instructions:
         raise RuntimeError("agent instruction changed after the execution snapshot was created")
+    from .source_search import POLICY_VERSION
+    policies = snapshot.get("source_search_policies", {})
+    if not isinstance(policies, dict) or any(
+        not isinstance(policy, dict)
+        or policy.get("schema_version") != POLICY_VERSION
+        or not str(policy.get("policy_fingerprint", "")).startswith("sha256:")
+        for policy in policies.values()
+    ):
+        raise RuntimeError("agent source-search policy in the execution snapshot is unsupported")
     work_unit = snapshot.get("work_unit")
     manifest = snapshot.get("context_manifest")
     if not isinstance(work_unit, dict) or not isinstance(manifest, dict):
@@ -578,6 +594,8 @@ def resolve_execution_snapshot(
         # закрытый снимок; рабочий API всегда проходит validate_project_contract.
         pointers, workflow_fingerprint = {}, "sha256:" + sha256(canonical_json(step)).hexdigest()
     safe_profiles: dict[str, dict[str, Any]] = {}
+    source_search_policies: dict[str, dict[str, Any]] = {}
+    from .source_search import resolve_policy
     for phase in phases:
         for role in phase["roles"]:
             name = role["agent_profile"]
@@ -587,6 +605,9 @@ def resolve_execution_snapshot(
             if profile.get("environment_preset") != "local-read-only":
                 raise ValueError("unsupported agent environment preset")
             safe_profiles[name] = dict(profile)
+            policy = resolve_policy(repo, profile, str(role["role_id"]), work_unit)
+            if policy is not None:
+                source_search_policies[f'{phase["phase_id"]}:{role["role_id"]}'] = policy
     snapshot = {
         "schema_version": "2",
         "context_contract_version": CONTEXT_CONTRACT_VERSION,
@@ -598,6 +619,7 @@ def resolve_execution_snapshot(
         "timeout_seconds": step["timeout_seconds"],
         "agent_phases": phases,
         "profiles": safe_profiles,
+        "source_search_policies": source_search_policies,
         "instructions": {
             version: instruction_fingerprint(version)
             for version in sorted({str(profile["instructions_version"]) for profile in safe_profiles.values()})
@@ -729,6 +751,9 @@ def execute(
     execution_snapshot: dict[str, Any] | None = None,
     context_manifest: dict[str, Any] | None = None,
     prepared_context: dict[str, Any] | None = None,
+    invocation_id: str = "",
+    source_search_capability: str = "",
+    operational_state_root: Path | None = None,
 ) -> dict[str, Any]:
     if execution_snapshot is None:
         execution_snapshot = resolve_execution_snapshot(repo, "standalone", operation, {"operation_version": "2", "timeout_seconds": timeout_seconds, "agent_phases": [{"roles": [{"agent_profile": "selected"}]}]}, {"selected": profile}, work_unit)
@@ -776,6 +801,22 @@ def execute(
         raise ValueError("unsupported agent environment preset")
     command = [executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only", "--color", "never", "--cd", str(repo), "--model", profile["model"], "--config", f'model_reasoning_effort="{profile["reasoning_effort"]}"', "--output-schema", str(schema_path), "--output-last-message", str(output_path), "-"]
     environment = {key: value for key, value in os.environ.items() if key in ENVIRONMENT_KEYS}
+    if source_search_capability:
+        if not invocation_id:
+            raise RuntimeError("source-search invocation identity is unavailable")
+        bridge_environment = {
+            "ONE_C_AUTORESEARCH_REPO": str(repo),
+            "ONE_C_AUTORESEARCH_INVOCATION_ID": invocation_id,
+            "ONE_C_AUTORESEARCH_SOURCE_SEARCH_CAPABILITY": source_search_capability,
+        }
+        if operational_state_root is not None:
+            bridge_environment["ONE_C_AUTORESEARCH_STATE_ROOT"] = str(operational_state_root)
+        environment.update(bridge_environment)
+        command[-1:-1] = [
+            "--config", f'mcp_servers.source_search.command={json.dumps(sys.executable)}',
+            "--config", 'mcp_servers.source_search.args=["-m","one_c_autoresearch.source_search_bridge"]',
+            "--config", "mcp_servers.source_search.enabled=true",
+        ]
     result = _run_command(subprocess.run, command, cancelled=cancelled, input=prompt, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=timeout_seconds, env=environment)
     if result.returncode:
         from .events import redact

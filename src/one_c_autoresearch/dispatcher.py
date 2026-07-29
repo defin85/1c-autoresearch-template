@@ -861,6 +861,18 @@ class DispatcherCoordinator:
             )
             if invocation is None:
                 raise RuntimeError("dispatcher lease or logical slot is unavailable")
+            search_policy = (execution_snapshot.get("source_search_policies") or {}).get(
+                f"{phase_id}:{role_id}"
+            )
+            search_capability = ""
+            if search_policy:
+                import secrets
+                search_capability = secrets.token_hex(32)
+                self.store.configure_source_search(
+                    invocation["invocation_id"],
+                    search_policy,
+                    "sha256:" + sha256(search_capability.encode()),
+                )
             self.store.reconcile_invocation_outbox(self.event_store)
             proposal_dir = proposal_root / sha256(canonical_json({"run_id": outcome.run_id, "operation": operation, "work_unit_id": work_unit.get("id"), "nonce": str(uuid.uuid4())}))
             try:
@@ -876,8 +888,36 @@ class DispatcherCoordinator:
                     execution_snapshot,
                     context_manifest,
                     prepared_context,
+                    invocation["invocation_id"],
+                    search_capability,
+                    self.store.base,
                 )
+                if search_policy:
+                    self.store.complete_source_search(invocation["invocation_id"])
+                    ledger = self.store.source_search_ledger(
+                        invocation["invocation_id"], limit=100
+                    )
+                    if ledger["usage"]["calls"]:
+                        from .source_search import (
+                            revalidate_proposal_evidence,
+                            revalidate_reuse_environment,
+                            reuse_binding,
+                        )
+                        from .source_search_bridge import _key
+                        revalidate_reuse_environment(
+                            repo, search_policy, ledger,
+                        )
+                        work_unit["dynamic_search_binding"] = reuse_binding(
+                            search_policy,
+                            ledger,
+                            revalidate_proposal_evidence(
+                                repo, search_policy, result
+                            ),
+                            _key(self.store.path.parent)[0],
+                        )
             except InterruptedError:
+                if search_policy:
+                    self.store.close_source_search(invocation["invocation_id"], "cancelled")
                 self.store.terminalize_invocation(
                     invocation["invocation_id"],
                     "cancelled",
@@ -888,6 +928,8 @@ class DispatcherCoordinator:
                 self.store.reconcile_invocation_outbox(self.event_store)
                 raise
             except Exception as exc:
+                if search_policy:
+                    self.store.close_source_search(invocation["invocation_id"], "interrupted")
                 from .events import redact
                 message = str(redact(str(exc)))
                 lowered = message.lower()

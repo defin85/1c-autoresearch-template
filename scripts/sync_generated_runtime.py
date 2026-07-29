@@ -13,7 +13,7 @@ from pathlib import Path
 
 FILES = (
     "AGENTS.md", "README.md", "pyproject.toml", "uv.lock",
-    "docs/operator/dispatcher-inspector-rollback.md",
+    "docs/operator/dispatcher-inspector-rollback.md", "docs/operator/source-search.md",
     "research/workflow.toml", "research/indexing.toml", "research/forbidden-authorities.json",
     "tests/test_external_folder.py", "tests/test_source_routing.py", "tests/test_source_tools.py",
     "tests/test_sources.py", "tests/test_diffs.py", "tests/test_extension_analyzer.py", "tests/test_indexes.py",
@@ -21,7 +21,7 @@ FILES = (
     "tests/test_stage_recompute_api.py", "tests/test_dispatcher.py", "tests/test_dispatcher_api.py",
     "tests/test_dispatcher_inspector_server.py", "tests/test_dispatcher_smoke.py", "tests/test_doctor.py", "tests/test_mrq.py",
     "tests/test_mrq_batches.py", "tests/test_pipeline_graphs.py", "tests/test_workflow.py",
-    "tests/test_contracts.py",
+    "tests/test_contracts.py", "tests/test_source_search.py",
     "tests/test_dif_classifications.py", "tests/test_consolidation.py",
     "tests/test_component_groups.py", "tests/test_service_extension_scope.py",
     "tests/test_decision_generations.py", "tests/test_workflow_migration.py",
@@ -244,12 +244,12 @@ def sync(
                 for prefix, source, target in promoted
                 for item in change_plan(source, target)
             ]
-            rollback = "docs/operator/dispatcher-inspector-rollback.md"
-            source, target = staging / rollback, package_root / rollback
-            if not target.is_file():
-                plan.append({"status": "A", "path": rollback, "hash": file_hash(source)})
-            elif file_hash(source) != file_hash(target):
-                plan.append({"status": "C", "path": rollback, "hash": file_hash(source)})
+            for relative in (path for path in FILES if path.startswith("docs/operator/")):
+                source, target = staging / relative, package_root / relative
+                if not target.is_file():
+                    plan.append({"status": "A", "path": relative, "hash": file_hash(source)})
+                elif file_hash(source) != file_hash(target):
+                    plan.append({"status": "C", "path": relative, "hash": file_hash(source)})
             for relative in (path for path in FILES if path.startswith("tests/")):
                 source, target = staging / relative, package_root / relative
                 if not target.is_file():
@@ -275,9 +275,10 @@ def promote_package(scaffold: Path, package_root: Path) -> None:
     target_package = package_root / "src/one_c_autoresearch"
     replace_tree(source_package, target_package)
     replace_tree(scaffold / "web/workspace", package_root / "web/workspace")
-    rollback = package_root / "docs/operator/dispatcher-inspector-rollback.md"
-    rollback.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(scaffold / "docs/operator/dispatcher-inspector-rollback.md", rollback)
+    for relative in (path for path in FILES if path.startswith("docs/operator/")):
+        target = package_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(scaffold / relative, target)
     for relative in (path for path in FILES if path.startswith("tests/")):
         target = package_root / relative
         target.parent.mkdir(parents=True, exist_ok=True)

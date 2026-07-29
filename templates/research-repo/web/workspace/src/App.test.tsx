@@ -4,6 +4,7 @@ import {
   App,
   AgentProfiles,
   Events,
+  Indexes,
   Registry,
   RoutingPreviewSummary,
   Sources,
@@ -310,6 +311,154 @@ test("agent profile explains the read-only environment and persists it", async (
       profile: { environment_preset: "local-read-only" },
     });
   });
+});
+
+test("agent profile persists the complete bounded source search policy", async () => {
+  const fetchMock = vi.fn().mockImplementation((_url: string, init?: RequestInit) =>
+    Promise.resolve({
+      ok: true,
+      json: async () => init?.method === "PUT"
+        ? {}
+        : _url.endsWith("/agent-capabilities")
+          ? { models: [{ id: "gpt-5.6-sol", name: "GPT-5.6-Sol", default_reasoning_effort: "low", reasoning_efforts: ["low"], input_context_tokens: 272000, context_estimator_version: "utf8-v1", capability_fingerprint: "sha256:test" }] }
+          : { items: {} },
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  render(<AgentProfiles project={{ id: "p", name: "p", root: "/repo" }} />);
+  fireEvent.click(await screen.findByText("Дополнительные параметры"));
+  fireEvent.click(screen.getByRole("checkbox", { name: "Разрешить ограниченный поиск по исходникам" }));
+  expect(await screen.findByText(/Резерв контекста:/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Проверить и сохранить профиль" }));
+  await waitFor(() => {
+    const put = fetchMock.mock.calls.find(([, init]) => init?.method === "PUT");
+    const profile = JSON.parse(String(put?.[1]?.body)).profile;
+    expect(profile.source_search).toMatchObject({
+      operations: expect.arrayContaining(["search_text", "find_symbol"]),
+      max_calls: expect.any(Number),
+      max_backend_seconds: expect.any(Number),
+      max_total_returned_bytes: expect.any(Number),
+    });
+    expect(profile.source_search.backend).toBeUndefined();
+  });
+});
+
+test("index validation is an explicit progress-visible action", async () => {
+  let finishValidation!: (value: unknown) => void;
+  const validation = new Promise((resolve) => {
+    finishValidation = resolve;
+  });
+  const fetchMock = vi.fn().mockImplementation((url: string) =>
+    url.endsWith("/actions")
+      ? validation
+      : Promise.resolve({
+      ok: true,
+      json: async () => url.endsWith("/indexes")
+        ? {
+            items: [],
+            configuration: {
+              schema_version: "2",
+              backends: [{ adapter_id: "rlm-tools-bsl", engine_version: "1.30.0" }],
+              routes: { "text-search": ["rlm-tools-bsl"] },
+            },
+            configuration_fingerprint: "sha256:config",
+          }
+          : {},
+      }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  render(<Indexes
+    project={{ id: "p", name: "p", root: "/repo" }}
+    snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
+  />);
+  fireEvent.click(await screen.findByRole("button", { name: "Проверить готовность" }));
+  expect(await screen.findByText("Проверяется готовность индексов…")).toBeInTheDocument();
+  await waitFor(() => {
+    const action = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/actions"));
+    expect(JSON.parse(String(action?.[1]?.body))).toMatchObject({
+      operation: "indexes.build",
+      payload: { mode: "validate" },
+    });
+  });
+  finishValidation({
+    ok: true,
+    json: async () => ({ operation: "indexes.validate", components: [] }),
+  });
+});
+
+test("index workspace shows mixed backend readiness and reviewed route impact", async () => {
+  const items = [
+    {
+      component_id: "target_cf:configuration",
+      source_generation_id: "gen",
+      fingerprint: "sha256:source",
+      adapter_id: "bsl-analyzer",
+      adapter_version: "bsl-analyzer-workspace/v1",
+      engine_version: "0.2.63",
+      bsl_file_count: 5,
+      status: "ready",
+      last_validation: "2026-07-29T00:00:00Z",
+      index_fingerprint: "sha256:bsl",
+      contract_version: "1.1",
+      capabilities: ["text-search"],
+      route_priorities: { "text-search": 0 },
+    },
+    {
+      component_id: "target_cf:configuration",
+      source_generation_id: "gen",
+      fingerprint: "sha256:source",
+      adapter_id: "rlm-tools-bsl",
+      adapter_version: "rlm-index/v1",
+      engine_version: "1.30.0",
+      bsl_file_count: 5,
+      status: "unavailable",
+      capabilities: [],
+      route_priorities: {},
+      failure_code: "backend.executable_unavailable",
+      failure_summary: "approved launcher is unavailable",
+    },
+  ];
+  const fetchMock = vi.fn().mockImplementation((url: string) =>
+    Promise.resolve({
+      ok: true,
+      json: async () => url.endsWith("/configuration-preview")
+        ? {
+            plan_fingerprint: "sha256:plan",
+            degraded_routes: ["text-search"],
+            rebuild_backends: [],
+          }
+        : url.endsWith("/indexes")
+          ? {
+              items,
+              configuration: {
+                schema_version: "2",
+                backends: [
+                  { adapter_id: "bsl-analyzer", engine_version: "0.2.63" },
+                  { adapter_id: "rlm-tools-bsl", engine_version: "1.30.0" },
+                ],
+                routes: {
+                  "text-search": ["bsl-analyzer", "rlm-tools-bsl"],
+                },
+              },
+              configuration_fingerprint: "sha256:config",
+            }
+          : {},
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  render(<Indexes
+    project={{ id: "p", name: "p", root: "/repo" }}
+    snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
+  />);
+  expect(await screen.findByText(/bsl-analyzer 0.2.63/)).toBeInTheDocument();
+  expect(screen.getByText(/rlm-tools-bsl 1.30.0/)).toBeInTheDocument();
+  expect(screen.getByText(/backend.executable_unavailable/)).toBeInTheDocument();
+  fireEvent.click(screen.getByText("Настройка адаптеров и маршрутов"));
+  fireEvent.click(screen.getByRole("button", { name: "Проверить изменения" }));
+  expect(await screen.findByText(/degraded_routes/)).toBeInTheDocument();
+  expect(screen.getByRole("button", {
+    name: "Применить проверенный план",
+  })).toBeEnabled();
 });
 
 test("workflow preview is invalidated by edits and apply uses the reviewed parameters", async () => {

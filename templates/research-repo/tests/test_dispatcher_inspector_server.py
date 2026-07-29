@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from one_c_autoresearch import source_search
 from one_c_autoresearch.events import EventStore
 from one_c_autoresearch.dispatcher import DispatcherCoordinator
 from one_c_autoresearch.service import ApplicationService
@@ -643,34 +644,61 @@ def test_stage_input_collections_are_distinct_from_pending_queues(
     tmp_path: Path, monkeypatch
 ) -> None:
     diffs = [{
-        "stable_diff_id": identifier, "before_role": "vendor_baseline",
-        "after_role": "target_cf", "path": f"{identifier}.bsl",
+        "stable_diff_id": identifier,
+        "before_role": "vendor_baseline",
+        "after_role": "target_cf",
+        "path": f"{identifier}.bsl",
         "object_kind": "metadata",
     } for identifier in ("DIF-OWNED", "DIF-UNASSIGNED")]
     mrqs = [
         {"mrq_id": "MRQ-DECIDED", "state": "approved"},
         {"mrq_id": "MRQ-PENDING", "state": "approved"},
     ]
-    dispositions = [{"stable_diff_id": "DIF-OWNED", "mrq_id": "MRQ-DECIDED", "primary": True}]
-    monkeypatch.setattr("one_c_autoresearch.workflow._active_rows", lambda _repo: (diffs, mrqs, dispositions, []))
-    monkeypatch.setattr("one_c_autoresearch.workflow._pointer", lambda _repo, _name: {})
-    monkeypatch.setattr("one_c_autoresearch.dif_classifications.load_active", lambda _repo: {"rows": [
-        {"stable_diff_id": identifier, "classification": "meaning"}
-        for identifier in ("DIF-OWNED", "DIF-UNASSIGNED")
-    ]})
-    monkeypatch.setattr("one_c_autoresearch.consolidation.load_active", lambda _repo: {"pointer": {
-        "decision_generation_id": "decisions", "batch_generation_id": "", "plan_fingerprint": "",
-    }})
-    monkeypatch.setattr("one_c_autoresearch.decision_generations.validate_generation", lambda *_args, **_kwargs: {"decisions.jsonl": [{
-        "mrq_id": "MRQ-DECIDED", "decision": {"decision": "adapt"},
-    }]})
+    dispositions = [{
+        "stable_diff_id": "DIF-OWNED", "mrq_id": "MRQ-DECIDED", "primary": True,
+    }]
+    monkeypatch.setattr(
+        "one_c_autoresearch.workflow._active_rows",
+        lambda _repo: (diffs, mrqs, dispositions, []),
+    )
+    monkeypatch.setattr(
+        "one_c_autoresearch.workflow._pointer",
+        lambda _repo, _name: {},
+    )
+    monkeypatch.setattr(
+        "one_c_autoresearch.dif_classifications.load_active",
+        lambda _repo: {"rows": [
+            {"stable_diff_id": identifier, "classification": "meaning"}
+            for identifier in ("DIF-OWNED", "DIF-UNASSIGNED")
+        ]},
+    )
+    monkeypatch.setattr(
+        "one_c_autoresearch.consolidation.load_active",
+        lambda _repo: {"pointer": {
+            "decision_generation_id": "decisions",
+            "batch_generation_id": "",
+            "plan_fingerprint": "",
+        }},
+    )
+    monkeypatch.setattr(
+        "one_c_autoresearch.decision_generations.validate_generation",
+        lambda *_args, **_kwargs: {"decisions.jsonl": [{
+            "mrq_id": "MRQ-DECIDED", "decision": {"decision": "adapt"},
+        }]},
+    )
     store = type("Store", (), {"proposals": lambda _self: []})()
 
     items = _dispatcher_items(tmp_path, store)
 
-    assert [row["id"] for row in items["meaning_diffs"]] == ["DIF-OWNED", "DIF-UNASSIGNED"]
-    assert [row["id"] for row in items["unassigned_meaning_diffs"]] == ["DIF-UNASSIGNED"]
-    assert [row["id"] for row in items["all_mrqs"]] == ["MRQ-DECIDED", "MRQ-PENDING"]
+    assert [row["id"] for row in items["meaning_diffs"]] == [
+        "DIF-OWNED", "DIF-UNASSIGNED",
+    ]
+    assert [row["id"] for row in items["unassigned_meaning_diffs"]] == [
+        "DIF-UNASSIGNED",
+    ]
+    assert [row["id"] for row in items["all_mrqs"]] == [
+        "MRQ-DECIDED", "MRQ-PENDING",
+    ]
     assert [row["id"] for row in items["mrqs"]] == ["MRQ-PENDING"]
     assert items["_queue_aggregates"]["unassigned-meaning-diffs"]["total"] == 1
     assert items["_queue_aggregates"]["all-mrqs"]["total"] == 2
@@ -751,8 +779,12 @@ def test_analyze_progress_counts_only_unpublished_results(
     monkeypatch.setattr(
         "one_c_autoresearch.dif_classifications.coverage",
         lambda _repo: {
-            "total": 210, "classified": 160, "remaining": 50,
-            "meaning": 160, "noise_candidate": 0, "all_dif_classified": False,
+            "total": 210,
+            "classified": 160,
+            "remaining": 50,
+            "meaning": 160,
+            "noise_candidate": 0,
+            "all_dif_classified": False,
         },
     )
     monkeypatch.setattr(
@@ -843,6 +875,110 @@ def test_valid_cursors_are_rejected_across_slot_and_invocation_scope() -> None:
     })
     with pytest.raises(ValueError):
         _event_cursor(event, {**event_scope, "invocation_id": "i2"})
+
+
+def test_source_search_diagnostics_are_content_free_and_cursor_bound(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    with TestClient(create_app(state, [REPO], testing=True)) as client:
+        project = _bookmark(client)
+        events = EventStore(state / "projects", project["id"])
+        fingerprint = _run(events, "run-search")
+        with DispatcherStore(REPO, state) as store:
+            token = store.acquire_lease(
+                "discover-mrq", "thread", "work", "test", None,
+                run_id="run-search",
+            )
+            invocation = store.start_invocation(
+                "discover-mrq", "run-search", "analyze-dif", "analyzer",
+                "work", 1, token,
+                execution_snapshot_fingerprint=fingerprint,
+                profile_id="local",
+                context_manifest_fingerprint="sha256:context",
+            )
+            policy = {
+                "schema_version": source_search.POLICY_VERSION,
+                "policy_fingerprint": "sha256:policy",
+                "scope_fingerprint": "sha256:scope",
+                "operations": ["search_text"],
+                "component_ids": ["target_cf:configuration"],
+                "logical_path_prefixes": ["configuration/CommonModules/"],
+                "max_calls": 4,
+                "max_concurrent_calls": 1,
+                "per_call_deadline_seconds": 10,
+                "max_backend_seconds": 20,
+                "max_query_bytes": 100,
+                "max_total_query_bytes": 200,
+                "max_results_per_call": 2,
+                "max_total_results": 4,
+                "max_returned_bytes_per_call": 100,
+                "max_total_returned_bytes": 200,
+            }
+            store.configure_source_search(
+                invocation["invocation_id"], policy, "sha256:capability",
+            )
+            for number in (1, 2):
+                store.reserve_source_search_call(
+                    invocation["invocation_id"], f"call-{number}",
+                    "sha256:capability", query_hmac=f"v1:hmac-{number}",
+                    capability="text-search", query_bytes=1,
+                    requested_results=1, requested_returned_bytes=10,
+                    requested_backend_seconds=1,
+                )
+                store.settle_source_search_call(
+                    invocation["invocation_id"], f"call-{number}",
+                    status="completed", adapter_id="rlm-tools-bsl",
+                    route_fingerprint="sha256:route",
+                    index_fingerprint="sha256:index",
+                    result_manifest_fingerprint=f"sha256:result-{number}",
+                )
+
+        url = f"/api/v1/projects/{project['id']}/dispatcher/inspect"
+        first = client.get(url, params={
+            "kind": "invocation",
+            "invocation_id": invocation["invocation_id"],
+            "source_search_limit": 1,
+        })
+        assert first.status_code == 200
+        diagnostics = first.json()["source_search"]
+        assert diagnostics["available"] is True
+        assert diagnostics["operations"] == ["search_text"]
+        assert diagnostics["scope"] == {
+            "component_count": 1,
+            "path_count": 1,
+            "fingerprint": "sha256:scope",
+        }
+        assert diagnostics["usage"]["calls"] == 2
+        assert diagnostics["status_counts"] == {"completed": 2}
+        assert diagnostics["next_cursor"]
+        assert '"query":' not in json.dumps(diagnostics)
+
+        second = client.get(url, params={
+            "kind": "invocation",
+            "invocation_id": invocation["invocation_id"],
+            "source_search_limit": 1,
+            "source_search_cursor": diagnostics["next_cursor"],
+        })
+        assert second.status_code == 200
+        assert second.json()["source_search"]["items"][0]["ordinal"] == 2
+
+        with DispatcherStore(REPO, state) as store:
+            store.reserve_source_search_call(
+                invocation["invocation_id"], "call-3", "sha256:capability",
+                query_hmac="v1:hmac-3", capability="text-search", query_bytes=1,
+                requested_results=1, requested_returned_bytes=10,
+                requested_backend_seconds=1,
+            )
+            store.settle_source_search_call(
+                invocation["invocation_id"], "call-3", status="completed",
+            )
+        stale = client.get(url, params={
+            "kind": "invocation",
+            "invocation_id": invocation["invocation_id"],
+            "source_search_cursor": diagnostics["next_cursor"],
+        })
+        assert stale.status_code == 422
 
 
 def test_event_pagination_over_limit_is_exclusive(tmp_path: Path) -> None:

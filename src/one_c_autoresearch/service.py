@@ -13,14 +13,34 @@ from .contracts import atomic_bytes, atomic_json, canonical_json, confined, reje
 
 
 class ApplicationService:
-    def __init__(self, repo: Path, rlm_executable: str | None = None, connections: dict[str, dict[str, Any]] | None = None, upload_drafts: Path | None = None, routing_previews: Path | None = None, progress: callable | None = None):
+    def __init__(self, repo: Path, rlm_executable: str | None = None, connections: dict[str, dict[str, Any]] | None = None, upload_drafts: Path | None = None, routing_previews: Path | None = None, progress: callable | None = None, agent_profiles: dict[str, dict[str, Any]] | None = None):
         self.repo = repo.resolve()
         self.rlm_executable = rlm_executable or indexes.discover_executable(self.repo)
         self.connections = connections
         self.upload_drafts = upload_drafts
         self.routing_previews = routing_previews
+        self.agent_profiles = agent_profiles
         self.progress = progress
         workflow.validate_workflow(self.repo)
+
+    def _required_index_capabilities(self) -> tuple[str, ...]:
+        if self.agent_profiles is None:
+            return tuple(indexes.CAPABILITIES)
+        from .source_search import OPERATIONS
+        assigned = {
+            role["agent_profile"]
+            for row in workflow.step_configurations(self.repo)
+            for phase in row["step"].get("agent_phases", [])
+            for role in phase["roles"]
+        }
+        return tuple(sorted({
+            OPERATIONS[operation]
+            for name in assigned
+            for operation in (
+                self.agent_profiles.get(name, {}).get("source_search") or {}
+            ).get("operations", [])
+            if operation in OPERATIONS
+        }))
 
     def snapshot(self, *, deep: bool = True) -> dict[str, Any]:
         snapshot = workflow.status(self.repo, deep=deep)
@@ -128,20 +148,49 @@ class ApplicationService:
             }
         canonical = workflow.next_work(self.repo)
         if canonical and canonical["action"] in {"mrq.discover-next", "mrq.decide-next"}:
-            required = [item["component_id"] for item in indexes.discover(self.repo)]
-            if required:
-                if not self.rlm_executable:
-                    return {**canonical, "job_id": "index-sources", "domain_action": canonical["action"], "action": "indexes.build", "blocker": {"code": "indexes.tool_missing", "message": "rlm-bsl-index is unavailable", "action": "indexes.build"}}
-                probe = lambda path: indexes.cli_probe(self.rlm_executable, path)
-                pending = [item for item in indexes.statuses(self.repo, probe=probe) if item["component_id"] in required and item["status"] not in {"ready", "not_indexable"}]
-                if pending:
-                    work_unit = {**(canonical.get("work_unit") or {}), "component_ids": [item["component_id"] for item in pending], "index_keys": {item["component_id"]: item["index_key"] for item in pending}}
-                    return {**canonical, "job_id": "index-sources", "domain_action": canonical["action"], "action": "indexes.build", "blocker": {"code": "indexes.missing", "message": f"{len(pending)} source component indexes require ensure", "action": "indexes.build"}, "work_unit": work_unit}
+            components = indexes.discover(self.repo)
+            if components:
+                statuses = indexes.backend_statuses(self.repo)
+                config = indexes.load_config(self.repo)
+                profiles = getattr(self, "agent_profiles", None)
+                if profiles is not None:
+                    required = set(self._required_index_capabilities())
+                    config = {
+                        **config,
+                        "routes": {
+                            capability: route
+                            for capability, route in config["routes"].items()
+                            if capability in required
+                        },
+                    }
+                coverage = indexes.route_coverage(config, components, statuses)
+                if coverage["blockers"]:
+                    pending = coverage["blockers"]
+                    work_unit = {
+                        **(canonical.get("work_unit") or {}),
+                        "component_ids": sorted({item["component_id"] for item in pending}),
+                        "backend_ids": sorted({
+                            adapter_id
+                            for item in pending
+                            for adapter_id in item["backend_ids"]
+                        }),
+                    }
+                    return {
+                        **canonical,
+                        "job_id": "index-sources",
+                        "domain_action": canonical["action"],
+                        "action": "indexes.build",
+                        "blocker": {
+                            "code": "indexes.route_unavailable",
+                            "message": f"{len(pending)} capability routes require a ready index",
+                            "action": "indexes.build",
+                        },
+                        "work_unit": work_unit,
+                    }
         return canonical
 
     def index_statuses(self) -> list[dict[str, Any]]:
-        probe = (lambda path: indexes.cli_probe(self.rlm_executable, path)) if self.rlm_executable else None
-        return indexes.statuses(self.repo, probe=probe)
+        return indexes.backend_statuses(self.repo)
 
     def workflow_configuration(self) -> dict[str, Any]:
         manifest = workflow.validate_workflow(self.repo)
@@ -151,6 +200,16 @@ class ApplicationService:
         if set(payload) != {"step_id", "parameters", "expected_manifest_fingerprint"}:
             raise ValueError("invalid workflow step patch")
         return workflow.preview_step_patch(self.repo, payload["step_id"], payload["parameters"], payload["expected_manifest_fingerprint"], state_base)
+
+    def preview_index_configuration(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if set(payload) != {"configuration", "expected_file_fingerprint"}:
+            raise ValueError("invalid indexing configuration preview")
+        return indexes.preview_config(
+            self.repo,
+            payload["configuration"],
+            str(payload["expected_file_fingerprint"]),
+            self._required_index_capabilities(),
+        )
 
     def apply(self, operation: str, payload: dict[str, Any], expected_fingerprint: str, cancelled: callable | None = None, *, staged: dict[str, dict[str, Any]] | None = None, fence: callable | None = None) -> dict[str, Any]:
         from .workflow_migration import guard_mutation
@@ -180,6 +239,7 @@ class ApplicationService:
             "sources.acquire": self._acquire_sources,
             "indexes.ensure": self._ensure_indexes,
             "indexes.build": self._ensure_indexes,
+            "indexes.configure": lambda value: self._locked(self._configure_indexes, value),
             "diff.build": self._build_diffs,
             "projections.build": lambda value: self._locked(self._build_projections, value),
             "workflow.patch-step": lambda value: self._locked(self._patch_step, value),
@@ -293,18 +353,44 @@ class ApplicationService:
         return {"operation": "sources.configure", "manifest_fingerprint": "sha256:" + sha256(path.read_bytes()), "comparison_epoch_changed": True}
 
     def _ensure_indexes(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if set(payload) - {"component_ids", "mode", "confirmed"}:
+        if set(payload) - {"component_ids", "backend_ids", "mode", "confirmed"}:
             raise ValueError("invalid index operation payload")
         mode = payload.get("mode", "ensure")
-        if mode not in {"ensure", "rebuild"}:
+        if mode not in {"ensure", "rebuild", "validate"}:
             raise ValueError("invalid index operation mode")
-        if not self.rlm_executable:
-            raise RuntimeError("rlm-bsl-index is unavailable in PATH")
-        indexes.validate_engine_version(self.repo, self.rlm_executable)
-        probe = lambda path: indexes.cli_probe(self.rlm_executable, path)
-        builder = lambda path, component_id: indexes.cli_build(self.rlm_executable, path, component_id)
-        rows = indexes.ensure(self.repo, builder, selected=payload.get("component_ids"), rebuild=mode == "rebuild", confirmed=bool(payload.get("confirmed")), probe=probe)
-        return {"components": rows}
+        if mode == "validate":
+            return {
+                "operation": "indexes.validate",
+                "components": indexes.validate_configured(
+                    self.repo,
+                    component_ids=payload.get("component_ids"),
+                    backend_ids=payload.get("backend_ids"),
+                ),
+            }
+        rows = indexes.ensure_configured(
+            self.repo,
+            component_ids=payload.get("component_ids"),
+            backend_ids=payload.get("backend_ids"),
+            rebuild=mode == "rebuild",
+            confirmed=bool(payload.get("confirmed")),
+            cancelled=self._cancelled,
+        )
+        return {"operation": "indexes.build", "components": rows}
+
+    def _configure_indexes(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if set(payload) != {
+            "configuration",
+            "expected_file_fingerprint",
+            "expected_plan_fingerprint",
+        }:
+            raise ValueError("invalid indexing configuration apply")
+        return indexes.apply_config(
+            self.repo,
+            payload["configuration"],
+            str(payload["expected_file_fingerprint"]),
+            str(payload["expected_plan_fingerprint"]),
+            self._required_index_capabilities(),
+        )
 
     def _build_diffs(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload:

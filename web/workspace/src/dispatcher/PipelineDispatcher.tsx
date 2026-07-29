@@ -107,6 +107,18 @@ interface ContextActions {
 }
 
 interface InspectionPage<T> { items: T[]; next_cursor?: string | null; truncated?: boolean; available?: boolean }
+interface SourceSearchInspection extends InspectionPage<Record<string, unknown>> {
+  schema_version?: string;
+  policy_fingerprint?: string;
+  scope_fingerprint?: string;
+  admission_state?: string;
+  expires_at?: string;
+  configured_limits?: Record<string, unknown>;
+  usage?: Record<string, unknown>;
+  ledger_complete?: boolean;
+  reconciled?: boolean;
+  ledger_fingerprint?: string;
+}
 interface DispatcherInspection {
   observed_at?: string;
   slot?: Record<string, unknown>;
@@ -120,6 +132,7 @@ interface DispatcherInspection {
     envelope_fingerprint?: string | null;
     provenance: InspectionPage<Record<string, unknown>>;
   };
+  source_search?: SourceSearchInspection;
   result?: Record<string, unknown>;
   availability?: Record<string, unknown>;
 }
@@ -270,6 +283,11 @@ function useDispatcherInspection(projectId: string, selection: DispatcherSelecti
                   ...value.context,
                   provenance: merge(current.context.provenance, value.context.provenance) ?? value.context.provenance,
                 } : value.context,
+                source_search: value.source_search && current.source_search ? {
+                  ...value.source_search,
+                  items: merge(current.source_search, value.source_search)?.items ?? value.source_search.items,
+                  next_cursor: current.source_search.next_cursor,
+                } : value.source_search,
               }
               : value,
           };
@@ -291,7 +309,7 @@ function useDispatcherInspection(projectId: string, selection: DispatcherSelecti
   }, [selection && selectionKey(selection)]);
   useEffect(() => () => pageControllerRef.current?.abort(), []);
   const resolved = activeKeyRef.current ? resolvedByKey[activeKeyRef.current] : undefined;
-  const loadPage = useCallback(async (section: 'history' | 'events' | 'context') => {
+  const loadPage = useCallback(async (section: 'history' | 'events' | 'context' | 'source_search') => {
     if (!selection || (selection.kind !== 'slot' && selection.kind !== 'invocation') || !resolved) return;
     const cursor = section === 'context'
       ? resolved.context?.provenance.next_cursor
@@ -302,7 +320,7 @@ function useDispatcherInspection(projectId: string, selection: DispatcherSelecti
     pageControllerRef.current = controller;
     const request = ++pageRequestRef.current;
     const activeKey = `${projectId}:${selectionKey(selection)}`;
-    const cursorName = section === 'events' ? 'event_cursor' : section === 'context' ? 'context_cursor' : 'history_cursor';
+    const cursorName = section === 'events' ? 'event_cursor' : section === 'context' ? 'context_cursor' : section === 'source_search' ? 'source_search_cursor' : 'history_cursor';
     const params = new URLSearchParams({ kind: selection.kind, [cursorName]: cursor });
     if (selection.kind === 'invocation') params.set('invocation_id', selection.invocationId);
     else {
@@ -667,10 +685,19 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
                 </Paper>)}
             </>}
         </Stack>}
+        {inspection.resolved?.source_search?.available && <Stack component="section" spacing={0.5} mt={1}>
+          <Typography variant="subtitle2">Динамический поиск по исходникам</Typography>
+          <DetailRows value={Object.fromEntries(Object.entries(inspection.resolved.source_search).filter(([key]) => !['items', 'next_cursor', 'available'].includes(key)))} />
+          <Typography variant="subtitle2">Журнал поиска ({inspection.resolved.source_search.items.length})</Typography>
+          {inspection.resolved.source_search.items.map((item, index) =>
+            <Paper variant="outlined" sx={{ p: 0.7 }} key={String(item.ordinal ?? index)}><DetailRows value={item} /></Paper>
+          )}
+        </Stack>}
         <Stack direction="row" spacing={1}>
           {inspection.resolved?.history?.next_cursor && <Button onClick={() => void inspection.loadPage('history')}>Ещё история</Button>}
           {inspection.resolved?.events?.next_cursor && <Button onClick={() => void inspection.loadPage('events')}>Ещё события</Button>}
           {inspection.resolved?.context?.provenance.next_cursor && <Button onClick={() => void inspection.loadPage('context')}>Ещё происхождение</Button>}
+          {inspection.resolved?.source_search?.next_cursor && <Button onClick={() => void inspection.loadPage('source_search')}>Ещё записи поиска</Button>}
         </Stack>
         {selection.kind === 'invocation' && onOpenJournal && <Button onClick={() => onOpenJournal({ invocationId: selection.invocationId, runId: selection.runId })}>Открыть в журнале</Button>}
       </Paper>}

@@ -75,6 +75,9 @@ def test_exact_operation_catalog_and_typed_patch_preview():
     assert set(OPERATION_CATALOG) == {operation for _job, _needs, steps in __import__("one_c_autoresearch.workflow", fromlist=["JOBS"]).JOBS for _step, operation, _version in steps}
     assert all({"version", "executor", "effect", "parameters", "paths", "artifacts", "validator", "retryable", "approval_required"} <= set(item) for item in OPERATION_CATALOG.values())
     assert OPERATION_CATALOG["indexes.build"]["fixed_inputs"] == {"mode": "ensure", "selector": "all"}
+    assert OPERATION_CATALOG["indexes.build"]["executor"] == "source-index-adapters"
+    assert OPERATION_CATALOG["indexes.build"]["paths"] == []
+    assert OPERATION_CATALOG["indexes.build"]["run_inputs"]["mode"] == ["ensure", "validate", "rebuild"]
     preview = preview_step_patch(REPO, "build-diffs", {"timeout_seconds": 60, "max_retries": 1}, workflow_fingerprint(REPO))
     assert preview["before"]["timeout_seconds"] == 1800
     assert preview["after"]["timeout_seconds"] == 60

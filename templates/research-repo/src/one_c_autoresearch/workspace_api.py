@@ -83,6 +83,20 @@ def _context_cursor(value: str, scope: dict[str, str]) -> int:
     return offset
 
 
+def _source_search_cursor(value: str, scope: dict[str, str]) -> int:
+    cursor = _decode_dispatcher_cursor(value)
+    offset = cursor.get("offset")
+    if (
+        set(cursor) != {"scope", "offset"}
+        or cursor.get("scope") != scope
+        or isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset < 0
+    ):
+        raise ValueError("source-search ledger cursor scope mismatch")
+    return offset
+
+
 def _public_invocation(value: dict[str, Any]) -> dict[str, Any]:
     result = dict(value)
     provenance = result.pop("context_provenance", [])
@@ -366,9 +380,13 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
     @app.get("/api/v1/projects/{project_id}/workflow/next")
     def next_work(project_id: str):
-        from .user_state import load_connections
+        from .user_state import load_agent_profiles, load_connections
         project = repo(project_id)
-        return ApplicationService(project, connections=load_connections(project, operational)).next()
+        return ApplicationService(
+            project,
+            connections=load_connections(project, operational),
+            agent_profiles=load_agent_profiles(project, operational),
+        ).next()
 
     @app.get("/api/v1/projects/{project_id}/workflow/configuration")
     def workflow_configuration(project_id: str): return ApplicationService(repo(project_id)).workflow_configuration()
@@ -387,7 +405,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         guard_mutation(project, base=operational)
         from .user_state import load_agent_profiles, load_connections
         preview_root = operational / "projects" / project_id / "source-routing-previews"
-        service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts", routing_previews=preview_root)
+        profiles = load_agent_profiles(project, operational)
+        service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts", routing_previews=preview_root, agent_profiles=profiles)
         from .runner import run_next
         store = EventStore(operational / "projects", project_id)
         result_path = store.root / ("idempotency-" + sha256(idempotency_key.encode()) + ".json")
@@ -400,7 +419,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             invoke = lambda operation, payload, cancelled: service.apply(operation, payload, service.snapshot()["workflow_fingerprint"], cancelled)
             if set(body.approved_operations) - {"sources.acquire", "dif.classify-next", "mrq.consolidate", "mrq.decide-next"}: raise ValueError("unsupported run approval")
             source_preview = {"source_routing_preview_id": body.source_routing_preview_id, "routing_plan_fingerprint": body.routing_plan_fingerprint} if body.source_routing_preview_id and body.routing_plan_fingerprint else None
-            result = run_next(service.repo, invoke, store, select=service.next, approved_operations=set(body.approved_operations), agent_profiles=load_agent_profiles(project, operational), source_routing_preview=source_preview)
+            result = run_next(service.repo, invoke, store, select=service.next, approved_operations=set(body.approved_operations), agent_profiles=profiles, source_routing_preview=source_preview)
             from .contracts import atomic_json
             atomic_json(result_path, result)
             return result
@@ -476,7 +495,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         guard_mutation(project, base=operational)
         from .user_state import load_agent_profiles, load_connections
         preview_root = operational / "projects" / project_id / "source-routing-previews"
-        service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts", routing_previews=preview_root)
+        profiles = load_agent_profiles(project, operational)
+        service = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts", routing_previews=preview_root, agent_profiles=profiles)
         if set(body.approved_operations) - {"sources.acquire", "dif.classify-next", "mrq.consolidate", "mrq.decide-next"}: raise ValueError("unsupported run approval")
         from .runner import run_until_blocked
         store = EventStore(operational / "projects", project_id)
@@ -488,7 +508,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             if body.expected_fingerprint != service.snapshot()["workflow_fingerprint"]: raise RuntimeError("stale workflow fingerprint")
             invoke = lambda operation, payload, cancelled: service.apply(operation, payload, service.snapshot()["workflow_fingerprint"], cancelled)
             source_preview = {"source_routing_preview_id": body.source_routing_preview_id, "routing_plan_fingerprint": body.routing_plan_fingerprint} if body.source_routing_preview_id and body.routing_plan_fingerprint else None
-            result = run_until_blocked(service.repo, invoke, store, max_units=body.max_units, select=service.next, approved_operations=set(body.approved_operations), agent_profiles=load_agent_profiles(project, operational), source_routing_preview=source_preview)
+            result = run_until_blocked(service.repo, invoke, store, max_units=body.max_units, select=service.next, approved_operations=set(body.approved_operations), agent_profiles=profiles, source_routing_preview=source_preview)
             from .contracts import atomic_json
             atomic_json(result_path, result)
             return result
@@ -536,9 +556,11 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         history_limit: int = 20,
         event_limit: int = 50,
         context_limit: int = 50,
+        source_search_limit: int = 50,
         history_cursor: str = "",
         event_cursor: str = "",
         context_cursor: str = "",
+        source_search_cursor: str = "",
     ):
         if kind not in {"invocation", "slot"}:
             raise ValueError("invalid dispatcher inspection kind")
@@ -546,6 +568,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             not 1 <= history_limit <= 100
             or not 1 <= event_limit <= 200
             or not 1 <= context_limit <= 100
+            or not 1 <= source_search_limit <= 100
         ):
             raise ValueError("invalid dispatcher inspection limit")
         if history_cursor:
@@ -554,6 +577,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             _decode_dispatcher_cursor(event_cursor)
         if context_cursor:
             _decode_dispatcher_cursor(context_cursor)
+        if source_search_cursor:
+            _decode_dispatcher_cursor(source_search_cursor)
         if kind == "invocation":
             if not invocation_id or any((phase_id, role_id, slot_id, run_id)):
                 raise ValueError("invocation inspection requires only invocation_id")
@@ -795,6 +820,50 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                         ),
                     },
                 }
+            source_search_diagnostics: dict[str, Any] = {
+                "available": False,
+                "items": [],
+                "next_cursor": None,
+            }
+            if invocation:
+                try:
+                    source_summary = store.source_search_ledger(
+                        str(invocation["invocation_id"]), 0, 1
+                    )
+                except KeyError:
+                    if source_search_cursor:
+                        raise ValueError(
+                            "source-search cursor requires a search-enabled invocation"
+                        )
+                else:
+                    search_scope = {
+                        "project_id": project_id,
+                        "invocation_id": str(invocation["invocation_id"]),
+                        "policy_fingerprint": source_summary["policy_fingerprint"],
+                        "ledger_fingerprint": source_summary["ledger_fingerprint"],
+                    }
+                    search_offset = (
+                        _source_search_cursor(source_search_cursor, search_scope)
+                        if source_search_cursor
+                        else 0
+                    )
+                    source_search_diagnostics = store.source_search_ledger(
+                        str(invocation["invocation_id"]),
+                        search_offset,
+                        source_search_limit,
+                    )
+                    next_offset = source_search_diagnostics.pop("next_offset")
+                    source_search_diagnostics.update({
+                        "available": True,
+                        "next_cursor": (
+                            _encode_dispatcher_cursor({
+                                "scope": search_scope,
+                                "offset": next_offset,
+                            })
+                            if next_offset is not None
+                            else None
+                        ),
+                    })
             public_invocation = (
                 _public_invocation(invocation) if invocation else None
             )
@@ -815,6 +884,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 "execution_identity": execution_identity,
                 "result": result,
                 "context": context,
+                "source_search": source_search_diagnostics,
                 "history": {
                     "available": bool(run_id),
                     "items": history,
@@ -1973,7 +2043,26 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         mutation(request, idempotency_key); return folder_idempotent(project_id, idempotency_key, "cancel", lambda: folder_store(project_id).cancel(preview_id))
 
     @app.get("/api/v1/projects/{project_id}/indexes")
-    def index_status(project_id: str): return {"items": ApplicationService(repo(project_id)).index_statuses(), "disposable": True}
+    def index_status(project_id: str):
+        from . import indexes
+        project = repo(project_id)
+        configuration = indexes.load_config(project)
+        configuration.pop("source_schema_version", None)
+        return {
+            "items": ApplicationService(project).index_statuses(),
+            "configuration": configuration,
+            "configuration_fingerprint": indexes.config_fingerprint(project),
+            "disposable": True,
+        }
+
+    @app.post("/api/v1/projects/{project_id}/indexes/configuration-preview")
+    def preview_index_configuration(project_id: str, body: dict[str, Any] = Body()):
+        from .user_state import load_agent_profiles
+        project = repo(project_id)
+        return ApplicationService(
+            project,
+            agent_profiles=load_agent_profiles(project, operational),
+        ).preview_index_configuration(body)
 
     @app.post("/api/v1/projects/{project_id}/actions")
     def action(project_id: str, body: ActionBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
@@ -1991,8 +2080,13 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             event_context = {"actor": "local-user", "operation": body.operation}
             store.emit("run.created", idempotency_key, {**event_context, "status": "running", "process_identity": process_identity(), "workflow_fingerprint": workflow_fingerprint, "idempotency_key": idempotency_key})
             try:
-                from .user_state import load_connections
-                result = ApplicationService(project, connections=load_connections(project, operational), upload_drafts=operational / "projects" / project_id / "upload-drafts").apply(body.operation, body.payload, body.expected_fingerprint)
+                from .user_state import load_agent_profiles, load_connections
+                result = ApplicationService(
+                    project,
+                    connections=load_connections(project, operational),
+                    upload_drafts=operational / "projects" / project_id / "upload-drafts",
+                    agent_profiles=load_agent_profiles(project, operational),
+                ).apply(body.operation, body.payload, body.expected_fingerprint)
             except Exception as exc:
                 from .contracts import atomic_json
                 atomic_json(result_path, {"schema_version": "1", "status": "failed"})

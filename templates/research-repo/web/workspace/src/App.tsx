@@ -74,6 +74,37 @@ type AgentProfile = {
   reasoning_effort: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   instructions_version: string;
   environment_preset: "local-read-only";
+  source_search?: SourceSearchPolicy;
+};
+type SourceSearchPolicy = {
+  operations: string[];
+  max_calls: number;
+  max_concurrent_calls: number;
+  per_call_deadline_seconds: number;
+  max_backend_seconds: number;
+  max_query_bytes: number;
+  max_total_query_bytes: number;
+  max_results_per_call: number;
+  max_total_results: number;
+  max_returned_bytes_per_call: number;
+  max_total_returned_bytes: number;
+};
+const SOURCE_SEARCH_OPERATIONS = [
+  "search_text", "find_symbol", "find_references",
+  "find_callers", "find_callees", "navigate_metadata",
+];
+const DEFAULT_SOURCE_SEARCH_POLICY: SourceSearchPolicy = {
+  operations: [...SOURCE_SEARCH_OPERATIONS],
+  max_calls: 8,
+  max_concurrent_calls: 2,
+  per_call_deadline_seconds: 30,
+  max_backend_seconds: 120,
+  max_query_bytes: 1024,
+  max_total_query_bytes: 8192,
+  max_results_per_call: 20,
+  max_total_results: 100,
+  max_returned_bytes_per_call: 32768,
+  max_total_returned_bytes: 262144,
 };
 type AgentModel = {
   id: string;
@@ -174,12 +205,21 @@ type SourceIndex = {
   component_id: string;
   source_generation_id: string;
   fingerprint: string;
-  index_key: string;
-  engine: string;
+  index_key?: string;
+  engine?: string;
+  adapter_id: string;
+  adapter_version: string;
   engine_version: string;
   bsl_file_count: number;
   status: string;
   last_validation?: string;
+  index_fingerprint?: string;
+  target_fingerprint?: string;
+  contract_version?: string;
+  capabilities: string[];
+  route_priorities: Record<string, number>;
+  failure_code?: string;
+  failure_summary?: string;
 };
 type StepConfiguration = {
   job_id: string;
@@ -572,6 +612,8 @@ export function AgentProfiles({ project }: { project: Project }) {
   const [version, setVersion] = useState("1");
   const [environment, setEnvironment] =
     useState<AgentProfile["environment_preset"]>("local-read-only");
+  const [sourceSearchEnabled, setSourceSearchEnabled] = useState(false);
+  const [sourceSearch, setSourceSearch] = useState<SourceSearchPolicy>(DEFAULT_SOURCE_SEARCH_POLICY);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const load = useCallback(
@@ -587,6 +629,8 @@ export function AgentProfiles({ project }: { project: Project }) {
             setReasoning(profile.reasoning_effort);
             setVersion(profile.instructions_version);
             setEnvironment(profile.environment_preset);
+            setSourceSearchEnabled(Boolean(profile.source_search));
+            setSourceSearch(profile.source_search ?? DEFAULT_SOURCE_SEARCH_POLICY);
           }
         })
         .catch((error) =>
@@ -618,6 +662,8 @@ export function AgentProfiles({ project }: { project: Project }) {
     setReasoning(profile.reasoning_effort);
     setVersion(profile.instructions_version);
     setEnvironment(profile.environment_preset);
+    setSourceSearchEnabled(Boolean(profile.source_search));
+    setSourceSearch(profile.source_search ?? DEFAULT_SOURCE_SEARCH_POLICY);
   };
   const save = async () => {
     setSaving(true);
@@ -633,6 +679,7 @@ export function AgentProfiles({ project }: { project: Project }) {
             reasoning_effort: reasoning,
             instructions_version: version,
             environment_preset: environment,
+            ...(sourceSearchEnabled ? { source_search: sourceSearch } : {}),
           },
         }),
       });
@@ -718,6 +765,42 @@ export function AgentProfiles({ project }: { project: Project }) {
                       <MenuItem value="local-read-only">local-read-only · только чтение</MenuItem>
                     </Select>
                   </FormControl>
+                  <FormControlLabel
+                    control={<Checkbox checked={sourceSearchEnabled} onChange={(event) => setSourceSearchEnabled(event.target.checked)} />}
+                    label="Разрешить ограниченный поиск по исходникам"
+                  />
+                  {sourceSearchEnabled && <>
+                    <Typography variant="caption">
+                      Резерв контекста: {(sourceSearch.max_total_query_bytes + sourceSearch.max_total_returned_bytes + sourceSearch.max_calls * 512).toLocaleString("ru-RU")} байт. Изменение применяется только к новым вызовам.
+                    </Typography>
+                    <Stack direction="row" useFlexGap flexWrap="wrap">
+                      {SOURCE_SEARCH_OPERATIONS.map((operation) => <FormControlLabel
+                        key={operation}
+                        control={<Checkbox
+                          checked={sourceSearch.operations.includes(operation)}
+                          onChange={(event) => setSourceSearch((current) => ({
+                            ...current,
+                            operations: event.target.checked
+                              ? [...current.operations, operation]
+                              : current.operations.filter((item) => item !== operation),
+                          }))}
+                        />}
+                        label={operation}
+                      />)}
+                    </Stack>
+                    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "repeat(2, 1fr)" }, gap: 1 }}>
+                      {(Object.keys(DEFAULT_SOURCE_SEARCH_POLICY) as Array<keyof SourceSearchPolicy>)
+                        .filter((field) => field !== "operations")
+                        .map((field) => <TextField
+                          key={field}
+                          type="number"
+                          label={field}
+                          value={sourceSearch[field]}
+                          inputProps={{ min: 1 }}
+                          onChange={(event) => setSourceSearch((current) => ({ ...current, [field]: Number(event.target.value) }))}
+                        />)}
+                    </Box>
+                  </>}
                 </Stack>
               </AccordionDetails>
             </Accordion>
@@ -2230,7 +2313,7 @@ export function Sources({
   );
 }
 
-function Indexes({
+export function Indexes({
   project,
   snapshot,
 }: {
@@ -2241,18 +2324,26 @@ function Indexes({
   const [selected, setSelected] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [pendingMode, setPendingMode] = useState<"ensure" | "rebuild">();
+  const [pendingMode, setPendingMode] = useState<"ensure" | "rebuild" | "validate">();
+  const [configurationText, setConfigurationText] = useState("");
+  const [configurationFingerprint, setConfigurationFingerprint] = useState("");
+  const [configurationPreview, setConfigurationPreview] = useState<Record<string, unknown>>();
   const refresh = useCallback(
     () =>
-      api<{ items: SourceIndex[] }>(`/projects/${project.id}/indexes`)
-        .then((value) => setItems(value.items))
+      api<{ items: SourceIndex[]; configuration: Record<string, unknown>; configuration_fingerprint: string }>(`/projects/${project.id}/indexes`)
+        .then((value) => {
+          setItems(value.items);
+          setConfigurationText(JSON.stringify(value.configuration, null, 2));
+          setConfigurationFingerprint(value.configuration_fingerprint);
+          setConfigurationPreview(undefined);
+        })
         .catch((error) => setError(error.message)),
     [project.id],
   );
   useEffect(() => {
     void refresh();
   }, [refresh]);
-  const run = async (mode: "ensure" | "rebuild") => {
+  const run = async (mode: "ensure" | "rebuild" | "validate") => {
     if (
       mode === "rebuild" &&
       !window.confirm(
@@ -2285,6 +2376,49 @@ function Indexes({
       setBusy(false);
     }
   };
+  const previewConfiguration = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const value = await api<Record<string, unknown>>(`/projects/${project.id}/indexes/configuration-preview`, {
+        method: "POST",
+        body: JSON.stringify({
+          configuration: JSON.parse(configurationText),
+          expected_file_fingerprint: configurationFingerprint,
+        }),
+      });
+      setConfigurationPreview(value);
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const applyConfiguration = async () => {
+    if (!configurationPreview) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/projects/${project.id}/actions`, {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify({
+          operation: "indexes.configure",
+          payload: {
+            configuration: JSON.parse(configurationText),
+            expected_file_fingerprint: configurationFingerprint,
+            expected_plan_fingerprint: configurationPreview.plan_fingerprint,
+          },
+          expected_fingerprint: snapshot.workflow_fingerprint,
+        }),
+      });
+      await refresh();
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <Stack spacing={2}>
       {error && <Alert severity="error">{error}</Alert>}
@@ -2292,6 +2426,34 @@ function Indexes({
         Индексы — одноразовое ускорение в пользовательском каталоге;
         канонические доказательства остаются в репозитории.
       </Alert>
+      <Accordion>
+        <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
+          <Typography fontWeight={700}>Настройка адаптеров и маршрутов</Typography>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Stack spacing={1}>
+            <TextField
+              label="Типизированная конфигурация"
+              multiline
+              minRows={10}
+              value={configurationText}
+              onChange={(event) => {
+                setConfigurationText(event.target.value);
+                setConfigurationPreview(undefined);
+              }}
+            />
+            <Stack direction="row" spacing={1}>
+              <Button disabled={busy} onClick={() => void previewConfiguration()}>Проверить изменения</Button>
+              <Button variant="contained" disabled={busy || !configurationPreview} onClick={() => void applyConfiguration()}>Применить проверенный план</Button>
+            </Stack>
+            {configurationPreview && <Alert severity="warning">
+              <Box component="pre" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                {JSON.stringify(configurationPreview, null, 2)}
+              </Box>
+            </Alert>}
+          </Stack>
+        </AccordionDetails>
+      </Accordion>
       <Stack direction="row" spacing={1}>
         <Button
           disabled={busy}
@@ -2299,6 +2461,12 @@ function Indexes({
           onClick={() => void run("ensure")}
         >
           Обеспечить индексы
+        </Button>
+        <Button
+          disabled={busy}
+          onClick={() => void run("validate")}
+        >
+          Проверить готовность
         </Button>
         <Button
           disabled={busy}
@@ -2312,12 +2480,16 @@ function Indexes({
         <Stack direction="row" spacing={1} alignItems="center" role="status" aria-live="polite">
           <CircularProgress size={18} />
           <Typography variant="body2">
-            {pendingMode === "ensure" ? "Проверяются и создаются индексы…" : "Перестраиваются индексы…"}
+            {pendingMode === "ensure"
+              ? "Проверяются и создаются индексы…"
+              : pendingMode === "validate"
+                ? "Проверяется готовность индексов…"
+                : "Перестраиваются индексы…"}
           </Typography>
         </Stack>
       )}
       {items.map((item) => (
-        <Card key={item.component_id} variant="outlined">
+        <Card key={`${item.adapter_id}:${item.component_id}`} variant="outlined">
           <CardContent>
             <FormControlLabel
               control={
@@ -2343,14 +2515,21 @@ function Indexes({
               <Chip size="small" label={`${item.bsl_file_count} BSL`} />
             </Stack>
             <Typography display="block" variant="caption">
-              {item.engine} {item.engine_version} · поколение{" "}
+              {item.adapter_id} {item.engine_version} · адаптер {item.adapter_version}
+              {item.contract_version ? ` · контракт ${item.contract_version}` : ""} · поколение{" "}
               {item.source_generation_id}
             </Typography>
             <Typography display="block" variant="caption">
-              Ключ {item.index_key} · проверка{" "}
-              {item.last_validation || "ещё не выполнялась"} · исходник{" "}
-              {item.fingerprint}
+              Возможности: {item.capabilities.join(", ") || "не объявлены"} · приоритеты:{" "}
+              {JSON.stringify(item.route_priorities)}
             </Typography>
+            <Typography display="block" variant="caption">
+              Индекс {item.index_fingerprint || "не создан"} · проверка{" "}
+              {item.last_validation || "ещё не выполнялась"} · исходник {item.fingerprint}
+            </Typography>
+            {item.failure_code && <Alert severity="error" sx={{ mt: 1 }}>
+              {item.failure_code}{item.failure_summary ? `: ${item.failure_summary}` : ""}
+            </Alert>}
           </CardContent>
         </Card>
       ))}

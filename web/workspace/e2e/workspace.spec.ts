@@ -34,6 +34,7 @@ async function openFixture(
   page: Page,
   initialProjection: DispatcherProjection = saturatedProjection,
   sourceSetup?: Record<string, unknown>,
+  indexSetup?: Record<string, unknown>,
 ) {
   let projection = initialProjection;
   let workflowRequests = 0;
@@ -128,6 +129,22 @@ async function openFixture(
             available: true,
             next_cursor: eventCursor ? undefined : 'event-next',
           },
+          source_search: invocationId ? {
+            available: true,
+            operations: ['search_text'],
+            scope: { component_count: 1, path_count: 2, fingerprint: 'sha256:scope' },
+            configured_limits: { max_calls: 4, max_concurrent_calls: 1 },
+            capacity_reserve_bytes: 4096,
+            usage: { calls: 2, in_flight: 0, results: 3, returned_bytes: 512, backend_seconds: 1.5 },
+            status_counts: { completed: 2 },
+            route_summaries: [{ capability: 'text-search', selected_backend_id: 'rlm-tools-bsl', fallback_reason: 'index_not_ready', calls: 2 }],
+            last_error: { code: 'source_search.budget_exhausted', limit: 'max_calls', limit_value: 4, consumed: 4, requested: 1, recovery: 'start_new_invocation' },
+            ledger_complete: true,
+            reconciled: true,
+            ledger_fingerprint: 'sha256:ledger',
+            items: [{ ordinal: 1, query_hmac: 'v1:opaque', status: 'completed' }],
+            next_cursor: undefined,
+          } : { available: false, items: [], next_cursor: undefined },
         }),
       });
       return;
@@ -165,8 +182,41 @@ async function openFixture(
     }),
   }));
   await page.route('**/api/v1/projects/fixture/indexes', (route) => route.fulfill({
-    status: 200, contentType: 'application/json', body: JSON.stringify({ items: [] }),
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(indexSetup || {
+      items: [],
+      configuration: {
+        schema_version: '2',
+        backends: [{ adapter_id: 'rlm-tools-bsl', engine_version: '1.30.0' }],
+        routes: { 'text-search': ['rlm-tools-bsl'] },
+      },
+      configuration_fingerprint: 'sha256:index-config',
+    }),
   }));
+  await page.route('**/api/v1/projects/fixture/indexes/configuration-preview', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      plan_fingerprint: 'sha256:index-plan',
+      degraded_routes: ['text-search'],
+      rebuild_backends: [],
+    }),
+  }));
+  await page.route('**/api/v1/projects/fixture/actions', async (route) => {
+    const request = route.request();
+    actionRequests.push({
+      url: request.url(),
+      method: request.method(),
+      body: request.postDataJSON(),
+      idempotencyKey: request.headers()['idempotency-key'] ?? null,
+    });
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ operation: 'indexes.validate', components: [] }),
+    });
+  });
   await page.route('**/api/v1/projects/fixture/registries/diff-inventory?*', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
@@ -433,6 +483,12 @@ test('context inspector navigates circuit, role, slot, invocation and queue item
   await expect(page.getByRole('heading', { name: 'Вызов invocation-01' })).toBeFocused();
   await expect(page.getByText('<b>literal</b>')).toBeVisible();
   await expect(page.locator('b')).toHaveCount(0);
+  await expect(page.getByText('Динамический поиск по исходникам')).toBeVisible();
+  await expect(page.getByText('rlm-tools-bsl')).toBeVisible();
+  await expect(page.getByText('index_not_ready')).toBeVisible();
+  await expect(page.getByText('sha256:ledger')).toBeVisible();
+  await expect(page.getByText('source_search.budget_exhausted')).toBeVisible();
+  await expect(page.getByText('start_new_invocation')).toBeVisible();
   await page.getByRole('button', { name: 'Ещё история' }).click();
   await expect(page.getByText('history-page-2')).toBeVisible();
   await page.getByRole('button', { name: 'Ещё события' }).click();
@@ -449,6 +505,68 @@ test('context inspector navigates circuit, role, slot, invocation and queue item
   const record = page.getByLabel('Запись реестра DIF-00001');
   await expect(record).toBeVisible();
   await expect(record).toContainText('Catalogs/Fixture.xml');
+});
+
+test('index workspace exposes mixed backends, safe failure and reviewed validation', async ({ page }) => {
+  const ledger = await openFixture(page, saturatedProjection, undefined, {
+    items: [
+      {
+        component_id: 'target_cf:configuration',
+        source_generation_id: 'gen',
+        fingerprint: 'sha256:source',
+        adapter_id: 'bsl-analyzer',
+        adapter_version: 'bsl-analyzer-workspace/v1',
+        engine_version: '0.2.63',
+        bsl_file_count: 5,
+        status: 'ready',
+        last_validation: '2026-07-29T00:00:00Z',
+        index_fingerprint: 'sha256:bsl',
+        contract_version: '1.1',
+        capabilities: ['text-search'],
+        route_priorities: { 'text-search': 0 },
+      },
+      {
+        component_id: 'target_cf:configuration',
+        source_generation_id: 'gen',
+        fingerprint: 'sha256:source',
+        adapter_id: 'rlm-tools-bsl',
+        adapter_version: 'rlm-index/v1',
+        engine_version: '1.30.0',
+        bsl_file_count: 5,
+        status: 'unavailable',
+        capabilities: [],
+        route_priorities: {},
+        failure_code: 'backend.executable_unavailable',
+        failure_summary: 'approved launcher is unavailable',
+      },
+    ],
+    configuration: {
+      schema_version: '2',
+      backends: [
+        { adapter_id: 'bsl-analyzer', engine_version: '0.2.63' },
+        { adapter_id: 'rlm-tools-bsl', engine_version: '1.30.0' },
+      ],
+      routes: { 'text-search': ['bsl-analyzer', 'rlm-tools-bsl'] },
+    },
+    configuration_fingerprint: 'sha256:index-config',
+  });
+  await page.getByRole('navigation', { name: 'Этапы диспетчера' })
+    .getByRole('button', { name: 'Подготовка различий' }).click();
+  await page.getByRole('button', { name: 'Проверить индексы' }).click();
+  await expect(page.getByText(/bsl-analyzer 0.2.63/)).toBeVisible();
+  await expect(page.getByText(/rlm-tools-bsl 1.30.0/)).toBeVisible();
+  await expect(page.getByText(/backend.executable_unavailable/)).toBeVisible();
+  await page.getByRole('button', { name: 'Проверить готовность' }).click();
+  await expect.poll(() => ledger.actionRequests.length).toBe(1);
+  expect(ledger.actionRequests[0]).toMatchObject({
+    method: 'POST',
+    body: {
+      operation: 'indexes.build',
+      payload: { mode: 'validate' },
+      expected_fingerprint: 'sha256:fixture',
+    },
+  });
+  expect(ledger.actionRequests[0].idempotencyKey).toBeTruthy();
 });
 
 test('degraded SSE reconciles the projection after five seconds', async ({ page }) => {
