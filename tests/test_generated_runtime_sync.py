@@ -22,13 +22,14 @@ def reference(tmp_path: Path, monkeypatch) -> Path:
         "research/workflow.toml": 'schema_version = "1"\n',
         "src/one_c_autoresearch/service.py": "VALUE = 1\n",
         "src/one_c_autoresearch/cli.py": "COMMAND = 'status'\n",
+        "tests/test_runner.py": "from pathlib import Path\nREPO = Path(__file__).resolve().parents[1]\n",
         "web/workspace/package.json": "{}\n",
     }
     for relative, content in files.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-    monkeypatch.setattr(MODULE, "FILES", ("README.md", "docs/operator/dispatcher-inspector-rollback.md", "research/workflow.toml"))
+    monkeypatch.setattr(MODULE, "FILES", ("README.md", "docs/operator/dispatcher-inspector-rollback.md", "research/workflow.toml", "tests/test_runner.py"))
     monkeypatch.setattr(MODULE, "TREES", ("src/one_c_autoresearch", "web/workspace"))
     monkeypatch.setattr(MODULE, "VISUAL_ASSETS", ())
     return root

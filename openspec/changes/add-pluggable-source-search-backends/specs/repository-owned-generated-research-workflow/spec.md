@@ -139,3 +139,26 @@ The generated workflow SHALL keep all backend index databases and lifecycle stat
 #### Scenario: Version-2 configuration is downgraded
 - **WHEN** an operator previews downgrade for a prior runtime
 - **THEN** the service MUST write exact schema version 1 only when one `rlm-tools-bsl` backend and all routes are exactly representable, otherwise block downgrade, retain compatible legacy state, and leave canonical generations unchanged.
+
+## MODIFIED Requirements
+
+### Requirement: Template maintenance is isolated from project runtime
+The template SHALL expose repository generation, synchronization, packaging, and `checks template|doctor|research` only through the exact retained repository-local scripts `scripts/sync_generated_runtime.py`, `scripts/build_workspace_template.py`, `scripts/bootstrap/new_research_repo.py`, and `scripts/checks/test_template.py`, `test_doctor.py`, `test_research_repo.py`. They SHALL not import a removed maintenance CLI, SHALL not be part of the installable runtime, and SHALL not be copied into generated project repositories.
+
+Active root documentation SHALL be limited to `README.md`, `AGENTS.md`, `docs/agent/repo-map.md`, `docs/agent/verification.md`, `docs/operator/dispatcher-inspector-rollback.md`, and `docs/operator/source-search.md`. Root-only tests SHALL be limited to `tests/test_generated_runtime_sync.py` and `tests/test_template_release.py` in addition to the exact canonical target test inventory.
+
+#### Scenario: Maintainer validates a target repository
+- **WHEN** `checks research` is invoked through the maintenance command for a canonical repository
+- **THEN** `test_research_repo.py` MUST execute that repository's canonical non-strict doctor with the current Python executable, explicit repository working directory and source path, no shell, and propagated exit status without requiring retired template contours.
+
+#### Scenario: Maintainer creates a repository
+- **WHEN** `new_research_repo.py` receives an empty destination and declared project tokens
+- **THEN** it MUST copy only the validated canonical scaffold and replace only those tokens without importing runtime maintenance commands.
+
+#### Scenario: Generated repository is inspected
+- **WHEN** a fresh generated repository or its runtime CLI is inspected
+- **THEN** it MUST contain no template-maintenance module, script, command, or repository-generation authority.
+
+#### Scenario: Template archive is published
+- **WHEN** root maintenance builds `research-template.zip`
+- **THEN** `build_workspace_template.py` MUST write a deterministic separate release artifact containing only the validated canonical portable repository payload and MUST NOT install it as `one_c_autoresearch` package data.

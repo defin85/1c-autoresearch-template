@@ -92,10 +92,28 @@ def test_release_distribution_members() -> None:
         wheel_names = archive.namelist()
     with tarfile.open(ROOT / "dist/one_c_autoresearch-0.3.0.tar.gz") as archive:
         sdist_names = archive.getnames()
+    with zipfile.ZipFile(ROOT / "dist/research-template.zip") as archive:
+        template_names = archive.namelist()
     for module in FORBIDDEN["modules"]:
         assert not any(name.endswith(f"one_c_autoresearch/{module}") for name in wheel_names + sdist_names)
     assert not any("workspace_assets/" in name or name.startswith("scripts/") for name in wheel_names)
     assert not any("/scripts/" in name or "/workspace_assets/" in name for name in sdist_names)
+    release_names = wheel_names + sdist_names + template_names
+    forbidden_operational = (
+        "source-search-hmac", "indexes-v2/", "/.build/",
+        "/targets/", "/instances/", "/staging/", "/quarantine/",
+    )
+    assert not any(
+        name.lower().endswith((".sqlite", ".sqlite3", ".db", ".key"))
+        or any(marker in name.lower() for marker in forbidden_operational)
+        for name in release_names
+    )
+    for marker in ("sources/generations/", "analysis/indexes/generations/"):
+        assert all(
+            name.endswith(".gitkeep")
+            for name in release_names
+            if marker in name
+        )
 
 
 @pytest.mark.parametrize("upgrade", [False, True])

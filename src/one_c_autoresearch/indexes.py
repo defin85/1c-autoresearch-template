@@ -40,7 +40,22 @@ BACKEND_CATALOG = {
 }
 ADAPTER_OUTPUT_LIMIT = 256 * 1024
 ADAPTER_STATE_LIMIT = 16 * 1024 * 1024
+ADAPTER_INDEX_LIMIT = 8 * 1024 * 1024 * 1024
 ADAPTER_TIMEOUT_SECONDS = 120
+
+
+def _backend_environment(private_home: Path) -> dict[str, str]:
+    private_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "LANG": "C.UTF-8",
+        "HOME": str(private_home),
+        "XDG_CONFIG_HOME": str(private_home / "config"),
+        "XDG_CACHE_HOME": str(private_home / "cache"),
+        "XDG_DATA_HOME": str(private_home / "data"),
+        "XDG_STATE_HOME": str(private_home / "state"),
+        "BSL_MCP_BROKER": "0",
+    }
 
 
 def _bounded_atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -231,17 +246,29 @@ def apply_config(
     }
 
 
-def capability_fingerprint(adapter_id: str, engine_version: str, capabilities: list[str]) -> str:
+def capability_fingerprint(
+    adapter_id: str,
+    engine_version: str,
+    capabilities: list[str],
+    executable_fingerprint: str = "",
+) -> str:
     return "sha256:" + sha256(canonical_json({
         "adapter_id": adapter_id,
         "adapter_version": BACKEND_CATALOG[adapter_id]["adapter_version"],
         "engine_version": engine_version,
+        "executable_fingerprint": executable_fingerprint,
         "capabilities": sorted(capabilities),
         "normalization_schema": "source-navigation-hit/v1",
     }))
 
 
-def target_identity(repo: Path, component: dict[str, Any], backend: dict[str, str], capabilities: list[str]) -> dict[str, Any]:
+def target_identity(
+    repo: Path,
+    component: dict[str, Any],
+    backend: dict[str, str],
+    capabilities: list[str],
+    executable_fingerprint: str = "",
+) -> dict[str, Any]:
     adapter_id = backend["adapter_id"]
     return {
         "adapter_id": adapter_id,
@@ -253,7 +280,12 @@ def target_identity(repo: Path, component: dict[str, Any], backend: dict[str, st
         "representation": component["representation"],
         "component_fingerprint": component["fingerprint"],
         "source_generation_id": component["source_generation_id"],
-        "capability_fingerprint": capability_fingerprint(adapter_id, backend["engine_version"], capabilities),
+        "capability_fingerprint": capability_fingerprint(
+            adapter_id,
+            backend["engine_version"],
+            capabilities,
+            executable_fingerprint,
+        ),
     }
 
 
@@ -421,12 +453,8 @@ def _bounded_run(
 ) -> subprocess.CompletedProcess[str]:
     if timeout_seconds <= 0 or timeout_seconds > 1800:
         raise ValueError("invalid adapter timeout")
-    environment = {
-        "PATH": os.environ.get("PATH", ""),
-        "LANG": "C.UTF-8",
-        "BSL_MCP_BROKER": "0",
-    }
-    with tempfile.TemporaryFile() as stdin:
+    with tempfile.TemporaryDirectory(prefix="one-c-index-home-") as private_home, tempfile.TemporaryFile() as stdin:
+        environment = _backend_environment(Path(private_home))
         if input is not None:
             stdin.write(input.encode())
             stdin.seek(0)
@@ -515,6 +543,9 @@ def probe_backend(repo: Path, backend: dict[str, str]) -> dict[str, Any]:
     if not executable:
         return {"available": False, "failure_code": "backend.executable_unavailable", "capabilities": []}
     try:
+        executable_fingerprint = "sha256:" + sha256(
+            Path(executable).resolve().read_bytes()
+        )
         if adapter_id == "rlm-tools-bsl":
             actual = cli_version(executable)
             if actual != backend["engine_version"]:
@@ -531,7 +562,13 @@ def probe_backend(repo: Path, backend: dict[str, str]) -> dict[str, Any]:
             "engine_version": backend["engine_version"],
             "contract_version": contract_version,
             "capabilities": capabilities,
-            "capability_fingerprint": capability_fingerprint(adapter_id, backend["engine_version"], capabilities),
+            "executable_fingerprint": executable_fingerprint,
+            "capability_fingerprint": capability_fingerprint(
+                adapter_id,
+                backend["engine_version"],
+                capabilities,
+                executable_fingerprint,
+            ),
         }
     except Exception as exc:
         return {
@@ -667,6 +704,26 @@ def cli_build(executable: str, path: Path, _component_id: str, timeout_seconds: 
     return {"ready": result.returncode == 0 and probe["ready"], "exit_code": result.returncode, "output": result.stdout}
 
 
+def _versioned_structured_content(result: dict[str, Any]) -> dict[str, Any]:
+    structured = result.get("structuredContent")
+    version = (
+        str(structured.get("schema_version", ""))
+        if isinstance(structured, dict)
+        else ""
+    )
+    if (
+        result.get("isError")
+        or not isinstance(structured, dict)
+        or not (
+            version == "1"
+            or version.startswith("1.")
+            or version.endswith("/v1")
+        )
+    ):
+        raise RuntimeError("bsl-analyzer returned an unsupported structured schema")
+    return structured
+
+
 def _bsl_mcp(
     executable: str,
     source_dir: Path,
@@ -685,21 +742,21 @@ def _bsl_mcp(
         "--source-dir",
         str(source_dir),
     ]
-    environment = {
-        "PATH": os.environ.get("PATH", ""),
-        "LANG": "C.UTF-8",
-        "BSL_MCP_BROKER": "0",
-    }
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=environment,
-        start_new_session=True,
-        bufsize=1,
-    )
+    private_home = tempfile.TemporaryDirectory(prefix="one-c-bsl-home-")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=_backend_environment(Path(private_home.name)),
+            start_new_session=True,
+            bufsize=1,
+        )
+    except Exception:
+        private_home.cleanup()
+        raise
     if process.stdin is None or process.stdout is None:
         raise RuntimeError("bsl-analyzer stdio is unavailable")
     selector = selectors.DefaultSelector()
@@ -759,15 +816,10 @@ def _bsl_mcp(
             attempts = 80 if wait_ready else 1
             for attempt in range(attempts):
                 result = send("tools/call", {"name": tool, "arguments": arguments})
-                structured = (
-                    result.get("structuredContent")
-                    if isinstance(result, dict)
-                    else None
-                )
+                structured = _versioned_structured_content(result)
                 if (
                     not wait_ready
-                    or isinstance(structured, dict)
-                    and structured.get("state") == "ready"
+                    or structured.get("state") == "ready"
                     and structured.get("stale") is not True
                     and structured.get("superseded") is not True
                 ):
@@ -792,13 +844,18 @@ def _bsl_mcp(
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
+        private_home.cleanup()
 
 
-def _operational_root(repo: Path, state_root: Path | None = None) -> Path:
+def _operational_path(repo: Path, state_root: Path | None = None) -> Path:
     base = state_root or Path(
         os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")
     ) / "one-c-autoresearch/indexes-v2"
-    root = base / repository_instance_fingerprint(repo).split(":", 1)[1]
+    return base / repository_instance_fingerprint(repo).split(":", 1)[1]
+
+
+def _operational_root(repo: Path, state_root: Path | None = None) -> Path:
+    root = _operational_path(repo, state_root)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     return root
 
@@ -853,7 +910,13 @@ def build_backend_index(
     probe = probe_backend(repo, backend)
     if not probe["available"]:
         raise RuntimeError(str(probe.get("failure_code")))
-    identity = target_identity(repo, component, backend, probe["capabilities"])
+    identity = target_identity(
+        repo,
+        component,
+        backend,
+        probe["capabilities"],
+        str(probe.get("executable_fingerprint", "")),
+    )
     target_key = target_fingerprint(identity).split(":", 1)[1]
     target_root = _operational_root(repo, state_root) / "targets" / target_key
     target_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -910,6 +973,8 @@ def build_backend_index(
         index_manifest = [item for item in mirror_manifest if item["path"] not in source_paths]
         if not index_manifest:
             raise RuntimeError("index adapter produced no rebuildable state")
+        if sum(int(item["size_bytes"]) for item in index_manifest) > ADAPTER_INDEX_LIMIT:
+            raise RuntimeError("index adapter payload exceeds the byte limit")
         promoted = promoted_identity(identity, index_manifest)
         instance_key = promoted["index_fingerprint"].split(":", 1)[1]
         instances = target_root / "instances"
@@ -983,8 +1048,14 @@ def ready_backend_state(
     probe = probe_backend(repo, backend)
     if not probe["available"]:
         return None
-    identity = target_identity(repo, component, backend, probe["capabilities"])
-    target_root = _operational_root(repo, state_root) / "targets" / target_fingerprint(identity).split(":", 1)[1]
+    identity = target_identity(
+        repo,
+        component,
+        backend,
+        probe["capabilities"],
+        str(probe.get("executable_fingerprint", "")),
+    )
+    target_root = _operational_path(repo, state_root) / "targets" / target_fingerprint(identity).split(":", 1)[1]
     pointer = target_root / "current.json"
     if not pointer.is_file():
         if backend["adapter_id"] != "rlm-tools-bsl":
@@ -1096,7 +1167,9 @@ def _bsl_hits(
         node_id = next(
             (
                 str(row["id"])
-                for row in _nested_dicts(resolved)
+                for row in _nested_dicts(
+                    _versioned_structured_content(resolved)
+                )
                 if row.get("id")
             ),
             "",
@@ -1143,7 +1216,10 @@ def _bsl_hits(
     else:
         raise ValueError("source_search.operation_forbidden")
     hits: list[dict[str, Any]] = []
-    for row in _nested_dicts(results):
+    for row in _nested_dicts([
+        _versioned_structured_content(result)
+        for result in results
+    ]):
         path = row.get("path") or row.get("relativePath") or row.get("file")
         if not isinstance(path, str) or not path:
             continue
@@ -1390,9 +1466,37 @@ def backend_statuses(repo: Path, state_root: Path | None = None) -> list[dict[st
             if promoted:
                 status = "ready"
                 index_fingerprint = promoted["index_fingerprint"]
+                readiness_reason = None
+                recovery_action = None
             else:
                 status = "unavailable" if not backend_probe["available"] else "missing"
                 index_fingerprint = ""
+                if status == "unavailable":
+                    readiness_reason = str(
+                        backend_probe.get("failure_code", "backend.unavailable")
+                    )
+                    recovery_action = "fix_backend_installation"
+                else:
+                    identity = target_identity(
+                        repo,
+                        component,
+                        backend,
+                        capabilities,
+                        str(backend_probe.get("executable_fingerprint", "")),
+                    )
+                    target_root = _operational_path(
+                        repo, state_root,
+                    ) / "targets" / target_fingerprint(identity).split(":", 1)[1]
+                    readiness_reason = (
+                        "index.stale"
+                        if (target_root / "current.json").is_file()
+                        else "index.missing"
+                    )
+                    recovery_action = (
+                        "rebuild_index"
+                        if readiness_reason == "index.stale"
+                        else "ensure_index"
+                    )
             rows.append({
                 **component,
                 "adapter_id": adapter_id,
@@ -1405,6 +1509,8 @@ def backend_statuses(repo: Path, state_root: Path | None = None) -> list[dict[st
                     if adapter_id in config["routes"].get(capability, [])
                 },
                 "status": status,
+                "readiness_reason": readiness_reason,
+                "recovery_action": recovery_action,
                 "index_fingerprint": index_fingerprint,
                 "target_fingerprint": promoted.get("target_fingerprint") if promoted else None,
                 "contract_version": backend_probe.get("contract_version"),

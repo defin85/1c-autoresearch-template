@@ -295,7 +295,7 @@ test("agent profile explains the read-only environment and persists it", async (
       json: async () => init?.method === "PUT"
         ? {}
         : _url.endsWith("/agent-capabilities")
-          ? { models: [{ id: "gpt-5.6-sol", name: "GPT-5.6-Sol", default_reasoning_effort: "low", reasoning_efforts: ["low", "max", "ultra"], input_context_tokens: 272000, context_estimator_version: "utf8-v1", capability_fingerprint: "sha256:test" }] }
+          ? { models: [{ id: "gpt-5.6-sol", name: "GPT-5.6-Sol", default_reasoning_effort: "low", reasoning_efforts: ["low", "max", "ultra"], input_context_tokens: 272000, context_estimator_version: "utf8-v1", capability_fingerprint: "sha256:test", structured_response_reserve_tokens: 4096, estimated_bytes_per_token: 2, source_search_framing_bytes_per_call: 512 }] }
           : { items: {} },
     }),
   );
@@ -320,7 +320,7 @@ test("agent profile persists the complete bounded source search policy", async (
       json: async () => init?.method === "PUT"
         ? {}
         : _url.endsWith("/agent-capabilities")
-          ? { models: [{ id: "gpt-5.6-sol", name: "GPT-5.6-Sol", default_reasoning_effort: "low", reasoning_efforts: ["low"], input_context_tokens: 272000, context_estimator_version: "utf8-v1", capability_fingerprint: "sha256:test" }] }
+          ? { models: [{ id: "gpt-5.6-sol", name: "GPT-5.6-Sol", default_reasoning_effort: "low", reasoning_efforts: ["low"], input_context_tokens: 272000, context_estimator_version: "utf8-v1", capability_fingerprint: "sha256:test", structured_response_reserve_tokens: 4096, estimated_bytes_per_token: 2, source_search_framing_bytes_per_call: 512 }] }
           : { items: {} },
     }),
   );
@@ -329,6 +329,7 @@ test("agent profile persists the complete bounded source search policy", async (
   fireEvent.click(await screen.findByText("Дополнительные параметры"));
   fireEvent.click(screen.getByRole("checkbox", { name: "Разрешить ограниченный поиск по исходникам" }));
   expect(await screen.findByText(/Резерв контекста:/)).toBeInTheDocument();
+  expect(screen.getByText(/Максимальный остаток для подготовленного контекста:/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Проверить и сохранить профиль" }));
   await waitFor(() => {
     const put = fetchMock.mock.calls.find(([, init]) => init?.method === "PUT");
@@ -416,6 +417,8 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
       route_priorities: {},
       failure_code: "backend.executable_unavailable",
       failure_summary: "approved launcher is unavailable",
+      readiness_reason: "backend.executable_unavailable",
+      recovery_action: "fix_backend_installation",
     },
   ];
   const fetchMock = vi.fn().mockImplementation((url: string) =>
@@ -437,10 +440,19 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
                   { adapter_id: "rlm-tools-bsl", engine_version: "1.30.0" },
                 ],
                 routes: {
-                  "text-search": ["bsl-analyzer", "rlm-tools-bsl"],
+                  "text-search": ["rlm-tools-bsl", "bsl-analyzer"],
                 },
               },
               configuration_fingerprint: "sha256:config",
+              route_health: {
+                blockers: [],
+                degraded: [{
+                  component_id: "target_cf:configuration",
+                  capability: "text-search",
+                  selected_backend_id: "bsl-analyzer",
+                  fallback_reason: "backend_unavailable",
+                }],
+              },
             }
           : {},
     }),
@@ -452,7 +464,9 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
   />);
   expect(await screen.findByText(/bsl-analyzer 0.2.63/)).toBeInTheDocument();
   expect(screen.getByText(/rlm-tools-bsl 1.30.0/)).toBeInTheDocument();
-  expect(screen.getByText(/backend.executable_unavailable/)).toBeInTheDocument();
+  expect(screen.getAllByText(/backend.executable_unavailable/)).toHaveLength(2);
+  expect(screen.getByText(/fix_backend_installation/)).toBeInTheDocument();
+  expect(screen.getByText(/Деградированные маршруты/)).toBeInTheDocument();
   fireEvent.click(screen.getByText("Настройка адаптеров и маршрутов"));
   fireEvent.click(screen.getByRole("button", { name: "Проверить изменения" }));
   expect(await screen.findByText(/degraded_routes/)).toBeInTheDocument();

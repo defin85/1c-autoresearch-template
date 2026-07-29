@@ -660,6 +660,72 @@ def test_mcp_tool_failure_is_typed_bounded_and_protocol_success():
     )["structuredContent"]["code"] == "source_search.timeout"
 
 
+def test_mcp_bridge_discards_result_closed_before_settlement(
+    monkeypatch, tmp_path: Path,
+):
+    import io
+    from one_c_autoresearch import source_search_bridge
+    from one_c_autoresearch.contracts import sha256
+    from one_c_autoresearch.sqlite_state import DispatcherStore
+
+    resolved = {
+        **policy(),
+        "schema_version": source_search.POLICY_VERSION,
+        "policy_fingerprint": "sha256:policy",
+        "scope_fingerprint": "sha256:scope",
+        "operations": ["search_text"],
+    }
+    capability = "private-capability"
+    with DispatcherStore(REPO, tmp_path) as store:
+        store.configure_source_search(
+            "inv-late", resolved, "sha256:" + sha256(capability.encode()),
+        )
+
+    def execute(*_args, **_kwargs):
+        with DispatcherStore(REPO, tmp_path) as store:
+            store.close_source_search("inv-late", "cancelled")
+        return {
+            "route": {
+                "route_fingerprint": "sha256:route",
+                "fallback_reason": None,
+                "selected_backend_id": "rlm-tools-bsl",
+                "adapter_version": "rlm-index/v1",
+                "capability_fingerprint": "sha256:capability",
+                "index_fingerprint": "sha256:index",
+            },
+            "result_manifest_fingerprint": "sha256:result",
+            "result_count": 0,
+            "returned_bytes": 2,
+        }
+
+    monkeypatch.setattr(source_search, "execute_query", execute)
+    monkeypatch.setattr(source_search_bridge.indexes, "backend_statuses", lambda _repo: [])
+    monkeypatch.setattr(source_search_bridge.sys, "stdin", io.StringIO(
+        json.dumps({
+            "jsonrpc": "2.0",
+            "id": "call-late",
+            "method": "tools/call",
+            "params": {
+                "name": "source_search",
+                "arguments": {
+                    "operation": "search_text",
+                    "query": "test",
+                    "component_id": None,
+                    "path_prefix": None,
+                    "max_results": 1,
+                },
+            },
+        }) + "\n"
+    ))
+    output = io.StringIO()
+    monkeypatch.setattr(source_search_bridge.sys, "stdout", output)
+    source_search_bridge.serve(REPO, tmp_path, "inv-late", capability)
+    reply = json.loads(output.getvalue())
+    assert reply["result"]["isError"] is True
+    assert reply["result"]["structuredContent"]["code"] == "source_search.cancelled"
+    assert "sha256:result" not in output.getvalue()
+
+
 def test_reservation_releases_unused_result_and_byte_capacity(tmp_path: Path):
     from one_c_autoresearch.sqlite_state import DispatcherStore
 

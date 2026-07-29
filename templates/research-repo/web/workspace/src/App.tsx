@@ -114,6 +114,9 @@ type AgentModel = {
   input_context_tokens: number;
   context_estimator_version: string;
   capability_fingerprint: string;
+  structured_response_reserve_tokens: number;
+  estimated_bytes_per_token: number;
+  source_search_framing_bytes_per_call: number;
 };
 type AgentRole = {
   role_id: string;
@@ -218,6 +221,8 @@ type SourceIndex = {
   contract_version?: string;
   capabilities: string[];
   route_priorities: Record<string, number>;
+  readiness_reason?: string;
+  recovery_action?: string;
   failure_code?: string;
   failure_summary?: string;
 };
@@ -656,6 +661,17 @@ export function AgentProfiles({ project }: { project: Project }) {
       .catch((error) => setError((error as Error).message));
   }, [load]);
   const selectedModel = models.find((item) => item.id === model);
+  const dynamicSearchReserve = sourceSearch.max_total_query_bytes
+    + sourceSearch.max_total_returned_bytes
+    + sourceSearch.max_calls * (selectedModel?.source_search_framing_bytes_per_call ?? 512);
+  const preparedInputHeadroom = selectedModel
+    ? Math.max(
+        0,
+        (selectedModel.input_context_tokens - selectedModel.structured_response_reserve_tokens)
+          * selectedModel.estimated_bytes_per_token
+          - dynamicSearchReserve,
+      )
+    : undefined;
   const selectProfile = (id: string, profile: AgentProfile) => {
     setProfileId(id);
     setModel(profile.model);
@@ -771,7 +787,9 @@ export function AgentProfiles({ project }: { project: Project }) {
                   />
                   {sourceSearchEnabled && <>
                     <Typography variant="caption">
-                      Резерв контекста: {(sourceSearch.max_total_query_bytes + sourceSearch.max_total_returned_bytes + sourceSearch.max_calls * 512).toLocaleString("ru-RU")} байт. Изменение применяется только к новым вызовам.
+                      Резерв контекста: {dynamicSearchReserve.toLocaleString("ru-RU")} байт.
+                      {preparedInputHeadroom !== undefined && ` Максимальный остаток для подготовленного контекста: ${preparedInputHeadroom.toLocaleString("ru-RU")} байт.`}
+                      {" "}Изменение применяется только к новым вызовам.
                     </Typography>
                     <Stack direction="row" useFlexGap flexWrap="wrap">
                       {SOURCE_SEARCH_OPERATIONS.map((operation) => <FormControlLabel
@@ -2328,11 +2346,13 @@ export function Indexes({
   const [configurationText, setConfigurationText] = useState("");
   const [configurationFingerprint, setConfigurationFingerprint] = useState("");
   const [configurationPreview, setConfigurationPreview] = useState<Record<string, unknown>>();
+  const [routeHealth, setRouteHealth] = useState<{ blockers: Record<string, unknown>[]; degraded: Record<string, unknown>[] }>({ blockers: [], degraded: [] });
   const refresh = useCallback(
     () =>
-      api<{ items: SourceIndex[]; configuration: Record<string, unknown>; configuration_fingerprint: string }>(`/projects/${project.id}/indexes`)
+      api<{ items: SourceIndex[]; configuration: Record<string, unknown>; configuration_fingerprint: string; route_health: { blockers: Record<string, unknown>[]; degraded: Record<string, unknown>[] } }>(`/projects/${project.id}/indexes`)
         .then((value) => {
           setItems(value.items);
+          setRouteHealth(value.route_health ?? { blockers: [], degraded: [] });
           setConfigurationText(JSON.stringify(value.configuration, null, 2));
           setConfigurationFingerprint(value.configuration_fingerprint);
           setConfigurationPreview(undefined);
@@ -2426,6 +2446,12 @@ export function Indexes({
         Индексы — одноразовое ускорение в пользовательском каталоге;
         канонические доказательства остаются в репозитории.
       </Alert>
+      {routeHealth.blockers.length > 0 && <Alert severity="error">
+        Недоступные маршруты: {JSON.stringify(routeHealth.blockers)}
+      </Alert>}
+      {routeHealth.degraded.length > 0 && <Alert severity="warning">
+        Деградированные маршруты: {JSON.stringify(routeHealth.degraded)}
+      </Alert>}
       <Accordion>
         <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
           <Typography fontWeight={700}>Настройка адаптеров и маршрутов</Typography>
@@ -2530,6 +2556,9 @@ export function Indexes({
             {item.failure_code && <Alert severity="error" sx={{ mt: 1 }}>
               {item.failure_code}{item.failure_summary ? `: ${item.failure_summary}` : ""}
             </Alert>}
+            {item.readiness_reason && <Typography display="block" variant="caption">
+              Причина: {item.readiness_reason} · восстановление: {item.recovery_action}
+            </Typography>}
           </CardContent>
         </Card>
       ))}

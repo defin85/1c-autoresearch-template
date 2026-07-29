@@ -36,8 +36,8 @@ fingerprinted plan. Bootstrap must reject non-empty destinations.
 
 The active root documentation surface is exactly `README.md`, `AGENTS.md`,
 `docs/agent/repo-map.md`, `docs/agent/verification.md`, and
-`docs/operator/dispatcher-inspector-rollback.md`. OpenSpec archives are
-non-executable history.
+`docs/operator/dispatcher-inspector-rollback.md` and
+`docs/operator/source-search.md`. OpenSpec archives are non-executable history.
 
 ## Navigation And Verification
 

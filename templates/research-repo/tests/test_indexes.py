@@ -414,9 +414,49 @@ def _minimal_index_repo(root: Path, project_id: str = "index-test") -> tuple[Pat
     return root, component
 
 
+def test_backend_status_has_safe_recovery_without_mutating_state(
+    monkeypatch, tmp_path: Path,
+):
+    repo, _component = _minimal_index_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    monkeypatch.setattr(indexes, "backend_executable", lambda *_args: None)
+    row = indexes.backend_statuses(repo, state)[0]
+    assert row["status"] == "unavailable"
+    assert row["readiness_reason"] == "backend.executable_unavailable"
+    assert row["recovery_action"] == "fix_backend_installation"
+    assert not state.exists()
+
+
+def test_ready_validation_does_not_create_operational_state(
+    monkeypatch, tmp_path: Path,
+):
+    repo, component = _minimal_index_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    monkeypatch.setattr(
+        indexes,
+        "probe_backend",
+        lambda *_args, **_kwargs: {
+            "available": True,
+            "executable": "/fixed/rlm-bsl-index",
+            "executable_fingerprint": "sha256:binary",
+            "capabilities": list(indexes.CAPABILITIES),
+            "contract_version": "provider-query/v1",
+        },
+    )
+    assert indexes.ready_backend_state(
+        repo,
+        component,
+        {"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"},
+        state_root=state,
+    ) is None
+    assert not state.exists()
+
+
 def test_backend_probe_uses_bsl_machine_contract(monkeypatch, tmp_path: Path):
     repo, _component = _minimal_index_repo(tmp_path)
-    monkeypatch.setattr(indexes, "backend_executable", lambda *_args: "/usr/bin/bsl-analyzer")
+    executable = tmp_path / "bsl-analyzer"
+    executable.write_bytes(b"fixed binary")
+    monkeypatch.setattr(indexes, "backend_executable", lambda *_args: str(executable))
     contract = {
         "contract_version": "1.1",
         "build_version": "0.2.63",
@@ -440,6 +480,14 @@ def test_backend_probe_uses_bsl_machine_contract(monkeypatch, tmp_path: Path):
     assert probe["available"] is True
     assert probe["contract_version"] == "1.1"
     assert set(probe["capabilities"]) == set(indexes.CAPABILITIES)
+    before = probe["capability_fingerprint"]
+    executable.write_bytes(b"replaced binary")
+    after = indexes.probe_backend(
+        repo,
+        {"adapter_id": "bsl-analyzer", "engine_version": "0.2.63"},
+    )
+    assert before != after["capability_fingerprint"]
+    assert probe["executable_fingerprint"] != after["executable_fingerprint"]
 
 
 def test_adapter_output_is_stopped_at_the_byte_limit(monkeypatch):
@@ -450,6 +498,40 @@ def test_adapter_output_is_stopped_at_the_byte_limit(monkeypatch):
             "-c",
             "import os; os.write(1, b'x' * 4096)",
         ])
+
+
+def test_backend_process_environment_is_private_and_closed(monkeypatch):
+    captured = {}
+
+    class Process:
+        pid = 1
+        stdout = type("Output", (), {"fileno": lambda self: 1})()
+        returncode = 0
+
+        def poll(self): return 0
+        def wait(self, timeout=None): return 0
+
+    class Selector:
+        def register(self, *_args): return None
+        def select(self, _timeout): return []
+        def close(self): return None
+
+    def popen(_command, **kwargs):
+        captured.update(kwargs["env"])
+        return Process()
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://private")
+    monkeypatch.setenv("OPENAI_API_KEY", "private")
+    monkeypatch.setattr(indexes.subprocess, "Popen", popen)
+    monkeypatch.setattr(indexes.selectors, "DefaultSelector", Selector)
+    indexes._bounded_run(["fixed-adapter"])
+    assert "DATABASE_URL" not in captured and "OPENAI_API_KEY" not in captured
+    assert captured["BSL_MCP_BROKER"] == "0"
+    assert captured["HOME"] != str(Path.home())
+    assert all(
+        captured[name].startswith(captured["HOME"])
+        for name in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME")
+    )
 
 
 def test_adapter_process_is_cancelled_before_unbounded_work():
@@ -473,6 +555,7 @@ def test_bsl_mcp_requires_structured_ready_state(monkeypatch, tmp_path: Path):
             "id": 3,
             "result": {
                 "structuredContent": {
+                    "schema_version": "bsl-analyzer-status/v1",
                     "state": "loading",
                     "message": "not ready",
                 },
@@ -483,6 +566,7 @@ def test_bsl_mcp_requires_structured_ready_state(monkeypatch, tmp_path: Path):
             "id": 4,
             "result": {
                 "structuredContent": {
+                    "schema_version": "bsl-analyzer-status/v1",
                     "state": "ready",
                     "stale": False,
                 },
@@ -515,6 +599,47 @@ def test_bsl_mcp_requires_structured_ready_state(monkeypatch, tmp_path: Path):
         [("graph", {"action": "status"}, True)],
     )
     assert result[0]["structuredContent"]["state"] == "ready"
+
+
+def test_bsl_mcp_rejects_unversioned_structured_output(monkeypatch, tmp_path: Path):
+    class Input:
+        def write(self, _value): return None
+        def flush(self): return None
+        def close(self): return None
+
+    replies = iter([
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {"structuredContent": {"state": "ready"}},
+        },
+    ])
+
+    class Output:
+        def readline(self): return json.dumps(next(replies)) + "\n"
+
+    class Process:
+        pid = 1
+        stdin = Input()
+        stdout = Output()
+        def wait(self, timeout=None): return 0
+
+    class Selector:
+        def register(self, *_args): return None
+        def select(self, _timeout): return [object()]
+        def close(self): return None
+
+    monkeypatch.setattr(
+        indexes.subprocess, "Popen", lambda *_args, **_kwargs: Process(),
+    )
+    monkeypatch.setattr(indexes.selectors, "DefaultSelector", Selector)
+    with pytest.raises(RuntimeError, match="structured schema"):
+        indexes._bsl_mcp(
+            "bsl-analyzer",
+            tmp_path,
+            [("graph", {"action": "status"}, True)],
+        )
 
 
 def test_private_index_promotion_is_clone_isolated_and_keeps_source_clean(monkeypatch, tmp_path: Path):
@@ -697,6 +822,45 @@ def test_oversized_state_fails_before_instance_promotion(monkeypatch, tmp_path: 
     )
     assert not (target / "current.json").exists()
     assert not any((target / "instances").iterdir())
+
+
+def test_oversized_index_payload_is_quarantined_before_promotion(
+    monkeypatch, tmp_path: Path,
+):
+    repo, component = _minimal_index_repo(tmp_path / "repo")
+    monkeypatch.setattr(
+        indexes,
+        "probe_backend",
+        lambda *_args, **_kwargs: {
+            "available": True,
+            "executable": "/fixed/rlm-bsl-index",
+            "capabilities": list(indexes.CAPABILITIES),
+            "contract_version": "provider-query/v1",
+        },
+    )
+
+    def build(command, **_kwargs):
+        mirror = Path(command[-1])
+        (mirror / ".rlm-index").mkdir()
+        (mirror / ".rlm-index/index.db").write_bytes(b"too large")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(indexes, "_bounded_run", build)
+    monkeypatch.setattr(indexes, "cli_probe", lambda *_args: {"ready": True})
+    monkeypatch.setattr(indexes, "ADAPTER_INDEX_LIMIT", 1)
+    state_root = tmp_path / "state"
+    with pytest.raises(RuntimeError, match="payload exceeds"):
+        indexes.build_backend_index(
+            repo,
+            component,
+            {"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"},
+            state_root=state_root,
+        )
+    target = next(
+        (indexes._operational_path(repo, state_root) / "targets").iterdir()
+    )
+    assert not (target / "current.json").exists()
+    assert len(list((target / "quarantine").iterdir())) == 1
 
 
 def test_simultaneous_rebuild_is_fenced_and_validation_keeps_old_pointer(

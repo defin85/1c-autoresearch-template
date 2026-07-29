@@ -155,6 +155,8 @@ def codex_capabilities() -> dict[str, Any]:
         timeout=15,
     )
     catalog = json.loads(result.stdout)
+    from .agents import STRUCTURED_RESPONSE_RESERVE_TOKENS
+    from .source_search import TOOL_FRAMING_BYTES_PER_CALL
     from .user_state import codex_model_capabilities
     context = codex_model_capabilities()
     models = [
@@ -165,6 +167,9 @@ def codex_capabilities() -> dict[str, Any]:
             "reasoning_efforts": [
                 level["effort"] for level in item.get("supported_reasoning_levels", [])
             ],
+            "structured_response_reserve_tokens": STRUCTURED_RESPONSE_RESERVE_TOKENS,
+            "estimated_bytes_per_token": 2,
+            "source_search_framing_bytes_per_call": TOOL_FRAMING_BYTES_PER_CALL,
             **context.get(item["slug"], {}),
         }
         for item in catalog.get("models", [])
@@ -2048,10 +2053,14 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         project = repo(project_id)
         configuration = indexes.load_config(project)
         configuration.pop("source_schema_version", None)
+        items = ApplicationService(project).index_statuses()
         return {
-            "items": ApplicationService(project).index_statuses(),
+            "items": items,
             "configuration": configuration,
             "configuration_fingerprint": indexes.config_fingerprint(project),
+            "route_health": indexes.route_coverage(
+                configuration, indexes.discover(project), items,
+            ),
             "disposable": True,
         }
 

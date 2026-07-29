@@ -114,10 +114,13 @@ def test_codex_capabilities_are_read_from_cli(monkeypatch) -> None:
 
     assert codex_capabilities()["models"] == [{
         "id": "actual",
-        "name": "Actual",
-        "default_reasoning_effort": "max",
-        "reasoning_efforts": ["max"],
-    }]
+            "name": "Actual",
+            "default_reasoning_effort": "max",
+            "reasoning_efforts": ["max"],
+            "structured_response_reserve_tokens": 4096,
+            "estimated_bytes_per_token": 2,
+            "source_search_framing_bytes_per_call": 512,
+        }]
 
 
 def test_extension_registries_are_paged_and_bound_to_active_diff(tmp_path: Path):
