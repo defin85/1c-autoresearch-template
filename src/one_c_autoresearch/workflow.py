@@ -994,21 +994,12 @@ def _dispatcher_items(
     try:
         diffs, mrqs, dispositions, approvals = _active_rows(repo)
         operational = store.proposals()
-        analyze_results = [
-            row for row in operational
-            if row.get("job_id") == "analyze-dif"
-            and row.get("kind") == "node-result"
-            and str(row.get("payload", {}).get("name", "")).startswith("analyze-dif:")
-        ]
-        latest_thread = analyze_results[-1]["thread_id"] if analyze_results else ""
         transient = {identifier: "meaning" for identifier in transient_meaning_ids or ()}
-        transient.update({
-            str(result["stable_diff_id"]): str(result["kind"])
-            for row in analyze_results
-            if row.get("thread_id") == latest_thread
-            for result in [row.get("payload", {}).get("envelope", {}).get("result", {})]
-            if result.get("kind") in {"meaning", "noise"} and result.get("stable_diff_id")
-        })
+        lease = store.lease("analyze-dif") if hasattr(store, "lease") else None
+        transient.update(_transient_analyze_results(
+            operational,
+            str(lease.get("thread_id", "")) if lease else None,
+        ))
         customer = sorted(
             (row for row in diffs if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"),
             key=lambda row: row["stable_diff_id"],
@@ -1054,8 +1045,8 @@ def _dispatcher_items(
             and row["stable_diff_id"] not in transient
             and row["stable_diff_id"] not in previously_owned
         ]
-        pending_mrqs = active_mrqs
         meaning_difs = [row for row in customer if classifications.get(row["stable_diff_id"]) == "meaning" or transient.get(row["stable_diff_id"]) == "meaning"]
+        unassigned_meaning_difs = [row for row in meaning_difs if row["stable_diff_id"] not in previously_owned]
         noise_difs = [row for row in customer if classifications.get(row["stable_diff_id"]) == "noise_candidate" or transient.get(row["stable_diff_id"]) == "noise"]
         proposals = [row for row in operational if row.get("kind") == "approval" and row.get("consumed_at") is None]
         decision_rows: list[dict[str, Any]] = []
@@ -1067,6 +1058,7 @@ def _dispatcher_items(
                 allowed_mrq_ids={row["mrq_id"] for row in active_mrqs},
             )["decisions.jsonl"]
         decision_by_mrq = {row["mrq_id"]: row["decision"] for row in decision_rows}
+        pending_mrqs = [row for row in active_mrqs if row["mrq_id"] not in decision_by_mrq]
         decisions = [
             {**row, "migration_decision": decision_by_mrq[row["mrq_id"]]}
             for row in active_mrqs if row["mrq_id"] in decision_by_mrq
@@ -1125,10 +1117,12 @@ def _dispatcher_items(
         return {
             "dif_queue": [card(row, "queued") for row in pending_difs[:32]],
             "meaning_diffs": [card(row, "meaning") for row in meaning_difs[:16]],
+            "unassigned_meaning_diffs": [card(row, "meaning") for row in unassigned_meaning_difs[:16]],
             "noise_diffs": [card(row, "noise") for row in noise_difs[:16]],
             "proposals": [_proposal_card(row) for row in proposals[:16]],
             "mrq_outcomes": mrq_outcomes[:32],
             "mrqs": [_mrq_card(row, dispositions) for row in pending_mrqs[:32]],
+            "all_mrqs": [_mrq_card(row, dispositions) for row in active_mrqs[:32]],
             "batches": [{"id": batch.batch_id, "mrq_ids": list(batch.mrq_ids), "reason": batch.basis} for batch in batches[:16]],
             "decisions": [_decision_card(row) for row in decisions[:32]],
             "approval_count": len(approvals),
@@ -1144,9 +1138,11 @@ def _dispatcher_items(
                     "omitted": max(len(pending_mrqs) - 32, 0),
                 },
                 "meaning-diffs": {"total": len(meaning_difs), "visible": min(len(meaning_difs), 16), "omitted": max(len(meaning_difs) - 16, 0)},
+                "unassigned-meaning-diffs": {"total": len(unassigned_meaning_difs), "visible": min(len(unassigned_meaning_difs), 16), "omitted": max(len(unassigned_meaning_difs) - 16, 0)},
                 "noise-diffs": {"total": len(noise_difs), "visible": min(len(noise_difs), 16), "omitted": max(len(noise_difs) - 16, 0)},
                 "proposals": {"total": len(proposals), "visible": min(len(proposals), 16), "omitted": max(len(proposals) - 16, 0)},
                 "mrq-outcomes": {"total": len(mrq_outcomes), "visible": min(len(mrq_outcomes), 32), "omitted": max(len(mrq_outcomes) - 32, 0)},
+                "all-mrqs": {"total": len(active_mrqs), "visible": min(len(active_mrqs), 32), "omitted": max(len(active_mrqs) - 32, 0)},
                 "batches": {"total": len(batches), "visible": min(len(batches), 16), "omitted": max(len(batches) - 16, 0)},
                 "decisions": {"total": len(decisions), "visible": min(len(decisions), 32), "omitted": max(len(decisions) - 32, 0)},
             },
@@ -1279,14 +1275,14 @@ def _analyze_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]:
         completed = reusable = failed = 0
         lease = store.lease("analyze-dif") if store else None
         if store and lease:
-            node_results = [
-                row for row in store.proposals()
-                if row.get("job_id") == "analyze-dif"
-                and row.get("thread_id") == lease.get("thread_id")
-                and row.get("kind") == "node-result"
-                and str(row.get("payload", {}).get("name", "")).startswith("analyze-dif:")
-            ]
-            completed = len(node_results)
+            try:
+                from .dif_classifications import load_active
+                published = {row["stable_diff_id"] for row in load_active(repo)["rows"]}
+            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                published = set()
+            completed = len(set(_transient_analyze_results(
+                store.proposals(), str(lease.get("thread_id", "")),
+            )) - published)
         return {
             **counts,
             "customer_diff_count": len(customer),
@@ -1297,12 +1293,32 @@ def _analyze_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]:
             "current_window_completed": completed,
             "failed": failed,
             "reusable_completed": reusable,
-            "window_published": bool(counts["classified"]) and completed == 0,
+            "window_published": not lease,
             "max_window": 32,
             "max_parallel": 4,
         }
     except Exception:
         return {"customer_diff_count": 0, "semantic_extension_diff_count": 0, "window_size": 0, "max_window": 32, "max_parallel": 4}
+
+
+def _transient_analyze_results(
+    operational: list[dict[str, Any]],
+    thread_id: str | None = None,
+) -> dict[str, str]:
+    rows = [
+        row for row in operational
+        if row.get("job_id") == "analyze-dif"
+        and row.get("kind") == "node-result"
+        and str(row.get("payload", {}).get("name", "")).startswith("analyze-dif:")
+    ]
+    selected_thread = thread_id or (rows[-1].get("thread_id") if rows else None)
+    return {
+        str(result["stable_diff_id"]): str(result["kind"])
+        for row in rows
+        if row.get("thread_id") == selected_thread
+        for result in [row.get("payload", {}).get("envelope", {}).get("result", {})]
+        if result.get("kind") in {"meaning", "noise"} and result.get("stable_diff_id")
+    }
 
 
 def _form_mrq_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]:

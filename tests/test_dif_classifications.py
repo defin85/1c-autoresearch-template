@@ -86,6 +86,26 @@ def test_stale_or_partial_window_does_not_move_pointer(repository: Path) -> None
     assert (repository / "research/active-dif-classification-generation.json").read_bytes() == before
 
 
+def test_stale_classification_is_reset_for_current_diff(repository: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from one_c_autoresearch.dif_classifications import ensure_current
+
+    prior = publish_empty(repository)
+    monkeypatch.setattr(
+        "one_c_autoresearch.dif_classifications._bindings",
+        lambda _repo: {
+            "source_generation_id": "s" * 64,
+            "source_fingerprint": "sha256:" + "1" * 64,
+            "diff_generation_id": "e" * 64,
+            "diff_fingerprint": "sha256:" + "3" * 64,
+        },
+    )
+    with pytest.raises(ValueError, match="stale DIF classification bindings"):
+        load_active(repository)
+    current = ensure_current(repository)
+    assert current["generation_id"] != prior["generation_id"]
+    assert load_active(repository)["rows"] == []
+
+
 def test_versioned_whole_component_result_can_replace_only_its_prior_result(repository: Path) -> None:
     active = publish_empty(repository)
     first = publish_window(

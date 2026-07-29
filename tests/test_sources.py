@@ -248,6 +248,25 @@ def test_cancellation_terminates_running_exporter():
     assert completed.stdout.strip() == "request"
 
 
+def test_timeout_terminates_descendants_holding_output_pipe():
+    started = time.monotonic()
+    code = (
+        "import subprocess,sys,time;"
+        "subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']);"
+        "time.sleep(30)"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_command(
+            subprocess.run,
+            [sys.executable, "-c", code],
+            cancelled=lambda: False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=0.2,
+        )
+    assert time.monotonic() - started < 5
+
+
 def test_acquisition_rejects_exhausted_space_without_pointer_change(tmp_path: Path, monkeypatch):
     research = tmp_path / "research"; research.mkdir()
     pointer = research / "active-source-generation.json"

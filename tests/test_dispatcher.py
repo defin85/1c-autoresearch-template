@@ -144,6 +144,11 @@ def test_load_bindings_reads_active_pointers(tmp_path: Path) -> None:
     assert bindings.diff_generation_id == "diff-xyz"
     assert bindings.canonical_generation_id == "canon-xyz"
     assert bindings.workflow_fingerprint == "sha256:wf"
+    (tmp_path / "research/active-consolidation-generation.json").write_text(json.dumps({"mrq_generation_id": None, "transaction_id": None}))
+    with patch("one_c_autoresearch.dispatcher.sha256", lambda value: value.decode() if isinstance(value, bytes) else value), patch("one_c_autoresearch.stage_recompute.state_fingerprint", lambda _repo: "sha256:wf"):
+        bindings = load_bindings(tmp_path, "proj", "analyze-dif", "DIF-1", {"model": "gpt"}, "sup")
+    assert bindings.canonical_generation_id == ""
+    assert bindings.consolidation_transaction_id == ""
 
 
 def test_start_acquires_lease_and_second_process_is_blocked(tmp_path: Path) -> None:
@@ -373,6 +378,34 @@ def test_analyze_bindings_allow_own_classification_publication(tmp_path: Path) -
     )
     (tmp_path / "research/active-consolidation-generation.json").write_text(
         json.dumps({"mrq_generation_id": "canon-1", "transaction_id": "transaction"}), encoding="utf-8"
+    )
+    try:
+        started = _start(coordinator, "analyze-dif", bindings)
+        lease = store.lease("analyze-dif")
+        bindings = replace(
+            bindings,
+            run_id=started.run_id,
+            execution_snapshot_fingerprint=lease["execution_snapshot_fingerprint"],
+        )
+        with patch(
+            "one_c_autoresearch.stage_recompute.active_state",
+            return_value=(
+                {"source": {"generation_id": "src-1"}, "diff": {"generation_id": "diff-1"}},
+                bindings.workflow_fingerprint,
+            ),
+        ):
+            assert coordinator.verify_bindings("analyze-dif", bindings) is True
+    finally:
+        coordinator.close()
+        store.close()
+
+
+def test_unpublished_null_bindings_remain_stable(tmp_path: Path) -> None:
+    coordinator, store, _ = _coordinator(tmp_path)
+    bindings = replace(_fake_bindings(), canonical_generation_id="", consolidation_transaction_id="")
+    (tmp_path / "research").mkdir()
+    (tmp_path / "research/active-consolidation-generation.json").write_text(
+        json.dumps({"mrq_generation_id": None, "transaction_id": None}), encoding="utf-8"
     )
     try:
         started = _start(coordinator, "analyze-dif", bindings)

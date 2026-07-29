@@ -2002,7 +2002,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             store.emit("run.finished", idempotency_key, {**event_context, "status": "completed", "result": result, "idempotency_key": idempotency_key, "duration_seconds": time.monotonic() - started}); return result
 
     @app.get("/api/v1/projects/{project_id}/events")
-    def events(project_id: str, cursor: int = 0, limit: int = 500): return EventStore(operational / "projects", project_id).replay(cursor, limit)
+    def events(project_id: str, cursor: int = 0, limit: int = 500, tail: bool = False): return EventStore(operational / "projects", project_id).replay(cursor, limit, tail=tail)
 
     @app.get("/api/v1/projects/{project_id}/events/stream")
     async def event_stream(project_id: str, request: Request, cursor: int = 0):

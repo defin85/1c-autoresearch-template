@@ -59,6 +59,7 @@ describe('dispatcherNewGraphModel', () => {
       !node.focusable && node.ariaRole === 'group' && node.data.interaction === 'none')).toBe(true);
     expect(graph.nodes.filter((node) => !roleNodes.has(node.id)).every((node) =>
       node.focusable && node.ariaRole === 'button' && node.data.interaction === 'open-circuit')).toBe(true);
+    expect(graph.edges).toContainEqual(expect.objectContaining({ source: 'analyzer-1', target: 'technical-noise' }));
   });
 
   test('показывает фактические значения проекции вместо демонстрационных', () => {
@@ -72,7 +73,7 @@ describe('dispatcherNewGraphModel', () => {
     expect(byId.get('semantic-dif')?.detail).toBe('Смысловых DIF: 6');
     expect(byId.get('technical-noise')?.detail).toBe('Элементов шума: 5');
     expect(graph.nodes.find((node) => node.id === 'semantic-dif')?.style?.width).toBeGreaterThanOrEqual(96);
-    expect(byId.get('publication')).toMatchObject({ zoneId: 'form-publication', detail: 'MRQ: 6' });
+    expect(byId.get('publication')).toMatchObject({ zoneId: 'form-publication', detail: 'Опубликовано MRQ: 6' });
     expect(byId.get('review')).toMatchObject({
       zoneId: 'form-review',
       state: 'Готово',
@@ -89,7 +90,7 @@ describe('dispatcherNewGraphModel', () => {
     expect(graph.nodes.filter((node) => node.type === 'role')).toHaveLength(5);
     expect(graph.nodes.some((node) => redundantAgentNodes.has(node.id))).toBe(false);
     expect([...nestedZones(saturatedProjection).keys()]).toEqual([]);
-    expect(byId.get('batch-output')).toMatchObject({ state: 'Готово', detail: 'Пакетов: 5' });
+    expect(byId.get('batch-output')).toMatchObject({ state: 'Готово', detail: 'Опубликовано пакетов: 5' });
 
     const serialized = JSON.stringify(graph);
     for (const demo of ['77 079', '1 342', '3.0.4', '28 731', 'прогресс 45%', 'прогресс 65%']) {
@@ -127,6 +128,7 @@ describe('dispatcherNewGraphModel', () => {
       state: 'Ошибка',
       active: false,
     });
+    expect(failed.nodes.find((node) => node.id === 'analysis')?.data.state).toBe('Ошибка');
     expect(failed.nodes.find((node) => node.id === 'publication')?.data.state).toBe('Готово');
   });
 });

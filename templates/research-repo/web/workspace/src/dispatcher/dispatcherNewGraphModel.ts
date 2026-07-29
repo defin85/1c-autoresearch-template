@@ -18,6 +18,13 @@ const CIRCUIT_BY_STAGE: Record<string, CircuitId> = {
   target: 'decide-target',
 };
 
+const JOB_BY_CIRCUIT: Partial<Record<CircuitId, string>> = {
+  'analyze-dif': 'analyze-dif',
+  'form-mrq': 'consolidate-mrq',
+  'classify-mrq': 'classify-mrq',
+  'decide-target': 'decide-mrq',
+};
+
 const ZONE_BY_NODE: Record<string, string> = {
   sources: 'sources',
   acquire: 'sources-acquire',
@@ -97,7 +104,9 @@ const STATUS_LABEL: Record<string, string> = {
 const statusLabel = (status?: string) => STATUS_LABEL[status ?? 'unknown'] ?? status ?? 'Недоступно';
 
 const circuitState = (projection: DispatcherProjection, id: CircuitId) =>
-  statusLabel(projection.circuits.find((circuit) => circuit.id === id)?.state);
+  statusLabel(projection.jobs[JOB_BY_CIRCUIT[id] ?? '']?.state === 'failed'
+    ? 'failed'
+    : projection.circuits.find((circuit) => circuit.id === id)?.state);
 
 const zone = (projection: DispatcherProjection, id: string): DispatcherZoneProjection | undefined => {
   for (const circuit of projection.circuits) {
@@ -135,11 +144,15 @@ const listPatch = (
 
 const difQueuePatch = (projection: DispatcherProjection, window: boolean): Partial<EnrichedNodeData> => {
   const aggregate = projection.queue_aggregates?.['dif-queue'];
+  const analysis = projection.circuits.find((item) => item.id === 'analyze-dif')?.aggregates;
+  const remaining = analysis?.remaining ?? aggregate?.total;
+  const completed = Number(analysis?.current_window_completed ?? 0);
+  const total = Number(analysis?.current_window_total ?? 0);
   return {
     state: projection.items.dif_queue.length ? 'Готово' : 'Ожидает',
     detail: window
-      ? `В текущем окне: ${aggregate?.visible ?? projection.items.dif_queue.length}`
-      : `Всего DIF: ${aggregate?.total ?? 'недоступно'}`,
+      ? `Выполнено в окне: ${completed} из ${total} · осталось: ${Math.max(total - completed, 0)}`
+      : `Канонически осталось: ${remaining ?? 'недоступно'}\nГотово к публикации: ${completed}`,
     active: false,
   };
 };
@@ -257,10 +270,7 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
     case 'dif-queue':
       return difQueuePatch(projection, false);
     case 'analysis-queue':
-      return {
-        ...difQueuePatch(projection, true),
-        detail: `В окне: ${projection.circuits.find((item) => item.id === 'analyze-dif')?.aggregates?.current_window_total ?? 'недоступно'} · выполнено: ${projection.circuits.find((item) => item.id === 'analyze-dif')?.aggregates?.current_window_completed ?? 'недоступно'}`,
-      };
+      return difQueuePatch(projection, true);
     case 'analyzer-1':
       return invocationPatch(analyzer[0], 'Анализатор 1');
     case 'analyzer-2':
@@ -272,7 +282,7 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
     case 'technical-noise':
       return collectionPatch(projection, 'noise-diffs', projection.items.noise_diffs, 'Элементов шума');
     case 'semantic-queue':
-      return collectionPatch(projection, 'meaning-diffs', projection.items.meaning_diffs, 'Смысловых DIF');
+      return collectionPatch(projection, 'unassigned-meaning-diffs', projection.items.unassigned_meaning_diffs ?? [], 'Без MRQ');
     case 'coordinator':
       return invocationPatch(coordinator[0], 'Координатор MRQ');
     case 'grouper-1':
@@ -301,9 +311,9 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
       };
     }
     case 'publication':
-      return { ...zonePatch(projection, 'publication'), ...collectionPatch(projection, 'mrq-queue', projection.items.mrqs, 'MRQ') };
+      return { ...zonePatch(projection, 'publication'), ...collectionPatch(projection, 'all-mrqs', projection.items.all_mrqs ?? projection.items.mrqs, 'Опубликовано MRQ') };
     case 'batch-input':
-      return collectionPatch(projection, 'mrq-queue', projection.items.mrqs, 'MRQ');
+      return collectionPatch(projection, 'all-mrqs', projection.items.all_mrqs ?? projection.items.mrqs, 'Входных MRQ');
     case 'classifier-1':
       return invocationPatch(classifier[0], 'Классификатор');
     case 'batch-validation': {
@@ -311,9 +321,9 @@ function dataPatch(projection: DispatcherProjection, nodeId: string): Partial<En
       return { state: state === 'valid' ? 'Готово' : 'Ожидает', detail: state === 'valid' ? 'Полное непересекающееся покрытие подтверждено' : 'Поколение пакетов не подтверждено', active: false };
     }
     case 'batch-output':
-      return collectionPatch(projection, 'batches', projection.items.batches, 'Пакетов');
+      return collectionPatch(projection, 'batches', projection.items.batches, 'Опубликовано пакетов');
     case 'mrq-queue':
-      return collectionPatch(projection, 'mrq-queue', projection.items.mrqs, 'Всего MRQ');
+      return collectionPatch(projection, 'mrq-queue', projection.items.mrqs, 'Ожидают решения');
     case 'researcher-1':
       return invocationPatch(researcher[0], 'Исследователь 1');
     case 'researcher-2':

@@ -105,6 +105,7 @@ export const ENRICHED_SUBFLOW_EDGES: Edge[] = [
   linked('analysis-queue', 'analyzer-2', '#757575'),
   linked('analysis-queue', 'analyzer-3', '#ed6c02', 'right-bottom', 'left'),
   linked('analyzer-1', 'semantic-dif', '#1976d2', 'right-top', 'left-top', true),
+  linked('analyzer-1', 'technical-noise', '#1976d2', 'right-bottom', 'left-top', true),
   linked('analyzer-2', 'semantic-dif', '#757575'),
   linked('analyzer-3', 'semantic-dif', '#ed6c02', 'right-bottom', 'left-bottom'),
   linked('semantic-dif', 'semantic-queue', '#6d3be7', 'right', 'left', true),

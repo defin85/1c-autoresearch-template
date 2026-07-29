@@ -7,6 +7,7 @@ import tempfile
 import tomllib
 import subprocess
 import re
+import signal
 import time
 import unicodedata
 from contextlib import nullcontext
@@ -240,8 +241,16 @@ def _run_command(run: callable, command: list[str], *, cancelled: callable | Non
     kwargs.pop("check", None)
     if input_data is not None:
         kwargs.setdefault("stdin", subprocess.PIPE)
+    kwargs.setdefault("start_new_session", os.name == "posix")
     started = time.monotonic()
     process = subprocess.Popen(command, **kwargs)
+
+    def stop(sig: signal.Signals) -> None:
+        try:
+            os.killpg(process.pid, sig) if os.name == "posix" else process.send_signal(sig)
+        except ProcessLookupError:
+            pass
+
     first_communicate = True
     while True:
         try:
@@ -250,14 +259,14 @@ def _run_command(run: callable, command: list[str], *, cancelled: callable | Non
         except subprocess.TimeoutExpired:
             first_communicate = False
             if cancelled():
-                process.terminate()
+                stop(signal.SIGTERM)
                 try:
                     process.communicate(timeout=5)
                 except subprocess.TimeoutExpired:
-                    process.kill(); process.communicate()
+                    stop(signal.SIGKILL); process.communicate()
                 raise InterruptedError("source acquisition cancelled")
             if timeout is not None and time.monotonic() - started >= timeout:
-                process.kill(); process.communicate()
+                stop(signal.SIGKILL); process.communicate()
                 raise subprocess.TimeoutExpired(command, timeout)
 
 

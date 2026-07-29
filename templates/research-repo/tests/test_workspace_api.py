@@ -8,11 +8,20 @@ from fastapi.testclient import TestClient
 
 from one_c_autoresearch.workspace_api import create_app
 from one_c_autoresearch.contracts import external_id
+from one_c_autoresearch.events import EventStore
 from one_c_autoresearch.sources import draft_fingerprint, extension_scope_status
 from one_c_autoresearch.user_state import load_connections
 
 
 REPO = Path(__file__).parents[1]
+
+def test_event_replay_can_open_at_the_current_tail(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events", "project")
+    for index in range(7):
+        store.emit("step.progress", "run", {"status": "running", "progress": {"index": index}}, job_id="job", step_id="step", attempt=1)
+    page = store.replay(0, 3, tail=True)
+    assert [event["sequence"] for event in page["events"]] == [5, 6, 7]
+    assert page["next_cursor"] == 7
 
 
 def test_source_acquisition_continues_automatic_pipeline(tmp_path: Path, monkeypatch) -> None:

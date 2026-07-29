@@ -284,7 +284,7 @@ class EventStore:
             interrupted.append(run_id)
         return interrupted
 
-    def replay(self, cursor: int, limit: int = 500) -> dict[str, Any]:
+    def replay(self, cursor: int, limit: int = 500, *, tail: bool = False) -> dict[str, Any]:
         if not 1 <= limit <= 500:
             raise ValueError("event page limit must be 1..500")
         events = self.events(); earliest = events[0]["sequence"] if events else cursor + 1
@@ -298,7 +298,7 @@ class EventStore:
                 if remaining <= 0: break
             next_cursor = max((event["sequence"] for snapshot in bounded for event in snapshot.get("events", [])), default=earliest - 1)
             return {"resync_required": True, "earliest_sequence": earliest, "events": [], "snapshot": list(reversed(bounded)), "next_cursor": next_cursor}
-        page = [item for item in events if item["sequence"] > cursor][:limit]
+        page = events[-limit:] if tail and cursor == 0 else [item for item in events if item["sequence"] > cursor][:limit]
         return {"resync_required": False, "earliest_sequence": earliest, "events": page, "next_cursor": page[-1]["sequence"] if page else cursor}
 
     def append_log(self, run_id: str, attempt: int, data: bytes) -> dict[str, Any]:

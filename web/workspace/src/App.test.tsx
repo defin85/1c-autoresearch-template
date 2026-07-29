@@ -68,6 +68,28 @@ test("journal target initializes the exact run group and invocation filter", asy
   expect(screen.getByRole("textbox", { name: "Поиск в событиях и журналах" })).toHaveValue("invoke-1");
 });
 
+test("journal shows the failure reason on the collapsed run card", async () => {
+  const fetchMock = vi.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({
+      events: [{
+        sequence: 1,
+        timestamp: "2026-01-01T00:00:00Z",
+        type: "step.finished",
+        run_id: "run-1",
+        payload: { status: "failed", exit: { blocker: { code: "dispatcher.graph.failed", message: "stale DIF classification bindings", action: "analyze-dif" } } },
+      }],
+      next_cursor: 1,
+      resync_required: false,
+    }),
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(<Events project={{ id: "p", name: "p", root: "/repo" }} />);
+  expect(await screen.findByText("dispatcher.graph.failed: stale DIF classification bindings")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /Запуск run-1/ })).toHaveAttribute("aria-expanded", "false");
+  expect(String(fetchMock.mock.calls[0][0])).toContain("cursor=0&limit=500&tail=true");
+});
+
 test("registry target requests only the exact stable item", async () => {
   const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ items: [], has_more: false }) });
   vi.stubGlobal("fetch", fetchMock);

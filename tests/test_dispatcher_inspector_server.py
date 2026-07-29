@@ -20,7 +20,7 @@ from one_c_autoresearch.workspace_api import (
     _history_cursor,
     create_app,
 )
-from one_c_autoresearch.workflow import _dispatcher_items
+from one_c_autoresearch.workflow import _analyze_aggregates, _dispatcher_items
 
 
 REPO = Path(__file__).resolve().parents[1] / "templates/research-repo"
@@ -639,6 +639,44 @@ def test_queue_aggregates_are_exact_before_bounded_slice(
     assert totals["mrq-queue"] == {"total": 38, "visible": 32, "omitted": 6}
 
 
+def test_stage_input_collections_are_distinct_from_pending_queues(
+    tmp_path: Path, monkeypatch
+) -> None:
+    diffs = [{
+        "stable_diff_id": identifier, "before_role": "vendor_baseline",
+        "after_role": "target_cf", "path": f"{identifier}.bsl",
+        "object_kind": "metadata",
+    } for identifier in ("DIF-OWNED", "DIF-UNASSIGNED")]
+    mrqs = [
+        {"mrq_id": "MRQ-DECIDED", "state": "approved"},
+        {"mrq_id": "MRQ-PENDING", "state": "approved"},
+    ]
+    dispositions = [{"stable_diff_id": "DIF-OWNED", "mrq_id": "MRQ-DECIDED", "primary": True}]
+    monkeypatch.setattr("one_c_autoresearch.workflow._active_rows", lambda _repo: (diffs, mrqs, dispositions, []))
+    monkeypatch.setattr("one_c_autoresearch.workflow._pointer", lambda _repo, _name: {})
+    monkeypatch.setattr("one_c_autoresearch.dif_classifications.load_active", lambda _repo: {"rows": [
+        {"stable_diff_id": identifier, "classification": "meaning"}
+        for identifier in ("DIF-OWNED", "DIF-UNASSIGNED")
+    ]})
+    monkeypatch.setattr("one_c_autoresearch.consolidation.load_active", lambda _repo: {"pointer": {
+        "decision_generation_id": "decisions", "batch_generation_id": "", "plan_fingerprint": "",
+    }})
+    monkeypatch.setattr("one_c_autoresearch.decision_generations.validate_generation", lambda *_args, **_kwargs: {"decisions.jsonl": [{
+        "mrq_id": "MRQ-DECIDED", "decision": {"decision": "adapt"},
+    }]})
+    store = type("Store", (), {"proposals": lambda _self: []})()
+
+    items = _dispatcher_items(tmp_path, store)
+
+    assert [row["id"] for row in items["meaning_diffs"]] == ["DIF-OWNED", "DIF-UNASSIGNED"]
+    assert [row["id"] for row in items["unassigned_meaning_diffs"]] == ["DIF-UNASSIGNED"]
+    assert [row["id"] for row in items["all_mrqs"]] == ["MRQ-DECIDED", "MRQ-PENDING"]
+    assert [row["id"] for row in items["mrqs"]] == ["MRQ-PENDING"]
+    assert items["_queue_aggregates"]["unassigned-meaning-diffs"]["total"] == 1
+    assert items["_queue_aggregates"]["all-mrqs"]["total"] == 2
+    assert items["_queue_aggregates"]["mrq-queue"]["total"] == 1
+
+
 def test_dispatcher_shows_current_analyzer_results_before_publication(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -680,6 +718,61 @@ def test_dispatcher_shows_current_analyzer_results_before_publication(
     assert [item["id"] for item in items["dif_queue"]] == ["DIF-PENDING"]
     assert items["_queue_aggregates"]["meaning-diffs"]["total"] == 1
     assert items["_queue_aggregates"]["noise-diffs"]["total"] == 1
+
+
+def test_analyze_progress_counts_only_unpublished_results(
+    tmp_path: Path, monkeypatch
+) -> None:
+    results = [{
+        "job_id": "analyze-dif",
+        "thread_id": "current",
+        "kind": "node-result",
+        "payload": {
+            "name": f"analyze-dif:DIF-{index:03d}",
+            "envelope": {
+                "result": {
+                    "stable_diff_id": f"DIF-{index:03d}",
+                    "kind": "meaning",
+                },
+            },
+        },
+    } for index in range(35)]
+    results.append({
+        "job_id": "analyze-dif", "thread_id": "stale", "kind": "node-result",
+        "payload": {"name": "analyze-dif:DIF-STALE", "envelope": {
+            "result": {"stable_diff_id": "DIF-STALE", "kind": "meaning"},
+        }},
+    })
+    published = [{"stable_diff_id": f"DIF-{index:03d}"} for index in range(28)]
+    monkeypatch.setattr(
+        "one_c_autoresearch.pipeline_graphs._read_diff_inventory",
+        lambda _repo: [{"stable_diff_id": f"DIF-{index:03d}"} for index in range(210)],
+    )
+    monkeypatch.setattr(
+        "one_c_autoresearch.dif_classifications.coverage",
+        lambda _repo: {
+            "total": 210, "classified": 160, "remaining": 50,
+            "meaning": 160, "noise_candidate": 0, "all_dif_classified": False,
+        },
+    )
+    monkeypatch.setattr(
+        "one_c_autoresearch.dif_classifications.load_active",
+        lambda _repo: {"rows": published},
+    )
+    monkeypatch.setattr(
+        "one_c_autoresearch.workflow._pointer",
+        lambda _repo, _name: {"generation_id": "test"},
+    )
+    store = type("Store", (), {
+        "lease": lambda _self, _job_id: {"thread_id": "current"},
+        "proposals": lambda _self: results,
+    })()
+
+    aggregates = _analyze_aggregates(tmp_path, store)
+
+    assert aggregates["current_window_total"] == 32
+    assert aggregates["current_window_completed"] == 7
+    assert aggregates["window_published"] is False
 
 
 def test_duplicate_timestamps_and_concurrent_slot_insertion_are_stable(

@@ -2390,7 +2390,7 @@ export function Events({ project, target }: { project: Project; target?: Journal
         earliest_sequence: number;
         snapshot?: { events: Event[] }[];
       }>(
-        `/projects/${project.id}/events?cursor=${cursor.current}&limit=500`,
+        `/projects/${project.id}/events?cursor=${cursor.current}&limit=500&tail=${cursor.current === 0}`,
       ).then((value) => {
         const incoming = value.resync_required
           ? (value.snapshot || []).flatMap((item) => item.events || [])
@@ -2473,6 +2473,16 @@ export function Events({ project, target }: { project: Project; target?: Journal
       {Object.entries(grouped).map(([runId, run]) => {
         const runKey = `run:${runId}`;
         const running = !terminalRuns.has(runId);
+        const failure = Object.values(run)
+          .flatMap((job) => Object.values(job))
+          .flatMap((step) => Object.values(step))
+          .flat()
+          .reverse()
+          .map((event) => {
+            const exit = event.payload.exit as Record<string, unknown> | undefined;
+            return (exit?.blocker || event.payload.blocker) as Blocker | undefined;
+          })
+          .find((blocker) => blocker?.message);
         return (
           <Card variant="outlined" key={runId}>
             <CardContent>
@@ -2499,6 +2509,7 @@ export function Events({ project, target }: { project: Project; target?: Journal
                   </Button>
                 )}
               </Stack>
+              {failure && <Alert severity="error" sx={{ mt: 1 }}>{failure.code}: {failure.message}</Alert>}
               {expanded.has(runKey) && (
                 <Stack spacing={1} mt={1}>
                   {Object.entries(run).map(([jobId, job]) => {

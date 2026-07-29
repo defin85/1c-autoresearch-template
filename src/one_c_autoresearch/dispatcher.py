@@ -117,12 +117,12 @@ def load_bindings(repo: Path, project_id: str, job_id: str, work_unit_id: str, a
         work_unit_id=work_unit_id,
         source_generation_id=str((pointers.get("source") or {}).get("generation_id", "")),
         diff_generation_id=str((pointers.get("diff") or {}).get("generation_id", "")),
-        canonical_generation_id=str(consolidation.get("mrq_generation_id", "")),
+        canonical_generation_id=str(consolidation.get("mrq_generation_id") or ""),
         workflow_fingerprint=workflow_fingerprint,
         agent_profile_fingerprint="sha256:" + sha256(canonical_json(agent_profile)) if agent_profile else "",
         instruction_supplement=instruction_supplement,
-        classification_generation_id=str(classification.get("generation_id", "")),
-        consolidation_transaction_id=str(consolidation.get("transaction_id", "")),
+        classification_generation_id=str(classification.get("generation_id") or ""),
+        consolidation_transaction_id=str(consolidation.get("transaction_id") or ""),
     )
 
 
@@ -1181,13 +1181,13 @@ class DispatcherCoordinator:
             if (
                 str((pointers.get("source") or {}).get("generation_id", "")) != bindings.source_generation_id
                 or str((pointers.get("diff") or {}).get("generation_id", "")) != bindings.diff_generation_id
-                or str(consolidation.get("mrq_generation_id", "")) != bindings.canonical_generation_id
+                or str(consolidation.get("mrq_generation_id") or "") != bindings.canonical_generation_id
             ):
                 return False
             if (
                 job_id != "analyze-dif"
-                and str(classification.get("generation_id", "")) != bindings.classification_generation_id
-            ) or str(consolidation.get("transaction_id", "")) != bindings.consolidation_transaction_id:
+                and str(classification.get("generation_id") or "") != bindings.classification_generation_id
+            ) or str(consolidation.get("transaction_id") or "") != bindings.consolidation_transaction_id:
                 return False
             run_file = self.event_store.run_snapshot(bindings.run_id)
             if run_file is None or run_file.get("execution_snapshot_fingerprint") != bindings.execution_snapshot_fingerprint:

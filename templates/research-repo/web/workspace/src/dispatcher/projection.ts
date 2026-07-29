@@ -124,10 +124,12 @@ export interface AgentPhaseProjection {
 export interface DispatcherItems {
   dif_queue: DifCard[];
   meaning_diffs: DifCard[];
+  unassigned_meaning_diffs?: DifCard[];
   noise_diffs: DifCard[];
   proposals: ProposalCard[];
   mrq_outcomes: CollectionCard[];
   mrqs: MrqCard[];
+  all_mrqs?: MrqCard[];
   batches: BatchCard[];
   decisions: DecisionCard[];
   approval_count: number;
@@ -155,7 +157,7 @@ export interface BatchCard { id: string; mrq_ids: string[]; reason: string }
 export interface DecisionCard { id: string; title: string; decision: string; target_solution: string; evidence_count: number; gap: boolean }
 export interface CollectionCard { id: string; title: string; state: string; evidence_count: number; source_ids?: string[]; target_ids?: string[] }
 
-export const EMPTY_ITEMS: DispatcherItems = { dif_queue: [], meaning_diffs: [], noise_diffs: [], proposals: [], mrq_outcomes: [], mrqs: [], batches: [], decisions: [], approval_count: 0 };
+export const EMPTY_ITEMS: DispatcherItems = { dif_queue: [], meaning_diffs: [], unassigned_meaning_diffs: [], noise_diffs: [], proposals: [], mrq_outcomes: [], mrqs: [], all_mrqs: [], batches: [], decisions: [], approval_count: 0 };
 
 export const EMPTY_PROJECTION: DispatcherProjection = {
   schema_version: '2',

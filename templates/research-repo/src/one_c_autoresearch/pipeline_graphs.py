@@ -940,6 +940,7 @@ def compile_analyze_graph(
 
     from langgraph.graph import END, START, StateGraph
     from .dif_classifications import (
+        ensure_current,
         load_active as load_classifications,
         make_row,
         publish_empty,
@@ -958,9 +959,7 @@ def compile_analyze_graph(
     role = next(item for item in policy["roles"] if item["role_id"] == "analyzer")
 
     def run(state: DiscoverState) -> DiscoverState:
-        pointer_path = repo / "research/active-dif-classification-generation.json"
-        if not pointer_path.is_file():
-            publish_empty(repo)
+        ensure_current(repo)
         while True:
             pending = remaining_ids(repo)
             if not pending:

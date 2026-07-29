@@ -134,12 +134,14 @@ const IDLE_REASON: Record<string, string> = {
   environment_unavailable: 'Окружение недоступно',
 };
 const COLLECTIONS = {
-  'dif-queue': { title: 'Очередь DIF', itemKind: 'dif', items: (projection: DispatcherProjection) => projection.items.dif_queue },
+  'dif-queue': { title: 'DIF, ожидающие анализа', itemKind: 'dif', items: (projection: DispatcherProjection) => projection.items.dif_queue },
   'meaning-diffs': { title: 'Смысловые DIF', itemKind: 'dif', items: (projection: DispatcherProjection) => projection.items.meaning_diffs },
+  'unassigned-meaning-diffs': { title: 'Смысловые DIF без MRQ', itemKind: 'dif', items: (projection: DispatcherProjection) => projection.items.unassigned_meaning_diffs ?? [] },
   'noise-diffs': { title: 'Технический шум', itemKind: 'dif', items: (projection: DispatcherProjection) => projection.items.noise_diffs },
   proposals: { title: 'Предложения групп', itemKind: 'proposal', items: (projection: DispatcherProjection) => projection.items.proposals },
   'mrq-outcomes': { title: 'Исходы консолидации MRQ', itemKind: 'outcome', items: (projection: DispatcherProjection) => projection.items.mrq_outcomes },
   'mrq-queue': { title: 'MRQ', itemKind: 'mrq', items: (projection: DispatcherProjection) => projection.items.mrqs },
+  'all-mrqs': { title: 'Опубликованные MRQ', itemKind: 'mrq', items: (projection: DispatcherProjection) => projection.items.all_mrqs ?? projection.items.mrqs },
   batches: { title: 'Пакеты MRQ', itemKind: 'batch', items: (projection: DispatcherProjection) => projection.items.batches },
   approvals: { title: 'Ожидают одобрения', itemKind: 'proposal', items: (projection: DispatcherProjection) => projection.items.proposals.filter((item) => item.kind === 'approval') },
   decisions: { title: 'Решения', itemKind: 'decision', items: (projection: DispatcherProjection) => projection.items.decisions },
@@ -676,11 +678,11 @@ export function DispatcherPanel({ projectId, projection, fingerprint, selection,
       {(selection?.kind === 'queue') && entityView && <Paper component="section" variant="outlined" sx={{ p: 1.4 }}>
         <Typography variant="subtitle2" fontWeight={700}>{String(entityView.title)}</Typography>
         <Typography variant="caption" color="text.secondary">
-          В текущем окне: {String(entityView.visible)}
+          Показано: {String(entityView.visible)}
         </Typography>
         <Typography variant="caption" display="block" color="text.secondary">
           {entityView.aggregate_available
-            ? `Всего: ${String(entityView.total)} · не показано: ${String(entityView.omitted)}`
+            ? `${selection.queueId === 'dif-queue' ? 'Ожидают анализа' : 'Всего'}: ${String(entityView.total)} · не показано: ${String(entityView.omitted)}`
             : 'Точный размер очереди сервером не предоставлен'}
         </Typography>
         <Stack spacing={1} mt={1}>
@@ -865,23 +867,25 @@ function StageRail({ projection }: { projection: DispatcherProjection }) {
     ['Исследование цели', '#0097a7'],
   ] as const;
   const runningJob = Object.entries(projection.jobs).find(([, lease]) => lease.state === 'running')?.[0];
+  const failedJob = Object.entries(projection.jobs).find(([, lease]) => lease.state === 'failed')?.[0];
   const readyCircuit = projection.circuits.find((circuit) => circuit.state === 'ready' || circuit.state === 'blocked')?.id;
-  const active = runningJob === 'decide-mrq' || readyCircuit === 'decide-target' ? 4
-    : runningJob === 'classify-mrq' || readyCircuit === 'classify-mrq' ? 3
-    : runningJob === 'consolidate-mrq' || readyCircuit === 'form-mrq' ? 2
-      : runningJob === 'analyze-dif' ? 1
+  const jobStage = ({ 'analyze-dif': 1, 'consolidate-mrq': 2, 'classify-mrq': 3, 'decide-mrq': 4 } as Record<string, number>)[runningJob ?? failedJob ?? ''];
+  const active = jobStage ?? (readyCircuit === 'decide-target' ? 4
+    : readyCircuit === 'classify-mrq' ? 3
+    : readyCircuit === 'form-mrq' ? 2
       : readyCircuit === 'analyze-dif' ? 1
       : projection.items.decisions.length ? 4
         : projection.items.batches.length ? 3
           : projection.items.mrqs.length ? 2
             : projection.items.meaning_diffs.length || projection.items.proposals.length ? 2
-              : states['prepare-diffs'] === 'complete' ? 1 : 0;
+              : states['prepare-diffs'] === 'complete' ? 1 : 0);
   return <Stack direction="row" alignItems="flex-start" justifyContent="center" sx={{ flex: 1, minWidth: 760 }}>{stages.map(([label, stageColor], index) => {
     const complete = index < active;
     const current = index === active;
-    const blocked = current && Object.values(states).includes('blocked');
-    const color = blocked ? '#d32f2f' : current ? stageColor : complete ? '#2e7d32' : '#9e9e9e';
-    return <Stack key={label} direction="row" alignItems="flex-start" sx={{ flex: index < stages.length - 1 ? 1 : 'none' }}><Stack alignItems="center" spacing={0.15} data-stage-state={complete ? 'complete' : current ? 'active' : 'future'}><Box sx={{ width: 32, height: 32, borderRadius: '50%', display: 'grid', placeItems: 'center', border: '2px solid', borderColor: color, bgcolor: current ? color : '#fff', color: current ? '#fff' : color, fontWeight: 750 }}>{complete ? <Check fontSize="small" /> : index + 1}</Box><Typography variant="body2" fontSize={13} fontWeight={current ? 750 : 500} color={color} whiteSpace="nowrap">{label}</Typography><Typography variant="caption" fontSize={11} color={color}>{complete ? 'Завершён' : current ? blocked ? 'Ожидает' : 'Текущий' : 'Впереди'}</Typography></Stack>{index < stages.length - 1 && <Box sx={{ flex: 1, height: 2, bgcolor: complete ? '#2e7d32' : '#cbd5e1', mt: 1.9, mx: 1 }} />}</Stack>;
+    const failed = current && failedJob === [undefined, 'analyze-dif', 'consolidate-mrq', 'classify-mrq', 'decide-mrq'][index];
+    const blocked = current && states[(['prepare-diffs', 'analyze-dif', 'form-mrq', 'classify-mrq', 'decide-target'] as CircuitId[])[index]] === 'blocked';
+    const color = failed || blocked ? '#d32f2f' : current ? stageColor : complete ? '#2e7d32' : '#9e9e9e';
+    return <Stack key={label} direction="row" alignItems="flex-start" sx={{ flex: index < stages.length - 1 ? 1 : 'none' }}><Stack alignItems="center" spacing={0.15} data-stage-state={failed ? 'error' : complete ? 'complete' : current ? 'active' : 'future'}><Box sx={{ width: 32, height: 32, borderRadius: '50%', display: 'grid', placeItems: 'center', border: '2px solid', borderColor: color, bgcolor: current ? color : '#fff', color: current ? '#fff' : color, fontWeight: 750 }}>{complete ? <Check fontSize="small" /> : index + 1}</Box><Typography variant="body2" fontSize={13} fontWeight={current ? 750 : 500} color={color} whiteSpace="nowrap">{label}</Typography><Typography variant="caption" fontSize={11} color={color}>{failed ? 'Ошибка' : complete ? 'Завершён' : current ? blocked ? 'Ожидает' : 'Текущий' : 'Впереди'}</Typography></Stack>{index < stages.length - 1 && <Box sx={{ flex: 1, height: 2, bgcolor: complete ? '#2e7d32' : '#cbd5e1', mt: 1.9, mx: 1 }} />}</Stack>;
   })}</Stack>;
 }
 
@@ -934,7 +938,7 @@ export function PipelineDispatcher({ projectId, initialProjection, initialFinger
     if (related) setLiveMessage(short(`${lastEvent.type || 'Обновление диспетчера'}: ${String(lastEvent.payload?.invocation_status || lastEvent.payload?.status || '')}`, 160));
   }, [lastEvent?.sequence, selection && selectionKey(selection)]);
   useEffect(() => {
-    void api<{ events: RecentEvent[]; snapshot?: { events: RecentEvent[] }[] }>(`/projects/${projectId}/events?cursor=0&limit=50`).then((value) => {
+    void api<{ events: RecentEvent[]; snapshot?: { events: RecentEvent[] }[] }>(`/projects/${projectId}/events?cursor=0&limit=50&tail=true`).then((value) => {
       const events = value.events.length ? value.events : (value.snapshot ?? []).flatMap((item) => item.events ?? []);
       setRecentEvents(events.filter((event) => event.payload.kind?.startsWith('dispatcher.')).slice(-4).reverse());
     }).catch(() => setRecentEvents([]));
@@ -965,7 +969,7 @@ export function PipelineDispatcher({ projectId, initialProjection, initialFinger
       <Box aria-live="polite" aria-atomic="true" sx={{ position: 'absolute', width: '1px', height: '1px', overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>{liveMessage}</Box>
       {error && <Alert severity="warning" action={resyncing ? <Button color="inherit" onClick={() => void refresh()}>Повторить снимок</Button> : undefined}>{error}</Alert>}
       {resyncing && !error && <LinearProgress aria-label="Пересинхронизация операционного состояния" />}
-      <Stack direction="row" alignItems="center" spacing={2}><StageRail projection={projection} /><Stack direction="row" spacing={1} alignItems="center"><Chip size="small" color={freshnessLabel(projection) === 'данные несвежие' ? 'warning' : 'success'} label={freshnessLabel(projection)} /><Typography variant="caption" color="text.secondary">Ревизия {projection.revision}</Typography>{onOpenJournal && <Button size="small" onClick={() => onOpenJournal()}>Журнал</Button>}{onOpenRegistry && <Button size="small" onClick={() => onOpenRegistry({ registry: 'diff-inventory', itemId: '' })}>Реестры</Button>}</Stack></Stack>
+      <Stack direction="row" alignItems="center" spacing={2}><StageRail projection={projection} /><Stack direction="row" spacing={1} alignItems="center"><Chip size="small" color={freshnessLabel(projection) === 'данные несвежие' ? 'warning' : 'success'} label={freshnessLabel(projection)} /><Typography variant="caption" color="text.secondary">Ревизия {projection.revision}</Typography></Stack></Stack>
       <Stack direction="row" spacing={1} component="nav" aria-label="Этапы диспетчера" useFlexGap flexWrap="wrap">
         {(Object.keys(CIRCUIT_LABEL) as CircuitId[]).map((circuit) => (
           <Button

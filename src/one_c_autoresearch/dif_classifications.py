@@ -210,16 +210,17 @@ def publish_window(
     rows: Iterable[dict[str, Any]],
     *,
     expected_generation_id: str | None,
+    reset: bool = False,
 ) -> dict[str, Any]:
     incoming = list(rows)
     with repository_lock(repo):
         bindings = _bindings(repo)
         path = repo / POINTER
-        active = load_active(repo) if path.is_file() else {"pointer": {}, "rows": []}
+        active = validate_generation(repo, json.loads(path.read_text(encoding="utf-8")), current=not reset) if path.is_file() else {"pointer": {}, "rows": []}
         actual = active["pointer"].get("generation_id")
         if actual != expected_generation_id:
             raise RuntimeError("stale DIF classification generation")
-        merged = {row["stable_diff_id"]: row for row in active["rows"]}
+        merged = {} if reset else {row["stable_diff_id"]: row for row in active["rows"]}
         if set(merged) & {row["stable_diff_id"] for row in incoming}:
             for row in incoming:
                 prior = merged.get(row["stable_diff_id"])
@@ -253,8 +254,21 @@ def publish_window(
         return pointer
 
 
-def publish_empty(repo: Path, *, expected_generation_id: str | None = None) -> dict[str, Any]:
-    return publish_window(repo, [], expected_generation_id=expected_generation_id)
+def publish_empty(repo: Path, *, expected_generation_id: str | None = None, reset: bool = False) -> dict[str, Any]:
+    return publish_window(repo, [], expected_generation_id=expected_generation_id, reset=reset)
+
+
+def ensure_current(repo: Path) -> dict[str, Any]:
+    path = repo / POINTER
+    if not path.is_file():
+        return publish_empty(repo)
+    try:
+        return load_active(repo)["pointer"]
+    except ValueError as exc:
+        if str(exc) != "stale DIF classification bindings":
+            raise
+    pointer = json.loads(path.read_text(encoding="utf-8"))
+    return publish_empty(repo, expected_generation_id=pointer.get("generation_id"), reset=True)
 
 
 def remaining_ids(repo: Path, *, limit: int = 32) -> list[str]:

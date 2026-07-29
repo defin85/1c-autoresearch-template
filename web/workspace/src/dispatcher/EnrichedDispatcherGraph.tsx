@@ -169,7 +169,7 @@ const CardNode = memo(function CardNode({ id, data }: NodeProps<Node<EnrichedNod
         tabIndex={0}
         role="region"
         aria-label={`${data.title}: содержимое`}
-        sx={{ flex: 1, minHeight: 0, overflowY: 'auto', fontSize: 10.5, color: 'text.secondary', lineHeight: 1.3, overflowWrap: 'anywhere' }}
+        sx={{ flex: 1, minHeight: 0, overflowY: 'auto', whiteSpace: 'pre-line', fontSize: 10.5, color: 'text.secondary', lineHeight: 1.3, overflowWrap: 'anywhere' }}
       >{data.detail}</Typography>}
       {data.items?.length ? <Stack
         spacing={0.35}
@@ -264,12 +264,12 @@ export function EnrichedDispatcherGraph({
         'analysis-queue': 'dif-queue',
         'semantic-dif': 'meaning-diffs',
         'technical-noise': 'noise-diffs',
-        'semantic-queue': 'meaning-diffs',
+        'semantic-queue': 'unassigned-meaning-diffs',
         coordinator: 'meaning-diffs',
         proposal: 'mrq-outcomes',
         review: 'mrq-outcomes',
-        publication: 'mrq-queue',
-        'batch-input': 'mrq-queue',
+        publication: 'all-mrqs',
+        'batch-input': 'all-mrqs',
         'batch-output': 'batches',
         'mrq-queue': 'mrq-queue',
         'target-db': 'approvals',

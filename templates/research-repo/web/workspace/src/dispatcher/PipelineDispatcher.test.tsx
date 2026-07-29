@@ -110,6 +110,8 @@ test('PipelineDispatcher renders five circuits and freshness label', async () =>
   expect((await screen.findAllByText(/Смысловых DIF: 1/)).length).toBeGreaterThan(0);
   expect(document.querySelector('[data-zone="decide-outcomes"]')).toBeNull();
   expect(screen.getByText('Легенда')).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Журнал' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Реестры' })).not.toBeInTheDocument();
   expect(screen.getByTestId('dispatcher-new-canvas')).toBeInTheDocument();
   expect(document.querySelectorAll('[data-stage-state="active"]')).toHaveLength(1);
   expect(document.querySelectorAll('[data-stage-state="future"]')).toHaveLength(3);
@@ -200,7 +202,7 @@ test('invocation inspector shows prepared context budget and provenance', async 
 
 test.each([
   [{ kind: 'role', circuitId: 'analyze-dif', phaseId: 'analyze-dif', roleId: 'analyzer' } as const, 'Профиль: local'],
-  [{ kind: 'queue', circuitId: 'analyze-dif', queueId: 'dif-queue' } as const, 'Всего: 75'],
+  [{ kind: 'queue', circuitId: 'analyze-dif', queueId: 'dif-queue' } as const, 'Ожидают анализа: 75'],
   [{ kind: 'item', itemKind: 'dif', circuitId: 'analyze-dif', queueId: 'dif-queue', itemId: 'DIF-001' } as const, 'Catalogs/Test.xml'],
 ])('preserves last resolved %s view when its projection entity disappears', async (selection, expected) => {
   const { rerender } = render(<DispatcherPanel projectId="proj-1" projection={snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection} fingerprint="sha256:fixture" selection={selection} onClose={() => {}} />);
@@ -355,9 +357,11 @@ test('dispatcher stages have keyboard-focusable text controls', async () => {
 test('DIF queue node shows only counts and opens detailed side panel', async () => {
   render(<PipelineDispatcher projectId="proj-1" initialProjection={snapshotWithDispatcher.dispatcher as unknown as DispatcherProjection} initialFingerprint="sha256:workflow" />);
   const node = await waitFor(() => document.querySelector<HTMLElement>('.react-flow__node[data-id="dif-queue"]')!);
-  expect(node).toHaveTextContent('Всего DIF: 75');
+  expect(node).toHaveTextContent('Канонически осталось: 75 Готово к публикации: 0');
   expect(node).not.toHaveTextContent('DIF-001');
   fireEvent.click(node);
+  expect(await screen.findByText('DIF, ожидающие анализа')).toBeInTheDocument();
+  expect(screen.getByText('Ожидают анализа: 75 · не показано: 74')).toBeInTheDocument();
   expect(await screen.findByText('DIF-001')).toBeInTheDocument();
   expect(screen.getByText('Catalogs/Test.xml')).toBeInTheDocument();
 });
@@ -372,7 +376,7 @@ test('collection nodes show counts and open their typed items in the side panel'
   fireEvent.click(screen.getByRole('button', { name: 'Закрыть' }));
 
   const batches = document.querySelector<HTMLElement>('.react-flow__node[data-id="batch-output"]')!;
-  expect(batches).toHaveTextContent('Пакетов: 1');
+  expect(batches).toHaveTextContent('Опубликовано пакетов: 1');
   fireEvent.click(batches);
   expect(await screen.findByRole('button', { name: 'MRQB-1234567890ABCDEF' })).toBeInTheDocument();
 });
@@ -410,6 +414,24 @@ test.each([
 ] as const)('%s состояние аренды показано текстом', (_name, projection, label) => {
   render(<DispatcherPanel projectId="proj-1" projection={projection} fingerprint="sha256:fixture" selection={{ kind: 'circuit', circuitId: 'analyze-dif' }} onClose={() => {}} />);
   expect(screen.getByText(new RegExp(`Аренда: fixture-agent \\(${label}\\)`))).toBeInTheDocument();
+});
+
+test('ошибка задания показана в основном контроле этапов', () => {
+  const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
+  projection.jobs['analyze-dif'] = { ...errorProjection.jobs['analyze-dif'] };
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={projection} />);
+  expect(document.querySelector('[data-stage-state="error"]')).toHaveTextContent('Анализ DIFОшибка');
+});
+
+test('активное задание имеет приоритет над заблокированным следующим этапом', () => {
+  const projection = structuredClone(snapshotWithDispatcher.dispatcher) as unknown as DispatcherProjection;
+  projection.circuits[1].state = 'active' as DispatcherProjection['circuits'][number]['state'];
+  projection.jobs['analyze-dif'] = {
+    job_id: 'analyze-dif', thread_id: 'thread', work_unit_id: 'analyze-dif', owner: 'local-user',
+    acquired_at: new Date().toISOString(), renewed_at: new Date().toISOString(), state: 'running', summary: {},
+  };
+  render(<PipelineDispatcher projectId="proj-1" initialProjection={projection} />);
+  expect(document.querySelector('[data-stage-state="active"]')).toHaveTextContent('Анализ DIFТекущий');
 });
 
 test('context settings action passes the selected workflow step', () => {
