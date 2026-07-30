@@ -121,6 +121,40 @@ test("shows accessible source tool installations and current use", async () => {
                 },
               ],
             },
+            {
+              tool_id: "rlm-tools-bsl",
+              status: "ready",
+              purpose: "source_indexer",
+              required: true,
+              route_capabilities: ["text-search", "symbol-definition"],
+              instances: [
+                {
+                  version: "1.30.0",
+                  status: "ready",
+                  path: "/tools/rlm-bsl-index",
+                },
+              ],
+            },
+            {
+              tool_id: "designer",
+              status: "ready",
+              purpose: "exporter",
+              instances: [
+                {
+                  version: "8.3.27.1989",
+                  status: "ready",
+                  path: "/opt/1cv8/1cv8",
+                },
+              ],
+            },
+            {
+              tool_id: "bsl-analyzer",
+              status: "unavailable",
+              purpose: "source_indexer",
+              required: false,
+              route_capabilities: [],
+              instances: [],
+            },
           ],
         }),
       }),
@@ -135,10 +169,13 @@ test("shows accessible source tool installations and current use", async () => {
   fireEvent.click(screen.getByText("Показать установки, версии и пути"));
   expect(
     screen.getByRole("table", {
-      name: "Установки инструментов получения исходников",
+      name: "Установки инструментов обработки исходников",
     }),
   ).toBeInTheDocument();
   expect(screen.getByText("требуется текущим маршрутом")).toBeInTheDocument();
+  expect(screen.getByText("не используется текущим способом получения")).toBeInTheDocument();
+  expect(screen.getByText(/требуется маршрутами: text-search, symbol-definition/)).toBeInTheDocument();
+  expect(screen.getByText("не выбран в маршрутах")).toBeInTheDocument();
 });
 
 test("shows a running routing preview before route groups are available", async () => {
@@ -164,6 +201,35 @@ test("shows a running routing preview before route groups are available", async 
   expect(screen.getByText(/Состояние: running/)).toBeInTheDocument();
   expect(screen.getByText("Проверено компонентов: 1 из 3. Текущий: configuration:target_cf")).toBeInTheDocument();
   expect(await screen.findByText("проверка завершена")).toBeInTheDocument();
+});
+
+test("blocks only indexing when a routed indexer is unavailable", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        complete: true,
+        tools: [{
+          tool_id: "bsl-analyzer",
+          status: "unavailable",
+          purpose: "source_indexer",
+          required: true,
+          route_capabilities: ["text-search"],
+          instances: [],
+        }],
+      }),
+    }),
+  );
+  render(
+    <ToolInventory
+      project={{ id: "p", name: "p", root: "/repo" }}
+      selectedProfile="ibcmd+form-aware/v1"
+    />,
+  );
+  expect(await screen.findByText(/Этап индексации заблокирован/)).toHaveTextContent(
+    "Получение исходников при этом остаётся доступно",
+  );
 });
 
 test("saved infobase connection parameters are visible and editable without exposing passwords", async () => {
@@ -335,7 +401,7 @@ test("agent profile persists the complete bounded source search policy", async (
     const put = fetchMock.mock.calls.find(([, init]) => init?.method === "PUT");
     const profile = JSON.parse(String(put?.[1]?.body)).profile;
     expect(profile.source_search).toMatchObject({
-      operations: expect.arrayContaining(["search_text", "find_symbol"]),
+      operations: expect.arrayContaining(["code.search_lexical", "symbol.info"]),
       max_calls: expect.any(Number),
       max_backend_seconds: expect.any(Number),
       max_total_returned_bytes: expect.any(Number),
@@ -384,6 +450,64 @@ test("index validation is an explicit progress-visible action", async () => {
   finishValidation({
     ok: true,
     json: async () => ({ operation: "indexes.validate", components: [] }),
+  });
+});
+
+test("schema 3 rollback requires a reviewed preview and confirmation", async () => {
+  const fetchMock = vi.fn().mockImplementation((url: string) =>
+    Promise.resolve({
+      ok: true,
+      json: async () => url.endsWith("/indexes")
+        ? {
+            items: [],
+            configuration: {
+              schema_version: "3",
+              backends: [{ adapter_id: "bsl-analyzer", engine_version: "1.0" }],
+              routes: {
+                "code-search-lexical": ["bsl-analyzer"],
+                "code-search-hybrid": ["bsl-analyzer"],
+              },
+              service_profiles: {
+                lexical: "lexical-default",
+                hybrid: "embedding-default",
+              },
+            },
+            configuration_fingerprint: "sha256:config",
+            reference_readiness: {
+              status: "not_ready",
+              recovery_action: "ensure_index",
+            },
+          }
+        : url.endsWith("/search-services")
+          ? { profiles: [], state_fingerprint: "sha256:services" }
+          : url.endsWith("/rollback-preview")
+            ? {
+                plan_fingerprint: "sha256:plan",
+                v2_inflight_ids: ["inv-1"],
+                admission_closure_required: true,
+                readiness_check_required: true,
+              }
+            : {},
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  vi.spyOn(window, "confirm").mockReturnValue(true);
+  render(<Indexes
+    project={{ id: "p", name: "p", root: "/repo" }}
+    snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
+  />);
+  expect(await screen.findByText(/Справочный индекс.*not_ready/)).toBeInTheDocument();
+  fireEvent.click(await screen.findByRole("button", { name: /Настройка адаптеров/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Просмотреть откат к схеме 2" }));
+  expect(await screen.findByText(/"admission_closure_required": true/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Применить проверенный откат" }));
+  await waitFor(() => {
+    const apply = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/indexes/rollback"));
+    expect(JSON.parse(String(apply?.[1]?.body))).toMatchObject({
+      plan_fingerprint: "sha256:plan",
+      inflight_handling: "cancelled",
+      confirmed: true,
+    });
   });
 });
 
@@ -444,6 +568,7 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
                 },
               },
               configuration_fingerprint: "sha256:config",
+              storage_root: "/state/one-c-autoresearch/indexes-v2/repository",
               route_health: {
                 blockers: [],
                 degraded: [{
@@ -467,6 +592,7 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
   expect(screen.getAllByText(/backend.executable_unavailable/)).toHaveLength(2);
   expect(screen.getByText(/fix_backend_installation/)).toBeInTheDocument();
   expect(screen.getByText(/Деградированные маршруты/)).toBeInTheDocument();
+  expect(screen.getByText(/\/state\/one-c-autoresearch\/indexes-v2\/repository/)).toBeInTheDocument();
   fireEvent.click(screen.getByText("Настройка адаптеров и маршрутов"));
   fireEvent.click(screen.getByRole("button", { name: "Проверить изменения" }));
   expect(await screen.findByText(/degraded_routes/)).toBeInTheDocument();

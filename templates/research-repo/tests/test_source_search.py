@@ -11,6 +11,10 @@ from one_c_autoresearch import indexes, source_search
 
 
 REPO = Path(__file__).parents[1]
+requires_source_generation = pytest.mark.skipif(
+    not (REPO / "research/active-source-generation.json").is_file(),
+    reason="requires a concrete research repository source generation",
+)
 
 
 def policy(**overrides):
@@ -32,6 +36,7 @@ def policy(**overrides):
 
 def test_profile_policy_is_closed_bounded_and_has_exact_dynamic_reserve():
     value = source_search.validate_profile_policy(policy())
+    assert value["operations"] == ["code.search_lexical", "symbol.info"]
     assert source_search.dynamic_reserve_bytes(value) == 200 + 8192 + 4 * 512
     with pytest.raises(ValueError, match="fields"):
         source_search.validate_profile_policy({**value, "backend": "bsl-analyzer"})
@@ -41,6 +46,59 @@ def test_profile_policy_is_closed_bounded_and_has_exact_dynamic_reserve():
         source_search.validate_profile_policy(policy(max_calls=1, max_concurrent_calls=2))
 
 
+def test_v2_request_surface_is_closed_complete_and_has_no_infrastructure_controls():
+    schema = source_search.request_schema()
+    variants = {
+        item["properties"]["operation"]["const"]: item
+        for item in schema["oneOf"]
+    }
+    assert set(variants) == set(source_search.V2_OPERATIONS)
+    assert len(variants) == len(schema["oneOf"])
+    assert all(item["additionalProperties"] is False for item in variants.values())
+    assert all(
+        not {"backend", "adapter", "native_tool", "native_action"} & set(item["properties"])
+        for item in variants.values()
+    )
+    assert "query" in variants["code.search_hybrid"]["required"]
+    assert "id" in variants["graph.neighbors"]["required"]
+    assert "path" in variants["diagnostics.file"]["required"]
+    assert "question" in variants["reference.its_help"]["required"]
+    assert "component_id" not in variants["reference.search_docs"]["properties"]
+
+
+def test_v2_response_surface_is_closed_bounded_and_has_no_cursor():
+    schema = source_search.response_schema()
+    assert schema["additionalProperties"] is False
+    assert "cursor" not in schema["properties"]
+    items = schema["properties"]["items"]
+    assert items["maxItems"] == source_search.POLICY_LIMITS["max_results_per_call"]
+    variants = items["items"]["oneOf"]
+    assert {
+        item["properties"]["kind"]["const"] for item in variants
+    } == {
+        "canonical-hit", "canonical-excerpt", "navigation-node",
+        "navigation-edge", "derived-finding", "reference-hit", "native-text",
+        "retry", "degraded",
+    }
+    assert all(item["additionalProperties"] is False for item in variants)
+
+
+def test_v1_aliases_migrate_exactly_and_false_references_fail_with_guidance():
+    migrated = source_search.validate_profile_policy(policy(operations=[
+        "search_text", "find_symbol", "find_callers", "find_callees", "navigate_metadata",
+    ]))
+    assert migrated["operations"] == [
+        "code.search_lexical", "symbol.info", "graph.callers", "graph.callees",
+        "metadata.tree",
+    ]
+    with pytest.raises(ValueError, match=r"find_references_unsupported.*symbol\.info.*graph\.callers"):
+        source_search.validate_profile_policy(policy(operations=["find_references"]))
+    assert source_search.request_schema("source-search-tool/v1")["properties"]["operation"]["enum"] == [
+        "find_callees", "find_callers", "find_symbol", "navigate_metadata", "search_text",
+    ]
+
+
+@requires_source_generation
 def test_policy_freezes_role_scope_and_routes():
     profile = {"source_search": policy()}
     resolved = source_search.resolve_policy(
@@ -54,9 +112,9 @@ def test_policy_freezes_role_scope_and_routes():
         },
     )
     assert resolved is not None
-    assert resolved["schema_version"] == "source-search-policy/v1"
+    assert resolved["schema_version"] == source_search.POLICY_VERSION
     assert resolved["component_ids"] == ["target_cf:configuration"]
-    assert resolved["operations"] == ["search_text", "find_symbol"]
+    assert resolved["operations"] == ["code.search_lexical", "symbol.info"]
     assert resolved["logical_path_prefixes"] == [
         "configuration/CommonModules/ЗагрузкаМетаданныхEDT/Ext/Module.bsl"
     ]
@@ -64,6 +122,7 @@ def test_policy_freezes_role_scope_and_routes():
     assert source_search.resolve_policy(REPO, {}, "analyzer", {"allowed_paths": []}) is None
 
 
+@requires_source_generation
 def test_source_search_returns_only_canonical_verified_navigation():
     component = next(item for item in indexes.discover(REPO) if item["component_id"] == "target_cf:configuration")
     backend = {"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"}
@@ -159,6 +218,228 @@ def test_source_search_returns_only_canonical_verified_navigation():
         )
 
 
+@requires_source_generation
+def test_workspace_v2_canonicalizes_hits_and_rereads_excerpts(monkeypatch):
+    component = next(
+        item for item in indexes.discover(REPO)
+        if item["component_id"] == "target_cf:configuration"
+    )
+    resolved = source_search.resolve_policy(
+        REPO,
+        {"source_search": policy(operations=["graph.source"])},
+        "analyzer",
+        {
+            "allowed_paths": [
+                "target_cf/configuration/CommonModules/ЗагрузкаМетаданныхEDT/Ext/Module.bsl"
+            ]
+        },
+    )
+    assert resolved
+    state = {
+        "adapter_id": "bsl-analyzer",
+        "adapter_version": "bsl-analyzer-workspace/v2",
+        "component_id": component["component_id"],
+        "capabilities": ["graph-source"],
+        "status": "ready",
+        "index_fingerprint": "sha256:index",
+        "capability_fingerprint": "sha256:capability",
+    }
+    monkeypatch.setattr(indexes, "select_backend", lambda *_args: {
+        "route_fingerprint": "sha256:route",
+        "preferred_backend_id": "bsl-analyzer",
+        "selected_backend_id": "bsl-analyzer",
+        "fallback_reason": None,
+        "state": state,
+    })
+    result = source_search.execute_query(
+        REPO,
+        resolved,
+        {
+            "operation": "graph.source",
+            "ids": ["node"],
+            "component_id": component["component_id"],
+            "max_results": 2,
+        },
+        [state],
+        lambda _decision, request: {
+            "items": [{
+                "kind": "canonical-hit",
+                "component_relative_path":
+                    "CommonModules/ЗагрузкаМетаданныхEDT/Ext/Module.bsl",
+                "line": 1,
+                "text": "MUST NOT SURVIVE",
+            }],
+            "truncated": False,
+        },
+    )
+    assert result["schema_version"] == "source-search-result/v2"
+    assert [item["kind"] for item in result["items"]] == [
+        "canonical-hit", "canonical-excerpt",
+    ]
+    assert "MUST NOT SURVIVE" not in json.dumps(result, ensure_ascii=False)
+    excerpt = result["items"][1]
+    canonical = (
+        REPO / "sources/generations"
+        / component["source_generation_id"] / component["path"]
+        / "CommonModules/ЗагрузкаМетаданныхEDT/Ext/Module.bsl"
+    ).read_text(encoding="utf-8")
+    assert excerpt["text"] in canonical
+    assert excerpt["fingerprint"] == result["items"][0]["fingerprint"]
+
+
+@requires_source_generation
+def test_workspace_v2_rejects_scope_escape_and_discards_native_source_text(monkeypatch):
+    component = next(
+        item for item in indexes.discover(REPO)
+        if item["component_id"] == "target_cf:configuration"
+    )
+    resolved = source_search.resolve_policy(
+        REPO,
+        {"source_search": policy(operations=["metadata.form"])},
+        "analyzer",
+        {
+            "allowed_paths": [
+                "target_cf/configuration/CommonModules/ЗагрузкаМетаданныхEDT/Ext/Module.bsl"
+            ]
+        },
+    )
+    assert resolved
+    state = {
+        "adapter_id": "bsl-analyzer",
+        "adapter_version": "bsl-analyzer-workspace/v2",
+        "component_id": component["component_id"],
+        "capabilities": ["metadata-form"],
+        "status": "ready",
+        "index_fingerprint": "sha256:index",
+    }
+    monkeypatch.setattr(indexes, "select_backend", lambda *_args: {
+        "route_fingerprint": "sha256:route",
+        "preferred_backend_id": "bsl-analyzer",
+        "selected_backend_id": "bsl-analyzer",
+        "fallback_reason": None,
+        "state": state,
+    })
+    result = source_search.execute_query(
+        REPO,
+        resolved,
+        {
+            "operation": "metadata.form",
+            "component_id": component["component_id"],
+            "object_type": "Catalog",
+        },
+        [state],
+        lambda *_args: {
+            "items": [{
+                "kind": "native-text",
+                "schema_version": "native-text-envelope/v1",
+                "text": "native source body",
+            }],
+            "truncated": False,
+        },
+    )
+    assert result["items"] == [{
+        "kind": "degraded",
+        "reason": "source_search.native_source_text_discarded",
+        "narrowing_hint": "use a structured BSL Analyzer response",
+    }]
+    with pytest.raises(ValueError, match="path_scope_forbidden"):
+        source_search.execute_query(
+            REPO,
+            {**resolved, "operations": ["diagnostics.file"]},
+            {
+                "operation": "diagnostics.file",
+                "component_id": component["component_id"],
+                "path": "configuration/Configuration.xml",
+                "max_results": 1,
+            },
+            [state],
+            lambda *_args: {"items": [], "truncated": False},
+        )
+
+
+@requires_source_generation
+def test_every_workspace_v2_operation_reaches_the_fixed_backend(monkeypatch):
+    component = next(
+        item for item in indexes.discover(REPO)
+        if item["component_id"] == "target_cf:configuration"
+    )
+    operations = [
+        operation for operation in source_search.V2_OPERATIONS
+        if not operation.startswith("reference.")
+    ]
+    resolved = source_search.resolve_policy(
+        REPO,
+        {"source_search": policy(operations=operations)},
+        "analyzer",
+        {
+            "allowed_paths": [
+                "target_cf/configuration/CommonModules/ЗагрузкаМетаданныхEDT/Ext/Module.bsl"
+            ]
+        },
+    )
+    assert resolved
+    state = {
+        "adapter_id": "bsl-analyzer",
+        "adapter_version": "bsl-analyzer-workspace/v2",
+        "component_id": component["component_id"],
+        "status": "ready",
+        "index_fingerprint": "sha256:index",
+    }
+    monkeypatch.setattr(indexes, "select_backend", lambda *_args: {
+        "route_fingerprint": "sha256:route",
+        "preferred_backend_id": "bsl-analyzer",
+        "selected_backend_id": "bsl-analyzer",
+        "fallback_reason": None,
+        "state": state,
+    })
+    common_path = "configuration/CommonModules/ЗагрузкаМетаданныхEDT/Ext/Module.bsl"
+    requests = {
+        "code.search_lexical": {"query": "Q", "max_results": 1},
+        "code.search_hybrid": {"query": "Q", "max_results": 1},
+        "symbol.info": {"symbol": "S"},
+        "symbol.info_at": {
+            "component_id": component["component_id"], "path": common_path, "line": 1,
+        },
+        "graph.overview": {},
+        "graph.schema": {},
+        "graph.resolve": {"query": "Q", "max_results": 1},
+        **{
+            f"graph.{name}": {"id": "node", "max_results": 1}
+            for name in ("node", "neighbors", "callers", "callees")
+        },
+        "graph.source": {"ids": ["node"], "max_results": 1},
+        "metadata.info": {"component_id": component["component_id"]},
+        "metadata.tree": {"component_id": component["component_id"], "max_results": 1},
+        "metadata.object": {
+            "component_id": component["component_id"],
+            "object_type": "Catalog", "object_name": "Items",
+        },
+        "metadata.form": {
+            "component_id": component["component_id"], "object_type": "Catalog",
+        },
+        "diagnostics.catalog": {"max_results": 1},
+        "diagnostics.schema": {"max_results": 1},
+        "diagnostics.workspace": {"max_results": 1},
+        "diagnostics.file": {
+            "component_id": component["component_id"], "path": common_path,
+            "max_results": 1,
+        },
+    }
+    seen = []
+    for operation in operations:
+        arguments = requests[operation]
+        result = source_search.execute_query(
+            REPO, resolved, {"operation": operation, **arguments}, [state],
+            lambda _decision, request: (
+                seen.append(request["operation"])
+                or {"items": [], "truncated": False}
+            ),
+        )
+        assert result["schema_version"] == "source-search-result/v2"
+    assert seen == operations
+
+
+@requires_source_generation
 def test_empty_success_never_falls_back_and_conflicting_hits_fail_closed(monkeypatch):
     component = next(
         item for item in indexes.discover(REPO)
@@ -250,6 +531,7 @@ def test_empty_success_never_falls_back_and_conflicting_hits_fail_closed(monkeyp
         )
 
 
+@requires_source_generation
 def test_extension_hit_becomes_an_ordinary_extension_evidence_path():
     component = next(
         item for item in indexes.discover(REPO)
@@ -336,6 +618,7 @@ def test_hmac_rotation_keeps_old_key_and_changes_query_identity(tmp_path: Path):
     )
 
 
+@requires_source_generation
 def test_final_evidence_revalidation_and_reuse_ignore_volatile_ledger_fields(
     monkeypatch,
 ):

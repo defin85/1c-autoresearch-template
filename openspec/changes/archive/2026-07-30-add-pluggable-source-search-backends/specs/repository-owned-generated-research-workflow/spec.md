@@ -128,6 +128,10 @@ The generated workflow SHALL keep all backend index databases and lifecycle stat
 - **WHEN** a backend builds or replaces one index target
 - **THEN** it MUST hold a target-keyed fenced lease, write only private staging, validate the exact source and index manifests, derive a promoted instance identity, atomically promote the immutable instance and switch the target pointer, serve queries only from pointed promoted state, and prevent stale, cancelled, crashed, or lease-lost work from promotion.
 
+#### Scenario: The local RLM CLI builds an index
+- **WHEN** the coordinator invokes `rlm-bsl-index` instead of the password-protected RLM MCP project registry
+- **THEN** build, validation, and query processes MUST share one instance-owned `RLM_INDEX_DIR`, promote that directory with the immutable instance, and MUST NOT depend on a user home, registered project, or project password.
+
 #### Scenario: A legacy matching index is discovered
 - **WHEN** existing `rlm-tools-bsl` state has the complete active component, generation, engine, and content identity required by the fixed adapter
 - **THEN** the runtime MAY adopt it after bounded validation without rebuilding it solely for the adapter migration.

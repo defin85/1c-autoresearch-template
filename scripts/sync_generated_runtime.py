@@ -22,6 +22,9 @@ FILES = (
     "tests/test_dispatcher_inspector_server.py", "tests/test_dispatcher_smoke.py", "tests/test_doctor.py", "tests/test_mrq.py",
     "tests/test_mrq_batches.py", "tests/test_pipeline_graphs.py", "tests/test_workflow.py",
     "tests/test_contracts.py", "tests/test_source_search.py",
+    "tests/test_source_search_v2_ledger.py", "tests/test_search_runtime.py",
+    "tests/test_search_services.py", "tests/test_reference_search.py",
+    "tests/fixtures/bsl-analyzer-contract-1.3.json",
     "tests/test_dif_classifications.py", "tests/test_consolidation.py",
     "tests/test_component_groups.py", "tests/test_service_extension_scope.py",
     "tests/test_decision_generations.py", "tests/test_workflow_migration.py",
@@ -59,6 +62,9 @@ def package_test_text(text: str) -> str:
     return text.replace(
         "REPO = Path(__file__).resolve().parents[1]\n",
         'REPO = Path(__file__).resolve().parents[1] / "templates/research-repo"\n',
+    ).replace(
+        "REPO = Path(__file__).parents[1]\n",
+        'REPO = Path(__file__).parents[1] / "templates/research-repo"\n',
     ).replace(
         '(Path(__file__).resolve().parents[1] / "research/',
         '(Path(__file__).resolve().parents[1] / "templates/research-repo" / "research/',

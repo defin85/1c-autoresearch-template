@@ -1,0 +1,42 @@
+{
+  "schema_version": "bsl-search-surface/v1",
+  "machine_contract_version": "1.3",
+  "profiles": {
+    "workspace": {
+      "allowed": {
+        "search": ["search_code", "status"],
+        "symbol_info": [],
+        "graph": ["overview", "schema", "status", "node", "source", "neighbors", "callers", "callees", "resolve"],
+        "metadata": ["info", "tree", "object", "form", "status"],
+        "diagnostics": ["catalog", "schema", "status", "file", "workspace"]
+      },
+      "denied": {
+        "query": ["validate", "execute", "schema"],
+        "execute": ["check", "run", "eval"],
+        "event_log": [],
+        "debug": ["attach", "disconnect", "set_breakpoint", "remove_breakpoint", "continue", "step", "wait_stop", "stack_trace", "locals", "eval"]
+      }
+    },
+    "reference": {
+      "allowed": {
+        "search": ["find_docs", "search_docs", "status"],
+        "syntax_help": [],
+        "its_help": []
+      },
+      "denied": {}
+    }
+  },
+  "structured_outputs": {
+    "reference.syntax_help": {
+      "schema_version": 1,
+      "output_schema_fingerprint": "blake3:77ab89c5868110d089b431d81c0ec5c3f1cbb4d755e1396f963ab4bbff72fa8e"
+    }
+  },
+  "workspace_transport": {
+    "mode": "broker-required",
+    "backend_pid_required": true,
+    "auto_launch": false,
+    "stdio_fallback": false,
+    "peer_identity": "supervised-pid+platform-trust"
+  }
+}

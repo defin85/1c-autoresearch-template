@@ -194,6 +194,15 @@ async function openFixture(
       configuration_fingerprint: 'sha256:index-config',
     }),
   }));
+  await page.route('**/api/v1/projects/fixture/search-services', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      schema_version: 'search-services/v1',
+      state_fingerprint: 'sha256:search-services',
+      profiles: [],
+    }),
+  }));
   await page.route('**/api/v1/projects/fixture/indexes/configuration-preview', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',

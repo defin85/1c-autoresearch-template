@@ -4,7 +4,7 @@ from pathlib import Path
 from one_c_autoresearch.doctor import check, legacy_failures, packaged_secret_failure
 
 
-REPO = Path(__file__).parents[1]
+REPO = Path(__file__).parents[1] / "templates/research-repo"
 
 
 def test_doctor_finds_no_legacy_authority_after_removal():

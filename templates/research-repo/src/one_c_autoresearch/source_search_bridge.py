@@ -98,6 +98,72 @@ def rotate_hmac_key(root: Path) -> str:
     return version
 
 
+def _modality(operation: str) -> str:
+    if operation == "code.search_lexical":
+        return "lexical"
+    if operation == "code.search_hybrid":
+        return "hybrid"
+    if operation == "reference.its_help":
+        return "its"
+    if operation.startswith("reference."):
+        return "reference"
+    return "workspace"
+
+
+def _v2_provenance(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("schema_version") != "source-search-result/v2":
+        return {}
+    operation = source_search.normalize_operation(result.get("operation"))
+    route = result.get("route")
+    items = result.get("items")
+    if not isinstance(route, dict) or not isinstance(items, list):
+        raise ValueError("source_search.incomplete_v2_provenance")
+    classes = {
+        "canonical-hit": "canonical_navigation_hit",
+        "canonical-excerpt": "canonical_excerpt",
+        "reference-hit": "reference_navigation_finding",
+    }
+    counts: dict[str, int] = {}
+    canonical: list[dict[str, Any]] = []
+    derived: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("source_search.incomplete_v2_provenance")
+        result_class = classes.get(str(item.get("kind")), "derived_navigation_finding")
+        counts[result_class] = counts.get(result_class, 0) + 1
+        identity = {
+            key: item[key]
+            for key in (
+                "kind", "component_id", "source_generation_id", "path",
+                "fingerprint", "line", "symbol",
+            )
+            if key in item
+        }
+        (canonical if result_class.startswith("canonical_") else derived).append(identity)
+    def fingerprint(values: list[dict[str, Any]]) -> str:
+        return "sha256:" + sha256(canonical_json(values))
+    surface_identity = str(
+        route.get("surface_identity")
+        or route.get("surface_manifest_fingerprint")
+        or result.get("surface_identity", "")
+    )
+    if not surface_identity.startswith("sha256:"):
+        raise ValueError("source_search.incomplete_v2_provenance")
+    return {
+        "surface_identity": surface_identity,
+        "embedding_identity": str(
+            route.get("embedding_identity") or result.get("embedding_identity", "")
+        ),
+        "reference_identity": str(
+            route.get("reference_identity") or result.get("reference_identity", "")
+        ),
+        "result_class_counts": counts,
+        "canonical_manifest_fingerprint": fingerprint(canonical) if canonical else "",
+        "derived_manifest_fingerprint": fingerprint(derived) if derived else "",
+        "modality": _modality(operation),
+    }
+
+
 def serve(repo: Path, state_base: Path | None, invocation_id: str, capability: str) -> None:
     verifier = "sha256:" + sha256(capability.encode())
     with DispatcherStore(repo, state_base) as store:
@@ -136,7 +202,9 @@ def serve(repo: Path, state_base: Path | None, invocation_id: str, capability: s
                     _reply(identifier, result={"tools": [{
                         "name": "source_search",
                         "description": "Search active bounded 1C sources through coordinator-owned routing.",
-                        "inputSchema": source_search.request_schema(),
+                        "inputSchema": source_search.request_schema(
+                            str(policy.get("tool_schema_version", "source-search-tool/v1")),
+                        ),
                     }]})
                 elif method == "tools/call":
                     params = request.get("params") or {}
@@ -146,7 +214,8 @@ def serve(repo: Path, state_base: Path | None, invocation_id: str, capability: s
                     if not isinstance(arguments, dict):
                         raise ValueError("source_search.invalid_request")
                     call_id = str(identifier)
-                    operation = str(arguments.get("operation", ""))
+                    requested_operation = str(arguments.get("operation", ""))
+                    operation = source_search.normalize_operation(requested_operation)
                     query = {
                         "operation": operation,
                         "query": str(arguments.get("query", "")),
@@ -159,7 +228,19 @@ def serve(repo: Path, state_base: Path | None, invocation_id: str, capability: s
                         call_id,
                         verifier,
                         query_hmac=source_search.query_hmac(hmac_key, key_version, query),
-                        capability=source_search.OPERATIONS.get(operation, ""),
+                        capability=source_search.V1_EXECUTION_CAPABILITIES.get(
+                            operation, source_search.OPERATIONS[operation],
+                        ),
+                        operation=(
+                            operation
+                            if requested_operation not in source_search.V1_ALIASES
+                            else ""
+                        ),
+                        modality=(
+                            _modality(operation)
+                            if requested_operation not in source_search.V1_ALIASES
+                            else ""
+                        ),
                         query_bytes=len(str(arguments.get("query", "")).encode()),
                         requested_results=int(arguments.get("max_results", 0)),
                         requested_returned_bytes=policy["max_returned_bytes_per_call"],
@@ -183,6 +264,9 @@ def serve(repo: Path, state_base: Path | None, invocation_id: str, capability: s
                                     invocation_id
                                 ),
                             ),
+                            cancelled=lambda: not store.source_search_admission_open(
+                                invocation_id
+                            ),
                         )
                     except Exception as exc:
                         store.settle_source_search_call(
@@ -193,6 +277,7 @@ def serve(repo: Path, state_base: Path | None, invocation_id: str, capability: s
                             error_code=str(exc)[:200],
                         )
                         raise
+                    provenance = _v2_provenance(result)
                     settled = store.settle_source_search_call(
                         invocation_id,
                         call_id,
@@ -204,6 +289,16 @@ def serve(repo: Path, state_base: Path | None, invocation_id: str, capability: s
                         capability_fingerprint=result["route"]["capability_fingerprint"],
                         index_fingerprint=result["route"]["index_fingerprint"],
                         result_manifest_fingerprint=result["result_manifest_fingerprint"],
+                        surface_identity=provenance.get("surface_identity", ""),
+                        embedding_identity=provenance.get("embedding_identity", ""),
+                        reference_identity=provenance.get("reference_identity", ""),
+                        result_class_counts=provenance.get("result_class_counts"),
+                        canonical_manifest_fingerprint=provenance.get(
+                            "canonical_manifest_fingerprint", ""
+                        ),
+                        derived_manifest_fingerprint=provenance.get(
+                            "derived_manifest_fingerprint", ""
+                        ),
                         result_count=result["result_count"],
                         returned_bytes=result["returned_bytes"],
                         backend_seconds=min(time.monotonic() - started, reserved["deadline_seconds"]),

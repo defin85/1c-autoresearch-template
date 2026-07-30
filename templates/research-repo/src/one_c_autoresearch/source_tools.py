@@ -134,12 +134,17 @@ def discover_tools(configured_roots: Iterable[str]) -> dict[str, Any]:
             incomplete.update(PURPOSES)
             break
         ibcmd = root / "ibcmd"
-        platform_version = add("ibcmd", ibcmd, root) if ibcmd.exists() else ""
+        if ibcmd.exists():
+            add("ibcmd", ibcmd, root)
         if (root / "1cv8").exists():
-            add("designer", root / "1cv8", root, platform_version)
-    for tool, name in (("edt", "1cedtcli"), ("v8unpack", "v8unpack")):
-        if executable := shutil.which(name):
-            add(tool, Path(executable))
+            add("designer", root / "1cv8", root, root.name if re.fullmatch(r"8\.\d+\.\d+\.\d+", root.name) else "")
+    edt_paths = sorted(Path("/opt/1C/1CE/components").glob("1c-edt-*-x86_64/1cedtcli"))
+    if executable := shutil.which("1cedtcli"):
+        edt_paths.append(Path(executable))
+    for executable in edt_paths:
+        add("edt", executable)
+    if executable := shutil.which("v8unpack"):
+        add("v8unpack", Path(executable))
 
     complete = not diagnostics
     tools = []

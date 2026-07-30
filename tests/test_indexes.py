@@ -1,16 +1,170 @@
 import json
+import os
 import shutil
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
-from one_c_autoresearch import indexes
+from one_c_autoresearch import indexes, search_runtime
 
 
-REPO = Path(__file__).parents[1]
+REPO = Path(__file__).parents[1] / "templates/research-repo"
+requires_source_generation = pytest.mark.skipif(
+    not (REPO / "research/active-source-generation.json").is_file(),
+    reason="requires a concrete research repository source generation",
+)
+
+
+def _schema2_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    (repo / "research").mkdir(parents=True)
+    (repo / "project.toml").write_text('[project]\nid = "migration-test"\n')
+    (repo / "research/indexing.toml").write_text(
+        'schema_version = "2"\n\n'
+        '[[backends]]\nadapter_id = "bsl-analyzer"\nengine_version = "1.0"\n\n'
+        '[routes]\n"text-search" = ["bsl-analyzer"]\n',
+        encoding="utf-8",
+    )
+    return repo
+
+
+def _schema3_candidate() -> dict:
+    return {
+        "schema_version": "3",
+        "machine_contract_version": "1.3",
+        "backends": [{"adapter_id": "bsl-analyzer", "engine_version": "1.0"}],
+        "routes": {
+            "code-search-lexical": ["bsl-analyzer"],
+            "code-search-hybrid": ["bsl-analyzer"],
+        },
+        "service_profiles": {
+            "lexical": "source-search-lexical/v2",
+            "hybrid": "source-search-hybrid/v2",
+        },
+    }
+
+
+def _complete_bsl_probe(_repo: Path, _backend: dict) -> dict:
+    return {
+        "available": True,
+        "contract_version": "1.3",
+        "surface_manifest": {
+            "state": "complete",
+            "machine_contract_version": "1.3",
+        },
+    }
+
+
+def test_schema3_migration_is_previewed_backed_up_and_does_not_build(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = _schema2_repo(tmp_path)
+    state = tmp_path / "state"
+    original = (repo / "research/indexing.toml").read_bytes()
+    monkeypatch.setattr(indexes, "probe_backend", _complete_bsl_probe)
+    operations = {
+        "lexical": ["code.search_lexical"],
+        "hybrid": ["code.search_hybrid", "graph.callers"],
+    }
+    preview = indexes.preview_schema3_migration(
+        repo, _schema3_candidate(), indexes.config_fingerprint(repo), operations,
+        ("legacy-running",),
+    )
+    assert (repo / "research/indexing.toml").read_bytes() == original
+    assert preview["explicit_routes"] == {
+        "lexical": ["bsl-analyzer"],
+        "hybrid": ["bsl-analyzer"],
+    }
+    result = indexes.apply_schema3_migration(
+        repo, _schema3_candidate(), indexes.config_fingerprint(repo),
+        preview["plan_fingerprint"], operations, ("legacy-running",), state,
+    )
+    assert result["build_started"] is False
+    assert result["preserved_v1_inflight"] == ["legacy-running"]
+    assert indexes.load_config(repo)["source_schema_version"] == "3"
+    backup = Path(result["backup"]["path"])
+    assert backup.read_bytes() == original
+    assert backup.stat().st_mode & 0o777 == 0o600
+    marker = (
+        state / indexes.repository_instance_fingerprint(repo).split(":", 1)[1]
+        / "schema3/stale-semantic-targets.json"
+    )
+    assert json.loads(marker.read_text())["targets"] == ["code-search-hybrid"]
+
+
+def test_schema3_migration_requires_exact_contract_and_rejects_legacy_operation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = _schema2_repo(tmp_path)
+    fingerprint = indexes.config_fingerprint(repo)
+    operations = {
+        "lexical": ["code.search_lexical"],
+        "hybrid": ["code.search_hybrid"],
+    }
+    monkeypatch.setattr(
+        indexes, "probe_backend",
+        lambda *_args: {
+            "available": True,
+            "contract_version": "1.2",
+            "surface_manifest": {"state": "complete", "machine_contract_version": "1.2"},
+        },
+    )
+    with pytest.raises(RuntimeError, match="contract 1.3"):
+        indexes.preview_schema3_migration(
+            repo, _schema3_candidate(), fingerprint, operations,
+        )
+    monkeypatch.setattr(indexes, "probe_backend", _complete_bsl_probe)
+    operations["hybrid"].append("find_references")
+    with pytest.raises(ValueError, match="not admitted"):
+        indexes.preview_schema3_migration(
+            repo, _schema3_candidate(), fingerprint, operations,
+        )
+
+
+def test_schema3_rollback_checks_readiness_and_restores_schema2(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = _schema2_repo(tmp_path)
+    state = tmp_path / "state"
+    original = (repo / "research/indexing.toml").read_bytes()
+    monkeypatch.setattr(indexes, "probe_backend", _complete_bsl_probe)
+    operations = {
+        "lexical": ["code.search_lexical"],
+        "hybrid": ["code.search_hybrid"],
+    }
+    migration = indexes.preview_schema3_migration(
+        repo, _schema3_candidate(), indexes.config_fingerprint(repo), operations,
+    )
+    indexes.apply_schema3_migration(
+        repo, _schema3_candidate(), indexes.config_fingerprint(repo),
+        migration["plan_fingerprint"], operations, state_root=state,
+    )
+    schema3 = (repo / "research/indexing.toml").read_bytes()
+    rollback = indexes.preview_schema3_rollback(
+        repo, indexes.config_fingerprint(repo), state,
+        v2_inflight_ids=("v2-running",), purge_v2_state=True,
+    )
+    with pytest.raises(RuntimeError, match="readiness"):
+        indexes.apply_schema3_rollback(
+            repo, indexes.config_fingerprint(repo), rollback["plan_fingerprint"],
+            lambda _backup: False, state, v2_inflight_ids=("v2-running",),
+            purge_v2_state=True, admission_closed=True,
+            inflight_handling="drained",
+        )
+    assert (repo / "research/indexing.toml").read_bytes() == schema3
+    result = indexes.apply_schema3_rollback(
+        repo, indexes.config_fingerprint(repo), rollback["plan_fingerprint"],
+        lambda backup: backup.read_bytes() == original, state,
+        v2_inflight_ids=("v2-running",), purge_v2_state=True,
+        admission_closed=True, inflight_handling="cancelled",
+    )
+    assert result["prior_runtime_ready"] is True
+    assert (repo / "research/indexing.toml").read_bytes() == original
+    assert indexes.load_config(repo)["source_schema_version"] == "2"
 
 
 def test_index_executable_is_found_above_nested_project(tmp_path: Path, monkeypatch) -> None:
@@ -22,6 +176,60 @@ def test_index_executable_is_found_above_nested_project(tmp_path: Path, monkeypa
     repo.mkdir(parents=True)
     monkeypatch.setattr(shutil, "which", lambda _name: None)
     assert indexes.discover_executable(repo) == str(executable)
+
+
+def test_backend_tool_inventory_marks_only_routed_adapter_required(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        indexes,
+        "load_config",
+        lambda _repo: {
+            "backends": [{"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"}],
+            "routes": {"text-search": ["rlm-tools-bsl"]},
+        },
+    )
+    monkeypatch.setattr(
+        indexes,
+        "backend_executable",
+        lambda _repo, adapter_id: "/tools/rlm-bsl-index"
+        if adapter_id == "rlm-tools-bsl"
+        else None,
+    )
+    monkeypatch.setattr(
+        indexes,
+        "probe_backend",
+        lambda _repo, _backend: {
+            "available": True,
+            "engine_version": "1.30.0",
+        },
+    )
+    tools = {item["tool_id"]: item for item in indexes.backend_tool_inventory(tmp_path)}
+    assert tools["rlm-tools-bsl"]["required"] is True
+    assert tools["rlm-tools-bsl"]["route_capabilities"] == ["text-search"]
+    assert tools["rlm-tools-bsl"]["status"] == "ready"
+    assert tools["bsl-analyzer"]["required"] is False
+    assert tools["bsl-analyzer"]["status"] == "unavailable"
+
+
+def test_backend_tool_inventory_reads_unconfigured_adapter_version(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        indexes,
+        "load_config",
+        lambda _repo: {"backends": [], "routes": {}},
+    )
+    monkeypatch.setattr(
+        indexes,
+        "backend_executable",
+        lambda _repo, adapter_id: "/tools/bsl-analyzer"
+        if adapter_id == "bsl-analyzer"
+        else None,
+    )
+    monkeypatch.setattr(indexes, "cli_version", lambda _executable: "0.2.65")
+    tools = {item["tool_id"]: item for item in indexes.backend_tool_inventory(tmp_path)}
+    assert tools["bsl-analyzer"]["instances"][0]["version"] == "0.2.65"
 
 
 def test_next_work_indexes_every_source_component_before_research(tmp_path: Path, monkeypatch) -> None:
@@ -129,6 +337,7 @@ def test_configuration_requires_routes_used_by_assigned_profiles():
         })
 
 
+@requires_source_generation
 def test_components_are_generation_bound_and_never_role_parents(tmp_path: Path):
     rows = indexes.discover(REPO)
     assert [row["component_id"] for row in rows] == sorted(row["component_id"] for row in rows)
@@ -145,12 +354,14 @@ def test_components_are_generation_bound_and_never_role_parents(tmp_path: Path):
         indexes.canonical_evidence(REPO, "target_cf:configuration", "../rlm-snippet")
 
 
+@requires_source_generation
 def test_routed_pointer_metadata_avoids_source_tree_scan(monkeypatch):
     monkeypatch.setattr(indexes, "_component_fingerprint", lambda _path: (_ for _ in ()).throw(AssertionError("source tree scanned")))
     rows = indexes.discover(REPO)
     assert all(row["fingerprint"].startswith("sha256:") and row["bsl_file_count"] >= 0 for row in rows)
 
 
+@requires_source_generation
 def test_index_ensure_reuses_ready_state_and_rebuild_is_confirmed(tmp_path: Path):
     first = indexes.ensure(REPO, lambda *_: {"ready": True}, state_root=tmp_path)
     assert all(row["status"] in {"ready", "not_indexable"} for row in first)
@@ -228,6 +439,7 @@ def test_legacy_indexing_config_normalizes_without_write(tmp_path: Path):
     assert path.read_bytes() == before
 
 
+@requires_source_generation
 def test_backend_identity_and_routing_are_repository_bound(tmp_path: Path):
     component = indexes.discover(REPO)[0]
     backend = {"adapter_id": "bsl-analyzer", "engine_version": "0.2.63"}
@@ -372,6 +584,74 @@ def test_index_configuration_exact_v1_downgrade_and_blocked_downgrade(tmp_path: 
         )
 
 
+def test_schema2_backup_is_owner_only_and_prior_runtime_reports_ready(
+    tmp_path: Path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    (repo / "research").mkdir(parents=True)
+    (repo / "project.toml").write_text('[project]\nid = "backup-test"\n', encoding="utf-8")
+    config = {
+        "schema_version": "2",
+        "backends": [{"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"}],
+        "routes": {
+            capability: ["rlm-tools-bsl"]
+            for capability in indexes.CAPABILITIES
+        },
+    }
+    original = indexes.serialize_config(config)
+    (repo / "research/indexing.toml").write_bytes(original)
+
+    captured = indexes.capture_schema2_backup(repo, state)
+    backup = Path(captured["path"])
+    assert backup.read_bytes() == original
+    assert backup.stat().st_mode & 0o777 == 0o600
+    assert captured["fingerprint"] == indexes.config_fingerprint(repo)
+
+    restored = tmp_path / "prior-runtime"
+    (restored / "research").mkdir(parents=True)
+    (restored / "research/indexing.toml").write_bytes(backup.read_bytes())
+    assert indexes.load_config(restored) == {
+        **config,
+        "source_schema_version": "2",
+    }
+    component = {
+        "component_id": "target_cf:configuration",
+        "path": "target_cf/configuration",
+        "fingerprint": "sha256:source",
+        "representation": "xml-hierarchical",
+        "source_generation_id": "source-1",
+        "engine": "rlm-tools-bsl",
+        "engine_version": "1.30.0",
+        "bsl_file_count": 1,
+    }
+    monkeypatch.setattr(indexes, "discover", lambda _repo: [component])
+    monkeypatch.setattr(indexes, "probe_backend", lambda *_args, **_kwargs: {
+        "available": True,
+        "capabilities": list(indexes.CAPABILITIES),
+        "contract_version": "provider-query/v1",
+        "capability_fingerprint": "sha256:capabilities",
+    })
+    monkeypatch.setattr(indexes, "ready_backend_state", lambda *_args, **_kwargs: {
+        "status": "ready",
+        "index_fingerprint": "sha256:index",
+        "target_fingerprint": "sha256:target",
+        "last_validation": "2026-07-30T00:00:00+00:00",
+    })
+    status = indexes.backend_statuses(restored)
+    assert len(status) == 1
+    assert status[0]["status"] == "ready"
+    assert status[0]["index_fingerprint"] == "sha256:index"
+
+    assert indexes.capture_schema2_backup(repo, state) == captured
+    (repo / "research/indexing.toml").write_text(
+        original.decode().replace("1.30.0", "1.31.0"),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="backup conflicts"):
+        indexes.capture_schema2_backup(repo, state)
+
+
 def _minimal_index_repo(root: Path, project_id: str = "index-test") -> tuple[Path, dict]:
     (root / "research").mkdir(parents=True)
     (root / "project.toml").write_text(f'[project]\nid = "{project_id}"\n', encoding="utf-8")
@@ -458,15 +738,29 @@ def test_backend_probe_uses_bsl_machine_contract(monkeypatch, tmp_path: Path):
     executable.write_bytes(b"fixed binary")
     monkeypatch.setattr(indexes, "backend_executable", lambda *_args: str(executable))
     contract = {
-        "contract_version": "1.1",
+        "contract_version": "1.3",
         "build_version": "0.2.63",
-        "mcp": {"profiles": {"workspace": {"tools": [
-            {"name": "search", "actions": [{"name": "search_code"}, {"name": "status"}]},
-            {"name": "graph", "actions": [{"name": name} for name in ("resolve", "callers", "callees", "status", "schema")]},
-            {"name": "metadata", "actions": [{"name": name} for name in ("tree", "object", "status")]},
-            {"name": "diagnostics", "actions": [{"name": name} for name in ("schema", "status")]},
-            {"name": "symbol_info", "actions": []},
-        ]}}},
+        "mcp": {"profiles": {
+            profile: {"tools": [
+                {
+                    "name": tool,
+                    "actions": [{"name": action} for action in actions],
+                    **({
+                        "output_schema_version": "1",
+                        "output_schema_fingerprint": indexes.BSL_SYNTAX_OUTPUT_SCHEMA_FINGERPRINT,
+                    } if tool == "syntax_help" else {}),
+                }
+                for disposition in ("allowed", "denied")
+                for tool, actions in groups[disposition].items()
+            ]}
+            for profile, groups in indexes.BSL_SEARCH_SURFACE_V1.items()
+        }},
+        "transports": {"workspace": {"broker-required": {
+            "backend_pid_required": True,
+            "auto_launch": False,
+            "stdio_fallback": False,
+            "peer_identity": "supervised-pid+platform-trust",
+        }}},
     }
     monkeypatch.setattr(
         indexes,
@@ -478,8 +772,16 @@ def test_backend_probe_uses_bsl_machine_contract(monkeypatch, tmp_path: Path):
         {"adapter_id": "bsl-analyzer", "engine_version": "0.2.63"},
     )
     assert probe["available"] is True
-    assert probe["contract_version"] == "1.1"
-    assert set(probe["capabilities"]) == set(indexes.CAPABILITIES)
+    assert probe["contract_version"] == "1.3"
+    assert set(probe["capabilities"]) == {
+        *indexes.BSL_CAPABILITIES,
+        *indexes.COMPLETE_SEARCH_CAPABILITIES,
+    }
+    assert probe["surface_manifest"]["state"] == "complete"
+
+    assert probe["surface_manifest"]["machine_contract_version"] == "1.3"
+    assert probe["surface_manifest"]["build_version"] == "0.2.63"
+    assert probe["surface_manifest"]["surface_fingerprint"].startswith("sha256:")
     before = probe["capability_fingerprint"]
     executable.write_bytes(b"replaced binary")
     after = indexes.probe_backend(
@@ -488,6 +790,275 @@ def test_backend_probe_uses_bsl_machine_contract(monkeypatch, tmp_path: Path):
     )
     assert before != after["capability_fingerprint"]
     assert probe["executable_fingerprint"] != after["executable_fingerprint"]
+
+
+def test_bsl_lexical_and_hybrid_targets_have_distinct_identities(tmp_path: Path):
+    repo, component = _minimal_index_repo(tmp_path)
+    backend = {"adapter_id": "bsl-analyzer", "engine_version": "0.2.65"}
+    common = (repo, component, backend, list(indexes.COMPLETE_SEARCH_CAPABILITIES), "sha256:tool")
+    lexical = indexes.target_identity(*common, modality="lexical")
+    hybrid = indexes.target_identity(
+        *common, modality="hybrid", embedding_identity="sha256:embedding"
+    )
+    assert indexes.target_fingerprint(lexical) != indexes.target_fingerprint(hybrid)
+    assert "embedding_identity" not in lexical
+    assert hybrid["embedding_identity"] == "sha256:embedding"
+
+
+def test_index_gc_removes_only_reviewed_unreferenced_instances(tmp_path: Path):
+    repo, _component = _minimal_index_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    target = indexes._operational_root(repo, state) / "targets" / "target"
+    current = target / "instances" / "current"
+    old = target / "instances" / "old"
+    current.mkdir(parents=True)
+    old.mkdir()
+    (current / "data").write_bytes(b"current")
+    (old / "data").write_bytes(b"old")
+    (target / "current.json").write_text(
+        json.dumps({"instance": "instances/current"})
+    )
+    plan = indexes.preview_index_gc(repo, state)
+    assert [item["instance"] for item in plan["candidates"]] == ["old"]
+    result = indexes.apply_index_gc(
+        repo, plan["plan_fingerprint"], confirmed=True, state_root=state
+    )
+    assert result["removed_instances"] == 1
+    assert current.is_dir()
+    assert not old.exists()
+
+
+def test_bsl_search_surface_fixture_is_complete_and_content_free():
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/bsl-analyzer-contract-1.3.json").read_text()
+    )
+    expected = {
+        profile: {
+            disposition: {
+                tool: sorted(actions)
+                for tool, actions in groups[disposition].items()
+            }
+            for disposition in ("allowed", "denied")
+        }
+        for profile, groups in indexes.BSL_SEARCH_SURFACE_V1.items()
+    }
+    actual = {
+        profile: {
+            disposition: {
+                tool: sorted(actions)
+                for tool, actions in groups[disposition].items()
+            }
+            for disposition in ("allowed", "denied")
+        }
+        for profile, groups in fixture["profiles"].items()
+    }
+    assert fixture["machine_contract_version"] == "1.3"
+    assert "build_version" not in fixture
+    assert actual == expected
+
+
+def test_bsl_search_surface_fails_closed_on_contract_drift(
+    monkeypatch, tmp_path: Path
+):
+    executable = tmp_path / "bsl-analyzer"
+    executable.write_bytes(b"fixed binary")
+    contract = {
+        "contract_version": "1.3",
+        "build_version": "selected",
+        "mcp": {"profiles": {
+            profile: {"tools": [
+                {
+                    "name": tool,
+                    "actions": [{"name": action} for action in actions],
+                    **({
+                        "output_schema_version": "1",
+                        "output_schema_fingerprint": indexes.BSL_SYNTAX_OUTPUT_SCHEMA_FINGERPRINT,
+                    } if tool == "syntax_help" else {}),
+                }
+                for disposition in ("allowed", "denied")
+                for tool, actions in groups[disposition].items()
+            ]}
+            for profile, groups in indexes.BSL_SEARCH_SURFACE_V1.items()
+        }},
+        "transports": {"workspace": {"broker-required": {
+            "backend_pid_required": True,
+            "auto_launch": False,
+            "stdio_fallback": False,
+            "peer_identity": "supervised-pid+platform-trust",
+        }}},
+    }
+    contract["mcp"]["profiles"]["workspace"]["tools"][0]["actions"].append(
+        {"name": "new_unreviewed_action"}
+    )
+    monkeypatch.setattr(
+        indexes,
+        "_bounded_run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, json.dumps(contract), ""
+        ),
+    )
+    with pytest.raises(
+        indexes.BslSurfaceContractError,
+        match="unreviewed additions",
+    ):
+        indexes._bsl_contract(str(executable), "selected")
+
+
+def test_bsl_search_surface_reports_partial_when_an_approved_action_is_missing(
+    monkeypatch, tmp_path: Path
+):
+    executable = tmp_path / "bsl-analyzer"
+    executable.write_bytes(b"fixed binary")
+    contract = {
+        "contract_version": "1.3",
+        "build_version": "selected",
+        "mcp": {"profiles": {
+            profile: {"tools": [
+                {
+                    "name": tool,
+                    "actions": [{"name": action} for action in actions],
+                    **({
+                        "output_schema_version": "1",
+                        "output_schema_fingerprint": indexes.BSL_SYNTAX_OUTPUT_SCHEMA_FINGERPRINT,
+                    } if tool == "syntax_help" else {}),
+                }
+                for disposition in ("allowed", "denied")
+                for tool, actions in groups[disposition].items()
+            ]}
+            for profile, groups in indexes.BSL_SEARCH_SURFACE_V1.items()
+        }},
+        "transports": {"workspace": {"broker-required": {
+            "backend_pid_required": True,
+            "auto_launch": False,
+            "stdio_fallback": False,
+            "peer_identity": "supervised-pid+platform-trust",
+        }}},
+    }
+    contract["mcp"]["profiles"]["workspace"]["tools"][0]["actions"].pop()
+    monkeypatch.setattr(
+        indexes, "_bounded_run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, json.dumps(contract), ""
+        ),
+    )
+    monkeypatch.setattr(indexes, "backend_executable", lambda *_args: str(executable))
+    probe = indexes.probe_backend(
+        tmp_path, {"adapter_id": "bsl-analyzer", "engine_version": "selected"}
+    )
+    assert probe["available"] is False
+    assert probe["surface_manifest"]["state"] == "partial"
+
+
+def test_native_text_envelope_requires_one_bounded_text_item():
+    assert indexes.native_text_envelope({
+        "content": [{"type": "text", "text": "ok"}],
+        "isError": False,
+    }) == {
+        "schema_version": "native-text-envelope/v1",
+        "text": "ok",
+        "returned_bytes": 2,
+    }
+    with pytest.raises(RuntimeError, match="invalid text-only"):
+        indexes.native_text_envelope({
+            "content": [{"type": "text", "text": "one"}, {"type": "text", "text": "two"}],
+        })
+    with pytest.raises(RuntimeError, match="byte limit"):
+        indexes.native_text_envelope(
+            {"content": [{"type": "text", "text": "too long"}]},
+            max_bytes=2,
+        )
+
+
+def test_every_workspace_v2_operation_maps_to_one_fixed_native_action():
+    cases = {
+        "code.search_lexical": ("search", "search_code"),
+        "code.search_hybrid": ("search", "search_code"),
+        "symbol.info": ("symbol_info", None),
+        "symbol.info_at": ("symbol_info", None),
+        **{
+            f"graph.{action}": ("graph", action)
+            for action in (
+                "overview", "schema", "resolve", "node", "source", "neighbors",
+                "callers", "callees",
+            )
+        },
+        **{
+            f"metadata.{action}": ("metadata", action)
+            for action in ("info", "tree", "object", "form")
+        },
+        **{
+            f"diagnostics.{action}": ("diagnostics", action)
+            for action in ("catalog", "schema", "file", "workspace")
+        },
+    }
+    for operation, (expected_tool, expected_action) in cases.items():
+        request = {
+            "operation": operation,
+            "query": "Q",
+            "symbol": "S",
+            "path": "CommonModules/M/Ext/Module.bsl",
+            "line": 1,
+            "id": "node",
+            "ids": ["node"],
+            "object_type": "Catalog",
+            "object_name": "Items",
+            "max_results": 3,
+        }
+        tool, arguments = indexes._bsl_workspace_request(request)
+        assert tool == expected_tool
+        assert arguments.get("action") == expected_action
+        assert not {
+            "backend", "adapter", "native_tool", "native_action", "connection"
+        } & set(arguments)
+        if operation.startswith("metadata."):
+            assert arguments["mode"] == "source"
+
+
+def test_workspace_code_modality_is_enforced_without_silent_fallback(monkeypatch, tmp_path: Path):
+    response = {
+        "structuredContent": {
+            "schema_version": "1",
+            "modality": "L",
+            "items": [{"path": "CommonModules/M/Ext/Module.bsl", "line": 0}],
+        },
+        "isError": False,
+    }
+    monkeypatch.setattr(indexes, "_bsl_mcp", lambda *_args, **_kwargs: [response])
+    lexical = indexes._bsl_workspace_query(
+        "bsl-analyzer", tmp_path,
+        {"operation": "code.search_lexical", "query": "Q", "max_results": 2},
+        10,
+    )
+    assert lexical["modalities"] == ["l"]
+    assert lexical["items"][0]["component_relative_path"].endswith("Module.bsl")
+    with pytest.raises(RuntimeError, match="semantic_modality_unavailable"):
+        indexes._bsl_workspace_query(
+            "bsl-analyzer", tmp_path,
+            {"operation": "code.search_hybrid", "query": "Q", "max_results": 2},
+            10,
+        )
+    response["structuredContent"]["modality"] = "H"
+    assert indexes._bsl_workspace_query(
+        "bsl-analyzer", tmp_path,
+        {"operation": "code.search_hybrid", "query": "Q", "max_results": 2},
+        10,
+    )["modalities"] == ["h"]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("BSL_ANALYZER_CONFORMANCE_EXECUTABLE"),
+    reason="selected BSL Analyzer executable is not explicitly provisioned",
+)
+def test_selected_bsl_analyzer_matches_offline_surface_fixture():
+    executable = os.environ["BSL_ANALYZER_CONFORMANCE_EXECUTABLE"]
+    raw = subprocess.run(
+        [executable, "contract"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    contract = json.loads(raw.stdout)
+    assert indexes._bsl_contract(executable, str(contract["build_version"]))
 
 
 def test_adapter_output_is_stopped_at_the_byte_limit(monkeypatch):
@@ -526,12 +1097,36 @@ def test_backend_process_environment_is_private_and_closed(monkeypatch):
     monkeypatch.setattr(indexes.selectors, "DefaultSelector", Selector)
     indexes._bounded_run(["fixed-adapter"])
     assert "DATABASE_URL" not in captured and "OPENAI_API_KEY" not in captured
-    assert captured["BSL_MCP_BROKER"] == "0"
+    assert "BSL_MCP_BROKER" not in captured
     assert captured["HOME"] != str(Path.home())
     assert all(
         captured[name].startswith(captured["HOME"])
         for name in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME")
     )
+
+
+def test_adapter_reuses_explicit_rlm_index_directory_across_processes(
+    tmp_path: Path,
+) -> None:
+    index_dir = tmp_path / "index"
+    write = indexes._bounded_run(
+        [
+            sys.executable,
+            "-c",
+            "import os,pathlib; pathlib.Path(os.environ['RLM_INDEX_DIR'],'marker').write_text('ready')",
+        ],
+        index_dir=index_dir,
+    )
+    read = indexes._bounded_run(
+        [
+            sys.executable,
+            "-c",
+            "import os,pathlib; print(pathlib.Path(os.environ['RLM_INDEX_DIR'],'marker').read_text())",
+        ],
+        index_dir=index_dir,
+    )
+    assert write.returncode == 0
+    assert read.stdout.strip() == "ready"
 
 
 def test_adapter_process_is_cancelled_before_unbounded_work():
@@ -543,6 +1138,13 @@ def test_adapter_process_is_cancelled_before_unbounded_work():
 
 
 def test_bsl_mcp_requires_structured_ready_state(monkeypatch, tmp_path: Path):
+    @contextmanager
+    def proxy(*_args, **_kwargs):
+        yield {
+            "command": ["bsl-analyzer", "--mode", "broker-required"],
+            "environment": {},
+        }
+    monkeypatch.setattr(search_runtime, "supervised_workspace_proxy", proxy)
     class Input:
         def write(self, _value): return None
         def flush(self): return None
@@ -588,9 +1190,7 @@ def test_bsl_mcp_requires_structured_ready_state(monkeypatch, tmp_path: Path):
         def select(self, _timeout): return [object()]
         def close(self): return None
 
-    monkeypatch.setattr(indexes.subprocess, "Popen", lambda command, **_kwargs: (
-        Process() if command[command.index("--mode") + 1] == "stdio" else None
-    ))
+    monkeypatch.setattr(indexes.subprocess, "Popen", lambda _command, **_kwargs: Process())
     monkeypatch.setattr(indexes.selectors, "DefaultSelector", Selector)
     monkeypatch.setattr(indexes.time, "sleep", lambda _seconds: None)
     result = indexes._bsl_mcp(
@@ -601,7 +1201,14 @@ def test_bsl_mcp_requires_structured_ready_state(monkeypatch, tmp_path: Path):
     assert result[0]["structuredContent"]["state"] == "ready"
 
 
-def test_bsl_mcp_rejects_unversioned_structured_output(monkeypatch, tmp_path: Path):
+def test_bsl_mcp_rejects_incompatible_structured_output(monkeypatch, tmp_path: Path):
+    @contextmanager
+    def proxy(*_args, **_kwargs):
+        yield {
+            "command": ["bsl-analyzer", "--mode", "broker-required"],
+            "environment": {},
+        }
+    monkeypatch.setattr(search_runtime, "supervised_workspace_proxy", proxy)
     class Input:
         def write(self, _value): return None
         def flush(self): return None
@@ -612,7 +1219,9 @@ def test_bsl_mcp_rejects_unversioned_structured_output(monkeypatch, tmp_path: Pa
         {
             "jsonrpc": "2.0",
             "id": 3,
-            "result": {"structuredContent": {"state": "ready"}},
+            "result": {
+                "structuredContent": {"schema_version": "2", "state": "ready"}
+            },
         },
     ])
 
@@ -657,9 +1266,9 @@ def test_private_index_promotion_is_clone_isolated_and_keeps_source_clean(monkey
     )
 
     def build(command, **_kwargs):
-        mirror = Path(command[-1])
-        (mirror / ".rlm-index").mkdir()
-        (mirror / ".rlm-index/index.db").write_bytes(b"index")
+        index_dir = _kwargs["index_dir"]
+        index_dir.mkdir(exist_ok=True)
+        (index_dir / "bsl_index.db").write_bytes(b"index")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(indexes, "_bounded_run", build)
@@ -671,7 +1280,9 @@ def test_private_index_promotion_is_clone_isolated_and_keeps_source_clean(monkey
     assert first["index_fingerprint"] != second["index_fingerprint"]
     assert first["target_fingerprint"] != second["target_fingerprint"]
     assert not (repo / "sources/generations/gen/target_cf/configuration/.rlm-index").exists()
-    assert indexes.ready_backend_state(repo, component, backend, state_root=state)
+    ready = indexes.ready_backend_state(repo, component, backend, state_root=state)
+    assert ready
+    assert Path(ready["index_dir"], "bsl_index.db").read_bytes() == b"index"
 
 
 def test_rebuild_promotes_a_new_instance_and_atomically_switches_pointer(monkeypatch, tmp_path: Path):
@@ -686,9 +1297,9 @@ def test_rebuild_promotes_a_new_instance_and_atomically_switches_pointer(monkeyp
     generation = iter((b"first", b"second"))
 
     def build(command, **_kwargs):
-        mirror = Path(command[-1])
-        (mirror / ".rlm-index").mkdir()
-        (mirror / ".rlm-index/index.db").write_bytes(next(generation))
+        index_dir = _kwargs["index_dir"]
+        index_dir.mkdir(exist_ok=True)
+        (index_dir / "bsl_index.db").write_bytes(next(generation))
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(indexes, "_bounded_run", build)
@@ -731,8 +1342,9 @@ def test_index_build_rejects_adapter_mutation_of_private_source(monkeypatch, tmp
     def build(command, **_kwargs):
         mirror = Path(command[-1])
         (mirror / "CommonModules/Test/Ext/Module.bsl").write_text("Изменено", encoding="utf-8")
-        (mirror / ".rlm-index").mkdir()
-        (mirror / ".rlm-index/index.db").write_bytes(b"index")
+        index_dir = _kwargs["index_dir"]
+        index_dir.mkdir(exist_ok=True)
+        (index_dir / "bsl_index.db").write_bytes(b"index")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(indexes, "_bounded_run", build)
@@ -762,9 +1374,9 @@ def test_cancelled_build_quarantines_output_without_promotion(
     )
 
     def build(command, **_kwargs):
-        mirror = Path(command[-1])
-        (mirror / ".rlm-index").mkdir()
-        (mirror / ".rlm-index/index.db").write_bytes(b"late")
+        index_dir = _kwargs["index_dir"]
+        index_dir.mkdir(exist_ok=True)
+        (index_dir / "bsl_index.db").write_bytes(b"late")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(indexes, "_bounded_run", build)
@@ -801,9 +1413,9 @@ def test_oversized_state_fails_before_instance_promotion(monkeypatch, tmp_path: 
     )
 
     def build(command, **_kwargs):
-        mirror = Path(command[-1])
-        (mirror / ".rlm-index").mkdir()
-        (mirror / ".rlm-index/index.db").write_bytes(b"index")
+        index_dir = _kwargs["index_dir"]
+        index_dir.mkdir(exist_ok=True)
+        (index_dir / "bsl_index.db").write_bytes(b"index")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(indexes, "_bounded_run", build)
@@ -840,9 +1452,9 @@ def test_oversized_index_payload_is_quarantined_before_promotion(
     )
 
     def build(command, **_kwargs):
-        mirror = Path(command[-1])
-        (mirror / ".rlm-index").mkdir()
-        (mirror / ".rlm-index/index.db").write_bytes(b"too large")
+        index_dir = _kwargs["index_dir"]
+        index_dir.mkdir(exist_ok=True)
+        (index_dir / "bsl_index.db").write_bytes(b"too large")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(indexes, "_bounded_run", build)
@@ -863,6 +1475,58 @@ def test_oversized_index_payload_is_quarantined_before_promotion(
     assert len(list((target / "quarantine").iterdir())) == 1
 
 
+def test_reference_index_is_built_explicitly_and_failed_staging_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from one_c_autoresearch import reference_search
+
+    root = tmp_path / "reference"
+    executable = tmp_path / "bsl-analyzer"
+    executable.touch()
+    probe = {
+        "available": True,
+        "engine_version": "current",
+        "executable_fingerprint": "sha256:" + "a" * 64,
+        "surface_manifest": {"surface_fingerprint": "sha256:" + "b" * 64},
+    }
+    monkeypatch.setattr(
+        indexes,
+        "_reference_index_target",
+        lambda *_args, **_kwargs: (
+            executable, "sha256:" + "c" * 64, probe, root,
+        ),
+    )
+    observed: dict[str, Path] = {}
+
+    def execute(_executable, state_dir, *_args, **_kwargs):
+        observed["state_dir"] = state_dir
+        return {"items": []}
+
+    monkeypatch.setattr(reference_search, "execute_reference", execute)
+    ready = indexes.ensure_reference_index(
+        tmp_path, {"adapter_id": "bsl-analyzer"}, state_root=tmp_path / "state"
+    )
+    assert ready["status"] == "ready"
+    assert reference_search.current_reference_index(
+        root, probe["executable_fingerprint"]
+    ).is_dir()
+    assert observed["state_dir"].parent.name == "staging"
+
+    monkeypatch.setattr(
+        reference_search,
+        "execute_reference",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("failed")),
+    )
+    failed = indexes.ensure_reference_index(
+        tmp_path,
+        {"adapter_id": "bsl-analyzer"},
+        state_root=tmp_path / "state",
+        rebuild=True,
+    )
+    assert failed["status"] == "failed"
+    assert not (root / "staging" / probe["executable_fingerprint"]).exists()
+
+
 def test_simultaneous_rebuild_is_fenced_and_validation_keeps_old_pointer(
     monkeypatch, tmp_path: Path,
 ):
@@ -880,13 +1544,13 @@ def test_simultaneous_rebuild_is_fenced_and_validation_keeps_old_pointer(
 
     def build(command, **_kwargs):
         nonlocal calls
-        mirror = Path(command[-1])
-        (mirror / ".rlm-index").mkdir()
+        index_dir = _kwargs["index_dir"]
+        index_dir.mkdir(exist_ok=True)
         calls += 1
         if calls == 2:
             started.set()
             assert release.wait(5)
-        (mirror / ".rlm-index/index.db").write_bytes(
+        (index_dir / "bsl_index.db").write_bytes(
             b"initial" if calls == 1 else b"replacement"
         )
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -934,9 +1598,9 @@ def test_dead_index_lease_is_recovered_but_live_lease_is_fenced(monkeypatch, tmp
     monkeypatch.setattr(indexes, "probe_backend", lambda *_args, **_kwargs: probe)
 
     def build(command, **_kwargs):
-        mirror = Path(command[-1])
-        (mirror / ".rlm-index").mkdir()
-        (mirror / ".rlm-index/index.db").write_bytes(b"index")
+        index_dir = _kwargs["index_dir"]
+        index_dir.mkdir(exist_ok=True)
+        (index_dir / "bsl_index.db").write_bytes(b"index")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(indexes, "_bounded_run", build)

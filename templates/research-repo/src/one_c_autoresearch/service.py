@@ -204,12 +204,42 @@ class ApplicationService:
     def preview_index_configuration(self, payload: dict[str, Any]) -> dict[str, Any]:
         if set(payload) != {"configuration", "expected_file_fingerprint"}:
             raise ValueError("invalid indexing configuration preview")
+        if payload["configuration"].get("schema_version") == "3":
+            return indexes.preview_schema3_migration(
+                self.repo,
+                payload["configuration"],
+                str(payload["expected_file_fingerprint"]),
+                self._schema3_profile_operations(),
+            )
         return indexes.preview_config(
             self.repo,
             payload["configuration"],
             str(payload["expected_file_fingerprint"]),
             self._required_index_capabilities(),
         )
+
+    def _schema3_profile_operations(self) -> dict[str, list[str]]:
+        from .source_search import V2_OPERATIONS, normalize_operation
+        operations = sorted({
+            normalize_operation(operation)
+            for profile in (self.agent_profiles or {}).values()
+            for operation in (profile.get("source_search") or {}).get(
+                "operations", []
+            )
+            if normalize_operation(operation) in V2_OPERATIONS
+        })
+        if not operations:
+            operations = sorted(V2_OPERATIONS)
+        return {
+            "lexical": [
+                operation for operation in operations
+                if operation != "code.search_hybrid"
+            ],
+            "hybrid": [
+                operation for operation in operations
+                if operation == "code.search_hybrid"
+            ] or ["code.search_hybrid"],
+        }
 
     def apply(self, operation: str, payload: dict[str, Any], expected_fingerprint: str, cancelled: callable | None = None, *, staged: dict[str, dict[str, Any]] | None = None, fence: callable | None = None) -> dict[str, Any]:
         from .workflow_migration import guard_mutation
@@ -384,6 +414,14 @@ class ApplicationService:
             "expected_plan_fingerprint",
         }:
             raise ValueError("invalid indexing configuration apply")
+        if payload["configuration"].get("schema_version") == "3":
+            return indexes.apply_schema3_migration(
+                self.repo,
+                payload["configuration"],
+                str(payload["expected_file_fingerprint"]),
+                str(payload["expected_plan_fingerprint"]),
+                self._schema3_profile_operations(),
+            )
         return indexes.apply_config(
             self.repo,
             payload["configuration"],

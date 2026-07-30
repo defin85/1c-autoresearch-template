@@ -1750,9 +1750,12 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
     def source_tools(project_id: str):
         project = repo(project_id)
         from .source_tools import discover_tools
+        from .indexes import backend_tool_inventory
         from .user_state import load_connections
         roots = [str(item.get("platform_path", "")) for item in load_connections(project, operational).values()]
-        return discover_tools(roots)
+        inventory = discover_tools(roots)
+        inventory["tools"].extend(backend_tool_inventory(project))
+        return inventory
 
     @app.post("/api/v1/projects/{project_id}/source-routing-previews", status_code=202)
     def create_source_routing_preview(project_id: str, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):
@@ -2049,11 +2052,18 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
     @app.get("/api/v1/projects/{project_id}/indexes")
     def index_status(project_id: str):
-        from . import indexes
+        from . import indexes, search_runtime
         project = repo(project_id)
         configuration = indexes.load_config(project)
         configuration.pop("source_schema_version", None)
         items = ApplicationService(project).index_statuses()
+        bsl = next(
+            (
+                backend for backend in configuration["backends"]
+                if backend["adapter_id"] == "bsl-analyzer"
+            ),
+            None,
+        )
         return {
             "items": items,
             "configuration": configuration,
@@ -2061,8 +2071,40 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             "route_health": indexes.route_coverage(
                 configuration, indexes.discover(project), items,
             ),
+            "storage_root": str(indexes._operational_path(project)),
+            "storage": indexes.storage_diagnostics(project),
             "disposable": True,
+            "runtime_backends": search_runtime.runtime_diagnostics(),
+            "reference_readiness": (
+                indexes.reference_index_status(project, bsl)
+                if bsl and configuration.get("schema_version") == "3"
+                else None
+            ),
         }
+
+    @app.get("/api/v1/projects/{project_id}/indexes/storage-cleanup-preview")
+    def preview_index_storage_cleanup(project_id: str):
+        from . import indexes
+        return indexes.preview_index_gc(repo(project_id))
+
+    @app.post("/api/v1/projects/{project_id}/indexes/storage-cleanup")
+    def apply_index_storage_cleanup(
+        project_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(),
+        idempotency_key: str | None = web["Header"](
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        mutation(request, idempotency_key)
+        if set(body) != {"plan_fingerprint", "confirmed"}:
+            raise ValueError("invalid index storage cleanup request")
+        from . import indexes
+        return indexes.apply_index_gc(
+            repo(project_id),
+            str(body["plan_fingerprint"]),
+            confirmed=body["confirmed"] is True,
+        )
 
     @app.post("/api/v1/projects/{project_id}/indexes/configuration-preview")
     def preview_index_configuration(project_id: str, body: dict[str, Any] = Body()):
@@ -2072,6 +2114,161 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             project,
             agent_profiles=load_agent_profiles(project, operational),
         ).preview_index_configuration(body)
+
+    @app.post("/api/v1/projects/{project_id}/indexes/rollback-preview")
+    def preview_index_rollback(
+        project_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(),
+        idempotency_key: str | None = web["Header"](
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        mutation(request, idempotency_key)
+        if set(body) != {"expected_file_fingerprint", "purge_v2_state"}:
+            raise ValueError("invalid index rollback preview request")
+        from . import indexes
+        from .sqlite_state import DispatcherStore
+        project = repo(project_id)
+        with DispatcherStore(project, operational) as store:
+            inflight = store.active_source_search_invocations()
+        return indexes.preview_schema3_rollback(
+            project,
+            str(body["expected_file_fingerprint"]),
+            v2_inflight_ids=inflight,
+            purge_v2_state=body["purge_v2_state"] is True,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/indexes/rollback")
+    def apply_index_rollback(
+        project_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(),
+        idempotency_key: str | None = web["Header"](
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        mutation(request, idempotency_key)
+        if set(body) != {
+            "expected_file_fingerprint", "plan_fingerprint",
+            "purge_v2_state", "inflight_handling", "confirmed",
+        } or body["confirmed"] is not True:
+            raise ValueError("invalid index rollback request")
+        from . import indexes, search_runtime
+        from .sqlite_state import DispatcherStore
+        project = repo(project_id)
+        with DispatcherStore(project, operational) as store:
+            inflight = store.active_source_search_invocations()
+        plan = indexes.preview_schema3_rollback(
+            project,
+            str(body["expected_file_fingerprint"]),
+            v2_inflight_ids=inflight,
+            purge_v2_state=body["purge_v2_state"] is True,
+        )
+        if plan["plan_fingerprint"] != str(body["plan_fingerprint"]):
+            raise RuntimeError("stale indexing schema 3 rollback plan")
+        with DispatcherStore(project, operational) as store:
+            for invocation_id in inflight:
+                store.close_source_search(invocation_id, "cancelled")
+        target = indexes.repository_instance_fingerprint(project).split(":", 1)[1]
+        search_runtime.shutdown_project_backends(target)
+        return indexes.apply_schema3_rollback(
+            project,
+            str(body["expected_file_fingerprint"]),
+            str(body["plan_fingerprint"]),
+            indexes.prior_runtime_schema2_ready,
+            v2_inflight_ids=inflight,
+            purge_v2_state=body["purge_v2_state"] is True,
+            admission_closed=True,
+            inflight_handling=str(body["inflight_handling"]),
+        )
+
+    @app.get("/api/v1/projects/{project_id}/search-services")
+    def search_service_profiles(project_id: str):
+        from . import search_services
+        project = repo(project_id)
+        return {
+            "schema_version": search_services.SCHEMA_VERSION,
+            "state_fingerprint": search_services.state_fingerprint(
+                project, operational
+            ),
+            "profiles": search_services.list_profiles(project, operational),
+        }
+
+    @app.post("/api/v1/projects/{project_id}/search-services/profile-preview")
+    def preview_search_service_profile(
+        project_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(),
+        idempotency_key: str | None = web["Header"](
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        mutation(request, idempotency_key)
+        if set(body) != {
+            "profile_id", "profile", "expected_state_fingerprint",
+            "acknowledged", "secret",
+        }:
+            raise ValueError("invalid search service preview request")
+        from . import indexes, search_services
+        project = repo(project_id)
+        components = indexes.discover(project)
+        manifests = [
+            indexes.file_manifest(
+                project / "sources/generations" / component["source_generation_id"]
+                / component["path"]
+            )
+            for component in components
+        ]
+        files = [item for manifest in manifests for item in manifest]
+        batch = int(body["profile"].get("build_limits", {}).get("batch", 1))
+        disclosure = {
+            "components": sorted(item["component_id"] for item in components),
+            "file_count": len(files),
+            "source_bytes": sum(int(item["size_bytes"]) for item in files),
+            "estimated_requests": (len(files) + max(1, batch) - 1) // max(1, batch),
+            "estimated_input_bytes": sum(int(item["size_bytes"]) for item in files),
+            "estimated_vectors": len(files),
+            "cost": {"kind": "unknown"},
+        }
+        return search_services.preview_profile(
+            project,
+            str(body["profile_id"]),
+            body["profile"],
+            actor="local-user",
+            idempotency_key=str(idempotency_key),
+            expected_state_fingerprint=str(body["expected_state_fingerprint"]),
+            disclosure=disclosure,
+            acknowledged=body["acknowledged"],
+            secret=body["secret"],
+            base=operational,
+        )
+
+    @app.post("/api/v1/projects/{project_id}/search-services/profile-apply")
+    def apply_search_service_profile(
+        project_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(),
+        idempotency_key: str | None = web["Header"](
+            default=None, alias="Idempotency-Key"
+        ),
+    ):
+        mutation(request, idempotency_key)
+        if set(body) != {
+            "preview_id", "expected_state_fingerprint", "plan_fingerprint",
+            "preview_idempotency_key",
+        }:
+            raise ValueError("invalid search service apply request")
+        from . import search_services
+        return search_services.apply_profile(
+            repo(project_id),
+            str(body["preview_id"]),
+            actor="local-user",
+            idempotency_key=str(body["preview_idempotency_key"]),
+            expected_state_fingerprint=str(body["expected_state_fingerprint"]),
+            plan_fingerprint=str(body["plan_fingerprint"]),
+            base=operational,
+        )
 
     @app.post("/api/v1/projects/{project_id}/actions")
     def action(project_id: str, body: ActionBody, request: Request, idempotency_key: str | None = web["Header"](default=None, alias="Idempotency-Key")):

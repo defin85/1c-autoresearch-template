@@ -13,7 +13,7 @@ from one_c_autoresearch.sources import draft_fingerprint, extension_scope_status
 from one_c_autoresearch.user_state import load_connections
 
 
-REPO = Path(__file__).parents[1]
+REPO = Path(__file__).parents[1] / "templates/research-repo"
 
 def test_event_replay_can_open_at_the_current_tail(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events", "project")
@@ -98,6 +98,116 @@ def test_legacy_agent_profile_can_be_explicitly_resaved(tmp_path: Path) -> None:
         assert response.status_code == 200
         assert response.json()["profile"] == profile
         assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_search_service_api_keeps_endpoint_and_secret_out_of_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "one_c_autoresearch.indexes.discover",
+        lambda _repo: [{
+            "component_id": "target_cf:configuration",
+            "source_generation_id": "generation",
+            "path": "target_cf/configuration",
+        }],
+    )
+    monkeypatch.setattr(
+        "one_c_autoresearch.indexes.file_manifest",
+        lambda _root: [{"size_bytes": 120}],
+    )
+    app = create_app(tmp_path / "state", [REPO], testing=True)
+    headers = {"Origin": "http://testserver", "Idempotency-Key": "bookmark"}
+    with TestClient(app) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"name": "test", "root": str(REPO)},
+            headers=headers,
+        ).json()
+        path = f"/api/v1/projects/{project['id']}/search-services"
+        state = client.get(path).json()
+        preview = client.post(
+            path + "/profile-preview",
+            headers=headers | {"Idempotency-Key": "profile-preview"},
+            json={
+                "profile_id": "embedding-default",
+                "profile": {
+                    "kind": "embedding",
+                    "label": "Local",
+                    "endpoint": "http://127.0.0.1:9999/v1",
+                    "model": "test-model",
+                    "dimension": 2,
+                    "build_limits": {
+                        "requests": 10,
+                        "input_bytes": 1000,
+                        "vectors": 10,
+                        "concurrency": 1,
+                        "batch": 2,
+                        "elapsed_seconds": 60,
+                    },
+                },
+                "expected_state_fingerprint": state["state_fingerprint"],
+                "acknowledged": False,
+                "secret": "write-only",
+            },
+        )
+        assert preview.status_code == 200, preview.text
+        plan = preview.json()
+        assert "write-only" not in preview.text
+        assert "127.0.0.1" not in preview.text
+        applied = client.post(
+            path + "/profile-apply",
+            headers=headers | {"Idempotency-Key": "profile-apply"},
+            json={
+                "preview_id": plan["preview_id"],
+                "expected_state_fingerprint": state["state_fingerprint"],
+                "plan_fingerprint": plan["plan_fingerprint"],
+                "preview_idempotency_key": "profile-preview",
+            },
+        )
+        assert applied.status_code == 200, applied.text
+        projection = client.get(path).json()
+        assert projection["profiles"][0]["credential_configured"] is True
+        assert "write-only" not in json.dumps(projection)
+        assert "127.0.0.1" not in json.dumps(projection)
+
+
+def test_stale_index_rollback_plan_does_not_stop_backends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = {
+        "schema_version": "indexing-schema3-rollback-plan/v1",
+        "plan_fingerprint": "sha256:current",
+    }
+    monkeypatch.setattr(
+        "one_c_autoresearch.indexes.preview_schema3_rollback",
+        lambda *_args, **_kwargs: plan,
+    )
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        "one_c_autoresearch.search_runtime.shutdown_project_backends",
+        lambda project: stopped.append(project) or 0,
+    )
+    app = create_app(tmp_path / "state", [REPO], testing=True)
+    headers = {"Origin": "http://testserver", "Idempotency-Key": "bookmark"}
+    with TestClient(app) as client:
+        project = client.post(
+            "/api/v1/projects",
+            json={"name": "test", "root": str(REPO)},
+            headers=headers,
+        ).json()
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/indexes/rollback",
+            headers=headers | {"Idempotency-Key": "rollback"},
+            json={
+                "expected_file_fingerprint": "sha256:file",
+                "plan_fingerprint": "sha256:stale",
+                "purge_v2_state": False,
+                "inflight_handling": "cancelled",
+                "confirmed": True,
+            },
+        )
+    assert response.status_code == 409
+    assert stopped == []
 
 
 def test_codex_capabilities_are_read_from_cli(monkeypatch) -> None:
@@ -188,6 +298,7 @@ def test_source_tool_and_routing_preview_api_matrix(tmp_path: Path, monkeypatch,
     connections = {role: {"platform_path": "/opt/1cv8/x86_64/8.3.27.1989"} for role in ("vendor_baseline", "target_cf", "next_vendor")}
     monkeypatch.setattr("one_c_autoresearch.user_state.load_connections", lambda *_args: connections)
     monkeypatch.setattr("one_c_autoresearch.source_tools.discover_tools", lambda _roots: {"schema_version": "1", "complete": tools_complete, "checked_at": "2026-01-01T00:00:00Z", "inventory_fingerprint": "sha256:" + "a" * 64, "tools": [], "diagnostics": []})
+    monkeypatch.setattr("one_c_autoresearch.indexes.backend_tool_inventory", lambda _repo: [{"tool_id": "rlm-tools-bsl", "status": "ready", "purpose": "source_indexer", "required": True, "route_capabilities": ["text-search"], "instances": []}])
     preview_value = {
         "schema_version": "1",
         "routing_plan_fingerprint": "sha256:" + "b" * 64,
@@ -201,7 +312,11 @@ def test_source_tool_and_routing_preview_api_matrix(tmp_path: Path, monkeypatch,
     headers = {"Origin": "http://testserver", "Idempotency-Key": "bookmark"}
     with TestClient(app) as client:
         project = client.post("/api/v1/projects", json={"name": "test", "root": str(REPO)}, headers=headers).json()
-        assert client.get(f"/api/v1/projects/{project['id']}/source-tools").json()["complete"] is tools_complete
+        inventory_response = client.get(f"/api/v1/projects/{project['id']}/source-tools")
+        assert inventory_response.status_code == 200, inventory_response.text
+        inventory = inventory_response.json()
+        assert inventory["complete"] is tools_complete
+        assert inventory["tools"][0]["required"] is True
         created = client.post(f"/api/v1/projects/{project['id']}/source-routing-previews", headers=headers | {"Idempotency-Key": "preview"})
         assert created.status_code == 202, created.text
         preview_id = created.json()["preview_id"]

@@ -89,10 +89,15 @@ type SourceSearchPolicy = {
   max_returned_bytes_per_call: number;
   max_total_returned_bytes: number;
 };
-const SOURCE_SEARCH_OPERATIONS = [
-  "search_text", "find_symbol", "find_references",
-  "find_callers", "find_callees", "navigate_metadata",
-];
+const SOURCE_SEARCH_OPERATION_GROUPS: Record<string, string[]> = {
+  "Код": ["code.search_lexical", "code.search_hybrid"],
+  "Символы": ["symbol.info", "symbol.info_at"],
+  "Граф": ["graph.overview", "graph.schema", "graph.resolve", "graph.node", "graph.source", "graph.neighbors", "graph.callers", "graph.callees"],
+  "Метаданные": ["metadata.info", "metadata.tree", "metadata.object", "metadata.form"],
+  "Диагностика": ["diagnostics.catalog", "diagnostics.schema", "diagnostics.file", "diagnostics.workspace"],
+  "Справка": ["reference.find_docs", "reference.search_docs", "reference.syntax_help", "reference.its_help"],
+};
+const SOURCE_SEARCH_OPERATIONS = Object.values(SOURCE_SEARCH_OPERATION_GROUPS).flat();
 const DEFAULT_SOURCE_SEARCH_POLICY: SourceSearchPolicy = {
   operations: [...SOURCE_SEARCH_OPERATIONS],
   max_calls: 8,
@@ -225,6 +230,9 @@ type SourceIndex = {
   recovery_action?: string;
   failure_code?: string;
   failure_summary?: string;
+  modality?: string;
+  surface_identity?: string;
+  embedding_identity?: string;
 };
 type StepConfiguration = {
   job_id: string;
@@ -282,6 +290,8 @@ type SourceToolInventory = {
     tool_id: string;
     status: string;
     purpose: string;
+    required?: boolean;
+    route_capabilities?: string[];
     instances: { version: string; status: string; path: string }[];
   }[];
 };
@@ -436,7 +446,13 @@ export function ToolInventory({
         ? "требуется при обычных или неопределённых формах"
         : tool === "edt"
           ? "только старые поколения"
-          : "не выбран";
+          : "не используется текущим способом получения";
+  const usage = (tool: SourceToolInventory["tools"][number]) =>
+    tool.purpose === "source_indexer"
+      ? tool.required
+        ? `требуется маршрутами: ${tool.route_capabilities?.join(", ")}`
+        : "не выбран в маршрутах"
+      : use(tool.tool_id);
   return (
     <Stack spacing={1}>
       <Stack direction="row" spacing={1} alignItems="center">
@@ -463,7 +479,7 @@ export function ToolInventory({
           <Box sx={{ overflowX: "auto", mt: 1 }}>
             <Box
               component="table"
-              aria-label="Установки инструментов получения исходников"
+              aria-label="Установки инструментов обработки исходников"
               sx={{ width: "100%", textAlign: "left" }}
             >
               <caption>
@@ -486,7 +502,7 @@ export function ToolInventory({
                         <tr key={`${tool.tool_id}:${item.path}`}>
                           <th scope="row">{index === 0 ? tool.tool_id : ""}</th>
                           <td>{item.status}</td>
-                          <td>{index === 0 ? use(tool.tool_id) : ""}</td>
+                          <td>{index === 0 ? usage(tool) : ""}</td>
                           <td>{item.version || "не определена"}</td>
                           <td>{item.path}</td>
                         </tr>
@@ -495,7 +511,7 @@ export function ToolInventory({
                         <tr key={tool.tool_id}>
                           <th scope="row">{tool.tool_id}</th>
                           <td>{tool.status}</td>
-                          <td>{use(tool.tool_id)}</td>
+                          <td>{usage(tool)}</td>
                           <td>—</td>
                           <td>не найдено</td>
                         </tr>,
@@ -510,6 +526,15 @@ export function ToolInventory({
         <Alert severity="warning">
           Проверка завершена частично: некоторые кандидаты не проверены в
           пределах лимита.
+        </Alert>
+      )}
+      {inventory?.tools.some(
+        (tool) => tool.purpose === "source_indexer" && tool.required && tool.status !== "ready",
+      ) && (
+        <Alert severity="error">
+          Этап индексации заблокирован: установите совместимую версию каждого
+          индексатора, выбранного в маршрутах. Получение исходников при этом
+          остаётся доступно.
         </Alert>
       )}
     </Stack>
@@ -791,21 +816,29 @@ export function AgentProfiles({ project }: { project: Project }) {
                       {preparedInputHeadroom !== undefined && ` Максимальный остаток для подготовленного контекста: ${preparedInputHeadroom.toLocaleString("ru-RU")} байт.`}
                       {" "}Изменение применяется только к новым вызовам.
                     </Typography>
-                    <Stack direction="row" useFlexGap flexWrap="wrap">
-                      {SOURCE_SEARCH_OPERATIONS.map((operation) => <FormControlLabel
-                        key={operation}
-                        control={<Checkbox
-                          checked={sourceSearch.operations.includes(operation)}
-                          onChange={(event) => setSourceSearch((current) => ({
-                            ...current,
-                            operations: event.target.checked
-                              ? [...current.operations, operation]
-                              : current.operations.filter((item) => item !== operation),
-                          }))}
-                        />}
-                        label={operation}
-                      />)}
-                    </Stack>
+                    <Alert severity="info">
+                      Роль агента дополнительно сужает этот список: классификатору доступны только поиск кода и сведения о символах. Параметры вызова проверяются отдельной закрытой схемой операции.
+                    </Alert>
+                    {Object.entries(SOURCE_SEARCH_OPERATION_GROUPS).map(([group, operations]) => (
+                      <Box key={group}>
+                        <Typography variant="subtitle2">{group}</Typography>
+                        <Stack direction="row" useFlexGap flexWrap="wrap">
+                          {operations.map((operation) => <FormControlLabel
+                            key={operation}
+                            control={<Checkbox
+                              checked={sourceSearch.operations.includes(operation)}
+                              onChange={(event) => setSourceSearch((current) => ({
+                                ...current,
+                                operations: event.target.checked
+                                  ? [...current.operations, operation]
+                                  : current.operations.filter((item) => item !== operation),
+                              }))}
+                            />}
+                            label={operation}
+                          />)}
+                        </Stack>
+                      </Box>
+                    ))}
                     <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "repeat(2, 1fr)" }, gap: 1 }}>
                       {(Object.keys(DEFAULT_SOURCE_SEARCH_POLICY) as Array<keyof SourceSearchPolicy>)
                         .filter((field) => field !== "operations")
@@ -2344,18 +2377,52 @@ export function Indexes({
   const [busy, setBusy] = useState(false);
   const [pendingMode, setPendingMode] = useState<"ensure" | "rebuild" | "validate">();
   const [configurationText, setConfigurationText] = useState("");
+  const [configurationSchema, setConfigurationSchema] = useState("");
   const [configurationFingerprint, setConfigurationFingerprint] = useState("");
   const [configurationPreview, setConfigurationPreview] = useState<Record<string, unknown>>();
+  const [rollbackPreview, setRollbackPreview] = useState<Record<string, unknown>>();
+  const [purgeV2State, setPurgeV2State] = useState(false);
+  const [storageRoot, setStorageRoot] = useState("");
   const [routeHealth, setRouteHealth] = useState<{ blockers: Record<string, unknown>[]; degraded: Record<string, unknown>[] }>({ blockers: [], degraded: [] });
+  const [serviceProfiles, setServiceProfiles] = useState<Record<string, unknown>[]>([]);
+  const [serviceFingerprint, setServiceFingerprint] = useState("");
+  const [profileId, setProfileId] = useState("embedding-default");
+  const [profileText, setProfileText] = useState(JSON.stringify({
+    kind: "embedding", label: "Основной векторный поиск", enabled: true,
+    endpoint: "http://127.0.0.1:8080/v1", provider: "openai-compatible",
+    model: "embedding", dimension: 1536, ca_bundle_id: null,
+    build_limits: { requests: 10000, input_bytes: 536870912, vectors: 1000000, concurrency: 4, batch: 256, elapsed_seconds: 1800 },
+  }, null, 2));
+  const [profileSecret, setProfileSecret] = useState("");
+  const [profileAcknowledged, setProfileAcknowledged] = useState(false);
+  const [profilePreview, setProfilePreview] = useState<Record<string, unknown>>();
+  const [profilePreviewKey, setProfilePreviewKey] = useState("");
+  const [runtimeBackends, setRuntimeBackends] = useState<Record<string, unknown>[]>([]);
+  const [referenceReadiness, setReferenceReadiness] = useState<Record<string, unknown>>();
+  const [storage, setStorage] = useState<{ used_bytes: number; quota_bytes: number; available_bytes: number }>();
+  const [cleanupPreview, setCleanupPreview] = useState<Record<string, unknown>>();
   const refresh = useCallback(
-    () =>
-      api<{ items: SourceIndex[]; configuration: Record<string, unknown>; configuration_fingerprint: string; route_health: { blockers: Record<string, unknown>[]; degraded: Record<string, unknown>[] } }>(`/projects/${project.id}/indexes`)
-        .then((value) => {
+    () => Promise.all([
+      api<{ items: SourceIndex[]; configuration: Record<string, unknown>; configuration_fingerprint: string; storage_root: string; storage?: { used_bytes: number; quota_bytes: number; available_bytes: number }; route_health: { blockers: Record<string, unknown>[]; degraded: Record<string, unknown>[] }; runtime_backends?: Record<string, unknown>[]; reference_readiness?: Record<string, unknown> }>(`/projects/${project.id}/indexes`),
+      api<{ profiles: Record<string, unknown>[]; state_fingerprint: string }>(`/projects/${project.id}/search-services`),
+    ])
+        .then(([value, services]) => {
           setItems(value.items);
           setRouteHealth(value.route_health ?? { blockers: [], degraded: [] });
           setConfigurationText(JSON.stringify(value.configuration, null, 2));
+          setConfigurationSchema(String(value.configuration.schema_version ?? ""));
           setConfigurationFingerprint(value.configuration_fingerprint);
+          setStorageRoot(value.storage_root);
           setConfigurationPreview(undefined);
+          setRollbackPreview(undefined);
+          setServiceProfiles(services.profiles ?? []);
+          setServiceFingerprint(services.state_fingerprint ?? "");
+          setProfilePreview(undefined);
+          setProfileSecret("");
+          setRuntimeBackends(value.runtime_backends ?? []);
+          setReferenceReadiness(value.reference_readiness);
+          setStorage(value.storage);
+          setCleanupPreview(undefined);
         })
         .catch((error) => setError(error.message)),
     [project.id],
@@ -2439,12 +2506,107 @@ export function Indexes({
       setBusy(false);
     }
   };
+  const previewRollback = async () => {
+    setBusy(true); setError("");
+    try {
+      setRollbackPreview(await api<Record<string, unknown>>(`/projects/${project.id}/indexes/rollback-preview`, {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify({
+          expected_file_fingerprint: configurationFingerprint,
+          purge_v2_state: purgeV2State,
+        }),
+      }));
+    } catch (error) { setError((error as Error).message); }
+    finally { setBusy(false); }
+  };
+  const applyRollback = async () => {
+    if (!rollbackPreview || !window.confirm("Остановить поиск версии 2 и восстановить схему индексов 2?")) return;
+    setBusy(true); setError("");
+    try {
+      await api(`/projects/${project.id}/indexes/rollback`, {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify({
+          expected_file_fingerprint: configurationFingerprint,
+          plan_fingerprint: rollbackPreview.plan_fingerprint,
+          purge_v2_state: purgeV2State,
+          inflight_handling: "cancelled",
+          confirmed: true,
+        }),
+      });
+      await refresh();
+    } catch (error) { setError((error as Error).message); }
+    finally { setBusy(false); }
+  };
+  const previewProfile = async () => {
+    setBusy(true); setError("");
+    const key = crypto.randomUUID();
+    try {
+      const value = await api<Record<string, unknown>>(`/projects/${project.id}/search-services/profile-preview`, {
+        method: "POST",
+        headers: { ...mutationHeaders(), "Idempotency-Key": key },
+        body: JSON.stringify({
+          profile_id: profileId,
+          profile: JSON.parse(profileText),
+          expected_state_fingerprint: serviceFingerprint,
+          acknowledged: profileAcknowledged,
+          secret: profileSecret || null,
+        }),
+      });
+      setProfilePreview(value); setProfilePreviewKey(key);
+    } catch (error) { setError((error as Error).message); }
+    finally { setBusy(false); }
+  };
+  const applyProfile = async () => {
+    if (!profilePreview) return;
+    setBusy(true); setError("");
+    try {
+      await api(`/projects/${project.id}/search-services/profile-apply`, {
+        method: "POST",
+        headers: mutationHeaders(),
+        body: JSON.stringify({
+          preview_id: profilePreview.preview_id,
+          expected_state_fingerprint: serviceFingerprint,
+          plan_fingerprint: profilePreview.plan_fingerprint,
+          preview_idempotency_key: profilePreviewKey,
+        }),
+      });
+      await refresh();
+    } catch (error) { setError((error as Error).message); }
+    finally { setBusy(false); }
+  };
+  const previewCleanup = async () => {
+    setBusy(true); setError("");
+    try {
+      setCleanupPreview(await api<Record<string, unknown>>(`/projects/${project.id}/indexes/storage-cleanup-preview`));
+    } catch (error) { setError((error as Error).message); }
+    finally { setBusy(false); }
+  };
+  const applyCleanup = async () => {
+    if (!cleanupPreview || !window.confirm("Удалить только перечисленные неактивные экземпляры индексов?")) return;
+    setBusy(true); setError("");
+    try {
+      await api(`/projects/${project.id}/indexes/storage-cleanup`, {
+        method: "POST", headers: mutationHeaders(),
+        body: JSON.stringify({ plan_fingerprint: cleanupPreview.plan_fingerprint, confirmed: true }),
+      });
+      await refresh();
+    } catch (error) { setError((error as Error).message); }
+    finally { setBusy(false); }
+  };
   return (
     <Stack spacing={2}>
       {error && <Alert severity="error">{error}</Alert>}
       <Alert severity="info">
         Индексы — одноразовое ускорение в пользовательском каталоге;
         канонические доказательства остаются в репозитории.
+        {storageRoot && <Box sx={{ mt: 0.5, overflowWrap: "anywhere" }}>
+          Хранилище индексов: <Box component="code">{storageRoot}</Box>
+        </Box>}
+        {storage && <Box sx={{ mt: 0.5 }}>
+          Использовано {storage.used_bytes.toLocaleString("ru-RU")} из {storage.quota_bytes.toLocaleString("ru-RU")} байт.
+        </Box>}
       </Alert>
       {routeHealth.blockers.length > 0 && <Alert severity="error">
         Недоступные маршруты: {JSON.stringify(routeHealth.blockers)}
@@ -2452,6 +2614,17 @@ export function Indexes({
       {routeHealth.degraded.length > 0 && <Alert severity="warning">
         Деградированные маршруты: {JSON.stringify(routeHealth.degraded)}
       </Alert>}
+      {runtimeBackends.length > 0 && <Alert severity="info">
+        Активные обслуживающие процессы: {JSON.stringify(runtimeBackends)}
+      </Alert>}
+      {referenceReadiness && <Alert severity={referenceReadiness.status === "ready" ? "success" : "warning"}>
+        Справочный индекс: {JSON.stringify(referenceReadiness)}
+      </Alert>}
+      <Stack direction="row" spacing={1}>
+        <Button disabled={busy} onClick={() => void previewCleanup()}>Просмотреть очистку хранилища</Button>
+        <Button color="warning" disabled={busy || !cleanupPreview} onClick={() => void applyCleanup()}>Удалить перечисленные неактивные индексы</Button>
+      </Stack>
+      {cleanupPreview && <Alert severity="warning"><Box component="pre" sx={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(cleanupPreview, null, 2)}</Box></Alert>}
       <Accordion>
         <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
           <Typography fontWeight={700}>Настройка адаптеров и маршрутов</Typography>
@@ -2466,6 +2639,7 @@ export function Indexes({
               onChange={(event) => {
                 setConfigurationText(event.target.value);
                 setConfigurationPreview(undefined);
+                setRollbackPreview(undefined);
               }}
             />
             <Stack direction="row" spacing={1}>
@@ -2477,6 +2651,45 @@ export function Indexes({
                 {JSON.stringify(configurationPreview, null, 2)}
               </Box>
             </Alert>}
+            {configurationSchema === "3" && <>
+              <FormControlLabel
+                control={<Checkbox checked={purgeV2State} onChange={(event) => {
+                  setPurgeV2State(event.target.checked);
+                  setRollbackPreview(undefined);
+                }} />}
+                label="Удалить состояние поиска версии 2 после отката"
+              />
+              <Stack direction="row" spacing={1}>
+                <Button color="warning" disabled={busy} onClick={() => void previewRollback()}>Просмотреть откат к схеме 2</Button>
+                <Button color="error" disabled={busy || !rollbackPreview} onClick={() => void applyRollback()}>Применить проверенный откат</Button>
+              </Stack>
+              {rollbackPreview && <Alert severity="warning">
+                <Box component="pre" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                  {JSON.stringify(rollbackPreview, null, 2)}
+                </Box>
+              </Alert>}
+            </>}
+          </Stack>
+        </AccordionDetails>
+      </Accordion>
+      <Accordion>
+        <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
+          <Typography fontWeight={700}>Профили векторного поиска и ИТС</Typography>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Stack spacing={1}>
+            <Typography variant="body2">
+              Настроено: {serviceProfiles.length}. Адреса и секреты сервер не возвращает.
+            </Typography>
+            <TextField label="Идентификатор профиля" value={profileId} onChange={(event) => { setProfileId(event.target.value); setProfilePreview(undefined); }} />
+            <TextField label="Параметры профиля" multiline minRows={8} value={profileText} onChange={(event) => { setProfileText(event.target.value); setProfilePreview(undefined); }} />
+            <TextField label="Новый секрет (необязательно при сохранении)" type="password" autoComplete="new-password" value={profileSecret} onChange={(event) => { setProfileSecret(event.target.value); setProfilePreview(undefined); }} />
+            <FormControlLabel control={<Checkbox checked={profileAcknowledged} onChange={(event) => { setProfileAcknowledged(event.target.checked); setProfilePreview(undefined); }} />} label="Подтверждаю указанную в плане передачу данных внешнему сервису" />
+            <Stack direction="row" spacing={1}>
+              <Button disabled={busy} onClick={() => void previewProfile()}>Просмотреть план</Button>
+              <Button variant="contained" disabled={busy || !profilePreview} onClick={() => void applyProfile()}>Применить проверенный план</Button>
+            </Stack>
+            {profilePreview && <Alert severity="warning"><Box component="pre" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{JSON.stringify(profilePreview, null, 2)}</Box></Alert>}
           </Stack>
         </AccordionDetails>
       </Accordion>
@@ -2544,6 +2757,7 @@ export function Indexes({
               {item.adapter_id} {item.engine_version} · адаптер {item.adapter_version}
               {item.contract_version ? ` · контракт ${item.contract_version}` : ""} · поколение{" "}
               {item.source_generation_id}
+              {item.modality ? ` · режим ${item.modality}` : ""}
             </Typography>
             <Typography display="block" variant="caption">
               Возможности: {item.capabilities.join(", ") || "не объявлены"} · приоритеты:{" "}
@@ -2553,6 +2767,10 @@ export function Indexes({
               Индекс {item.index_fingerprint || "не создан"} · проверка{" "}
               {item.last_validation || "ещё не выполнялась"} · исходник {item.fingerprint}
             </Typography>
+            {(item.surface_identity || item.embedding_identity) && <Typography display="block" variant="caption">
+              Поверхность {item.surface_identity || "не подтверждена"}
+              {item.embedding_identity ? ` · векторная модель ${item.embedding_identity}` : ""}
+            </Typography>}
             {item.failure_code && <Alert severity="error" sx={{ mt: 1 }}>
               {item.failure_code}{item.failure_summary ? `: ${item.failure_summary}` : ""}
             </Alert>}
@@ -3045,6 +3263,7 @@ function Workspace({
             Диспетчер
           </Button>
           <Button onClick={() => setView("sources")}>Источники</Button>
+          <Button variant={view === "indexes" ? "contained" : "text"} onClick={() => setView("indexes")}>Индексы</Button>
           <Button onClick={() => setView("journal")}>Журнал</Button>
           <Button onClick={() => setView("registries")}>Реестры</Button>
           <Button onClick={() => { setSettingsStep(undefined); setSettingsTab("stages"); setView("settings"); }}>

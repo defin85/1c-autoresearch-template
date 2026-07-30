@@ -22,6 +22,14 @@ only for one `rlm-tools-bsl` backend when every route contains exactly that
 backend. Any BSL Analyzer backend, missing route, or different route order
 blocks the downgrade without changing the file.
 
+Schema version 3 enables the closed `source-search-tool/v2` surface. Its
+reviewed migration pins machine contract 1.3, explicit lexical and hybrid
+routes, and stable service-profile IDs. Migration stores an owner-only schema
+2 backup, marks semantic targets stale, invalidates v2 reuse, and starts no
+build. Rollback first closes v2 admission, drains or cancels in-flight work,
+proves the prior runtime can read the backup, and then either retains or
+explicitly purges disposable v2 state.
+
 ## Build, validation, and disk ownership
 
 **Validate readiness** is read-only and never starts a build. **Rebuild**
@@ -36,6 +44,35 @@ in the repository. The user running the workspace owns this directory. It can
 be removed to force rebuilding without changing source, DIF, MRQ, or published
 generations. Do not copy it into a repository, wheel, source archive, or
 research deliverable.
+
+The complete BSL Analyzer workspace surface requires the supervised native
+broker. The coordinator starts one daemon for an exact target identity and
+connects per-call `broker-required` proxies; auto-launch and direct-stdio
+fallback are incompatible. Queries run against a private copy-on-write serving
+workspace. The lightweight reference profile remains a separate direct-stdio
+process and uses only the corpus bundled with the selected executable.
+
+## Semantic and reference services
+
+Named embedding and ITS profiles live only in the owner-only
+`<state-root>/projects/<workspace-id>/search-services.json`. Read APIs expose
+neither raw endpoints nor credentials. Changes use preview/apply fingerprints;
+remote use requires an acknowledgement that is bound to the exact disclosure
+plan.
+
+Lexical work receives no inherited embedding, proxy, credential, CA, or global
+BSL Analyzer variables. Hybrid work receives only a coordinator-owned loopback
+embedding broker URL, a one-use local capability, model, dimension, and fixed
+limits. The broker alone holds the upstream endpoint and credential, validates
+DNS, connected peer, TLS, redirects, response shape, dimensions, retries, and
+budgets. A hybrid request fails closed when semantic coverage or identity is
+not proved; it never silently becomes lexical search.
+
+Reference findings are navigation aids, not repository evidence.
+`syntax_help` consumes structured schema 1; ITS uses only
+`https://code.1c.ai`, a write-only token, one in-flight call, and no retry or
+reuse. Final evidence must still be re-read from the active canonical source
+generation.
 
 ## Worker search and limits
 

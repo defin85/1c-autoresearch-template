@@ -313,6 +313,8 @@ def _ensure_dispatcher_tables(conn) -> None:
                 ordinal INTEGER NOT NULL,
                 query_hmac TEXT NOT NULL,
                 capability TEXT NOT NULL,
+                operation TEXT,
+                modality TEXT,
                 scope_fingerprint TEXT NOT NULL,
                 route_fingerprint TEXT,
                 fallback_reason TEXT,
@@ -321,6 +323,12 @@ def _ensure_dispatcher_tables(conn) -> None:
                 capability_fingerprint TEXT,
                 index_fingerprint TEXT,
                 result_manifest_fingerprint TEXT,
+                surface_identity TEXT,
+                embedding_identity TEXT,
+                reference_identity TEXT,
+                result_class_counts TEXT,
+                canonical_manifest_fingerprint TEXT,
+                derived_manifest_fingerprint TEXT,
                 reserved_query_bytes INTEGER NOT NULL,
                 reserved_results INTEGER NOT NULL,
                 reserved_returned_bytes INTEGER NOT NULL,
@@ -424,7 +432,12 @@ def _ensure_dispatcher_tables(conn) -> None:
         search_call_columns = {
             row[1] for row in cur.execute("PRAGMA table_info(source_search_calls)")
         }
-        for name in ("fallback_reason", "adapter_id", "adapter_version", "capability_fingerprint"):
+        for name in (
+            "fallback_reason", "adapter_id", "adapter_version", "capability_fingerprint",
+            "operation", "modality", "surface_identity", "embedding_identity",
+            "reference_identity", "result_class_counts",
+            "canonical_manifest_fingerprint", "derived_manifest_fingerprint",
+        ):
             if name not in search_call_columns:
                 cur.execute(f"ALTER TABLE source_search_calls ADD COLUMN {name} TEXT")
         phase_columns = {
@@ -1596,6 +1609,14 @@ class DispatcherStore:
                 ),
             )
 
+    def active_source_search_invocations(self) -> tuple[str, ...]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT invocation_id FROM source_search_invocations "
+                "WHERE admission_state = 'open' ORDER BY invocation_id"
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
     def reserve_source_search_call(
         self,
         invocation_id: str,
@@ -1604,12 +1625,22 @@ class DispatcherStore:
         *,
         query_hmac: str,
         capability: str,
+        operation: str = "",
+        modality: str = "",
         query_bytes: int,
         requested_results: int,
         requested_returned_bytes: int,
         requested_backend_seconds: float,
     ) -> dict[str, Any]:
-        if not call_id or len(call_id) > 200 or not query_hmac:
+        if (
+            not call_id
+            or len(call_id) > 200
+            or not query_hmac
+            or operation and operation not in __import__(
+                "one_c_autoresearch.source_search", fromlist=["V2_OPERATIONS"]
+            ).V2_OPERATIONS
+            or modality not in {"", "lexical", "hybrid", "workspace", "reference", "its"}
+        ):
             raise ValueError("source_search.invalid_request")
         with repository_lock(self.repo), self._lock, self.conn:
             row = self.conn.execute(
@@ -1726,16 +1757,18 @@ class DispatcherStore:
             now = _now_iso()
             self.conn.execute(
                 "INSERT INTO source_search_calls "
-                "(invocation_id, call_id, ordinal, query_hmac, capability, scope_fingerprint, "
+                "(invocation_id, call_id, ordinal, query_hmac, capability, operation, modality, scope_fingerprint, "
                 "reserved_query_bytes, reserved_results, reserved_returned_bytes, "
                 "reserved_backend_seconds, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?)",
                 (
                     invocation_id,
                     call_id,
                     ordinal,
                     query_hmac,
                     capability,
+                    operation or None,
+                    modality or None,
                     policy["scope_fingerprint"],
                     query_bytes,
                     requested_results,
@@ -1763,6 +1796,12 @@ class DispatcherStore:
         capability_fingerprint: str = "",
         index_fingerprint: str = "",
         result_manifest_fingerprint: str = "",
+        surface_identity: str = "",
+        embedding_identity: str = "",
+        reference_identity: str = "",
+        result_class_counts: dict[str, int] | None = None,
+        canonical_manifest_fingerprint: str = "",
+        derived_manifest_fingerprint: str = "",
         result_count: int = 0,
         returned_bytes: int = 0,
         backend_seconds: float = 0,
@@ -1779,6 +1818,40 @@ class DispatcherStore:
             ).fetchone()
             if row is None:
                 return False
+            call = self.conn.execute(
+                "SELECT operation, modality FROM source_search_calls "
+                "WHERE invocation_id = ? AND call_id = ?",
+                (invocation_id, call_id),
+            ).fetchone()
+            counts = result_class_counts or {}
+            allowed_classes = {
+                "canonical_navigation_hit", "canonical_excerpt",
+                "derived_navigation_finding", "reference_navigation_finding",
+            }
+            if call and call[0] and (
+                set(counts) - allowed_classes
+                or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in counts.values())
+                or sum(counts.values()) != result_count
+            ):
+                raise ValueError("source_search.invalid_result_class_counts")
+            if status == "completed" and call and call[0]:
+                operation, modality = str(call[0]), str(call[1] or "")
+                if (
+                    not surface_identity.startswith("sha256:")
+                    or operation == "code.search_hybrid"
+                    and not embedding_identity.startswith("sha256:")
+                    or operation.startswith("reference.")
+                    and not reference_identity.startswith("sha256:")
+                    or operation.startswith("reference.") and modality not in {"reference", "its"}
+                    or not operation.startswith("reference.") and modality not in {"lexical", "hybrid", "workspace"}
+                    or counts.get("canonical_navigation_hit", 0)
+                    + counts.get("canonical_excerpt", 0) > 0
+                    and not canonical_manifest_fingerprint.startswith("sha256:")
+                    or counts.get("derived_navigation_finding", 0)
+                    + counts.get("reference_navigation_finding", 0) > 0
+                    and not derived_manifest_fingerprint.startswith("sha256:")
+                ):
+                    raise ValueError("source_search.incomplete_v2_provenance")
             if (
                 result_count < 0 or result_count > row[0]
                 or returned_bytes < 0 or returned_bytes > row[1]
@@ -1789,6 +1862,9 @@ class DispatcherStore:
                 "UPDATE source_search_calls SET status = ?, route_fingerprint = ?, fallback_reason = ?, "
                 "adapter_id = ?, adapter_version = ?, capability_fingerprint = ?, "
                 "index_fingerprint = ?, result_manifest_fingerprint = ?, "
+                "surface_identity = ?, embedding_identity = ?, reference_identity = ?, "
+                "result_class_counts = ?, canonical_manifest_fingerprint = ?, "
+                "derived_manifest_fingerprint = ?, "
                 "actual_results = ?, actual_returned_bytes = ?, actual_backend_seconds = ?, "
                 "error_code = ?, finished_at = ? "
                 "WHERE invocation_id = ? AND call_id = ? AND status = 'reserved'",
@@ -1801,6 +1877,12 @@ class DispatcherStore:
                     capability_fingerprint or None,
                     index_fingerprint or None,
                     result_manifest_fingerprint or None,
+                    surface_identity or None,
+                    embedding_identity or None,
+                    reference_identity or None,
+                    canonical_json(counts).decode(),
+                    canonical_manifest_fingerprint or None,
+                    derived_manifest_fingerprint or None,
                     result_count,
                     returned_bytes,
                     backend_seconds,
@@ -1872,18 +1954,23 @@ class DispatcherStore:
             if invocation is None:
                 raise KeyError("source-search invocation not found")
             rows = self.conn.execute(
-                "SELECT ordinal, query_hmac, capability, scope_fingerprint, "
+                "SELECT ordinal, query_hmac, capability, operation, modality, scope_fingerprint, "
                 "route_fingerprint, fallback_reason, adapter_id, adapter_version, capability_fingerprint, "
-                "index_fingerprint, result_manifest_fingerprint, "
+                "index_fingerprint, result_manifest_fingerprint, surface_identity, "
+                "embedding_identity, reference_identity, result_class_counts, "
+                "canonical_manifest_fingerprint, derived_manifest_fingerprint, "
                 "actual_results, actual_returned_bytes, actual_backend_seconds, status, "
                 "error_code, created_at, finished_at FROM source_search_calls "
                 "WHERE invocation_id = ? ORDER BY ordinal LIMIT ? OFFSET ?",
                 (invocation_id, limit + 1, offset),
             ).fetchall()
         keys = (
-            "ordinal", "query_hmac", "capability", "scope_fingerprint",
+            "ordinal", "query_hmac", "capability", "operation", "modality", "scope_fingerprint",
             "route_fingerprint", "fallback_reason", "adapter_id", "adapter_version",
             "capability_fingerprint", "index_fingerprint", "result_manifest_fingerprint",
+            "surface_identity", "embedding_identity", "reference_identity",
+            "result_class_counts", "canonical_manifest_fingerprint",
+            "derived_manifest_fingerprint",
             "result_count", "returned_bytes", "backend_seconds", "status",
             "error_code", "created_at", "finished_at",
         )
@@ -1898,22 +1985,43 @@ class DispatcherStore:
                 (invocation_id,),
             ).fetchone()
             all_rows = self.conn.execute(
-                "SELECT ordinal, query_hmac, capability, scope_fingerprint, "
+                "SELECT ordinal, query_hmac, capability, operation, modality, scope_fingerprint, "
                 "route_fingerprint, fallback_reason, adapter_id, adapter_version, capability_fingerprint, "
-                "index_fingerprint, result_manifest_fingerprint, "
+                "index_fingerprint, result_manifest_fingerprint, surface_identity, "
+                "embedding_identity, reference_identity, result_class_counts, "
+                "canonical_manifest_fingerprint, derived_manifest_fingerprint, "
                 "actual_results, actual_returned_bytes, status, error_code "
                 "FROM source_search_calls WHERE invocation_id = ? ORDER BY ordinal",
                 (invocation_id,),
             ).fetchall()
         items = [dict(zip(keys, row)) for row in rows[:limit]]
+        for item in items:
+            item["result_class_counts"] = json.loads(item["result_class_counts"] or "{}")
         policy = json.loads(invocation[1])
         status_counts: dict[str, int] = {}
         routes: dict[tuple[str, str, str], int] = {}
         for row in all_rows:
-            status = str(row[13])
+            status = str(row[21])
             status_counts[status] = status_counts.get(status, 0) + 1
-            route = (str(row[2]), str(row[6] or ""), str(row[5] or ""))
+            route = (str(row[2]), str(row[8] or ""), str(row[7] or ""))
             routes[route] = routes.get(route, 0) + 1
+        completed_v2 = [item for item in items if item["status"] == "completed" and item["operation"]]
+        reuse_ready = (
+            totals[1] == 0
+            and all(
+                item["surface_identity"]
+                and item["result_class_counts"]
+                and (
+                    not item["operation"].startswith("reference.")
+                    or item["reference_identity"]
+                )
+                and (
+                    item["operation"] != "code.search_hybrid"
+                    or item["embedding_identity"]
+                )
+                for item in completed_v2
+            )
+        )
         ledger_fingerprint = "sha256:" + sha256(canonical_json(all_rows))
         return {
             "schema_version": "source-search-ledger/v1",
@@ -1969,6 +2077,7 @@ class DispatcherStore:
             ),
             "ledger_complete": totals[1] == 0,
             "reconciled": totals[1] == 0,
+            "reuse_ready": reuse_ready,
             "ledger_fingerprint": ledger_fingerprint,
             "items": items,
             "next_offset": offset + limit if len(rows) > limit else None,

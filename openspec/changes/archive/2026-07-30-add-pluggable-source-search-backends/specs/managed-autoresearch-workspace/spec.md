@@ -5,7 +5,11 @@ The managed workspace SHALL expose the fixed approved indexing backends, their c
 
 #### Scenario: A user opens index diagnostics
 - **WHEN** one or more backends are configured
-- **THEN** the workspace MUST show backend and adapter IDs, engine and adapter versions, capability summary, component, representation, source-generation binding, index fingerprint, status, last validation, and route priority.
+- **THEN** the workspace MUST show the user-scope operational storage root, backend and adapter IDs, engine and adapter versions, capability summary, component, representation, source-generation binding, index fingerprint, status, last validation, and route priority.
+
+#### Scenario: A user checks host tools before running the workflow
+- **WHEN** the common live tool inventory is opened
+- **THEN** it MUST list every fixed indexing adapter with detected installation, version, path, and route-derived requirement, MUST block only the indexing stage when a required adapter is unavailable or incompatible, and MUST NOT block source acquisition for an unselected indexer.
 
 #### Scenario: A backend fallback occurred
 - **WHEN** a query used a lower-priority backend

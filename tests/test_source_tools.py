@@ -24,6 +24,35 @@ def test_inventory_reports_multiple_platforms_and_stable_fingerprint(tmp_path: P
     assert configured == ["8.3.27.1989", "8.5.4.1306"]
 
 
+def test_designer_version_does_not_depend_on_ibcmd(tmp_path: Path, monkeypatch):
+    root = tmp_path / "8.3.24.1761"
+    executable(root / "1cv8", "exit 0")
+    monkeypatch.setattr("one_c_autoresearch.source_tools._platform_roots", lambda _roots: ([root], 0))
+    monkeypatch.setattr("one_c_autoresearch.source_tools.shutil.which", lambda _name: None)
+    designer = next(item for item in discover_tools([])["tools"] if item["tool_id"] == "designer")
+    assert (designer["status"], designer["instances"][0]["version"]) == ("ready", "8.3.24.1761")
+
+
+def test_inventory_reports_every_installed_edt(tmp_path: Path, monkeypatch):
+    components = tmp_path / "components"
+    older = executable(components / "1c-edt-2024.1.3+13-x86_64/1cedtcli", "exit 0")
+    current = executable(components / "1c-edt-2024.2.5+16-x86_64/1cedtcli", "exit 0")
+    monkeypatch.setattr(
+        "one_c_autoresearch.source_tools.Path.glob",
+        lambda _path, _pattern: iter([older, current]),
+    )
+    monkeypatch.setattr(
+        "one_c_autoresearch.source_tools.shutil.which",
+        lambda name: str(current) if name == "1cedtcli" else None,
+    )
+    monkeypatch.setattr("one_c_autoresearch.source_tools._platform_roots", lambda _roots: ([], 0))
+    edt = next(item for item in discover_tools([])["tools"] if item["tool_id"] == "edt")
+    assert [(item["version"], item["status"]) for item in edt["instances"]] == [
+        ("2024.1.3+13", "incompatible"),
+        ("2024.2.5+16", "ready"),
+    ]
+
+
 def test_inventory_marks_unsupported_v8unpack_incompatible(tmp_path: Path, monkeypatch):
     converter = executable(tmp_path / "v8unpack", "echo 'v8unpack 9.9.9'")
     monkeypatch.setattr("one_c_autoresearch.source_tools._platform_roots", lambda _roots: ([], 0))
@@ -47,6 +76,7 @@ def test_inventory_priority_limit_and_tool_scoped_partial_state(tmp_path: Path, 
     assert roots[:16] == sorted(path.resolve() for path in configured)[:16]
     assert omitted >= 4
     monkeypatch.setattr("one_c_autoresearch.source_tools._platform_roots", lambda _roots: ([], 2))
+    monkeypatch.setattr("one_c_autoresearch.source_tools.Path.glob", lambda _path, _pattern: iter(()))
     monkeypatch.setattr("one_c_autoresearch.source_tools.shutil.which", lambda _name: None)
     result = discover_tools([])
     states = {item["tool_id"]: item["status"] for item in result["tools"]}
@@ -58,6 +88,7 @@ def test_inventory_stops_at_total_scan_deadline(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("one_c_autoresearch.source_tools._platform_roots", lambda _roots: ([root], 0))
     moments = iter((0.0, 999.0))
     monkeypatch.setattr("one_c_autoresearch.source_tools.time.monotonic", lambda: next(moments))
+    monkeypatch.setattr("one_c_autoresearch.source_tools.Path.glob", lambda _path, _pattern: iter(()))
     monkeypatch.setattr("one_c_autoresearch.source_tools.shutil.which", lambda _name: None)
     result = discover_tools([])
     assert {"code": "scan_deadline_reached", "subject": "platform_roots", "omitted_count": 0} in result["diagnostics"]
