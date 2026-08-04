@@ -25,7 +25,10 @@ jobs:
           tool: ripgrep
 
       - name: Install Python test dependencies
-        run: python -m pip install '.[workspace]' pytest build
+        run: python -m pip install '.[workspace]' pytest build basedpyright==1.39.9
+
+      - name: Check Python types
+        run: basedpyright
 
       - name: Test template contract
         run: python scripts/checks/test_template.py

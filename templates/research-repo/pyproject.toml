@@ -28,3 +28,13 @@ markers = [
   "smoke: end-to-end tests that require a real codex CLI and active repository state; skipped by default",
 ]
 addopts = "-m 'not smoke'"
+
+[tool.basedpyright]
+include = ["src/one_c_autoresearch"]
+pythonVersion = "3.11"
+baselineFile = ".basedpyright/baseline.json"
+
+[dependency-groups]
+dev = [
+    "basedpyright==1.39.9",
+]

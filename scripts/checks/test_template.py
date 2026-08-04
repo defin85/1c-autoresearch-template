@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import tomllib
 
 
 ROOT_RUNTIME = "src/one_c_autoresearch"
@@ -17,6 +18,11 @@ MAINTENANCE = {
 ACTIVE_DOCS = {
     "README.md", "AGENTS.md", "docs/agent/repo-map.md", "docs/agent/verification.md",
     "docs/operator/dispatcher-inspector-rollback.md", "docs/operator/source-search.md",
+}
+TYPE_CHECK_CONFIG = {
+    "include": ["src/one_c_autoresearch"],
+    "pythonVersion": "3.11",
+    "baselineFile": ".basedpyright/baseline.json",
 }
 
 
@@ -78,6 +84,16 @@ def check(root: Path) -> list[str]:
     }
     if active_docs != ACTIVE_DOCS:
         errors.append(f"active documentation inventory mismatch: {sorted(active_docs)}")
+    for project_root in (root, scaffold):
+        project = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
+        if project.get("tool", {}).get("basedpyright") != TYPE_CHECK_CONFIG:
+            errors.append(f"BasedPyright policy mismatch: {project_root.relative_to(root) or '.'}")
+        if project.get("dependency-groups", {}).get("dev") != ["basedpyright==1.39.9"]:
+            errors.append(f"BasedPyright version mismatch: {project_root.relative_to(root) or '.'}")
+        for path in (project_root / ROOT_RUNTIME).rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            if "# type: ignore" in text or "# pyright:" in text:
+                errors.append(f"type-check suppression is forbidden: {path.relative_to(root)}")
     manifest = json.loads((scaffold / "research/runtime-sync-manifest.json").read_text(encoding="utf-8"))["paths"]
     actual = sorted(path for path in files(scaffold) if path != "research/runtime-sync-manifest.json")
     expected = sorted(path for path in manifest if path != "research/runtime-sync-manifest.json")

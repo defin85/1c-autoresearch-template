@@ -48,6 +48,7 @@ The active root documentation surface is exactly `README.md`, `AGENTS.md`,
 python scripts/checks/test_template.py
 python scripts/checks/test_doctor.py
 python scripts/checks/test_research_repo.py --repo-path <target-repo>
+uv run --extra workspace basedpyright
 pytest -q
 ```
 

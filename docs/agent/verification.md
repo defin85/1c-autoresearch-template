@@ -9,6 +9,7 @@ Release `0.3.0` exposes only the canonical generated-repository runtime.
 python scripts/checks/test_template.py
 python scripts/checks/test_doctor.py
 python scripts/checks/test_research_repo.py --repo-path <target-repo>
+uv run --extra workspace basedpyright
 pytest -q
 ```
 
@@ -47,6 +48,7 @@ fingerprints its wheel before clean-install and upgrade checks.
 | Safety | Customer generations, binaries, credentials, absolute workstation paths, and customer outputs are rejected before mutation. Non-empty unapproved destinations are rejected. |
 | Maintenance | Exactly six repository-local scripts create, synchronize, package, and verify; none are installed or copied into generated repositories. |
 | Runtime behavior | Canonical source routing, immutable generations, stable `DIF-*` identity/lineage, semantic/physical closure, bounded unsupported diagnostics, large CSV fields, DIF/MRQ flow, dispatcher, and invocation inspector pass target-first tests. |
+| Python types | Pinned BasedPyright checks every production module under `src/one_c_autoresearch`; the temporary migration baseline may only shrink and must be absent from completed release artifacts. |
 | Workspace | Canonical repositories open; legacy-authority repositories are rejected without mutation; CLI works without web extras; stale configuration saves preserve external edits. |
 | Release | Build and fingerprint `0.2.0` from the exact pre-cleanup commit in an isolated worktree, clear outputs, then test clean and `0.2.0`-to-`0.3.0` installs both without extras and with workspace extras. |
 | Fresh repository | Bootstrap an empty destination, replace only declared tokens, then run canonical doctor, Python tests, web tests/build, exact workflow-catalog comparison, parity, and forbidden scans. |

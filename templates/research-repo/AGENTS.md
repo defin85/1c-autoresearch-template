@@ -29,6 +29,7 @@ This repository uses one repository-owned research workflow.
 ```bash
 python -m one_c_autoresearch doctor
 python -m one_c_autoresearch doctor --strict
+uv run --extra workspace basedpyright
 uv run --extra workspace --with pytest --with httpx python -m pytest -q tests
 cd web/workspace && npm test -- --run && npm run build
 ```

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import tomllib
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -19,6 +20,25 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN = json.loads((ROOT / "templates/research-repo/research/forbidden-authorities.json").read_text(encoding="utf-8"))
+
+
+def test_python_type_check_policy_is_pinned_without_source_suppressions() -> None:
+    expected = {
+        "include": ["src/one_c_autoresearch"],
+        "pythonVersion": "3.11",
+        "baselineFile": ".basedpyright/baseline.json",
+    }
+    for project_root in (ROOT, ROOT / "templates/research-repo"):
+        project = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
+        assert project["tool"]["basedpyright"] == expected
+        assert project["dependency-groups"]["dev"] == ["basedpyright==1.39.9"]
+        for path in (project_root / "src/one_c_autoresearch").rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            assert "# type: ignore" not in text
+            assert "# pyright:" not in text
+    workflow = (ROOT / ".github/workflows/verify.yml").read_text(encoding="utf-8")
+    assert "basedpyright==1.39.9" in workflow
+    assert "run: basedpyright" in workflow
 
 
 def test_runtime_matches_canonical_scaffold() -> None:
