@@ -3,10 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from one_c_autoresearch.service import ApplicationService
+from one_c_autoresearch.service import ApplicationService, backend_state
 
 
 UUID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+
+def test_backend_state_omits_null_optional_identities() -> None:
+    assert backend_state({"status": "missing", "embedding_identity": None, "reference_identity": None}) == {"status": "missing"}
 
 
 def _status() -> dict:

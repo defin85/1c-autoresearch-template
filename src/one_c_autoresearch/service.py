@@ -90,8 +90,8 @@ def backend_state(value: JsonObject) -> indexes.BackendState:
     if "index_key" in value: result["index_key"] = _string(value["index_key"])
     if "instance_path" in value: result["instance_path"] = _string(value["instance_path"])
     if "index_dir" in value: result["index_dir"] = _string(value["index_dir"])
-    if "embedding_identity" in value: result["embedding_identity"] = _string(value["embedding_identity"])
-    if "reference_identity" in value: result["reference_identity"] = _string(value["reference_identity"])
+    if value.get("embedding_identity") is not None: result["embedding_identity"] = _string(value["embedding_identity"])
+    if value.get("reference_identity") is not None: result["reference_identity"] = _string(value["reference_identity"])
     if "validated_at" in value: result["validated_at"] = _string(value["validated_at"])
     if "capabilities" in value:
         result["capabilities"] = _strings(value["capabilities"])
