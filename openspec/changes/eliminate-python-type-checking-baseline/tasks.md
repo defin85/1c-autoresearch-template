@@ -44,12 +44,7 @@
 - [x] 7.1 Run target doctor, strict doctor where the fixture is publication-complete, the full Python suite and the unsuppressed type check.
 - [x] 7.2 Preview and fingerprint canonical synchronization, apply the unchanged plan, and prove normalized two-way parity for runtime source, configuration, lockfile and verification commands.
 - [x] 7.3 Run template, doctor, fresh-repository, package, distribution, frontend and browser gates required by the release matrix.
-<!-- GOAL_CURSOR -->
-- [ ] 7.4 Run BasedPyright on Ubuntu, Windows and macOS with the pinned version and review platform-specific branches.
-  - Этап цикла: финальная проверка
-  - Состояние шага: BasedPyright фактически прошел на трех ОС; выпуск и Linux-проверки зелёные, условие Linux-зависимого набора уточнено
-  - Следующее действие: опубликовать условие матрицы и дождаться полностью зеленого прогона
-  - Файлы шага: `.github/workflows/verify.yml`
+- [x] 7.4 Run BasedPyright on Ubuntu, Windows and macOS with the pinned version and review platform-specific branches.
 - [x] 7.5 Run `openspec validate eliminate-python-type-checking-baseline --strict --no-interactive`, `openspec validate --all --strict`, `git diff --check`, and direct final diff and artifact review.
 
 ## Разрывы ревью
