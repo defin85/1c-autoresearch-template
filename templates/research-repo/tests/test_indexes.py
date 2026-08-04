@@ -12,7 +12,7 @@ import pytest
 from one_c_autoresearch import indexes, search_runtime
 
 
-REPO = Path(__file__).parents[1]
+REPO = Path(__file__).parents[1] / "templates/research-repo"
 requires_source_generation = pytest.mark.skipif(
     not (REPO / "research/active-source-generation.json").is_file(),
     reason="requires a concrete research repository source generation",
@@ -176,6 +176,17 @@ def test_index_executable_is_found_above_nested_project(tmp_path: Path, monkeypa
     repo.mkdir(parents=True)
     monkeypatch.setattr(shutil, "which", lambda _name: None)
     assert indexes.discover_executable(repo) == str(executable)
+
+
+def test_cli_version_accepts_semver_build_metadata(monkeypatch) -> None:
+    monkeypatch.setattr(
+        indexes,
+        "_bounded_run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, "rlm-bsl-index 1.30.1+v8unpack.1\n", "",
+        ),
+    )
+    assert indexes.cli_version("rlm-bsl-index") == "1.30.1+v8unpack.1"
 
 
 def test_backend_tool_inventory_marks_only_routed_adapter_required(

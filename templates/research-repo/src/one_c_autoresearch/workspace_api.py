@@ -2230,6 +2230,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             ),
             "storage_root": _string(storage["root"]),
             "storage": storage,
+            "backend_tools": indexes.backend_tool_inventory(project),
             "disposable": True,
             "runtime_backends": search_runtime.runtime_diagnostics(),
             "reference_readiness": (

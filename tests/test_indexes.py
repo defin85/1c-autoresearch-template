@@ -178,6 +178,17 @@ def test_index_executable_is_found_above_nested_project(tmp_path: Path, monkeypa
     assert indexes.discover_executable(repo) == str(executable)
 
 
+def test_cli_version_accepts_semver_build_metadata(monkeypatch) -> None:
+    monkeypatch.setattr(
+        indexes,
+        "_bounded_run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, "rlm-bsl-index 1.30.1+v8unpack.1\n", "",
+        ),
+    )
+    assert indexes.cli_version("rlm-bsl-index") == "1.30.1+v8unpack.1"
+
+
 def test_backend_tool_inventory_marks_only_routed_adapter_required(
     tmp_path: Path, monkeypatch
 ) -> None:

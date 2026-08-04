@@ -1686,7 +1686,10 @@ def _component_fingerprint(path: str) -> str:
 def cli_version(executable: str) -> str:
     result = _bounded_run([executable, "--version"])
     import re
-    match = re.fullmatch(r"(?:rlm-bsl-index|bsl-analyzer)\s+(\d+\.\d+\.\d+)\s*", result.stdout)
+    semver = r"\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    match = re.fullmatch(
+        rf"(?:rlm-bsl-index|bsl-analyzer)\s+({semver})\s*", result.stdout,
+    )
     if result.returncode or not match:
         raise RuntimeError("cannot determine exact indexer version")
     return match.group(1)
