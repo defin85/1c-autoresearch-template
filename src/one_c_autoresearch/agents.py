@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
 import shutil
 import subprocess
 import sys
 from hashlib import sha256
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import IO, Protocol, runtime_checkable
 
-from .contracts import atomic_json, canonical_json, normalize_relative, reject_secrets
-from .sources import _run_command
+from .contracts import JsonValue, atomic_json, canonical_json, normalize_relative, parse_json_object, reject_secrets
+from .sources import run_command
+
+_run_command = run_command
 
 
 PROPOSAL_FIELDS = {
@@ -28,13 +32,13 @@ STRING_ARRAY_FIELDS = {
     "semantic_hints", "stable_diff_ids", "supporting_diff_ids", "component_keys",
     "source_mrq_ids", "mrq_ids", "acceptance_criteria", "open_questions",
 }
-EVIDENCE_SCHEMA = {
+EVIDENCE_SCHEMA: dict[str, JsonValue] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["path", "fingerprint", "stable_diff_id"],
     "properties": {key: {"type": "string"} for key in ("path", "fingerprint", "stable_diff_id")},
 }
-TARGET_COVERAGE_SCHEMA = {
+TARGET_COVERAGE_SCHEMA: dict[str, JsonValue] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["customer_diff_id", "target_diff_ids", "coverage_status", "evidence_ref", "notes"],
@@ -80,6 +84,117 @@ INSTRUCTION_CATALOG = {
 _UNRESOLVED_PROBE = object()
 
 
+def _object(value: object, message: str = "expected object") -> dict[str, JsonValue]:
+    raw_value: object = value
+    if not isinstance(value, dict):
+        raise ValueError(message)
+    return parse_json_object(canonical_json(raw_value).decode())
+
+
+def _objects(value: object, message: str = "expected object array") -> list[dict[str, JsonValue]]:
+    raw_value: object = value
+    if not isinstance(value, list):
+        raise ValueError(message)
+    normalized = _object({"items": raw_value})["items"]
+    if not isinstance(normalized, list) or not all(
+        isinstance(item, dict) for item in normalized
+    ):
+        raise ValueError(message)
+    return [_object(item) for item in normalized]
+
+
+def _strings(value: object, message: str = "expected string array") -> list[str]:
+    raw_value: object = value
+    if not isinstance(value, list):
+        raise ValueError(message)
+    normalized = _object({"items": raw_value})["items"]
+    if not isinstance(normalized, list) or not all(
+        isinstance(item, str) for item in normalized
+    ):
+        raise ValueError(message)
+    return [item for item in normalized if isinstance(item, str)]
+
+
+def _reserve_bytes(function: object, policy: dict[str, JsonValue]) -> int:
+    if not callable(function):
+        raise TypeError("reserve estimator is not callable")
+    value = function(policy)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError("reserve estimator returned a non-integer value")
+    return value
+
+
+class ReserveEstimator(Protocol):
+    def __call__(self, policy: dict[str, JsonValue], /) -> int: ...
+
+
+class PolicyResolver(Protocol):
+    def __call__(
+        self,
+        repo: Path,
+        profile: dict[str, JsonValue],
+        role_id: str,
+        work_unit: dict[str, JsonValue],
+        /,
+    ) -> object: ...
+
+
+@runtime_checkable
+class SourceSearchModule(Protocol):
+    POLICY_VERSION: str
+    dynamic_reserve_bytes: ReserveEstimator
+    resolve_policy: PolicyResolver
+
+
+class ActiveStateResolver(Protocol):
+    def __call__(self, repo: Path, /) -> tuple[object, str]: ...
+
+
+@runtime_checkable
+class StageRecomputeModule(Protocol):
+    active_state: ActiveStateResolver
+
+
+def _source_search_module() -> SourceSearchModule:
+    module: object = importlib.import_module(".source_search", __package__)
+    if not isinstance(module, SourceSearchModule):
+        raise RuntimeError("source-search module contract is unavailable")
+    return module
+
+
+def _stage_recompute_module() -> StageRecomputeModule:
+    module: object = importlib.import_module(".stage_recompute", __package__)
+    if not isinstance(module, StageRecomputeModule):
+        raise RuntimeError("stage recompute module contract is unavailable")
+    return module
+
+
+def _subprocess_runner(
+    command: list[str],
+    *,
+    stdin: IO[str] | int | None = None,
+    stdout: int | None = None,
+    stderr: int | None = None,
+    text: bool = False,
+    check: bool = False,
+    timeout: float | None = None,
+    env: dict[str, str] | None = None,
+    input: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    _ = text
+    return subprocess.run(
+        command,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        text=True,
+        check=check,
+        timeout=timeout,
+        env=env,
+        input=input,
+    )
+
+
 def instruction_fingerprint(version: str) -> str:
     try:
         text = INSTRUCTION_CATALOG[version]
@@ -88,11 +203,11 @@ def instruction_fingerprint(version: str) -> str:
     return "sha256:" + sha256(text.encode()).hexdigest()
 
 
-def _bounded_string() -> dict[str, Any]:
+def _bounded_string() -> dict[str, JsonValue]:
     return {"type": "string", "maxLength": MAX_RESPONSE_STRING}
 
 
-def proposal_schema(operation: str, work_unit: dict[str, Any]) -> dict[str, Any]:
+def proposal_schema(operation: str, work_unit: dict[str, JsonValue]) -> dict[str, JsonValue]:
     """Builds the fixed bounded response schema before context budgeting."""
 
     if operation == "mrq.consolidate":
@@ -168,7 +283,7 @@ def proposal_schema(operation: str, work_unit: dict[str, Any]) -> dict[str, Any]
                 },
             }
     fields = CONSOLIDATION_GROUP_FIELDS if operation == "mrq.consolidate" else PROPOSAL_FIELDS[operation]
-    properties = {
+    properties: dict[str, JsonValue] = {
         key: {
             "type": "array",
             "maxItems": MAX_RESPONSE_ITEMS,
@@ -181,7 +296,7 @@ def proposal_schema(operation: str, work_unit: dict[str, Any]) -> dict[str, Any]
                 **TARGET_COVERAGE_SCHEMA,
                 "properties": {
                     name: _bounded_string()
-                    for name in TARGET_COVERAGE_SCHEMA["properties"]
+                    for name in _object(TARGET_COVERAGE_SCHEMA["properties"])
                 },
             },
         } if key == "target_coverage"
@@ -192,7 +307,7 @@ def proposal_schema(operation: str, work_unit: dict[str, Any]) -> dict[str, Any]
                 **EVIDENCE_SCHEMA,
                 "properties": {
                     name: _bounded_string()
-                    for name in EVIDENCE_SCHEMA["properties"]
+                    for name in _object(EVIDENCE_SCHEMA["properties"])
                 },
             },
             **({"minItems": 1} if key == "evidence" else {}),
@@ -202,7 +317,7 @@ def proposal_schema(operation: str, work_unit: dict[str, Any]) -> dict[str, Any]
         else _bounded_string()
         for key in sorted(fields)
     }
-    item_schema = {
+    item_schema: dict[str, JsonValue] = {
         "type": "object",
         "additionalProperties": False,
         "required": sorted(fields),
@@ -214,7 +329,7 @@ def proposal_schema(operation: str, work_unit: dict[str, Any]) -> dict[str, Any]
     }
     if not grouped:
         return item_schema
-    schema_properties = {
+    schema_properties: dict[str, JsonValue] = {
         "groups": {
             "type": "array",
             "maxItems": MAX_RESPONSE_GROUPS,
@@ -238,14 +353,14 @@ def proposal_schema(operation: str, work_unit: dict[str, Any]) -> dict[str, Any]
 
 
 def _context_provenance(
-    work_unit: dict[str, Any],
-    manifest: dict[str, Any],
+    work_unit: dict[str, JsonValue],
+    manifest: dict[str, JsonValue],
 ) -> list[dict[str, str]]:
     identifier = str(work_unit.get("id", ""))
     kind = str(work_unit.get("kind", "work-unit"))
     if not identifier:
         raise ValueError("agent context subject has no stable item key")
-    rows = [{
+    rows: list[dict[str, str]] = [{
         "item_key": f"{kind}:{identifier}",
         "item_kind": "subject",
         "selection_reason": "primary_subject",
@@ -263,22 +378,22 @@ def _context_provenance(
             "origin_ref": identifier,
             "fingerprint": "sha256:" + sha256(canonical_json(work_unit[key])).hexdigest(),
         })
-    for item in manifest["paths"]:
+    for item in _objects(manifest["paths"]):
         rows.append({
             "item_key": f"path:{item['path']}",
             "item_kind": "evidence",
             "selection_reason": "selected_path",
             "origin_kind": "repository_path",
-            "origin_ref": item["path"],
-            "fingerprint": item["fingerprint"],
+            "origin_ref": str(item["path"]),
+            "fingerprint": str(item["fingerprint"]),
         })
     return rows
 
 
 def _render_prepared_input(
-    profile: dict[str, Any],
+    profile: dict[str, JsonValue],
     operation: str,
-    provider_context: dict[str, Any],
+    provider_context: dict[str, JsonValue],
     supplement: str,
 ) -> str:
     instruction_version = str(profile["instructions_version"])
@@ -292,15 +407,15 @@ def _render_prepared_input(
 
 def prepare_context_envelope(
     repo: Path,
-    profile: dict[str, Any],
+    profile: dict[str, JsonValue],
     operation: str,
     phase_id: str,
     role_id: str,
-    work_unit: dict[str, Any],
+    work_unit: dict[str, JsonValue],
     supplement: str,
-    execution_snapshot: dict[str, Any],
-    context_manifest: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    execution_snapshot: dict[str, JsonValue],
+    context_manifest: dict[str, JsonValue] | None = None,
+) -> dict[str, JsonValue]:
     """Freezes, budgets, and fingerprints one provider-bound context."""
 
     manifest = context_manifest or build_context_manifest(repo, work_unit)
@@ -310,7 +425,8 @@ def prepare_context_envelope(
     except KeyError as exc:
         raise ValueError("agent context selection policy is unsupported") from exc
     provenance = _context_provenance(work_unit, manifest)
-    provider_context = {
+    subject_bindings = _object(execution_snapshot.get("subject_bindings") or {})
+    provider_context: dict[str, JsonValue] = {
         "contract_version": CONTEXT_CONTRACT_VERSION,
         "stage": phase_id,
         "role": role_id,
@@ -322,7 +438,7 @@ def prepare_context_envelope(
             **{
                 key: str(value or "")
                 for key, value in sorted(
-                    (execution_snapshot.get("subject_bindings") or {}).items()
+                    subject_bindings.items()
                 )
             },
             "context_manifest_fingerprint": "sha256:"
@@ -355,11 +471,12 @@ def prepare_context_envelope(
         "prompt": prompt,
         "response_schema": schema,
     })
-    from .source_search import dynamic_reserve_bytes
-    search_policy = (execution_snapshot.get("source_search_policies") or {}).get(
+    dynamic_reserve_bytes = _source_search_module().dynamic_reserve_bytes
+    source_search_policies = _object(execution_snapshot.get("source_search_policies") or {})
+    search_policy = source_search_policies.get(
         f"{phase_id}:{role_id}"
     )
-    dynamic_bytes = dynamic_reserve_bytes(search_policy) if search_policy else 0
+    dynamic_bytes = _reserve_bytes(dynamic_reserve_bytes, _object(search_policy)) if search_policy else 0
     if profile.get("context_estimator_version") != CONTEXT_ESTIMATOR_VERSION:
         raise ValueError("agent context estimator is unsupported")
     capacity = profile.get("input_context_tokens")
@@ -371,7 +488,7 @@ def prepare_context_envelope(
     headroom = allowance - len(prepared_bytes) - dynamic_bytes
     if headroom < 0:
         raise ValueError("agent.context_capacity")
-    budget = {
+    budget: dict[str, JsonValue] = {
         "estimator_version": CONTEXT_ESTIMATOR_VERSION,
         "context_window_tokens": capacity,
         "structured_response_reserve_tokens": STRUCTURED_RESPONSE_RESERVE_TOKENS,
@@ -382,7 +499,7 @@ def prepare_context_envelope(
         "headroom_bytes": headroom,
     }
     prepared_input_fingerprint = "sha256:" + sha256(prepared_bytes).hexdigest()
-    envelope = {
+    envelope: dict[str, JsonValue] = {
         **provider_context,
         "budget": budget,
         "prepared_input_fingerprint": prepared_input_fingerprint,
@@ -390,7 +507,7 @@ def prepare_context_envelope(
     envelope["envelope_fingerprint"] = "sha256:" + sha256(
         canonical_json(envelope)
     ).hexdigest()
-    diagnostics = {
+    diagnostics: dict[str, JsonValue] = {
         "contract_version": CONTEXT_CONTRACT_VERSION,
         "selection_policy_version": policy_version,
         **budget,
@@ -416,7 +533,7 @@ def _fingerprint_path(root: Path, path: Path) -> str:
     if path.is_file():
         return "sha256:" + sha256(path.read_bytes()).hexdigest()
     if path.is_dir():
-        rows = []
+        rows: list[tuple[str, str]] = []
         for item in sorted(path.rglob("*")):
             if not item.is_file():
                 continue
@@ -428,17 +545,15 @@ def _fingerprint_path(root: Path, path: Path) -> str:
     raise ValueError("agent context path is not a file or directory")
 
 
-def build_context_manifest(repo: Path, work_unit: dict[str, Any]) -> dict[str, Any]:
+def build_context_manifest(repo: Path, work_unit: dict[str, JsonValue]) -> dict[str, JsonValue]:
     root = repo.resolve()
     generation_id = str(work_unit.get("source_generation_id", ""))
     pointer = root / "research/active-source-generation.json"
     if not generation_id and pointer.is_file():
-        generation_id = str(json.loads(pointer.read_text(encoding="utf-8"))["generation_id"])
+        generation_id = str(parse_json_object(pointer.read_text(encoding="utf-8"))["generation_id"])
     source_root = root / "sources/generations" / normalize_relative(generation_id) if generation_id else root
-    allowed = work_unit.get("allowed_paths", [])
-    if not isinstance(allowed, list) or any(not isinstance(item, str) for item in allowed):
-        raise ValueError("agent context allowed_paths must be a list of repository paths")
-    paths = []
+    allowed = _strings(work_unit.get("allowed_paths", []), "agent context allowed_paths must be a list of repository paths")
+    paths: list[dict[str, JsonValue]] = []
     for raw in allowed:
         relative = normalize_relative(raw)
         candidates = (source_root / relative, source_root / "target_cf" / relative)
@@ -455,17 +570,17 @@ def build_context_manifest(repo: Path, work_unit: dict[str, Any]) -> dict[str, A
     }
 
 
-def verify_context_manifest(repo: Path, work_unit: dict[str, Any], manifest: dict[str, Any]) -> None:
+def verify_context_manifest(repo: Path, work_unit: dict[str, JsonValue], manifest: dict[str, JsonValue]) -> None:
     if build_context_manifest(repo, work_unit) != manifest:
         raise RuntimeError("agent context manifest is stale")
 
 
-def _verify_executable(environment: dict[str, Any]) -> str:
+def _verify_executable(environment: dict[str, JsonValue]) -> str:
     if set(environment) != {"preset", "preset_version", "executable", "executable_fingerprint", "inherited_environment_keys", "arguments"}:
         raise ValueError("agent execution environment does not match the closed preset")
     if environment["preset"] != "local-read-only" or environment["preset_version"] != ENVIRONMENT_PRESET_VERSION:
         raise ValueError("unsupported agent environment preset")
-    if tuple(environment["arguments"]) != EXEC_ARGUMENTS or tuple(environment["inherited_environment_keys"]) != ENVIRONMENT_KEYS:
+    if tuple(_strings(environment["arguments"])) != EXEC_ARGUMENTS or tuple(_strings(environment["inherited_environment_keys"])) != ENVIRONMENT_KEYS:
         raise ValueError("agent execution environment differs from the closed preset")
     executable = Path(str(environment["executable"])).resolve(strict=True)
     if not executable.is_file() or "sha256:" + sha256(executable.read_bytes()).hexdigest() != environment["executable_fingerprint"]:
@@ -501,19 +616,28 @@ def probe_codex_environment() -> dict[str, str] | None:
 
 
 def verify_execution_environment(
-    snapshot: dict[str, Any],
+    snapshot: dict[str, JsonValue],
     probe: dict[str, str] | None | object = _UNRESOLVED_PROBE,
 ) -> None:
     """Проверяет исполняемый файл и зафиксированную версию Codex."""
 
-    executable = _verify_executable(snapshot["environment"])
+    executable = _verify_executable(_object(snapshot["environment"]))
     current = probe_codex_environment() if probe is _UNRESOLVED_PROBE else probe
-    if current is None:
+    raw_current: object = current
+    if current is None or not isinstance(current, dict):
         raise RuntimeError("codex executable version is unavailable")
+    normalized_current = _object(raw_current)
+    current_environment = {
+        key: value for key, value in normalized_current.items()
+        if isinstance(value, str)
+    }
+    if len(current_environment) != len(normalized_current):
+        raise RuntimeError("codex executable version is unavailable")
+    environment = _object(snapshot["environment"])
     if (
-        current["executable"] != executable
-        or current["executable_fingerprint"] != snapshot["environment"]["executable_fingerprint"]
-        or current["codex_version"] != snapshot.get("codex_version")
+        current_environment["executable"] != executable
+        or current_environment["executable_fingerprint"] != environment["executable_fingerprint"]
+        or current_environment["codex_version"] != snapshot.get("codex_version")
     ):
         raise RuntimeError("codex version changed after the execution snapshot was created")
 
@@ -524,10 +648,10 @@ def codex_environment_available() -> bool:
     return probe_codex_environment() is not None
 
 
-def validate_execution_snapshot(repo: Path, snapshot: dict[str, Any]) -> None:
+def validate_execution_snapshot(repo: Path, snapshot: dict[str, JsonValue]) -> None:
     """Проверяет, что сохранённый снимок всё ещё воспроизводим локально."""
 
-    if snapshot.get("schema_version") not in {"1", "2"} or snapshot.get("environment", {}).get("preset") != "local-read-only":
+    if snapshot.get("schema_version") not in {"1", "2"} or _object(snapshot.get("environment", {})).get("preset") != "local-read-only":
         raise RuntimeError("agent execution snapshot is unsupported")
     if snapshot.get("schema_version") == "2" and (
         snapshot.get("context_contract_version") != CONTEXT_CONTRACT_VERSION
@@ -542,17 +666,17 @@ def validate_execution_snapshot(repo: Path, snapshot: dict[str, Any]) -> None:
         version: instruction_fingerprint(version)
         for version in {
             str(profile.get("instructions_version", ""))
-            for profile in snapshot.get("profiles", {}).values()
+            for profile in _object(snapshot.get("profiles", {})).values()
             if isinstance(profile, dict)
         }
     }
     if instructions != expected_instructions:
         raise RuntimeError("agent instruction changed after the execution snapshot was created")
-    from .source_search import POLICY_VERSION
-    policies = snapshot.get("source_search_policies", {})
-    if not isinstance(policies, dict) or any(
+    policy_version = _source_search_module().POLICY_VERSION
+    policies = _object(snapshot.get("source_search_policies", {}))
+    if any(
         not isinstance(policy, dict)
-        or policy.get("schema_version") != POLICY_VERSION
+        or policy.get("schema_version") != policy_version
         or not str(policy.get("policy_fingerprint", "")).startswith("sha256:")
         for policy in policies.values()
     ):
@@ -568,10 +692,10 @@ def resolve_execution_snapshot(
     repo: Path,
     run_id: str,
     operation: str,
-    step: dict[str, Any],
-    profiles: dict[str, dict[str, Any]],
-    work_unit: dict[str, Any],
-) -> dict[str, Any]:
+    step: dict[str, JsonValue],
+    profiles: dict[str, dict[str, JsonValue]],
+    work_unit: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
     """Разрешает только безопасную серверную конфигурацию до захвата аренды."""
 
     executable = shutil.which("codex")
@@ -585,30 +709,51 @@ def resolve_execution_snapshot(
         raise RuntimeError("codex executable cannot be fingerprinted") from exc
     if version.returncode:
         raise RuntimeError("codex executable version is unavailable")
-    phases = step.get("agent_phases", [])
+    phases = _objects(step.get("agent_phases", []))
     try:
-        from .stage_recompute import active_state
-        pointers, workflow_fingerprint = active_state(repo)
+        raw_pointers, workflow_fingerprint = _stage_recompute_module().active_state(repo)
+        pointers = _object(raw_pointers)
     except (OSError, ValueError, KeyError):
         # Узкие модульные вызовы без проектного контракта всё равно получают
         # закрытый снимок; рабочий API всегда проходит validate_project_contract.
         pointers, workflow_fingerprint = {}, "sha256:" + sha256(canonical_json(step)).hexdigest()
-    safe_profiles: dict[str, dict[str, Any]] = {}
-    source_search_policies: dict[str, dict[str, Any]] = {}
-    from .source_search import resolve_policy
+    safe_profiles: dict[str, dict[str, JsonValue]] = {}
+    source_search_policies: dict[str, dict[str, JsonValue]] = {}
+    resolve_policy = _source_search_module().resolve_policy
+    search_work_unit: dict[str, JsonValue] = {}
+    paths_value = work_unit.get("allowed_paths")
+    if isinstance(paths_value, list):
+        search_work_unit["allowed_paths"] = [str(path) for path in paths_value]
+    diff_value = work_unit.get("diff")
+    if isinstance(diff_value, dict):
+        diff = _object(diff_value)
+        typed_diff: dict[str, JsonValue] = {}
+        for key in ("before_role", "after_role"):
+            value = diff.get(key)
+            if value is not None:
+                typed_diff[key] = str(value)
+        search_work_unit["diff"] = typed_diff
+    kind_value = work_unit.get("kind")
+    if kind_value is not None:
+        search_work_unit["kind"] = str(kind_value)
     for phase in phases:
-        for role in phase["roles"]:
-            name = role["agent_profile"]
+        for role in _objects(phase["roles"]):
+            name = str(role["agent_profile"])
             profile = profiles.get(name)
             if profile is None:
                 raise RuntimeError(f"user-scope agent profile is unavailable: {name}")
             if profile.get("environment_preset") != "local-read-only":
                 raise ValueError("unsupported agent environment preset")
             safe_profiles[name] = dict(profile)
-            policy = resolve_policy(repo, profile, str(role["role_id"]), work_unit)
+            search_profile: dict[str, JsonValue] = {}
+            if "source_search" in profile:
+                search_profile["source_search"] = profile["source_search"]
+            policy = resolve_policy(
+                repo, search_profile, str(role["role_id"]), search_work_unit
+            )
             if policy is not None:
-                source_search_policies[f'{phase["phase_id"]}:{role["role_id"]}'] = policy
-    snapshot = {
+                source_search_policies[f'{phase["phase_id"]}:{role["role_id"]}'] = _object(policy)
+    snapshot: dict[str, JsonValue] = {
         "schema_version": "2",
         "context_contract_version": CONTEXT_CONTRACT_VERSION,
         "context_estimator_version": CONTEXT_ESTIMATOR_VERSION,
@@ -635,10 +780,10 @@ def resolve_execution_snapshot(
         "codex_version": " ".join((version.stdout or version.stderr).split())[:200],
         "application_version": "one-c-autoresearch/0.2",
         "subject_bindings": {
-            "source_generation_id": str((pointers.get("source") or {}).get("generation_id", "")),
-            "diff_generation_id": str((pointers.get("diff") or {}).get("generation_id", "")),
+            "source_generation_id": str(_object(pointers.get("source") or {}).get("generation_id", "")),
+            "diff_generation_id": str(_object(pointers.get("diff") or {}).get("generation_id", "")),
             "canonical_generation_id": str(
-                json.loads(
+                parse_json_object(
                     (repo / "research/active-consolidation-generation.json").read_text(encoding="utf-8")
                 ).get("mrq_generation_id", "")
             ),
@@ -651,7 +796,7 @@ def resolve_execution_snapshot(
     return snapshot
 
 
-def validate_proposal(operation: str, payload: dict[str, Any], work_unit: dict[str, Any]) -> dict[str, Any]:
+def validate_proposal(operation: str, payload: dict[str, JsonValue], work_unit: dict[str, JsonValue]) -> dict[str, JsonValue]:
     if operation == "mrq.consolidate":
         kind = work_unit.get("kind")
         if kind == "consolidation-link-page":
@@ -704,7 +849,7 @@ def validate_proposal(operation: str, payload: dict[str, Any], work_unit: dict[s
             or (coordinator and (
                 not isinstance(payload["approved_noise"], list)
                 or any(not isinstance(identifier, str) for identifier in payload["approved_noise"])
-                or payload["approved_noise"] != sorted(set(payload["approved_noise"]))
+                or payload["approved_noise"] != sorted(set(_strings(payload["approved_noise"])))
             ))
         ):
             raise ValueError("consolidation proposal does not match the fixed response schema")
@@ -731,7 +876,7 @@ def validate_proposal(operation: str, payload: dict[str, Any], work_unit: dict[s
     work_id = str(work_unit.get("id", ""))
     if operation == "dif.classify-next" and payload["classification"] not in {"meaning", "noise"}:
         raise ValueError("DIF classification must be meaning or noise")
-    if operation == "mrq.discover-next" and work_id not in payload["stable_diff_ids"]:
+    if operation == "mrq.discover-next" and work_id not in _strings(payload["stable_diff_ids"]):
         raise ValueError("discovery proposal does not own its selected DIF work unit")
     if operation == "mrq.decide-next" and payload["mrq_id"] != work_id:
         raise ValueError("decision proposal targets a different MRQ work unit")
@@ -742,29 +887,29 @@ def validate_proposal(operation: str, payload: dict[str, Any], work_unit: dict[s
 def execute(
     repo: Path,
     proposal_dir: Path,
-    profile: dict[str, Any],
+    profile: dict[str, JsonValue],
     operation: str,
-    work_unit: dict[str, Any],
+    work_unit: dict[str, JsonValue],
     supplement: str,
     timeout_seconds: int,
-    cancelled: callable,
-    execution_snapshot: dict[str, Any] | None = None,
-    context_manifest: dict[str, Any] | None = None,
-    prepared_context: dict[str, Any] | None = None,
+    cancelled: Callable[[], bool],
+    execution_snapshot: dict[str, JsonValue] | None = None,
+    context_manifest: dict[str, JsonValue] | None = None,
+    prepared_context: dict[str, JsonValue] | None = None,
     invocation_id: str = "",
     source_search_capability: str = "",
     operational_state_root: Path | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     if execution_snapshot is None:
         execution_snapshot = resolve_execution_snapshot(repo, "standalone", operation, {"operation_version": "2", "timeout_seconds": timeout_seconds, "agent_phases": [{"roles": [{"agent_profile": "selected"}]}]}, {"selected": profile}, work_unit)
     if execution_snapshot.get("operation") != operation:
         raise RuntimeError("agent invocation differs from its execution snapshot")
-    if profile not in execution_snapshot.get("profiles", {}).values():
+    if profile not in _object(execution_snapshot.get("profiles", {})).values():
         raise RuntimeError("agent profile differs from its execution snapshot")
     validate_execution_snapshot(repo, execution_snapshot)
-    manifest = context_manifest or execution_snapshot["context_manifest"]
+    manifest = context_manifest or _object(execution_snapshot["context_manifest"])
     verify_context_manifest(repo, work_unit, manifest)
-    executable = str(execution_snapshot["environment"]["executable"])
+    executable = str(_object(execution_snapshot["environment"])["executable"])
     proposal_dir.mkdir(parents=True, exist_ok=False)
     schema = proposal_schema(operation, work_unit)
     schema_path = proposal_dir / "output-schema.json"
@@ -799,7 +944,7 @@ def execute(
     prompt = str(prepared_context["prompt"])
     if profile.get("environment_preset") != "local-read-only":
         raise ValueError("unsupported agent environment preset")
-    command = [executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only", "--color", "never", "--cd", str(repo), "--model", profile["model"], "--config", f'model_reasoning_effort="{profile["reasoning_effort"]}"', "--output-schema", str(schema_path), "--output-last-message", str(output_path), "-"]
+    command = [executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--sandbox", "read-only", "--color", "never", "--cd", str(repo), "--model", str(profile["model"]), "--config", f'model_reasoning_effort="{profile["reasoning_effort"]}"', "--output-schema", str(schema_path), "--output-last-message", str(output_path), "-"]
     environment = {key: value for key, value in os.environ.items() if key in ENVIRONMENT_KEYS}
     if source_search_capability:
         if not invocation_id:
@@ -817,13 +962,13 @@ def execute(
             "--config", 'mcp_servers.source_search.args=["-m","one_c_autoresearch.source_search_bridge"]',
             "--config", "mcp_servers.source_search.enabled=true",
         ]
-    result = _run_command(subprocess.run, command, cancelled=cancelled, input=prompt, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=timeout_seconds, env=environment)
+    result = _run_command(_subprocess_runner, command, cancelled=cancelled, input=prompt, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=timeout_seconds, env=environment)
     if result.returncode:
         from .events import redact
         detail = str(redact((result.stderr or result.stdout or "").strip()))[-1000:]
         raise RuntimeError(f"local agent failed with exit {result.returncode}: {detail}")
     try:
-        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        payload = parse_json_object(output_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError("local agent did not return a valid proposal") from exc
     validate_execution_snapshot(repo, execution_snapshot)

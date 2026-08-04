@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import base64
-import json
 import os
 import sqlite3
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import NotRequired, TypedDict
 
-from .contracts import atomic_json, canonical_json, sha256
-from .consolidation import fingerprint as consolidation_fingerprint, sentinel as consolidation_sentinel
+from .contracts import JsonValue, atomic_json, canonical_json, json_array, json_object, parse_json_object, sha256
+from .consolidation import sentinel as consolidation_sentinel
 from .dif_classifications import (
     POINTER as CLASSIFICATION_POINTER,
+    ClassificationRow,
     coverage,
     make_row,
     publish_empty,
@@ -34,8 +35,95 @@ PHASES = (
 POINTER_GLOB = "active-*-generation.json"
 
 
-def _fingerprint(value: Any) -> str:
+class FileBackup(TypedDict):
+    exists: bool
+    sha256: str | None
+    bytes_base64: str | None
+
+
+class DatabaseBackup(TypedDict):
+    path: str
+    sha256: str
+
+
+class JournalBackups(TypedDict):
+    repository_fingerprint: str
+    workflow_fingerprint: str
+    files: dict[str, FileBackup]
+    pointers: dict[str, FileBackup]
+    database_backup: DatabaseBackup
+
+
+class MigrationJournal(TypedDict):
+    schema_version: str
+    migration_id: str
+    phase: str
+    lease_token: str
+    thread_id: str | None
+    repository_fingerprint: str
+    workflow_fingerprint: str
+    legacy_lease_preimage: JsonValue
+    legacy_audit_ids: JsonValue
+    backups: JournalBackups
+    effects: dict[str, JsonValue]
+    result: dict[str, JsonValue] | None
+
+
+class RecoveryJournal(MigrationJournal):
+    recovery_action: str
+
+
+class AnalyzerResult(TypedDict):
+    stable_diff_id: str
+    kind: str
+
+
+class AnalyzerEnvelope(TypedDict):
+    compatibility_fingerprint: str
+    result_fingerprint: str
+    result: AnalyzerResult
+    source_run_id: NotRequired[str]
+
+
+def _fingerprint(value: object) -> str:
     return "sha256:" + sha256(canonical_json(value))
+
+
+def _file_backup(value: object) -> FileBackup:
+    item = json_object(value)
+    exists, digest, payload = item.get("exists"), item.get("sha256"), item.get("bytes_base64")
+    if not isinstance(exists, bool) or not (digest is None or isinstance(digest, str)) or not (payload is None or isinstance(payload, str)):
+        raise ValueError("invalid workflow migration file backup")
+    return {"exists": exists, "sha256": digest, "bytes_base64": payload}
+
+
+def _database(value: object) -> DatabaseBackup:
+    item = json_object(value)
+    path, digest = item.get("path"), item.get("sha256")
+    if not isinstance(path, str) or not isinstance(digest, str):
+        raise ValueError("invalid workflow migration database backup")
+    return {"path": path, "sha256": digest}
+
+
+def _integer(value: object, *, default: int = 0) -> int:
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("expected integer")
+    return value
+
+
+def _validate_backups(value: object) -> JournalBackups:
+    item = json_object(value)
+    files = json_object(item.get("files"))
+    pointers = json_object(item.get("pointers"))
+    return {
+        "repository_fingerprint": str(item.get("repository_fingerprint", "")),
+        "workflow_fingerprint": str(item.get("workflow_fingerprint", "")),
+        "files": {key: _file_backup(child) for key, child in files.items()},
+        "pointers": {key: _file_backup(child) for key, child in pointers.items()},
+        "database_backup": _database(item.get("database_backup")),
+    }
 
 
 def operational_root(repo: Path, base: Path | None = None) -> Path:
@@ -46,7 +134,7 @@ def journal_path(repo: Path, base: Path | None = None) -> Path:
     return operational_root(repo, base) / "migrations/workflow-v3-v4.json"
 
 
-def _encoded_file(path: Path) -> dict[str, Any]:
+def _encoded_file(path: Path) -> FileBackup:
     if not path.is_file():
         return {"exists": False, "sha256": None, "bytes_base64": None}
     payload = path.read_bytes()
@@ -57,18 +145,22 @@ def _encoded_file(path: Path) -> dict[str, Any]:
     }
 
 
-def _restore_file(path: Path, backup: dict[str, Any]) -> None:
+def _restore_file(path: Path, backup: FileBackup) -> None:
     if not backup["exists"]:
         path.unlink(missing_ok=True)
         return
-    payload = base64.b64decode(backup["bytes_base64"], validate=True)
-    if sha256(payload) != backup["sha256"]:
+    encoded = backup["bytes_base64"]
+    digest = backup["sha256"]
+    if encoded is None or digest is None:
+        raise ValueError(f"migration backup is corrupt: {path.name}")
+    payload = base64.b64decode(encoded, validate=True)
+    if sha256(payload) != digest:
         raise ValueError(f"migration backup is corrupt: {path.name}")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
-            stream.write(payload)
+            _ = stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -76,7 +168,7 @@ def _restore_file(path: Path, backup: dict[str, Any]) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def _matches_file(path: Path, backup: dict[str, Any]) -> bool:
+def _matches_file(path: Path, backup: FileBackup) -> bool:
     return (
         (not backup["exists"] and not path.exists())
         or (
@@ -87,7 +179,7 @@ def _matches_file(path: Path, backup: dict[str, Any]) -> bool:
     )
 
 
-def _database_backup(store: DispatcherStore, path: Path) -> dict[str, str]:
+def _database_backup(store: DispatcherStore, path: Path) -> DatabaseBackup:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.with_suffix(".tmp")
     temporary.unlink(missing_ok=True)
@@ -108,7 +200,7 @@ def _seed(
     repository_fingerprint: str,
     workflow_fingerprint: str,
     base: Path | None,
-) -> dict[str, Any]:
+) -> JournalBackups:
     root = operational_root(repo, base)
     pointers = {
         path.relative_to(repo).as_posix(): _encoded_file(path)
@@ -120,7 +212,7 @@ def _seed(
         "research/active-consolidation-generation.json",
         "research/active-generation.json",
     ):
-        pointers.setdefault(relative, _encoded_file(repo / relative))
+        _ = pointers.setdefault(relative, _encoded_file(repo / relative))
     files = {
         "research/workflow.toml": _encoded_file(repo / "research/workflow.toml"),
         "agent-profiles.json": _encoded_file(agent_profiles_path(repo, base)),
@@ -137,7 +229,8 @@ def _seed(
     }
 
 
-def _validate_journal(value: dict[str, Any]) -> dict[str, Any]:
+def _validate_journal(value: object) -> MigrationJournal:
+    value = json_object(value)
     required = {
         "schema_version", "migration_id", "phase", "lease_token", "thread_id",
         "repository_fingerprint", "workflow_fingerprint", "legacy_lease_preimage",
@@ -155,7 +248,26 @@ def _validate_journal(value: dict[str, Any]) -> dict[str, Any]:
         or not isinstance(value["effects"], dict)
     ):
         raise ValueError("invalid workflow migration journal")
-    return value
+    backups = _validate_backups(value["backups"])
+    result_value = value["result"]
+    result = None if result_value is None else json_object(result_value)
+    thread_id = value["thread_id"]
+    if thread_id is not None and not isinstance(thread_id, str):
+        raise ValueError("invalid workflow migration journal")
+    return {
+        "schema_version": str(value["schema_version"]),
+        "migration_id": str(value["migration_id"]),
+        "phase": str(value["phase"]),
+        "lease_token": str(value["lease_token"]),
+        "thread_id": thread_id,
+        "repository_fingerprint": str(value["repository_fingerprint"]),
+        "workflow_fingerprint": str(value["workflow_fingerprint"]),
+        "legacy_lease_preimage": value["legacy_lease_preimage"],
+        "legacy_audit_ids": value["legacy_audit_ids"],
+        "backups": backups,
+        "effects": json_object(value["effects"]),
+        "result": result,
+    }
 
 
 def reconstruct_journal(
@@ -164,33 +276,42 @@ def reconstruct_journal(
     migration_id: str,
     *,
     base: Path | None = None,
-) -> dict[str, Any]:
+) -> MigrationJournal:
     """Recreates the first external artifact from the durable handoff row."""
 
     path = journal_path(repo, base)
     row = store.workflow_migration(migration_id)
     if row is None or row["status"] != "handoff_prepared":
         if path.is_file():
-            return _validate_journal(json.loads(path.read_text(encoding="utf-8")))
+            return _validate_journal(parse_json_object(path.read_text(encoding="utf-8")))
         raise ValueError("workflow migration handoff is missing")
-    if not store.owns_lease("workflow-migration", row["lease_token"], row["thread_id"]):
+    if not store.owns_lease("workflow-migration", str(row["lease_token"]), str(row["thread_id"]) or None):
         raise RuntimeError("workflow migration lease was fenced")
-    journal = {
+    seed = _validate_backups(row["journal_seed"])
+    lease_token = row["lease_token"]
+    thread_id = row["thread_id"]
+    repository_fingerprint = row["repository_fingerprint"]
+    workflow_fingerprint = row["workflow_fingerprint"]
+    if not isinstance(lease_token, str) or not isinstance(repository_fingerprint, str) or not isinstance(workflow_fingerprint, str):
+        raise ValueError("invalid workflow migration handoff")
+    if thread_id is not None and not isinstance(thread_id, str):
+        raise ValueError("invalid workflow migration handoff")
+    journal: MigrationJournal = {
         "schema_version": SCHEMA_VERSION,
         "migration_id": migration_id,
         "phase": "prepared",
-        "lease_token": row["lease_token"],
-        "thread_id": row["thread_id"],
-        "repository_fingerprint": row["repository_fingerprint"],
-        "workflow_fingerprint": row["workflow_fingerprint"],
+        "lease_token": lease_token,
+        "thread_id": thread_id,
+        "repository_fingerprint": repository_fingerprint,
+        "workflow_fingerprint": workflow_fingerprint,
         "legacy_lease_preimage": row["legacy_lease_preimage"],
         "legacy_audit_ids": row["legacy_audit_ids"],
-        "backups": row["journal_seed"],
+        "backups": seed,
         "effects": {},
         "result": None,
     }
     if path.is_file():
-        current = _validate_journal(json.loads(path.read_text(encoding="utf-8")))
+        current = _validate_journal(parse_json_object(path.read_text(encoding="utf-8")))
         if current != journal:
             raise RuntimeError("workflow migration journal conflicts with handoff")
         return current
@@ -206,9 +327,9 @@ def start_migration(
     repository_fingerprint: str,
     workflow_fingerprint: str,
     owner: str,
-    process_identity: dict | None = None,
+    process_identity: dict[str, JsonValue] | None = None,
     base: Path | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue] | MigrationJournal:
     migration_id = sha256(canonical_json({
         "repository": str(repo.resolve()),
         "repository_fingerprint": repository_fingerprint,
@@ -219,7 +340,7 @@ def start_migration(
         prior = store.workflow_migration(migration_id)
         if prior is not None:
             if prior["status"] == "committed":
-                return prior["result"]
+                return json_object(prior["result"])
             return reconstruct_journal(repo, store, migration_id, base=base)
         seed = _seed(
             repo, store, migration_id, repository_fingerprint,
@@ -231,16 +352,16 @@ def start_migration(
             process_identity=process_identity,
             repository_fingerprint=repository_fingerprint,
             workflow_fingerprint=workflow_fingerprint,
-            journal_seed=seed,
+            journal_seed=json_object(seed),
         )
         if handoff is None:
             raise RuntimeError("workflow migration conflicts with an active lease")
         return reconstruct_journal(repo, store, migration_id, base=base)
 
 
-def load_journal(repo: Path, *, base: Path | None = None) -> dict[str, Any] | None:
+def load_journal(repo: Path, *, base: Path | None = None) -> MigrationJournal | None:
     path = journal_path(repo, base)
-    return _validate_journal(json.loads(path.read_text(encoding="utf-8"))) if path.is_file() else None
+    return _validate_journal(parse_json_object(path.read_text(encoding="utf-8"))) if path.is_file() else None
 
 
 def guard_mutation(repo: Path, *, base: Path | None = None) -> None:
@@ -267,10 +388,10 @@ def advance(
     lease_token: str,
     phase: str,
     *,
-    effects: dict[str, Any] | None = None,
-    result: dict[str, Any] | None = None,
+    effects: dict[str, JsonValue] | None = None,
+    result: dict[str, JsonValue] | None = None,
     base: Path | None = None,
-) -> dict[str, Any]:
+) -> MigrationJournal:
     if phase not in PHASES:
         raise ValueError("invalid workflow migration phase")
     path = journal_path(repo, base)
@@ -286,7 +407,7 @@ def advance(
             return journal
         if target_index > current_index + 1:
             raise ValueError("workflow migration phase cannot be skipped")
-        updated = {
+        updated: MigrationJournal = {
             **journal,
             "phase": phase,
             "effects": {**journal["effects"], **(effects or {})},
@@ -307,17 +428,21 @@ def advance(
 
 def import_compatible_analyzer_results(
     repo: Path,
-    envelopes: Iterable[dict[str, Any]],
+    envelopes: Iterable[dict[str, JsonValue]],
     expected: dict[str, dict[str, str]],
 ) -> dict[str, int]:
     """Publishes only exact analyzer envelopes; grouping envelopes are ignored."""
 
-    rows = []
+    rows: list[ClassificationRow] = []
     rejected = 0
     for envelope in envelopes:
-        result = envelope.get("result")
-        identifier = result.get("stable_diff_id") if isinstance(result, dict) else None
-        binding = expected.get(str(identifier))
+        result_value = envelope.get("result")
+        result = json_object(result_value) if isinstance(result_value, dict) else {}
+        identifier = result.get("stable_diff_id")
+        if not isinstance(identifier, str):
+            rejected += 1
+            continue
+        binding = expected.get(identifier)
         if (
             binding is None
             or envelope.get("compatibility_fingerprint") != binding.get("compatibility_fingerprint")
@@ -328,7 +453,7 @@ def import_compatible_analyzer_results(
             continue
         try:
             rows.append(make_row(
-                str(identifier), result,
+                identifier, result,
                 evidence_fingerprint=binding["evidence_fingerprint"],
                 result_schema_fingerprint=binding["result_schema_fingerprint"],
                 profile_fingerprint=binding["profile_fingerprint"],
@@ -339,12 +464,15 @@ def import_compatible_analyzer_results(
             rejected += 1
     pointer_path = repo / CLASSIFICATION_POINTER
     if not pointer_path.is_file():
-        publish_empty(repo)
-    active = json.loads(pointer_path.read_text(encoding="utf-8"))
+        _ = publish_empty(repo)
+    active = parse_json_object(pointer_path.read_text(encoding="utf-8"))
+    generation_id = active.get("generation_id")
+    if not isinstance(generation_id, str):
+        raise ValueError("invalid classification pointer")
     if rows:
-        publish_window(
+        _ = publish_window(
             repo, rows,
-            expected_generation_id=active["generation_id"],
+            expected_generation_id=generation_id,
         )
     counts = coverage(repo)
     return {
@@ -356,48 +484,61 @@ def import_compatible_analyzer_results(
 
 def discover_compatible_analyzer_results(
     repo: Path, *, base: Path | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, str]]]:
+) -> tuple[list[dict[str, JsonValue]], dict[str, dict[str, str]]]:
     """Reconstructs exact legacy analyzer expectations from durable run snapshots."""
 
     from .dif_classifications import physical_evidence_fingerprints
     root = operational_root(repo, base)
     evidence = physical_evidence_fingerprints(repo)
-    envelopes: list[dict[str, Any]] = []
+    envelopes: list[dict[str, JsonValue]] = []
     expected: dict[str, dict[str, str]] = {}
     with DispatcherStore(repo, base) as store:
         candidates = [
             row for row in store.proposals()
             if row.get("job_id") == "discover-mrq"
             and row.get("kind") == "node-result"
-            and str(row.get("payload", {}).get("name", "")).startswith("analyze-dif:")
+            and str(json_object(row.get("payload", {})).get("name", "")).startswith("analyze-dif:")
         ]
     for candidate in candidates:
-        envelope = candidate.get("payload", {}).get("envelope")
-        result = envelope.get("result") if isinstance(envelope, dict) else None
-        identifier = result.get("stable_diff_id") if isinstance(result, dict) else None
-        run_path = root / "runs" / f"{envelope.get('source_run_id', '')}.json" if isinstance(envelope, dict) else None
-        if not identifier or identifier not in evidence or not run_path or not run_path.is_file():
+        payload = json_object(candidate.get("payload", {}))
+        envelope_value = payload.get("envelope")
+        if not isinstance(envelope_value, dict):
             continue
-        run = json.loads(run_path.read_text(encoding="utf-8"))
-        execution = run.get("execution_snapshot", {})
-        work_unit = execution.get("work_unit", {})
-        profile_name = next((
-            role["agent_profile"]
-            for phase in execution.get("agent_phases", [])
-            if phase.get("phase_id") == "analyze-dif"
-            for role in phase.get("roles", [])
-            if role.get("role_id") == "analyzer"
-        ), "")
-        profile = execution.get("profiles", {}).get(profile_name, {})
+        envelope = json_object(envelope_value)
+        result_value = envelope.get("result")
+        result = json_object(result_value) if isinstance(result_value, dict) else {}
+        identifier = result.get("stable_diff_id")
+        source_run_id = envelope.get("source_run_id", "")
+        run_path = root / "runs" / f"{source_run_id}.json"
+        if not isinstance(identifier, str) or identifier not in evidence or not run_path.is_file():
+            continue
+        run = parse_json_object(run_path.read_text(encoding="utf-8"))
+        execution = json_object(run.get("execution_snapshot", {}))
+        work_unit = json_object(execution.get("work_unit", {}))
+        profile_name = ""
+        for phase_value in json_array(execution.get("agent_phases", [])):
+            phase = json_object(phase_value)
+            if phase.get("phase_id") != "analyze-dif":
+                continue
+            for role_value in json_array(phase.get("roles", [])):
+                role = json_object(role_value)
+                if role.get("role_id") == "analyzer" and isinstance(role.get("agent_profile"), str):
+                    profile_name = str(role["agent_profile"])
+                    break
+        profiles = json_object(execution.get("profiles", {}))
+        profile_value = profiles.get(profile_name, {})
+        profile = json_object(profile_value) if isinstance(profile_value, dict) else {}
         if work_unit.get("id") != identifier or not profile:
             continue
+        allowed_paths = [str(value) for value in json_array(work_unit.get("allowed_paths", []))]
+        instruction_version = str(profile.get("instructions_version", ""))
         compatibility = {
             "operation": "mrq.discover-next",
             "phase_id": "analyze-dif",
             "role_id": "analyzer",
             "work_unit": work_unit,
-            "allowed_paths": sorted(work_unit.get("allowed_paths", [])),
-            "base_instruction_version": str(profile.get("instructions_version", "")),
+            "allowed_paths": sorted(allowed_paths),
+            "base_instruction_version": instruction_version,
             "response_schema": "analyze-dif-analyzer/v1",
             "validator_version": "agent-phase-result/v1",
         }
@@ -406,7 +547,7 @@ def discover_compatible_analyzer_results(
             "evidence_fingerprint": evidence[str(identifier)],
             "result_schema_fingerprint": "sha256:" + sha256(b"analyze-dif-result/v1"),
             "profile_fingerprint": _fingerprint(profile),
-            "instruction_fingerprint": "sha256:" + sha256(str(profile.get("instructions_version", "")).encode()),
+            "instruction_fingerprint": "sha256:" + sha256(instruction_version.encode()),
             "context_fingerprint": _fingerprint(work_unit.get("allowed_path_fingerprints", [])),
         }
         envelopes.append(envelope)
@@ -418,10 +559,10 @@ def execute(
     migration_id: str,
     *,
     workflow_v4: bytes,
-    analyzer_envelopes: Iterable[dict[str, Any]] = (),
+    analyzer_envelopes: Iterable[dict[str, JsonValue]] = (),
     expected_analyzers: dict[str, dict[str, str]] | None = None,
     base: Path | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     """Completes the guarded v3->v4 cutover under the durable migration fence."""
 
     journal = load_journal(repo, base=base)
@@ -450,15 +591,69 @@ def execute(
             candidate = tomllib.loads(workflow_v4.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
             raise ValueError("invalid workflow-v4 bytes") from exc
-        from .workflow import validate_workflow_manifest
-        validate_workflow_manifest(candidate)
-        classification = json.loads((repo / CLASSIFICATION_POINTER).read_text(encoding="utf-8"))
+        from .workflow import AgentPhase, AgentRole, WorkflowGate, WorkflowJob, WorkflowManifest, WorkflowStep, validate_workflow_manifest
+        source = json_object(candidate)
+        gates: list[WorkflowGate] = []
+        for gate_value in json_array(source.get("gates", [])):
+            gate = json_object(gate_value)
+            gates.append({"id": str(gate.get("id", "")), "validator": str(gate.get("validator", ""))})
+        jobs: list[WorkflowJob] = []
+        for job_value in json_array(source.get("jobs", [])):
+            job = json_object(job_value)
+            steps: list[WorkflowStep] = []
+            for step_value in json_array(job.get("steps", [])):
+                step = json_object(step_value)
+                typed_step: WorkflowStep = {
+                    "id": str(step.get("id", "")),
+                    "operation": str(step.get("operation", "")),
+                    "operation_version": str(step.get("operation_version", "")),
+                }
+                timeout_seconds = step.get("timeout_seconds")
+                if isinstance(timeout_seconds, int):
+                    typed_step["timeout_seconds"] = timeout_seconds
+                max_retries = step.get("max_retries")
+                if isinstance(max_retries, int):
+                    typed_step["max_retries"] = max_retries
+                if "agent_phases" in step:
+                    phases: list[AgentPhase] = []
+                    for phase_value in json_array(step["agent_phases"]):
+                        phase = json_object(phase_value)
+                        roles: list[AgentRole] = []
+                        for role_value in json_array(phase.get("roles", [])):
+                            role = json_object(role_value)
+                            roles.append({
+                                "role_id": str(role.get("role_id", "")),
+                                "agent_profile": str(role.get("agent_profile", "")),
+                                "count": _integer(role.get("count")),
+                                "instruction_supplement": str(role.get("instruction_supplement", "")),
+                            })
+                        phases.append({
+                            "phase_id": str(phase.get("phase_id", "")),
+                            "mode": str(phase.get("mode", "")),
+                            "max_concurrency": _integer(phase.get("max_concurrency")),
+                            "roles": roles,
+                        })
+                    typed_step["agent_phases"] = phases
+                steps.append(typed_step)
+            jobs.append({
+                "id": str(job.get("id", "")),
+                "needs": [str(value) for value in json_array(job.get("needs", []))],
+                "steps": steps,
+            })
+        manifest: WorkflowManifest = {
+            "schema_version": str(source.get("schema_version", "")),
+            "tool_version": str(source.get("tool_version", "")),
+            "gates": gates,
+            "jobs": jobs,
+        }
+        _ = validate_workflow_manifest(manifest)
+        _ = parse_json_object((repo / CLASSIFICATION_POINTER).read_text(encoding="utf-8"))
         atomic_json(repo / "research/active-consolidation-generation.json", consolidation_sentinel())
         workflow_path = repo / "research/workflow.toml"
         fd, temporary = tempfile.mkstemp(prefix=".workflow.toml.", dir=workflow_path.parent)
         try:
             with os.fdopen(fd, "wb") as stream:
-                stream.write(workflow_v4)
+                _ = stream.write(workflow_v4)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, workflow_path)
@@ -470,7 +665,7 @@ def execute(
         )
     if journal["phase"] == "catalog-switched":
         from .workflow import validate_workflow
-        validate_workflow(repo)
+        _ = validate_workflow(repo)
         result = {
             "migration_id": migration_id,
             "phase": "committed",
@@ -487,7 +682,7 @@ def recover(
     migration_id: str,
     *,
     base: Path | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue] | MigrationJournal | RecoveryJournal:
     should_rollback = False
     with DispatcherStore(repo, base) as store:
         journal = load_journal(repo, base=base)
@@ -553,7 +748,10 @@ def recover(
         should_rollback = not valid
     if should_rollback:
         return rollback(repo, migration_id, base=base)
-    return {**journal, "recovery_action": "resume"}
+    return {
+        **journal,
+        "recovery_action": "resume",
+    }
 
 
 def rollback(
@@ -561,7 +759,7 @@ def rollback(
     migration_id: str,
     *,
     base: Path | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     with DispatcherStore(repo, base) as store:
         journal = load_journal(repo, base=base)
         if journal is None or journal["migration_id"] != migration_id:
@@ -579,7 +777,7 @@ def rollback(
         backup_path = Path(database["path"])
         if not backup_path.is_file() or sha256(backup_path.read_bytes()) != database["sha256"]:
             raise ValueError("workflow migration database backup is corrupt")
-        result = {"migration_id": migration_id, "phase": "rolled_back"}
+        result: dict[str, JsonValue] = {"migration_id": migration_id, "phase": "rolled_back"}
         if not store.rollback_workflow_migration(
             migration_id, token, backup_path, result
         ):

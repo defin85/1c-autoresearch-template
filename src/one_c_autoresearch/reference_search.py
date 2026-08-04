@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import os
 import selectors
 import signal
@@ -9,9 +10,12 @@ import shutil
 import subprocess
 import threading
 import time
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from types import TracebackType
+from typing import TypedDict
+
+from .contracts import JsonValue, parse_json_object
 
 
 REFERENCE_SCHEMA = "reference-search/v1"
@@ -37,24 +41,63 @@ _PROXY_KEYS = {
 _SECRET_KEYS = {"NAPARNIK_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"}
 
 
-def _bounded_text(value: Any, maximum: int, error: str) -> str:
+class ProcessSpec(TypedDict):
+    command: list[str]
+    environment: dict[str, str]
+    network: bool
+    downloads: bool
+    reuse_process: bool
+    operation: str
+
+
+class DocsResult(TypedDict):
+    schema_version: str
+    hits: list[dict[str, JsonValue]]
+    shown: JsonValue
+    total: JsonValue
+    evidence_class: str
+
+
+class SyntaxResult(TypedDict):
+    structured: dict[str, JsonValue]
+    compatibility_diagnostic: str
+    evidence_class: str
+
+
+def _bounded_text(value: object, maximum: int, error: str) -> str:
     if not isinstance(value, str) or len(value.encode("utf-8")) > maximum:
         raise ValueError(error)
     return value
 
 
-def validate_reference_contract(contract: Mapping[str, Any]) -> None:
+def _integer(value: object, error: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(error)
+    return value
+
+
+def _object(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    return dict(parse_json_object(json.dumps(value, ensure_ascii=False)))
+
+
+def _json_object(value: object) -> dict[str, JsonValue]:
+    if not isinstance(value, Mapping):
+        return {}
+    return parse_json_object(json.dumps(value, ensure_ascii=False))
+
+
+def validate_reference_contract(contract: Mapping[str, object]) -> None:
     if contract.get("machine_contract_version") != "1.3":
         raise ValueError("reference_search.unsupported_machine_contract")
-    allowed = contract.get("profiles", {}).get("reference", {}).get("allowed", {})
+    allowed = _object(_object(_object(contract.get("profiles")).get("reference")).get("allowed"))
     expected = {
         "search": ["find_docs", "search_docs", "status"],
         "syntax_help": [],
         "its_help": [],
     }
-    structured = contract.get("structured_outputs", {}).get(
-        "reference.syntax_help", {}
-    )
+    structured = _object(_object(contract.get("structured_outputs")).get("reference.syntax_help"))
     if (
         allowed != expected
         or structured.get("schema_version") != 1
@@ -65,17 +108,26 @@ def validate_reference_contract(contract: Mapping[str, Any]) -> None:
         raise ValueError("reference_search.incomplete_contract")
 
 
-def validate_syntax_tool(tool: Mapping[str, Any]) -> None:
-    output = tool.get("outputSchema")
-    properties = output.get("properties", {}) if isinstance(output, Mapping) else {}
-    schema = properties.get("schema_version", {})
-    kind = properties.get("kind", {})
-    schema_values = schema.get("enum", [schema.get("const")])
-    kind_values = set(kind.get("enum", []))
+def validate_syntax_tool(tool: Mapping[str, object]) -> None:
+    tool_json = parse_json_object(json.dumps(tool, ensure_ascii=False))
+    output_object = _json_object(tool_json.get("outputSchema"))
+    properties = _json_object(output_object.get("properties"))
+    schema = _json_object(properties.get("schema_version"))
+    kind = _json_object(properties.get("kind"))
+    enum_value = schema.get("enum")
+    schema_values: set[str] = set()
+    if isinstance(enum_value, list):
+        schema_values = {value for value in enum_value if isinstance(value, str)}
+    else:
+        schema_const = schema.get("const")
+        if isinstance(schema_const, str):
+            schema_values = {schema_const}
+    kind_enum = kind.get("enum")
+    kind_values: set[str] = {value for value in kind_enum if isinstance(value, str)} if isinstance(kind_enum, list) else set()
     if (
-        not isinstance(output, Mapping)
-        or set(value for value in schema_values if value is not None) != {STRUCTURED_SCHEMA}
-        or kind_values != SYNTAX_KINDS
+        not output_object
+        or schema_values != {STRUCTURED_SCHEMA}
+        or kind_values != set(SYNTAX_KINDS)
     ):
         raise ValueError("reference_search.unsupported_syntax_output_schema")
 
@@ -87,7 +139,7 @@ def reference_process_spec(
     *,
     token: str | None = None,
     environment: Mapping[str, str] | None = None,
-) -> dict[str, Any]:
+) -> ProcessSpec:
     if operation not in {"probe", "build", "docs", "syntax", "its"}:
         raise ValueError("reference_search.unsupported_operation")
     env = {
@@ -130,7 +182,7 @@ def reference_process_spec(
 def stage_reference_index(
     root: Path,
     executable_fingerprint: str,
-    corpus_manifest: Mapping[str, Any],
+    corpus_manifest: Mapping[str, object],
 ) -> Path:
     if (
         corpus_manifest.get("source") != "selected-build-bundled"
@@ -142,7 +194,7 @@ def stage_reference_index(
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True, mode=0o700)
-    (staging / "manifest.json").write_text(
+    _ = (staging / "manifest.json").write_text(
         json.dumps(
             {
                 "schema_version": REFERENCE_SCHEMA,
@@ -176,39 +228,43 @@ def _fsync_tree(root: Path) -> None:
         os.close(descriptor)
 
 
-def promote_reference_index(staging: Path, result: Mapping[str, Any]) -> Path:
-    manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
+def promote_reference_index(staging: Path, result: Mapping[str, object]) -> Path:
+    manifest = parse_json_object((staging / "manifest.json").read_text(encoding="utf-8"))
+    corpus = _object(manifest.get("corpus"))
     if (
         result.get("state") != "ready"
         or result.get("cancelled", False)
         or result.get("download_attempts", 0) != 0
         or result.get("network_attempts", 0) != 0
         or result.get("corpus_fingerprint")
-        != manifest["corpus"]["corpus_fingerprint"]
+        != corpus.get("corpus_fingerprint")
     ):
         raise ValueError("reference_search.reference_index_not_promotable")
     root = staging.parent.parent
-    destination = root / "instances" / manifest["executable_fingerprint"]
+    executable_fingerprint = manifest.get("executable_fingerprint")
+    if not isinstance(executable_fingerprint, str):
+        raise ValueError("reference_search.reference_index_not_promotable")
+    destination = root / "instances" / executable_fingerprint
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.is_symlink():
         raise ValueError("reference_search.index_symlink_forbidden")
     if destination.exists():
         shutil.rmtree(destination)
     manifest["state"] = "ready"
-    (staging / "manifest.json").write_text(
+    _ = (staging / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, sort_keys=True), encoding="utf-8"
     )
     _fsync_tree(staging)
-    staging.replace(destination)
+    _ = staging.replace(destination)
     _fsync_tree(destination.parent)
     temporary = root / "current.tmp"
-    temporary.write_text(destination.name, encoding="utf-8")
+    _ = temporary.write_text(destination.name, encoding="utf-8")
     descriptor = os.open(temporary, os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    temporary.replace(root / "current")
+    _ = temporary.replace(root / "current")
     _fsync_tree(root)
     return destination
 
@@ -225,51 +281,57 @@ def current_reference_index(root: Path, executable_fingerprint: str) -> Path:
     manifest_path = instance / "manifest.json"
     if instance.is_symlink() or manifest_path.is_symlink():
         raise ValueError("reference_search.index_symlink_forbidden")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = parse_json_object(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("state") != "ready":
         raise ValueError("reference_search.stale_reference_index")
     return instance
 
 
-def normalize_docs_result(value: Mapping[str, Any]) -> dict[str, Any]:
-    body = value.get("structuredContent")
-    if not isinstance(body, Mapping) or body.get("schema_version") != STRUCTURED_SCHEMA:
+def normalize_docs_result(value: Mapping[str, object]) -> DocsResult:
+    body = _object(value.get("structuredContent"))
+    if body.get("schema_version") != STRUCTURED_SCHEMA:
         raise ValueError("reference_search.unsupported_docs_schema")
-    hits = body.get("hits")
+    body_json = parse_json_object(json.dumps(body, ensure_ascii=False))
+    hits = body_json.get("hits")
     if not isinstance(hits, list) or len(hits) > DOCS_MAX_HITS:
         raise ValueError("reference_search.docs_bounds_exceeded")
-    normalized = []
+    normalized: list[dict[str, JsonValue]] = []
     for hit in hits:
         if not isinstance(hit, Mapping):
             raise ValueError("reference_search.invalid_docs_hit")
-        copy = dict(hit)
+        copy = parse_json_object(json.dumps(dict(hit), ensure_ascii=False))
         if "snippet" in copy:
             copy["snippet"] = _bounded_text(
                 copy["snippet"], DOCS_MAX_EXCERPT_BYTES, "reference_search.docs_bounds_exceeded"
             )
         normalized.append(copy)
+    shown = body.get("shown", len(normalized))
+    total = body.get("total", len(normalized))
+    if not isinstance(shown, int) or isinstance(shown, bool) or not isinstance(total, int) or isinstance(total, bool):
+        raise ValueError("reference_search.unsupported_docs_schema")
     return {
         "schema_version": STRUCTURED_SCHEMA,
         "hits": normalized,
-        "shown": body.get("shown", len(normalized)),
-        "total": body.get("total", len(normalized)),
+        "shown": shown,
+        "total": total,
         "evidence_class": "navigation_only",
     }
 
 
-def normalize_syntax_result(value: Mapping[str, Any]) -> dict[str, Any]:
-    body = value.get("structuredContent")
+def normalize_syntax_result(value: Mapping[str, object]) -> SyntaxResult:
+    body = _object(value.get("structuredContent"))
     if (
-        not isinstance(body, Mapping)
-        or body.get("schema_version") != STRUCTURED_SCHEMA
+        body.get("schema_version") != STRUCTURED_SCHEMA
         or body.get("kind") not in SYNTAX_KINDS
     ):
         raise ValueError("reference_search.unsupported_syntax_schema")
-    text_blocks = [
-        item.get("text")
-        for item in value.get("content", [])
-        if isinstance(item, Mapping) and item.get("type") == "text"
-    ]
+    content = parse_json_object(json.dumps(value, ensure_ascii=False)).get("content")
+    text_blocks: list[object] = []
+    if isinstance(content, list):
+        for item in content:
+            item_object = _object(item)
+            if item_object.get("type") == "text":
+                text_blocks.append(item_object.get("text"))
     compatibility = ""
     if text_blocks:
         if len(text_blocks) != 1:
@@ -278,22 +340,22 @@ def normalize_syntax_result(value: Mapping[str, Any]) -> dict[str, Any]:
             text_blocks[0], TEXT_MAX_BYTES, "reference_search.syntax_bounds_exceeded"
         )
     return {
-        "structured": dict(body),
+        "structured": parse_json_object(json.dumps(dict(body), ensure_ascii=False)),
         "compatibility_diagnostic": compatibility,
         "evidence_class": "navigation_only",
     }
 
 
 def validate_its_request(question: str, *, disclosure_acknowledged: bool, token: str | None) -> None:
-    _bounded_text(question, ITS_QUESTION_MAX_BYTES, "reference_search.its_question_too_large")
+    _ = _bounded_text(question, ITS_QUESTION_MAX_BYTES, "reference_search.its_question_too_large")
     if not disclosure_acknowledged:
         raise ValueError("reference_search.its_disclosure_required")
     if not token:
         raise ValueError("reference_search.its_token_required")
 
 
-def normalize_its_result(value: Mapping[str, Any]) -> dict[str, Any]:
-    content = value.get("content")
+def normalize_its_result(value: Mapping[str, object]) -> dict[str, JsonValue]:
+    content = parse_json_object(json.dumps(value, ensure_ascii=False)).get("content")
     if (
         not isinstance(content, list)
         or len(content) != 1
@@ -311,37 +373,42 @@ def normalize_its_result(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def require_repository_evidence(value: Mapping[str, Any]) -> None:
+def require_repository_evidence(value: Mapping[str, object]) -> None:
     if value.get("evidence_class") == "navigation_only":
         raise ValueError("reference_search.not_canonical_evidence")
 
 
 class ItsAdmission:
     def __init__(self) -> None:
-        self._slot = threading.Lock()
+        self._slot: threading.Lock = threading.Lock()
 
-    @contextmanager
-    def acquire(self) -> Iterator[None]:
+    def acquire(self) -> ItsAdmission:
+        return self
+
+    def __enter__(self) -> None:
         if not self._slot.acquire(blocking=False):
             raise RuntimeError("reference_search.its_busy")
-        try:
-            yield
-        finally:
-            self._slot.release()
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None) -> None:
+        self._slot.release()
 
 
 _ITS_ADMISSION = ItsAdmission()
 
 
+def _read_text_line(reader: io.TextIOBase) -> str:
+    return reader.readline()
+
+
 def _mcp_call(
-    spec: Mapping[str, Any],
+    spec: ProcessSpec,
     tool: str,
-    arguments: Mapping[str, Any],
+    arguments: Mapping[str, object],
     *,
     timeout_seconds: float,
     retry_not_ready: bool = False,
     cancelled: Callable[[], bool] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     for name in (
         "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
         "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
@@ -349,7 +416,7 @@ def _mcp_call(
         Path(spec["environment"][name]).mkdir(
             parents=True, exist_ok=True, mode=0o700
         )
-    process = subprocess.Popen(
+    process = subprocess.Popen[str](
         spec["command"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -358,8 +425,10 @@ def _mcp_call(
         env=dict(spec["environment"]),
         start_new_session=True,
     )
-    if process.stdin is None or process.stdout is None:
+    if not isinstance(process.stdin, io.TextIOBase) or not isinstance(process.stdout, io.TextIOBase):
         raise RuntimeError("reference_search.stdio_unavailable")
+    stdin = process.stdin
+    stdout = process.stdout
     requests = (
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": "2025-06-18", "capabilities": {},
@@ -371,37 +440,39 @@ def _mcp_call(
         }},
     )
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
+    _ = selector.register(stdout, selectors.EVENT_READ)
     deadline = time.monotonic() + timeout_seconds
     try:
         for request in requests:
-            process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-        process.stdin.flush()
+            _ = stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+        stdin.flush()
         while time.monotonic() < deadline:
             if cancelled and cancelled():
                 raise InterruptedError("reference_search.cancelled")
             if not selector.select(min(0.1, max(0, deadline - time.monotonic()))):
                 continue
-            line = process.stdout.readline()
+            line = _read_text_line(stdout)
             if not line:
                 break
             try:
-                response = json.loads(line)
-            except json.JSONDecodeError:
+                response = parse_json_object(line)
+            except ValueError:
                 continue
-            if isinstance(response.get("id"), int) and response["id"] >= 2:
+            response_id = response.get("id")
+            if isinstance(response_id, int) and not isinstance(response_id, bool) and response_id >= 2:
                 if response.get("error"):
                     raise RuntimeError("reference_search.native_error")
-                result = response.get("result") or {}
+                result = _json_object(response.get("result"))
                 structured = result.get("structuredContent")
                 if (
                     retry_not_ready
                     and isinstance(structured, Mapping)
                     and structured.get("status") == "not_ready"
                 ):
-                    delay = min(
-                        2.0, max(0.05, float(structured.get("retry_after_ms", 100)) / 1000)
-                    )
+                    retry_after = structured.get("retry_after_ms", 100)
+                    if not isinstance(retry_after, int | float) or isinstance(retry_after, bool):
+                        raise RuntimeError("reference_search.native_error")
+                    delay = min(2.0, max(0.05, float(retry_after) / 1000))
                     if time.monotonic() + delay >= deadline:
                         raise TimeoutError("reference_search.build_deadline")
                     wake = time.monotonic() + delay
@@ -409,40 +480,40 @@ def _mcp_call(
                         if cancelled and cancelled():
                             raise InterruptedError("reference_search.cancelled")
                         time.sleep(min(0.05, wake - time.monotonic()))
-                    identifier = response["id"] + 1
-                    process.stdin.write(json.dumps({
+                    identifier = response_id + 1
+                    _ = stdin.write(json.dumps({
                         "jsonrpc": "2.0", "id": identifier,
                         "method": "tools/call",
                         "params": {"name": tool, "arguments": dict(arguments)},
                     }, ensure_ascii=False) + "\n")
-                    process.stdin.flush()
+                    stdin.flush()
                     continue
-                return result
+                return parse_json_object(json.dumps(dict(result), ensure_ascii=False))
         raise TimeoutError("reference_search.deadline")
     finally:
         selector.close()
-        process.stdin.close()
+        stdin.close()
         try:
-            process.wait(timeout=1)
+            _ = process.wait(timeout=1)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGTERM)
             try:
-                process.wait(timeout=1)
+                _ = process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+                _ = process.wait()
 
 
 def execute_reference(
     executable: Path,
     state_dir: Path,
-    request: Mapping[str, Any],
+    request: Mapping[str, object],
     *,
     token: str | None = None,
     disclosure_acknowledged: bool = False,
     environment: Mapping[str, str] | None = None,
     cancelled: Callable[[], bool] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     operation = str(request["operation"])
     if operation in {"reference.find_docs", "reference.search_docs"}:
         spec = reference_process_spec(
@@ -454,7 +525,7 @@ def execute_reference(
             {
                 "action": operation.removeprefix("reference.").replace("_", "_"),
                 "query": request["query"],
-                "limit": min(int(request["max_results"]), DOCS_MAX_HITS),
+                "limit": min(_integer(request["max_results"], "reference_search.invalid_limit"), DOCS_MAX_HITS),
                 "max_output_tokens": 8192,
             },
             timeout_seconds=ITS_DEADLINE_SECONDS,
@@ -474,7 +545,7 @@ def execute_reference(
             }
             for hit in body["hits"]
         ]
-        return {"items": items, "truncated": body["total"] > len(items)}
+        return {"items": items, "truncated": _integer(body["total"], "reference_search.unsupported_docs_schema") > len(items)}
     if operation == "reference.syntax_help":
         spec = reference_process_spec(
             executable, state_dir, "syntax", environment=environment

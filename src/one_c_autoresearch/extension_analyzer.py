@@ -3,10 +3,11 @@ from __future__ import annotations
 import re
 import unicodedata
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import NotRequired, TypedDict
 
-from .contracts import canonical_json, content_id, normalize_relative, sha256, validate_unique_ids
+from .contracts import JsonValue, canonical_json, content_id, normalize_relative, parse_json_object, sha256, validate_unique_ids
 
 
 ANALYZER_VERSION = "extension-semantic/v1"
@@ -28,7 +29,7 @@ KINDS = {
 }
 _ANNOTATION = {"перед": "before", "после": "after", "вместо": "instead"}
 _DECLARATION = re.compile(
-    r"(?im)^\s*(?:(асинх|async)\s+)?(процедура|функция|procedure|function)\s+"
+    r"(?im)^\s*(?:(асинх|async)\s+)?(процедура|функция|procedure|function)\s+" +
     r"([^\W\d]\w*)\s*\(([^\r\n)]*)\)\s*(экспорт|export)?\s*$"
 )
 _ANNOTATION_LINE = re.compile(r'(?im)^\s*&\s*(Перед|После|Вместо)\s*\(\s*"((?:""|[^"])*)"\s*\)\s*$')
@@ -36,7 +37,101 @@ _PREPROCESSOR = re.compile(r"(?im)^\s*#\s*(?:если|иначеесли|ина�
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
+BslMethod = TypedDict(
+    "BslMethod",
+    {
+        "annotation_kind": str,
+        "annotation_target": str,
+        "async": bool,
+        "export": bool,
+        "method_kind": str,
+        "module_context": str,
+        "name": str,
+        "parameters": list[str],
+    },
+)
+
+
+class Evidence(TypedDict):
+    path: str
+    fingerprint: str
+
+
+class MainMatch(TypedDict):
+    identity: str
+    structural_fingerprint: NotRequired[str]
+    source_reference: NotRequired[str]
+    evidence: NotRequired[list[Evidence]]
+
+
+class Snapshot(TypedDict):
+    affected_base_identity: str
+    diagnostic_codes: list[str]
+    dependency_structural_fingerprint: str
+    dependency_source_reference: str
+    evidence: list[Evidence]
+    evidence_sensitive: bool
+    evidence_fingerprint: str
+    extension_object_identity: str
+    extension_uuid: str
+    intervention_kind: str
+    mapping_identity: str
+    object_scope: str
+    structural_fingerprint: str
+    structural_sublocation: str
+    symbol_identity: str
+    technical_identity: str
+    intervention_key: str
+
+
+class DiffEvidence(Evidence):
+    role: str
+    side: str
+
+
+class Detail(TypedDict):
+    affected_base_identity: str
+    after_evidence_fingerprint: str
+    after_structural_fingerprint: str
+    after_role: str
+    before_evidence_fingerprint: str
+    before_structural_fingerprint: str
+    before_role: str
+    change_type: str
+    comparison_id: str
+    dependency_ids: list[str]
+    diagnostic_codes: list[str]
+    evidence: list[DiffEvidence]
+    extension_object_identity: str
+    extension_uuid: str
+    intervention_key: str
+    intervention_kind: str
+    object_scope: str
+    schema_version: str
+    stable_diff_id: str
+    structural_sublocation: str
+    symbol_identity: str
+
+
+class Dependency(TypedDict):
+    dependency_id: str
+    dependency_kind: str
+    diagnostic_code: str
+    evidence: list[DiffEvidence]
+    extension_uuid: str
+    normalized_source_reference: str
+    outcome: str
+    resolved_base_identity: str
+    role: str
+    schema_version: str
+    stable_diff_id: str
+
+
 class AnalyzerDiagnosticError(ValueError):
+    code: str
+    total_count: int
+    samples: list[str]
+
     def __init__(self, code: str, items: list[str]) -> None:
         ordered = sorted(items)
         self.code = code
@@ -50,15 +145,15 @@ class AnalyzerDiagnosticError(ValueError):
         )
 
 
-def _text(value: Any) -> str:
+def _text(value: object) -> str:
     return unicodedata.normalize("NFC", str(value or "")).strip()
 
 
-def _fold(value: Any) -> str:
+def _fold(value: object) -> str:
     return " ".join(_text(value).casefold().split())
 
 
-def _fingerprint(value: Any) -> str:
+def _fingerprint(value: object) -> str:
     return "sha256:" + sha256(canonical_json(value))
 
 
@@ -102,7 +197,7 @@ def _strip_bsl_comments(text: str) -> str:
     return re.sub(r"//[^\r\n]*", lambda match: " " * len(match.group()), text)
 
 
-def parse_bsl_methods(text: str, module_context: str) -> list[dict[str, Any]]:
+def parse_bsl_methods(text: str, module_context: str) -> list[BslMethod]:
     """Extract declaration identities without evaluating BSL."""
     clean = _strip_bsl_literals(text)
     if _PREPROCESSOR.search(clean):
@@ -120,7 +215,7 @@ def parse_bsl_methods(text: str, module_context: str) -> list[dict[str, Any]]:
         recognized_annotations = recognized_annotations[: match.start()] + recognized_annotations[match.end() :]
     if re.search(r"(?im)^\s*&\s*(?:перед|после|вместо)\b", recognized_annotations):
         raise ValueError("unsupported_bsl_structure: annotation")
-    rows: list[dict[str, Any]] = []
+    rows: list[BslMethod] = []
     for match in declaration_matches:
         annotation = next(
             (
@@ -130,7 +225,7 @@ def parse_bsl_methods(text: str, module_context: str) -> list[dict[str, Any]]:
             ),
             None,
         )
-        parameters = []
+        parameters: list[str] = []
         for raw in match.group(4).split(","):
             name = raw.split("=", 1)[0].strip()
             if name:
@@ -155,7 +250,7 @@ def parse_bsl_methods(text: str, module_context: str) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda item: canonical_json(item))
 
 
-def _base_method_structure(method: dict[str, Any], *, extension: bool = False) -> dict[str, Any]:
+def _base_method_structure(method: BslMethod, *, extension: bool = False) -> dict[str, object]:
     return {
         "async": method["async"],
         "export": method["export"],
@@ -166,7 +261,7 @@ def _base_method_structure(method: dict[str, Any], *, extension: bool = False) -
     }
 
 
-def intervention_key(snapshot: dict[str, Any]) -> str:
+def intervention_key(snapshot: Snapshot) -> str:
     preimage = {
         "affected_base_identity": snapshot.get("affected_base_identity", ""),
         "extension_analyzer_version": ANALYZER_VERSION,
@@ -234,14 +329,14 @@ def dependency_id(intervention: str, role: str, kind: str, source_reference: str
 
 
 def resolve_dependency(
-    detail: dict[str, Any],
+    detail: Detail,
     role: str,
     dependency_kind: str,
     source_reference: str,
-    base_matches: list[dict[str, Any]],
-    extension_matches: list[dict[str, Any]] | None = None,
+    base_matches: list[MainMatch],
+    extension_matches: list[MainMatch] | None = None,
     expected_structural_fingerprint: str = "",
-) -> dict[str, Any]:
+) -> Dependency:
     """Resolve one normalized reference against the same-role main configuration."""
     reference = _fold(source_reference)
     matches = sorted(base_matches, key=canonical_json)
@@ -261,8 +356,8 @@ def resolve_dependency(
             )
             else "present_changed"
         )
-        evidence = sorted(
-            ({**item, "role": role, "side": "before" if role == "vendor_baseline" else "after"} for item in match.get("evidence", [])),
+        evidence: list[DiffEvidence] = sorted(
+            ({"path": item["path"], "fingerprint": item["fingerprint"], "role": role, "side": "before" if role == "vendor_baseline" else "after"} for item in match.get("evidence", [])),
             key=canonical_json,
         )
     elif not matches and extension_matches:
@@ -297,7 +392,7 @@ def _xml_value(root: ET.Element, name: str) -> str:
 
 
 def _xml_references(root: ET.Element) -> list[str]:
-    references = set()
+    references: set[str] = set()
     for item in root.iter():
         value = _text(item.text)
         typed_reference = any(_local(key) == "type" and _text(raw).endswith("MDObjectRef") for key, raw in item.attrib.items())
@@ -318,10 +413,10 @@ def _xml_scalar_properties(root: ET.Element) -> dict[str, str]:
     }
 
 
-def _json_references(value: Any) -> list[str]:
+def _json_references(value: JsonValue) -> list[str]:
     references: set[str] = set()
 
-    def visit(item: Any) -> None:
+    def visit(item: JsonValue) -> None:
         if isinstance(item, dict):
             for nested in item.values():
                 visit(nested)
@@ -337,7 +432,7 @@ def _json_references(value: Any) -> list[str]:
     return sorted(references)
 
 
-def _v8_structure(value: dict[str, Any]) -> dict[str, Any]:
+def _v8_structure(value: dict[str, JsonValue]) -> dict[str, JsonValue]:
     ignored = {
         "comment", "name2", "configinfo", "copyinfo", "file_uuid", "v8unpack",
         "code_encoding_obj", "code_info_obj", "code_encoding_mgr", "code_info_mgr",
@@ -345,7 +440,7 @@ def _v8_structure(value: dict[str, Any]) -> dict[str, Any]:
     return {key: value[key] for key in sorted(value) if key not in ignored}
 
 
-def _scalar_properties(value: dict[str, Any]) -> dict[str, Any]:
+def _scalar_properties(value: dict[str, JsonValue]) -> dict[str, JsonValue]:
     ignored = {
         "comment", "name", "name2", "header", "obj_version", "configinfo", "copyinfo",
         "file_uuid", "v8unpack", "code_encoding_obj", "code_info_obj",
@@ -384,8 +479,8 @@ def _record(
     scope: str,
     kind: str,
     object_identity: str,
-    structure: dict[str, Any],
-    evidence: dict[str, str] | list[dict[str, str]],
+    structure: object,
+    evidence: Evidence | list[Evidence],
     base_identity: str = "",
     symbol_identity: str = "",
     sublocation: str = "",
@@ -393,13 +488,13 @@ def _record(
     mapping_identity: str = "",
     technical_identity: str = "",
     evidence_sensitive: bool = True,
-    dependency_structure: dict[str, Any] | None = None,
+    dependency_structure: object | None = None,
     dependency_source_reference: str = "",
-) -> dict[str, Any]:
+) -> Snapshot:
     if scope not in {"owned", "adopted"} or kind not in KINDS:
         raise ValueError("invalid normalized extension intervention")
-    evidence_items = [evidence] if isinstance(evidence, dict) else sorted(evidence, key=canonical_json)
-    row = {
+    evidence_items: list[Evidence] = [evidence] if isinstance(evidence, dict) else sorted(evidence, key=canonical_json)
+    row: Snapshot = {
         "affected_base_identity": base_identity,
         "diagnostic_codes": sorted(set(diagnostics or [])),
         "dependency_structural_fingerprint": _fingerprint(dependency_structure) if dependency_structure else "",
@@ -410,6 +505,7 @@ def _record(
         "extension_object_identity": object_identity,
         "extension_uuid": extension_uuid,
         "intervention_kind": kind,
+        "intervention_key": "",
         "mapping_identity": mapping_identity,
         "object_scope": scope,
         "structural_fingerprint": _fingerprint(structure),
@@ -436,13 +532,11 @@ def _manifest(
     extension_uuid: str,
     representation: str,
     payload: bytes | None = None,
-) -> tuple[dict[str, Any], dict[str, str]]:
+) -> tuple[dict[str, JsonValue], Evidence]:
     path = root / "component-manifest.json"
     payload = path.read_bytes() if payload is None else payload
     try:
-        import json
-
-        manifest = json.loads(payload)
+        manifest = parse_json_object(payload.decode())
     except (UnicodeDecodeError, ValueError) as exc:
         raise ValueError("invalid_component_manifest") from exc
     if (
@@ -458,11 +552,11 @@ def parse_component(
     root: Path,
     representation: str,
     extension_uuid: str,
-    manifest: dict[str, Any] | None = None,
+    manifest: dict[str, JsonValue] | None = None,
     manifest_payload: bytes | None = None,
-    cancelled: callable | None = None,
-    base_index: dict[str, list[dict[str, Any]]] | None = None,
-) -> list[dict[str, Any]]:
+    cancelled: Callable[[], bool] | None = None,
+    base_index: dict[str, list[MainMatch]] | None = None,
+) -> list[Snapshot]:
     """Normalize one validated extension component using its bound adapter."""
     if representation not in ADAPTERS:
         raise ValueError(f"unsupported_representation:{representation}")
@@ -493,20 +587,20 @@ def parse_component(
         )
         for field, value in root_fields.items()
     ]
-    object_contexts: dict[str, tuple[str, str, str, str, str, str, str, dict[str, Any] | None]] = {}
-    contexts_by_identity: dict[tuple[str, str], tuple[str, str, str, str, str, str, str, dict[str, Any] | None]] = {}
+    object_contexts: dict[str, tuple[str, str, str, str, str, str, str, dict[str, JsonValue] | None]] = {}
+    contexts_by_identity: dict[tuple[str, str], tuple[str, str, str, str, str, str, str, dict[str, JsonValue] | None]] = {}
 
-    def parent_context(relative: str) -> tuple[str, str, str, str, str, str, str, dict[str, Any] | None] | None:
+    def parent_context(relative: str) -> tuple[str, str, str, str, str, str, str, dict[str, JsonValue] | None] | None:
         for parent in Path(relative).parents:
             context = object_contexts.get(parent.as_posix().rstrip("/") + "/")
             if context:
                 return context
         return None
 
-    def register_context(context: tuple[str, str, str, str, str, str, str, dict[str, Any] | None]) -> None:
+    def register_context(context: tuple[str, str, str, str, str, str, str, dict[str, JsonValue] | None]) -> None:
         object_contexts[context[0]] = context
         contexts_by_identity[(context[4], context[5])] = context
-    v8_ids: dict[tuple[str, str], tuple[str, dict[str, str]]] = {}
+    v8_ids: dict[tuple[str, str], tuple[str, Evidence]] = {}
     unaccounted_paths: list[str] = []
     entries = list(root.rglob("*"))
     unsafe = next((path for path in entries if path.is_symlink()), None)
@@ -526,7 +620,8 @@ def parse_component(
             raise ValueError(f"unsafe_component_path:{path.relative_to(root).as_posix()}")
         relative = normalize_relative(path.relative_to(root).as_posix())
         payload = path.read_bytes()
-        evidence = {"path": relative, "fingerprint": "sha256:" + sha256(payload)}
+        evidence: Evidence = {"path": relative, "fingerprint": "sha256:" + sha256(payload)}
+        object_evidence: list[Evidence]
         if representation == "xml-hierarchical/v1" and relative == "Configuration.xml":
             node = _safe_xml(payload, relative)
             configuration = next(iter(node), node)
@@ -576,7 +671,7 @@ def parse_component(
                     base_identity = "unresolved:" + sha256(canonical_json(unresolved))
                     diagnostics.append("unresolved_adoption_identity")
             object_identity = f"uuid:{own_uuid}" if scope == "owned" and _UUID.fullmatch(own_uuid) else _fold(qualified)
-            dependency_structure = {"metadata_type": _fold(object_type), "name": _fold(name), "uuid": own_uuid}
+            dependency_structure: dict[str, JsonValue] = {"metadata_type": _fold(object_type), "name": _fold(name), "uuid": own_uuid}
             register_context(
                 (
                     relative.removesuffix(".xml") + "/",
@@ -655,13 +750,9 @@ def parse_component(
                 )
         elif representation == "v8unpack/v1" and path.name.endswith(".json"):
             try:
-                import json
-
-                value = json.loads(payload)
+                value = parse_json_object(payload.decode())
             except (UnicodeDecodeError, ValueError) as exc:
                 raise ValueError(f"invalid_v8unpack_json:{relative}") from exc
-            if not isinstance(value, dict):
-                raise ValueError(f"invalid_v8unpack_json:{relative}")
             if relative == "ConfigurationExtension.json":
                 rows.append(
                     _record(
@@ -892,7 +983,7 @@ def parse_component(
             and row["affected_base_identity"] in owned_identities
         )
     ]
-    by_key: dict[str, dict[str, Any]] = {}
+    by_key: dict[str, Snapshot] = {}
     for row in rows:
         prior = by_key.get(row["intervention_key"])
         if prior and prior != row:
@@ -901,11 +992,11 @@ def parse_component(
     return sorted(rows, key=lambda item: item["intervention_key"])
 
 
-def build_main_config_index(root: Path, cancelled: callable | None = None) -> dict[str, list[dict[str, Any]]]:
+def build_main_config_index(root: Path, cancelled: Callable[[], bool] | None = None) -> dict[str, list[MainMatch]]:
     """Build a payload-free identity index for one role-matched main configuration."""
     root = root.resolve()
-    result: dict[str, list[dict[str, Any]]] = {}
-    identifiers: dict[tuple[str, str], tuple[str, dict[str, str]]] = {}
+    result: dict[str, list[MainMatch]] = {}
+    identifiers: dict[tuple[str, str], tuple[str, Evidence]] = {}
     paths = [path for path in root.rglob("*") if path.is_file()]
     paths.sort(key=lambda path: (0 if path.name.endswith(".id.json") else 1, path.relative_to(root).as_posix()))
     for path in paths:
@@ -915,15 +1006,14 @@ def build_main_config_index(root: Path, cancelled: callable | None = None) -> di
             raise ValueError(f"unsafe_component_path:{path.relative_to(root).as_posix()}")
         relative = normalize_relative(path.relative_to(root).as_posix())
         payload = path.read_bytes()
-        evidence = {"path": relative, "fingerprint": "sha256:" + sha256(payload)}
+        evidence: Evidence = {"path": relative, "fingerprint": "sha256:" + sha256(payload)}
+        object_evidence: list[Evidence]
         if path.name.endswith(".id.json"):
             try:
-                import json
-
-                value = json.loads(payload)
+                value = parse_json_object(payload.decode())
             except (UnicodeDecodeError, ValueError) as exc:
                 raise ValueError(f"invalid_v8unpack_json:{relative}") from exc
-            identifier = _fold(value.get("uuid")) if isinstance(value, dict) else ""
+            identifier = _fold(value.get("uuid"))
             if not _UUID.fullmatch(identifier):
                 raise ValueError(f"invalid_v8unpack_identity:{relative}")
             object_type = path.name.removesuffix(".id.json")
@@ -939,14 +1029,12 @@ def build_main_config_index(root: Path, cancelled: callable | None = None) -> di
             object_evidence = [evidence]
         elif path.suffix.casefold() == ".json" and not path.name.endswith(".elem.json"):
             try:
-                import json
-
-                value = json.loads(payload)
+                value = parse_json_object(payload.decode())
             except (UnicodeDecodeError, ValueError) as exc:
                 raise ValueError(f"invalid_v8unpack_json:{relative}") from exc
             object_type = path.name.removesuffix(".json")
             found = identifiers.get((path.parent.relative_to(root).as_posix(), object_type))
-            if not isinstance(value, dict) or found is None:
+            if found is None:
                 continue
             identifier, identity_evidence = found
             name = _fold(value.get("name") or path.parent.name)
@@ -969,7 +1057,7 @@ def build_main_config_index(root: Path, cancelled: callable | None = None) -> di
             object_type, object_name, module = _object_context(relative)
             identity = f"{object_type}.{object_name}"
             for method in methods:
-                entry = {
+                entry: MainMatch = {
                     "identity": identity,
                     "source_reference": f"{identity}#{module}.{method['name']}",
                     "structural_fingerprint": _fingerprint(_base_method_structure(method)),
@@ -982,11 +1070,11 @@ def build_main_config_index(root: Path, cancelled: callable | None = None) -> di
         if not name:
             continue
         identity = f"{object_type}.{name}"
-        entry = {
-            "identity": identity,
-            "structural_fingerprint": _fingerprint(structure),
-            "evidence": object_evidence,
-        }
+        entry = MainMatch(
+            identity=identity,
+            structural_fingerprint=_fingerprint(structure),
+            evidence=object_evidence,
+        )
         result.setdefault(identity, []).append(entry)
         if _UUID.fullmatch(identifier):
             result.setdefault(f"uuid:{identifier}", []).append(entry)
@@ -996,18 +1084,18 @@ def build_main_config_index(root: Path, cancelled: callable | None = None) -> di
 def _role_snapshots(
     role_components: dict[str, dict[str, Path | tuple[Path, str]]],
     representations: dict[tuple[str, str], str] | None = None,
-    cancelled: callable | None = None,
-    main_config_indexes: dict[str, dict[str, list[dict[str, Any]]]] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    main_config_indexes: dict[str, dict[str, list[MainMatch]]] | None = None,
 ) -> tuple[
-    dict[str, dict[str, list[dict[str, Any]]]],
-    dict[tuple[str, str], tuple[Path, str, dict[str, Any], bytes]],
+    dict[str, dict[str, list[Snapshot]]],
+    dict[tuple[str, str], tuple[Path, str, dict[str, JsonValue], bytes]],
 ]:
     """Analyze the lowercase UUID union; absent role members become empty snapshots."""
     if set(role_components) != set(ROLES):
         raise ValueError("extension role set must be exact")
     uuids = sorted({_fold(uuid) for members in role_components.values() for uuid in members})
-    result: dict[str, dict[str, list[dict[str, Any]]]] = {role: {} for role in ROLES}
-    loaded: dict[tuple[str, str], tuple[Path, str, dict[str, Any], bytes]] = {}
+    result: dict[str, dict[str, list[Snapshot]]] = {role: {} for role in ROLES}
+    loaded: dict[tuple[str, str], tuple[Path, str, dict[str, JsonValue], bytes]] = {}
     for role in ROLES:
         normalized_members = {_fold(uuid): value for uuid, value in role_components[role].items()}
         if len(normalized_members) != len(role_components[role]):
@@ -1026,12 +1114,14 @@ def _role_snapshots(
                 representation = (representations or {}).get((role, uuid), "")
             raw = (root / "component-manifest.json").read_bytes()
             try:
-                import json
-
-                manifest = json.loads(raw)
+                manifest = parse_json_object(raw.decode())
             except (UnicodeDecodeError, ValueError) as exc:
                 raise ValueError("invalid_component_manifest") from exc
-            representation = representation or manifest["representation_schema"]
+            saved_representation = manifest.get("representation_schema")
+            if not representation and not isinstance(saved_representation, str):
+                raise ValueError("invalid_component_manifest")
+            representation = representation or saved_representation
+            assert isinstance(representation, str)
             if not representation.endswith("/v1"):
                 representation += "/v1"
             loaded[(role, uuid)] = (root, representation, manifest, raw)
@@ -1048,13 +1138,13 @@ def _role_snapshots(
 
 
 def compare_snapshots(
-    before: dict[str, list[dict[str, Any]]],
-    after: dict[str, list[dict[str, Any]]],
+    before: dict[str, list[Snapshot]],
+    after: dict[str, list[Snapshot]],
     comparison: str,
     before_role: str = "vendor_baseline",
     after_role: str = "target_cf",
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+) -> list[Detail]:
+    rows: list[Detail] = []
     for uuid in sorted(set(before) | set(after)):
         left = {item["intervention_key"]: item for item in before.get(uuid, [])}
         right = {item["intervention_key"]: item for item in after.get(uuid, [])}
@@ -1073,23 +1163,28 @@ def compare_snapshots(
                 continue
             snapshot = new or old
             assert snapshot is not None
-            evidence = [
+            old_evidence = old["evidence"] if old else []
+            new_evidence = new["evidence"] if new else []
+            evidence: list[DiffEvidence] = [
                 {
                     "fingerprint": item["fingerprint"],
                     "path": item["path"],
                     "role": before_role,
                     "side": "before",
                 }
-                for item in (old or {}).get("evidence", [])
-            ] + [
+                for item in old_evidence
+            ]
+            evidence.extend(
+                [
                 {
                     "fingerprint": item["fingerprint"],
                     "path": item["path"],
                     "role": after_role,
                     "side": "after",
                 }
-                for item in (new or {}).get("evidence", [])
-            ]
+                    for item in new_evidence
+                ]
+            )
             rows.append(
                 {
                     "affected_base_identity": snapshot["affected_base_identity"],
@@ -1141,10 +1236,10 @@ def analyze_role_union(
     representations: dict[tuple[str, str], str] | None = None,
     *,
     source_generation_id: str = "",
-    main_config_indexes: dict[str, dict[str, list[dict[str, Any]]]] | None = None,
+    main_config_indexes: dict[str, dict[str, list[MainMatch]]] | None = None,
     raw_rows: list[dict[str, str]] | None = None,
-    cancelled: callable | None = None,
-) -> dict[str, Any]:
+    cancelled: Callable[[], bool] | None = None,
+) -> dict[str, object]:
     """Return deterministic core facts ready for version-2 serializers."""
     snapshots, loaded = _role_snapshots(
         role_components,
@@ -1172,10 +1267,10 @@ def analyze_role_union(
         "vendor_baseline",
         "next_vendor",
     )
-    bindings = []
+    bindings: list[dict[str, str | bool]] = []
     for role in ROLES:
         for uuid in sorted(role_components[role]):
-            root, representation, manifest, raw = loaded[(role, _fold(uuid))]
+            _root, representation, manifest, raw = loaded[(role, _fold(uuid))]
             bindings.append(
                 {
                     "active": bool(manifest.get("active")),
@@ -1190,7 +1285,7 @@ def analyze_role_union(
                 }
             )
     details = sorted(customer + target, key=lambda item: (item["comparison_id"], item["stable_diff_id"]))
-    dependencies = []
+    dependencies: list[Dependency] = []
     indexes = main_config_indexes or {}
     extension_identities = {
         role: {
@@ -1212,17 +1307,17 @@ def analyze_role_union(
             else [detail["before_role"], detail["after_role"]]
         )
         for role in roles:
-            snapshot = next(
+            snapshot: Snapshot | None = next(
                 (
                     item
                     for item in snapshots[role].get(detail["extension_uuid"], [])
                     if item["intervention_key"] == detail["intervention_key"]
                 ),
-                {},
+                None,
             )
-            dependency_reference = snapshot.get("dependency_source_reference") or reference
+            dependency_reference = (snapshot["dependency_source_reference"] if snapshot else "") or reference
             name_matches = indexes.get(role, {}).get(_fold(dependency_reference), [])
-            mapping_matches = indexes.get(role, {}).get(snapshot.get("mapping_identity", ""), [])
+            mapping_matches = indexes.get(role, {}).get(snapshot["mapping_identity"] if snapshot else "", [])
             matches_by_value = {
                 canonical_json(item): item
                 for item in (
@@ -1238,14 +1333,14 @@ def analyze_role_union(
                 dependency_reference,
                 list(matches_by_value.values()),
                 [{"identity": reference}] if _fold(reference) in extension_identities[role] else [],
-                snapshot.get("dependency_structural_fingerprint", ""),
+                snapshot["dependency_structural_fingerprint"] if snapshot else "",
             )
             dependencies.append(dependency)
             detail["dependency_ids"].append(dependency["dependency_id"])
             if dependency["diagnostic_code"]:
                 detail["diagnostic_codes"] = sorted(set(detail["diagnostic_codes"] + [dependency["diagnostic_code"]]))
         detail["dependency_ids"].sort()
-    semantic_rows = []
+    semantic_rows: list[dict[str, str]] = []
     for detail in details:
         evidence = detail["evidence"]
         first_path = evidence[0]["path"] if evidence else ""
@@ -1268,8 +1363,8 @@ def analyze_role_union(
                 "stable_diff_id": detail["stable_diff_id"],
             }
         )
-    coverage = []
-    unaccounted_paths = []
+    coverage: list[dict[str, str]] = []
+    unaccounted_paths: list[str] = []
     semantic_owners: dict[tuple[str, str], set[str]] = {}
     for detail in details:
         for item in detail["evidence"]:
@@ -1311,7 +1406,7 @@ def analyze_role_union(
     }
 
 
-def target_coverage(customer: dict[str, Any], target_diffs: list[dict[str, Any]]) -> dict[str, str]:
+def target_coverage(customer: Detail, target_diffs: list[Detail]) -> dict[str, str]:
     candidates = [row for row in target_diffs if row["intervention_key"] == customer["intervention_key"]]
     if customer.get("diagnostic_codes") or any(row.get("diagnostic_codes") for row in candidates):
         coverage = "needs_semantic_review"

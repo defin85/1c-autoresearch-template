@@ -10,13 +10,16 @@
 
 from __future__ import annotations
 
-import csv
 import json
-from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+import importlib
+from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import CancelledError, FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from threading import Event
-from typing import Any, Callable, Iterable, Literal, TypedDict
+from typing import Protocol, TypeVar, TypedDict, runtime_checkable
+
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from .agents import (
     CONSOLIDATION_REDUCED_FIELDS,
@@ -25,8 +28,8 @@ from .agents import (
     CONTEXT_SELECTION_POLICIES,
     proposal_schema,
 )
-from .contracts import canonical_json, sha256
-from .mrq_batches import MAX_BATCH_SIZE, MRQBatch, batch_id, load_active, publish as publish_batches, source_mrq_payload, stable_windows
+from .contracts import JsonValue, canonical_json, json_array, json_object, parse_json, sha256
+from .mrq_batches import MAX_BATCH_SIZE, MRQBatch, MRQRecord, batch_id, load_active, publish as publish_batches, source_mrq_payload, stable_windows
 
 
 # -- зафиксированные лимиты (design.md §2) ---------------------------------
@@ -35,15 +38,105 @@ MAX_DIF_WINDOW = 32
 MAX_GROUP_CANDIDATES = 64
 
 
+def _object(value: object) -> dict[str, JsonValue]:
+    return json_object(value)
+
+
+def _string(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("expected string")
+    return value
+
+
+def _integer(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("expected integer")
+    return value
+
+
+def _ordered_pair(left: str, right: str) -> tuple[str, str]:
+    return (left, right) if left <= right else (right, left)
+
+
+def _strings(value: object) -> list[str]:
+    items = json_array(value)
+    if not all(isinstance(item, str) for item in items):
+        raise ValueError("expected string array")
+    return [item for item in items if isinstance(item, str)]
+
+
+def _objects(value: object) -> list[dict[str, JsonValue]]:
+    return [_object(item) for item in json_array(value)]
+
+
+def _json(value: object) -> JsonValue:
+    return parse_json(canonical_json(value).decode())
+
+
+class AgentExecutor(Protocol):
+    def __call__(
+        self,
+        repo: Path,
+        selected_profile: dict[str, JsonValue],
+        operation: str,
+        work_unit: dict[str, JsonValue],
+        supplement: str,
+        timeout: int,
+        cancelled: Callable[[], bool],
+    ) -> dict[str, JsonValue]: ...
+
+
+class RolePolicy(TypedDict):
+    role_id: str
+    count: int
+    instruction_supplement: str
+
+
+class PhasePolicy(TypedDict):
+    max_concurrency: int
+    roles: list[RolePolicy]
+
+
+def _phase_policy(value: object) -> PhasePolicy:
+    raw = _object(value)
+    roles = _objects(raw.get("roles", []))
+    return {
+        "max_concurrency": _integer(raw.get("max_concurrency")),
+        "roles": [
+            {
+                "role_id": _string(role.get("role_id")),
+                "count": _integer(role.get("count")),
+                "instruction_supplement": _string(role.get("instruction_supplement", "")),
+            }
+            for role in roles
+        ],
+    }
+
+
 # -- типизированные состояния графов --------------------------------------
 
 
 class AnalyzeResult(TypedDict, total=False):
     stable_diff_id: str
-    kind: Literal["meaning", "noise"]
-    proposal: dict[str, Any]
-    evidence: list[dict[str, Any]]
+    kind: str
+    proposal: dict[str, JsonValue]
+    evidence: list[dict[str, JsonValue]]
+    semantic_hints: JsonValue
     rationale: str
+
+
+def _analyze_result(value: object) -> AnalyzeResult:
+    raw = _object(value)
+    result = AnalyzeResult(
+        stable_diff_id=_string(raw.get("stable_diff_id", "")),
+        kind=_string(raw.get("kind", "")),
+        proposal=_object(raw.get("proposal", {})),
+        evidence=_objects(raw.get("evidence", [])),
+        rationale=_string(raw.get("rationale", "")),
+    )
+    if "semantic_hints" in raw:
+        result["semantic_hints"] = raw["semantic_hints"]
+    return result
 
 
 class GroupProposal(TypedDict, total=False):
@@ -52,7 +145,7 @@ class GroupProposal(TypedDict, total=False):
     title: str
     stable_diff_ids: list[str]
     supporting_diff_ids: list[str]
-    evidence: list[dict[str, Any]]
+    evidence: list[dict[str, JsonValue]]
     business_meaning: str
     scope: str
     confidence: str
@@ -75,21 +168,22 @@ class DiscoverState(TypedDict, total=False):
     run_id: str
     window: list[str]  # стабильный порядок DIF в окне
     analyzed: dict[str, AnalyzeResult]
-    analyze_results: dict[str, dict[str, Any]]
+    analyze_results: dict[str, dict[str, JsonValue]]
     meanings: list[str]  # упорядоченные смысловые DIF
     noise: list[str]
     noise_review_ids: list[str]
     approved_noise_ids: list[str]
-    approved_noise: list[dict[str, Any]]
+    approved_noise: list[dict[str, JsonValue]]
     preliminary_groups: dict[str, GroupProposal]  # anchor_diff_id -> proposal
-    form_mrq_results: dict[str, dict[str, Any]]
+    form_mrq_results: dict[str, dict[str, JsonValue]]
     barrier_open: bool
     batch_proposals: list[GroupProposal]
-    approved_batch: dict[str, Any] | None
+    approved_batch: dict[str, JsonValue] | None
     published_mrq_ids: list[str]
-    target_batches: list[dict[str, Any]]
+    target_batches: list[dict[str, JsonValue]]
+    consolidation_plan: dict[str, JsonValue] | None
     status: str
-    blocker: dict[str, Any] | None
+    blocker: dict[str, JsonValue] | None
 
 
 class DecideState(TypedDict, total=False):
@@ -109,12 +203,12 @@ class DecideState(TypedDict, total=False):
     run_id: str
     batch_id: str | None
     batch_mrqs: list[str]
-    findings: dict[str, list[dict[str, Any]]]
-    research_results: dict[str, dict[str, Any]]
-    decision_proposal: dict[str, Any] | None
-    approved_decision: dict[str, Any] | None
+    findings: dict[str, list[dict[str, JsonValue]]]
+    research_results: dict[str, dict[str, JsonValue]]
+    decision_proposal: dict[str, JsonValue] | None
+    approved_decision: dict[str, JsonValue] | None
     status: str
-    blocker: dict[str, Any] | None
+    blocker: dict[str, JsonValue] | None
 
 
 class ClassifyState(TypedDict, total=False):
@@ -131,24 +225,66 @@ class ClassifyState(TypedDict, total=False):
     thread_id: str
     run_id: str
     source_mrq_fingerprint: str
-    batches: list[dict[str, Any]]
-    batch_generation: dict[str, Any] | None
+    batches: list[dict[str, JsonValue]]
+    batch_generation: dict[str, JsonValue] | None
     published: bool
     status: str
-    blocker: dict[str, Any] | None
+    blocker: dict[str, JsonValue] | None
+
+
+StateT = TypeVar("StateT", DiscoverState, DecideState, ClassifyState, contravariant=True)
+ResultT = TypeVar("ResultT")
+
+
+class CompiledGraph(Protocol[StateT]):
+    def invoke(self, input: StateT, config: RunnableConfig | None = None) -> object: ...
+
+
+BuilderStateT = TypeVar("BuilderStateT", DiscoverState, DecideState, ClassifyState)
+
+
+class StateGraphBuilder(Protocol[BuilderStateT]):
+    def add_node(
+        self,
+        node: str,
+        action: Callable[[BuilderStateT], BuilderStateT],
+    ) -> object: ...
+
+    def add_edge(self, start_key: str, end_key: str) -> object: ...
+
+    def compile(
+        self,
+        checkpointer: BaseCheckpointSaver[str] | bool | None = None,
+    ) -> CompiledGraph[BuilderStateT]: ...
+
+
+class StateGraphFactory(Protocol):
+    def __call__(
+        self,
+        state_schema: type[BuilderStateT],
+    ) -> StateGraphBuilder[BuilderStateT]: ...
+
+
+@runtime_checkable
+class GraphModule(Protocol):
+    START: str
+    END: str
+    StateGraph: StateGraphFactory
+
+
+def _graph_module() -> GraphModule:
+    module = importlib.import_module("langgraph.graph")
+    if not isinstance(module, GraphModule):
+        raise RuntimeError("langgraph.graph has an incompatible runtime interface")
+    return module
 
 
 # -- helpers --------------------------------------------------------------
 
 
 def _read_diff_inventory(repo: Path) -> list[dict[str, str]]:
-    pointer = json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
-    path = repo / "analysis/indexes/generations" / pointer["generation_id"] / "diff-inventory.csv"
-    if not path.is_file():
-        return []
-    with path.open(encoding="utf-8", newline="") as stream:
-        return [row for row in csv.DictReader(stream) if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"]
-
+    from .workflow import read_diff_inventory
+    return read_diff_inventory(repo)
 
 def _owned_diff_ids(repo: Path) -> set[str]:
     """Возвращает DIF с первичной дислокацией (MRQ или утверждённым шумом)."""
@@ -175,13 +311,6 @@ def select_dif_window(repo: Path, *, limit: int = MAX_DIF_WINDOW) -> list[str]:
     return [identifier for identifier in customer if identifier not in owned][:limit]
 
 
-def _ensure_active_generation(repo: Path) -> dict[str, Any]:
-    try:
-        return json.loads((repo / "research/active-generation.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("invalid research/active-generation.json pointer") from exc
-
-
 def _stable_group_candidates(anchor: str, meanings: list[str], inventory: dict[str, dict[str, str]], *, limit: int = MAX_GROUP_CANDIDATES) -> list[str]:
     """Формирует область кандидатов группы по проверяемым связям исходников.
 
@@ -205,22 +334,22 @@ def _bounded_map(
     *,
     max_concurrency: int,
     slot_count: int,
-    function: Callable[[str], Any],
+    function: Callable[[str], ResultT],
     cancelled: Callable[[], bool],
     bindings_check: Callable[[], bool],
     cancel_active: Callable[[], None] = lambda: None,
-) -> tuple[dict[str, Any], dict[str, str], bool]:
+) -> tuple[dict[str, ResultT], dict[str, str], bool]:
     """Выполняет только ограниченное окно и прекращает выдачу после первой ошибки."""
 
     limit = min(max_concurrency, slot_count, len(items))
     if limit <= 0:
         return {}, {}, cancelled() or not bindings_check()
     iterator = iter(items)
-    results: dict[str, Any] = {}
+    results: dict[str, ResultT] = {}
     errors: dict[str, str] = {}
     stopped = False
     pool = ThreadPoolExecutor(max_workers=limit)
-    active: dict[Any, str] = {}
+    active: dict[Future[ResultT], str] = {}
     try:
         while len(active) < limit and not cancelled() and bindings_check():
             try:
@@ -240,7 +369,7 @@ def _bounded_map(
             if errors or stopped:
                 cancel_active()
                 for future in active:
-                    future.cancel()
+                    _ = future.cancel()
                 while active:
                     completed, _ = wait(active, return_when=FIRST_COMPLETED)
                     for future in completed:
@@ -264,14 +393,21 @@ def _bounded_map(
     return results, errors, stopped
 
 
-def _result_envelope(state: dict[str, Any], phase_id: str, role_id: str, work_unit: dict[str, Any], result: Any, instruction_version: str = "") -> dict[str, Any]:
+def _result_envelope(
+    state: Mapping[str, object],
+    phase_id: str,
+    role_id: str,
+    work_unit: dict[str, JsonValue],
+    result: object,
+    instruction_version: str = "",
+) -> dict[str, JsonValue]:
     operation = "mrq.decide-next" if phase_id == "research-target" else "mrq.classify-batches" if phase_id == "classify-batches" else "dif.classify-next" if state.get("job_id") == "analyze-dif" else "mrq.consolidate" if state.get("job_id") == "consolidate-mrq" else "mrq.discover-next"
     compatibility = {
         "operation": operation,
         "phase_id": phase_id,
         "role_id": role_id,
         "work_unit": work_unit,
-        "allowed_paths": sorted(work_unit.get("allowed_paths", [])),
+        "allowed_paths": sorted(_strings(work_unit.get("allowed_paths", []))),
         "selected_path_manifest": work_unit.get("allowed_path_fingerprints", []),
         "context_contract_version": CONTEXT_CONTRACT_VERSION,
         "context_estimator_version": CONTEXT_ESTIMATOR_VERSION,
@@ -284,28 +420,28 @@ def _result_envelope(state: dict[str, Any], phase_id: str, role_id: str, work_un
         ),
         "validator_version": "agent-phase-result/v1",
     }
-    return {
+    return _object({
         "source_run_id": state["run_id"],
         "source_execution_snapshot_fingerprint": state.get("execution_snapshot_fingerprint", ""),
         "compatibility": compatibility,
         "compatibility_fingerprint": "sha256:" + sha256(canonical_json(compatibility)),
         "result_fingerprint": "sha256:" + sha256(canonical_json(result)),
-        "result": result,
-    }
+        "result": _json(result),
+    })
 
 
 def _compatible_cached(
-    envelope: dict[str, Any] | None,
-    expected: dict[str, Any],
+    envelope: dict[str, JsonValue] | None,
+    expected: dict[str, JsonValue],
     required_origin: dict[str, str] | None = None,
-) -> Any | None:
+) -> object | None:
     if not isinstance(envelope, dict):
         return None
     if envelope.get("compatibility_fingerprint") != expected["compatibility_fingerprint"]:
         source = envelope.get("compatibility")
         target = expected["compatibility"]
         field = "legacy_result_metadata"
-        if isinstance(source, dict):
+        if isinstance(source, dict) and isinstance(target, dict):
             field = next(
                 (
                     key for key in (
@@ -333,28 +469,29 @@ def _compatible_cached(
 # -- этапы discover-mrq ---------------------------------------------------
 
 
-def _analyze_work_unit(repo: Path, stable_diff_id: str) -> dict[str, Any]:
+def _analyze_work_unit(repo: Path, stable_diff_id: str) -> dict[str, JsonValue]:
     from .workflow import semantic_diff_context
     from .agents import build_context_manifest
     fact = next((row for row in _read_diff_inventory(repo) if row["stable_diff_id"] == stable_diff_id), None)
-    unit = {"id": stable_diff_id, "kind": "uncovered-diff", **semantic_diff_context(repo, stable_diff_id, fact)}
+    semantic_fact = _object(fact) if fact is not None else None
+    unit: dict[str, JsonValue] = {"id": stable_diff_id, "kind": "uncovered-diff", **_object(semantic_diff_context(repo, stable_diff_id, semantic_fact))}
     return {**unit, "allowed_path_fingerprints": build_context_manifest(repo, unit)["paths"]}
 
 
-def _group_work_unit(state: DiscoverState, anchor: str, repo: Path) -> dict[str, Any]:
+def _group_work_unit(state: DiscoverState, anchor: str, repo: Path) -> dict[str, JsonValue]:
     meanings = list(state.get("meanings", []))
     inventory = {row["stable_diff_id"]: row for row in _read_diff_inventory(repo)}
     candidates = _stable_group_candidates(anchor, meanings, inventory)
     from .workflow import semantic_diff_context
-    semantic = [semantic_diff_context(repo, identifier, inventory[identifier]) for identifier in candidates if inventory.get(identifier, {}).get("object_kind") == "extension_intervention"]
-    unit = {
+    semantic = [_object(semantic_diff_context(repo, identifier, _object(inventory[identifier]))) for identifier in candidates if inventory.get(identifier, {}).get("object_kind") == "extension_intervention"]
+    unit: dict[str, JsonValue] = {
         "id": anchor,
         "kind": "preliminary-group",
         "candidate_diff_ids": candidates,
         "semantic_extension_context": semantic,
         "allowed_paths": sorted(
             {str(inventory[identifier]["path"]) for identifier in candidates if inventory.get(identifier, {}).get("path")}
-            | {path for context in semantic for path in context["allowed_paths"]}
+            | {path for context in semantic for path in _strings(context["allowed_paths"])}
         ),
     }
     from .agents import build_context_manifest
@@ -374,7 +511,7 @@ def discover_select_window(state: DiscoverState, *, repo: Path) -> DiscoverState
     return {**state, "window": window, "status": "running"}
 
 
-def discover_analyze_one(state: DiscoverState, stable_diff_id: str, *, executor: Callable[..., dict[str, Any]], repo: Path, profile: dict[str, Any], supplement: str, timeout_seconds: int, cancelled: Callable[[], bool], bindings_check: Callable[[], bool], operation: str = "mrq.discover-next") -> DiscoverState:
+def discover_analyze_one(state: DiscoverState, stable_diff_id: str, *, executor: AgentExecutor, repo: Path, profile: dict[str, JsonValue], supplement: str, timeout_seconds: int, cancelled: Callable[[], bool], bindings_check: Callable[[], bool], operation: str = "mrq.discover-next") -> DiscoverState:
     """Этап 2: один вызов агента для DIF. Возвращает обновлённое состояние.
 
     Параллелизм ограничивается координатором/``AddDynamicEdges``; эта функция
@@ -391,7 +528,7 @@ def discover_analyze_one(state: DiscoverState, stable_diff_id: str, *, executor:
         "kind": str(payload.get("classification")) if operation == "dif.classify-next" else ("meaning" if payload.get("semantic_key") else "noise"),
         "semantic_hints": payload.get("semantic_hints", []),
         "proposal": payload,
-        "evidence": payload.get("evidence", []),
+        "evidence": _objects(payload.get("evidence", [])),
         "rationale": str(payload.get("rationale", "")),
     }
     analyzed = dict(state.get("analyzed", {}))
@@ -399,7 +536,7 @@ def discover_analyze_one(state: DiscoverState, stable_diff_id: str, *, executor:
     meanings = list(state.get("meanings", []))
     noise = list(state.get("noise", []))
     if stable_diff_id not in meanings and stable_diff_id not in noise:
-        if result["kind"] == "meaning":
+        if result.get("kind") == "meaning":
             meanings.append(stable_diff_id)
         else:
             noise.append(stable_diff_id)
@@ -408,14 +545,7 @@ def discover_analyze_one(state: DiscoverState, stable_diff_id: str, *, executor:
     return {**state, "analyzed": analyzed, "meanings": meanings, "noise": noise}
 
 
-def _path_for(repo: Path, stable_diff_id: str) -> str:
-    for row in _read_diff_inventory(repo):
-        if row["stable_diff_id"] == stable_diff_id:
-            return str(row.get("path", ""))
-    return ""
-
-
-def discover_preliminary_group(state: DiscoverState, anchor: str, *, executor: Callable[..., dict[str, Any]], repo: Path, profile: dict[str, Any], supplement: str, timeout_seconds: int, cancelled: Callable[[], bool]) -> DiscoverState:
+def discover_preliminary_group(state: DiscoverState, anchor: str, *, executor: AgentExecutor, repo: Path, profile: dict[str, JsonValue], supplement: str, timeout_seconds: int, cancelled: Callable[[], bool]) -> DiscoverState:
     """Этап 3: формирование/обновление предварительной группы для опорного DIF.
 
     Группы операционны: не создают владения и могут быть вытеснены новым полным
@@ -428,9 +558,9 @@ def discover_preliminary_group(state: DiscoverState, anchor: str, *, executor: C
         "anchor_diff_id": anchor,
         "semantic_key": str(proposal_payload.get("semantic_key", "")),
         "title": str(proposal_payload.get("title", proposal_payload.get("semantic_key", ""))),
-        "stable_diff_ids": list(proposal_payload.get("stable_diff_ids", [anchor])),
-        "supporting_diff_ids": list(proposal_payload.get("supporting_diff_ids", [])),
-        "evidence": list(proposal_payload.get("evidence", [])),
+        "stable_diff_ids": _strings(proposal_payload.get("stable_diff_ids", [anchor])),
+        "supporting_diff_ids": _strings(proposal_payload.get("supporting_diff_ids", [])),
+        "evidence": _objects(proposal_payload.get("evidence", [])),
         "business_meaning": str(proposal_payload.get("business_meaning", "")),
         "scope": str(proposal_payload.get("scope", "")),
         "confidence": str(proposal_payload.get("confidence", "medium")),
@@ -457,7 +587,6 @@ def discover_barrier(state: DiscoverState, *, repo: Path) -> DiscoverState:
         if row["stable_diff_id"] not in owned
     ]
     customer_set = set(customer)
-    analyzed = state.get("analyzed", {})
     meanings = set(state.get("meanings", []))
     noise = set(state.get("noise", []))
     classified = meanings | noise
@@ -472,11 +601,10 @@ def discover_barrier(state: DiscoverState, *, repo: Path) -> DiscoverState:
         referenced.update(proposal.get("supporting_diff_ids", []))
         evidence = proposal.get("evidence", [])
         if not evidence or any(
-            not isinstance(item, dict)
-            or not isinstance(item.get("path"), str)
+            not isinstance(item.get("path"), str)
             or not item["path"]
             or not isinstance(item.get("fingerprint"), str)
-            or not item["fingerprint"].startswith("sha256:")
+            or not _string(item["fingerprint"]).startswith("sha256:")
             for item in evidence
         ):
             return {**state, "barrier_open": False, "status": "failed", "blocker": {"code": "dispatcher.barrier.evidence", "message": "every group requires path and content fingerprint evidence", "action": "mrq.discover-next"}}
@@ -535,7 +663,7 @@ def discover_review_noise(
 
 def discover_batch_from_groups(
     state: DiscoverState,
-    approved_noise: list[dict[str, Any]] | None = None,
+    approved_noise: list[dict[str, JsonValue]] | None = None,
 ) -> DiscoverState:
     """Этап 5: сборка одобряемого пакета групп из предварительных."""
 
@@ -545,52 +673,53 @@ def discover_batch_from_groups(
     return {
         **state,
         "batch_proposals": batch_proposals,
-        "approved_noise_ids": [item["stable_diff_id"] for item in reviewed],
+        "approved_noise_ids": [_string(item["stable_diff_id"]) for item in reviewed],
         "approved_noise": reviewed,
     }
 
 
-def discover_publish_batch(state: DiscoverState, *, repo: Path, apply: Callable[[str, dict[str, Any]], dict[str, Any]], approved_noise_payload: list[dict[str, Any]]) -> DiscoverState:
+def discover_publish_batch(state: DiscoverState, *, repo: Path, apply: Callable[[str, dict[str, JsonValue]], dict[str, JsonValue]], approved_noise_payload: list[dict[str, JsonValue]]) -> DiscoverState:
     """Этап 6: применение одобренного пакета через ``mrq.publish-source-batch``.
 
     Вызывается только после явного одобрения локальным пользователем.
     Атомарность гарантируется прикладным сервисом под репозиторной блокировкой.
     """
 
+    _ = repo
     groups = state.get("batch_proposals", [])
     payload = {
         "approved_noise": approved_noise_payload,
         "group_proposals": [
             {
-                "semantic_key": group["semantic_key"],
-                "title": group.get("title", group["semantic_key"]),
-                "stable_diff_ids": list(group["stable_diff_ids"]),
+                "semantic_key": _string(group.get("semantic_key", "")),
+                "title": _string(group.get("title", group.get("semantic_key", ""))),
+                "stable_diff_ids": list(group.get("stable_diff_ids", [])),
                 "supporting_diff_ids": list(group.get("supporting_diff_ids", [])),
                 "evidence": list(group.get("evidence", [])),
-                "business_meaning": group["business_meaning"],
-                "scope": group["scope"],
-                "confidence": group["confidence"],
-                "rationale": group["rationale"],
+                "business_meaning": _string(group.get("business_meaning", "")),
+                "scope": _string(group.get("scope", "")),
+                "confidence": _string(group.get("confidence", "")),
+                "rationale": _string(group.get("rationale", "")),
             }
             for group in groups
         ],
     }
-    result = apply("mrq.publish-source-batch", payload)
-    return {**state, "published_mrq_ids": result.get("mrq_ids", []), "status": "running"}
+    result = apply("mrq.publish-source-batch", _object(payload))
+    return {**state, "published_mrq_ids": _strings(result.get("mrq_ids", [])), "status": "running"}
 
 
-def build_classify_state(bindings: dict[str, Any], run_id: str, thread_id: str) -> ClassifyState:
+def build_classify_state(bindings: dict[str, JsonValue], run_id: str, thread_id: str) -> ClassifyState:
     return ClassifyState(
-        project_id=bindings["project_id"],
-        job_id=bindings["job_id"],
-        work_unit_id=bindings["work_unit_id"],
-        source_generation_id=bindings["source_generation_id"],
-        diff_generation_id=bindings["diff_generation_id"],
-        canonical_generation_id=bindings["canonical_generation_id"],
-        workflow_fingerprint=bindings["workflow_fingerprint"],
-        agent_profile_fingerprint=bindings["agent_profile_fingerprint"],
-        instruction_supplement=bindings["instruction_supplement"],
-        execution_snapshot_fingerprint=bindings.get("execution_snapshot_fingerprint", ""),
+        project_id=_string(bindings["project_id"]),
+        job_id=_string(bindings["job_id"]),
+        work_unit_id=_string(bindings["work_unit_id"]),
+        source_generation_id=_string(bindings["source_generation_id"]),
+        diff_generation_id=_string(bindings["diff_generation_id"]),
+        canonical_generation_id=_string(bindings["canonical_generation_id"]),
+        workflow_fingerprint=_string(bindings["workflow_fingerprint"]),
+        agent_profile_fingerprint=_string(bindings["agent_profile_fingerprint"]),
+        instruction_supplement=_string(bindings["instruction_supplement"]),
+        execution_snapshot_fingerprint=_string(bindings.get("execution_snapshot_fingerprint", "")),
         thread_id=thread_id,
         run_id=run_id,
         source_mrq_fingerprint="",
@@ -602,7 +731,7 @@ def build_classify_state(bindings: dict[str, Any], run_id: str, thread_id: str) 
     )
 
 
-def _validated_window_batches(window: list[dict[str, Any]], response: dict[str, Any]) -> list[MRQBatch]:
+def _validated_window_batches(window: list[MRQRecord], response: dict[str, JsonValue]) -> list[MRQBatch]:
     if set(response) != {"groups"}:
         raise ValueError("classifier response must contain only groups")
     groups = response.get("groups")
@@ -612,25 +741,24 @@ def _validated_window_batches(window: list[dict[str, Any]], response: dict[str, 
     covered: list[str] = []
     batches: list[MRQBatch] = []
     by_id = {record["mrq_id"]: record for record in window}
-    for group in groups:
+    for group in _objects(groups):
         if (
-            not isinstance(group, dict)
-            or set(group) != {"mrq_ids", "basis", "linkage_proven"}
+            set(group) != {"mrq_ids", "basis", "linkage_proven"}
             or not isinstance(group.get("mrq_ids"), list)
             or not isinstance(group.get("basis"), str)
             or not isinstance(group.get("linkage_proven"), bool)
         ):
             raise ValueError("classifier group has invalid structure")
-        identifiers = sorted(str(value) for value in group["mrq_ids"])
+        identifiers = sorted(_strings(group["mrq_ids"]))
         if not identifiers or len(identifiers) > MAX_BATCH_SIZE or any(value not in expected for value in identifiers):
             raise ValueError("classifier group references invalid MRQ set")
         covered.extend(identifiers)
         if group.get("linkage_proven") is not True and len(identifiers) > 1:
             for identifier in identifiers:
                 record = by_id[identifier]
-                batches.append(MRQBatch(batch_id([identifier]), (identifier,), "standalone MRQ without provable linkage", tuple(record["source_component_ids"])))
+                batches.append(MRQBatch(batch_id([identifier]), (identifier,), "standalone MRQ without provable linkage", tuple(_strings(record["source_component_ids"]))))
             continue
-        components = tuple(sorted({component for identifier in identifiers for component in by_id[identifier]["source_component_ids"]}))
+        components = tuple(sorted({component for identifier in identifiers for component in _strings(by_id[identifier]["source_component_ids"])}))
         basis = str(group.get("basis") or "").strip()
         if not basis:
             raise ValueError("classifier group basis is required")
@@ -643,24 +771,25 @@ def _validated_window_batches(window: list[dict[str, Any]], response: dict[str, 
 def compile_classify_graph(
     *,
     repo: Path,
-    saver: Any,
-    executor: Callable[..., dict[str, Any]],
-    profile: dict[str, Any],
+    saver: BaseCheckpointSaver[str],
+    executor: AgentExecutor,
+    profile: dict[str, JsonValue],
     supplement: str,
     timeout_seconds: int,
     cancelled: Callable[[], bool],
     bindings_check: Callable[[], bool],
-    phase_policy: dict[str, Any] | None = None,
-    profiles_by_role: dict[str, dict[str, Any]] | None = None,
-    load_result: Callable[[str], dict[str, Any] | None] | None = None,
-    save_result: Callable[[str, dict[str, Any]], None] | None = None,
+    phase_policy: dict[str, JsonValue] | None = None,
+    profiles_by_role: dict[str, dict[str, JsonValue]] | None = None,
+    load_result: Callable[[str], dict[str, JsonValue] | None] | None = None,
+    save_result: Callable[[str, dict[str, JsonValue]], None] | None = None,
     register_work: Callable[[str, str, list[str]], None] | None = None,
     reuse_work: Callable[[str, str, str], None] | None = None,
-    record_work: Callable[[str, str, str, str, str, dict[str, Any]], None] | None = None,
-):
+    record_work: Callable[[str, str, str, str, str, dict[str, JsonValue]], None] | None = None,
+) -> CompiledGraph[ClassifyState]:
     """Компилирует последовательную классификацию стабильных окон MRQ."""
 
-    from langgraph.graph import END, START, StateGraph
+    graph_module = _graph_module()
+    END, START, StateGraph = graph_module.END, graph_module.START, graph_module.StateGraph
 
     def classify_windows(state: ClassifyState) -> ClassifyState:
         if cancelled():
@@ -673,7 +802,7 @@ def compile_classify_graph(
         _generation_id, fingerprint, records = source_mrq_payload(repo)
         windows = stable_windows(records)
         classifier_profile = (profiles_by_role or {}).get("classifier", profile)
-        policy = phase_policy or {"max_concurrency": 1, "roles": [{"role_id": "classifier", "count": 1, "instruction_supplement": supplement}]}
+        policy = _phase_policy(phase_policy or {"max_concurrency": 1, "roles": [{"role_id": "classifier", "count": 1, "instruction_supplement": supplement}]})
         classifier_supplement = next(role.get("instruction_supplement", "") for role in policy["roles"] if role["role_id"] == "classifier")
         if register_work:
             register_work("classify-batches", "classifier", [f"window:{index}" for index in range(len(windows))])
@@ -689,8 +818,9 @@ def compile_classify_graph(
                 "kind": "mrq-batch-window",
                 "source_mrq_fingerprint": fingerprint,
                 "mrqs": window,
-                "allowed_paths": sorted({evidence["path"] for record in window for evidence in record["source_evidence"]}),
+                "allowed_paths": sorted({_string(evidence["path"]) for record in window for evidence in record["source_evidence"]}),
             }
+            work_unit = _object(work_unit)
             expected = _result_envelope(
                 state, "classify-batches", "classifier", work_unit, None,
                 str(classifier_profile.get("instructions_version", "")),
@@ -701,7 +831,7 @@ def compile_classify_graph(
                 state.get("required_reuse_origin"),
             )
             if cached is not None:
-                batches.extend(_validated_window_batches(window, cached))
+                batches.extend(_validated_window_batches(window, _object(cached)))
                 if reuse_work:
                     reuse_work("classify-batches", "classifier", f"window:{index}")
                 continue
@@ -709,7 +839,7 @@ def compile_classify_graph(
                 record_work(
                     "classify-batches", "classifier", f"window:{index}",
                     "provider", "queued",
-                    {"reuse": {"status": "incompatible", **expected["reuse_incompatibility"]}},
+                    {"reuse": {"status": "incompatible", **_object(expected["reuse_incompatibility"])}},
                 )
             response = executor(repo, classifier_profile, "mrq.classify-batches", work_unit, classifier_supplement, timeout_seconds, cancelled)
             batches.extend(_validated_window_batches(window, response))
@@ -729,84 +859,56 @@ def compile_classify_graph(
         return {**state, "source_mrq_fingerprint": fingerprint, "batches": [batch.canonical_payload() for batch in batches], "batch_generation": binding, "published": True, "status": "completed", "blocker": None}
 
     graph = StateGraph(ClassifyState)
-    graph.add_node("classify-batches", classify_windows)
-    graph.add_edge(START, "classify-batches")
-    graph.add_edge("classify-batches", END)
+    _ = graph.add_node("classify-batches", classify_windows)
+    _ = graph.add_edge(START, "classify-batches")
+    _ = graph.add_edge("classify-batches", END)
     return graph.compile(checkpointer=saver)
 
 
 # -- этапы decide-mrq -----------------------------------------------------
 
-def _decision_mrqs(repo: Path) -> list[dict[str, Any]]:
-    """Строит вход этапа 5 из агрегатного поколения MRQ и решений."""
-
-    if not (repo / "research/active-consolidation-generation.json").is_file():
-        # Совместимость только для ещё не мигрировавшего контракта v3.
-        from .mrq import active
-        return active(repo)["mrq.jsonl"]
-    from .consolidation import load_active
-    state = load_active(repo)
-    pointer = state["pointer"]
-    decisions: dict[str, dict[str, Any]] = {}
-    if pointer.get("decision_generation_id"):
-        from .decision_generations import validate_generation
-        decisions = {
-            row["mrq_id"]: row["decision"]
-            for row in validate_generation(
-                repo,
-                pointer["decision_generation_id"],
-                allowed_mrq_ids={row["mrq_id"] for row in state["mrq"]["mrq.jsonl"]},
-            )["decisions.jsonl"]
-        }
-    evidence: dict[str, list[dict[str, Any]]] = {}
-    for row in state["mrq"]["evidence.jsonl"]:
-        evidence.setdefault(row["mrq_id"], []).append({
-            "stable_diff_id": row["stable_diff_id"],
-            **row.get("payload", {}),
-        })
-    return [
-        {
-            **row,
-            "migration_decision": decisions.get(row["mrq_id"], {}),
-            "source_customization": {
-                "business_meaning": row.get("business_meaning", ""),
-                "scope": row.get("scope", ""),
-                "evidence": evidence.get(row["mrq_id"], []),
-            },
-        }
-        for row in state["mrq"]["mrq.jsonl"]
-    ]
-
+def _decision_mrqs(repo: Path) -> list[dict[str, JsonValue]]:
+    from .workflow import decision_mrqs
+    return decision_mrqs(repo)
 
 def decide_select_mrq(state: DecideState, *, repo: Path) -> DecideState:
     """Выбор следующего MRQ без решения (с привязкой к пакету исследования)."""
 
     rows = _decision_mrqs(repo)
-    pending = sorted((item for item in rows if item.get("state") not in {"superseded", "approved"} and not item.get("migration_decision", {}).get("decision")), key=lambda item: item["mrq_id"])
+    pending = sorted(
+        (
+            item for item in rows
+            if item.get("state") not in {"superseded", "approved"}
+            and not _object(item.get("migration_decision", {})).get("decision")
+        ),
+        key=lambda item: _string(item["mrq_id"]),
+    )
     if not pending:
         return {**state, "status": "completed", "blocker": None}
     target = pending[0]
-    batch_mrqs = state.get("batch_mrqs", []) or [target["mrq_id"]]
-    return {**state, "mrq_id": target["mrq_id"], "batch_mrqs": batch_mrqs, "status": "running"}
+    batch_mrqs = state.get("batch_mrqs", []) or [_string(target["mrq_id"])]
+    return {**state, "mrq_id": _string(target["mrq_id"]), "batch_mrqs": batch_mrqs, "status": "running"}
 
 
-def _research_work_unit(state: DecideState, mrq_id: str, repo: Path) -> dict[str, Any] | None:
+def _research_work_unit(state: DecideState, mrq_id: str, repo: Path) -> dict[str, JsonValue] | None:
     rows = _decision_mrqs(repo)
     target = next((item for item in rows if item["mrq_id"] == mrq_id), None)
     if target is None:
         return None
     batch_ids = state.get("batch_mrqs", [])
-    batch_context = [
-        {"mrq_id": item["mrq_id"], "semantic_key": item.get("semantic_key"), "title": item.get("title"), "business_meaning": item.get("source_customization", {}).get("business_meaning"), "scope": item.get("source_customization", {}).get("scope")}
+    batch_context: list[dict[str, JsonValue]] = [
+        {"mrq_id": item["mrq_id"], "semantic_key": item.get("semantic_key"), "title": item.get("title"), "business_meaning": _object(item.get("source_customization", {})).get("business_meaning"), "scope": _object(item.get("source_customization", {})).get("scope")}
         for item in rows
         if item["mrq_id"] in batch_ids
     ]
-    unit = {"id": mrq_id, "kind": "migration-decision", "mrq": target, "batch_context": batch_context, "allowed_paths": sorted({evidence["path"] for evidence in target.get("source_customization", {}).get("evidence", []) if evidence.get("path")})}
+    source_customization = _object(target.get("source_customization", {}))
+    evidence_rows = _objects(source_customization.get("evidence", []))
+    unit: dict[str, JsonValue] = {"id": mrq_id, "kind": "migration-decision", "mrq": target, "batch_context": batch_context, "allowed_paths": sorted({_string(evidence["path"]) for evidence in evidence_rows if evidence.get("path")})}
     from .agents import build_context_manifest
     return {**unit, "allowed_path_fingerprints": build_context_manifest(repo, unit)["paths"]}
 
 
-def decide_research_one(state: DecideState, mrq_id: str, *, executor: Callable[..., dict[str, Any]], repo: Path, profile: dict[str, Any], supplement: str, timeout_seconds: int, cancelled: Callable[[], bool], bindings_check: Callable[[], bool]) -> DecideState:
+def decide_research_one(state: DecideState, mrq_id: str, *, executor: AgentExecutor, repo: Path, profile: dict[str, JsonValue], supplement: str, timeout_seconds: int, cancelled: Callable[[], bool], bindings_check: Callable[[], bool]) -> DecideState:
     """Один вызов исследования цели. Запрещает менять исходную часть MRQ."""
 
     if not bindings_check():
@@ -814,7 +916,7 @@ def decide_research_one(state: DecideState, mrq_id: str, *, executor: Callable[.
     work_unit = _research_work_unit(state, mrq_id, repo)
     if work_unit is None:
         return {**state, "status": "failed", "blocker": {"code": "dispatcher.mrq.missing", "message": f"MRQ disappeared: {mrq_id}", "action": "mrq.decide-next"}}
-    target = work_unit["mrq"]
+    target = _object(work_unit["mrq"])
     payload = executor(repo, profile, "mrq.decide-next", work_unit, supplement, timeout_seconds, cancelled)
     # запрет изменения исходной части MRQ
     if payload.get("semantic_key") and payload["semantic_key"] != target.get("semantic_key"):
@@ -824,24 +926,24 @@ def decide_research_one(state: DecideState, mrq_id: str, *, executor: Callable[.
     return {**state, "findings": findings, "decision_proposal": payload, "status": "running"}
 
 
-def decide_apply(state: DecideState, *, apply: Callable[[str, dict[str, Any]], dict[str, Any]]) -> DecideState:
+def decide_apply(state: DecideState, *, apply: Callable[[str, dict[str, JsonValue]], dict[str, JsonValue]]) -> DecideState:
     """Применение одобренного решения через существующую ``mrq.decide``."""
 
     proposal = state.get("decision_proposal")
     if not proposal:
         return {**state, "status": "failed", "blocker": {"code": "dispatcher.decision.missing", "message": "no decision proposal to apply", "action": "mrq.decide-next"}}
     payload = {key: proposal[key] for key in ("mrq_id", "decision", "target_evidence", "target_coverage", "residual_gap", "target_solution", "rationale", "acceptance_criteria", "risk", "open_questions") if key in proposal}
-    apply("mrq.decide", payload)
+    _ = apply("mrq.decide", payload)
     return {**state, "approved_decision": payload, "status": "completed"}
 
 
-def derived_gap_card(mrq_row: dict[str, Any]) -> dict[str, Any] | None:
+def derived_gap_card(mrq_row: dict[str, JsonValue]) -> dict[str, JsonValue] | None:
     """Производная карточка функционального разрыва только для решения ``adapt``.
 
     Не создаёт отдельную каноническую сущность ``GAP-*``.
     """
 
-    decision = mrq_row.get("migration_decision", {})
+    decision = _object(mrq_row.get("migration_decision", {}))
     if decision.get("decision") != "adapt":
         return None
     return {
@@ -855,18 +957,18 @@ def derived_gap_card(mrq_row: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def build_discover_state(bindings: dict[str, Any], run_id: str, thread_id: str) -> DiscoverState:
+def build_discover_state(bindings: dict[str, JsonValue], run_id: str, thread_id: str) -> DiscoverState:
     return DiscoverState(
-        project_id=bindings["project_id"],
-        job_id=bindings["job_id"],
-        work_unit_id=bindings["work_unit_id"],
-        source_generation_id=bindings["source_generation_id"],
-        diff_generation_id=bindings["diff_generation_id"],
-        canonical_generation_id=bindings["canonical_generation_id"],
-        workflow_fingerprint=bindings["workflow_fingerprint"],
-        agent_profile_fingerprint=bindings["agent_profile_fingerprint"],
-        instruction_supplement=bindings["instruction_supplement"],
-        execution_snapshot_fingerprint=bindings.get("execution_snapshot_fingerprint", ""),
+        project_id=_string(bindings["project_id"]),
+        job_id=_string(bindings["job_id"]),
+        work_unit_id=_string(bindings["work_unit_id"]),
+        source_generation_id=_string(bindings["source_generation_id"]),
+        diff_generation_id=_string(bindings["diff_generation_id"]),
+        canonical_generation_id=_string(bindings["canonical_generation_id"]),
+        workflow_fingerprint=_string(bindings["workflow_fingerprint"]),
+        agent_profile_fingerprint=_string(bindings["agent_profile_fingerprint"]),
+        instruction_supplement=_string(bindings["instruction_supplement"]),
+        execution_snapshot_fingerprint=_string(bindings.get("execution_snapshot_fingerprint", "")),
         thread_id=thread_id,
         run_id=run_id,
         window=[],
@@ -889,19 +991,19 @@ def build_discover_state(bindings: dict[str, Any], run_id: str, thread_id: str) 
     )
 
 
-def build_decide_state(bindings: dict[str, Any], run_id: str, thread_id: str, *, batch: MRQBatch | None = None) -> DecideState:
+def build_decide_state(bindings: dict[str, JsonValue], run_id: str, thread_id: str, *, batch: MRQBatch | None = None) -> DecideState:
     return DecideState(
-        project_id=bindings["project_id"],
-        job_id=bindings["job_id"],
-        work_unit_id=bindings["work_unit_id"],
-        mrq_id=bindings["work_unit_id"],
-        source_generation_id=bindings["source_generation_id"],
-        diff_generation_id=bindings["diff_generation_id"],
-        canonical_generation_id=bindings["canonical_generation_id"],
-        workflow_fingerprint=bindings["workflow_fingerprint"],
-        agent_profile_fingerprint=bindings["agent_profile_fingerprint"],
-        instruction_supplement=bindings["instruction_supplement"],
-        execution_snapshot_fingerprint=bindings.get("execution_snapshot_fingerprint", ""),
+        project_id=_string(bindings["project_id"]),
+        job_id=_string(bindings["job_id"]),
+        work_unit_id=_string(bindings["work_unit_id"]),
+        mrq_id=_string(bindings["work_unit_id"]),
+        source_generation_id=_string(bindings["source_generation_id"]),
+        diff_generation_id=_string(bindings["diff_generation_id"]),
+        canonical_generation_id=_string(bindings["canonical_generation_id"]),
+        workflow_fingerprint=_string(bindings["workflow_fingerprint"]),
+        agent_profile_fingerprint=_string(bindings["agent_profile_fingerprint"]),
+        instruction_supplement=_string(bindings["instruction_supplement"]),
+        execution_snapshot_fingerprint=_string(bindings.get("execution_snapshot_fingerprint", "")),
         thread_id=thread_id,
         run_id=run_id,
         batch_id=batch.batch_id if batch else None,
@@ -921,45 +1023,46 @@ def build_decide_state(bindings: dict[str, Any], run_id: str, thread_id: str, *,
 def compile_analyze_graph(
     *,
     repo: Path,
-    saver: Any,
-    executor: Callable[..., dict[str, Any]],
-    profile: dict[str, Any],
+    saver: BaseCheckpointSaver[str],
+    executor: AgentExecutor,
+    profile: dict[str, JsonValue],
     supplement: str,
     timeout_seconds: int,
     cancelled: Callable[[], bool],
     bindings_check: Callable[[], bool],
-    phase_policies: dict[str, dict[str, Any]] | None = None,
-    profiles_by_role: dict[str, dict[str, Any]] | None = None,
-    load_result: Callable[[str], dict[str, Any] | None] | None = None,
-    save_result: Callable[[str, dict[str, Any]], None] | None = None,
+    phase_policies: dict[str, dict[str, JsonValue]] | None = None,
+    profiles_by_role: dict[str, dict[str, JsonValue]] | None = None,
+    load_result: Callable[[str], dict[str, JsonValue] | None] | None = None,
+    save_result: Callable[[str, dict[str, JsonValue]], None] | None = None,
     register_work: Callable[[str, str, list[str]], None] | None = None,
     reuse_work: Callable[[str, str, str], None] | None = None,
-    record_work: Callable[[str, str, str, str, str, dict[str, Any]], None] | None = None,
-):
+    record_work: Callable[[str, str, str, str, str, dict[str, JsonValue]], None] | None = None,
+) -> CompiledGraph[DiscoverState]:
     """Классифицирует весь инвентарь окнами по 32, не формируя MRQ."""
 
-    from langgraph.graph import END, START, StateGraph
+    graph_module = _graph_module()
+    END, START, StateGraph = graph_module.END, graph_module.START, graph_module.StateGraph
     from .dif_classifications import (
+        ClassificationRow,
         ensure_current,
         load_active as load_classifications,
         make_row,
-        publish_empty,
         publish_window,
         physical_evidence_fingerprints,
         remaining_ids,
     )
 
-    policy = (phase_policies or {
+    policy = _phase_policy((phase_policies or {
         "analyze-dif": {
             "max_concurrency": 4,
             "roles": [{"role_id": "analyzer", "count": 4, "instruction_supplement": supplement}],
         }
-    })["analyze-dif"]
+    })["analyze-dif"])
     selected_profile = (profiles_by_role or {"analyzer": profile})["analyzer"]
     role = next(item for item in policy["roles"] if item["role_id"] == "analyzer")
 
     def run(state: DiscoverState) -> DiscoverState:
-        ensure_current(repo)
+        _ = ensure_current(repo)
         while True:
             pending = remaining_ids(repo)
             if not pending:
@@ -982,7 +1085,7 @@ def compile_analyze_graph(
                 register_work("analyze-dif", "analyzer", pending)
             if record_work:
                 for identifier in sorted(deterministic):
-                    local = deterministic[identifier]
+                    local = _object(deterministic[identifier])
                     record_work(
                         "analyze-dif",
                         "analyzer",
@@ -1003,7 +1106,7 @@ def compile_analyze_graph(
                         },
                     )
 
-            def branch(identifier: str) -> tuple[AnalyzeResult, dict[str, Any]]:
+            def branch(identifier: str) -> tuple[AnalyzeResult, dict[str, JsonValue]]:
                 unit = _analyze_work_unit(repo, identifier)
                 expected = _result_envelope(
                     state, "analyze-dif", "analyzer", unit, None,
@@ -1017,11 +1120,11 @@ def compile_analyze_graph(
                 if cached is not None:
                     if reuse_work:
                         reuse_work("analyze-dif", "analyzer", identifier)
-                    return cached, unit
+                    return _analyze_result(cached), unit
                 if record_work and expected.get("reuse_incompatibility"):
                     record_work(
                         "analyze-dif", "analyzer", identifier, "provider", "queued",
-                        {"reuse": {"status": "incompatible", **expected["reuse_incompatibility"]}},
+                        {"reuse": {"status": "incompatible", **_object(expected["reuse_incompatibility"])}},
                     )
                 local = discover_analyze_one(
                     state, identifier, executor=executor, repo=repo,
@@ -1065,55 +1168,61 @@ def compile_analyze_graph(
                         "reusable_completed": len(results),
                     },
                 }
-            rows = []
+            rows: list[ClassificationRow] = []
             evidence_fingerprints = physical_evidence_fingerprints(repo)
             for identifier in pending:
                 if identifier in deterministic:
-                    local = deterministic[identifier]
-                    rows.append(make_row(identifier, local["result"], **{key: local[key] for key in (
-                        "evidence_fingerprint", "result_schema_fingerprint", "profile_fingerprint",
-                        "instruction_fingerprint", "context_fingerprint",
-                    )}))
+                    local = _object(deterministic[identifier])
+                    rows.append(make_row(
+                        identifier,
+                        _object(local["result"]),
+                        evidence_fingerprint=_string(local["evidence_fingerprint"]),
+                        result_schema_fingerprint=_string(local["result_schema_fingerprint"]),
+                        profile_fingerprint=_string(local["profile_fingerprint"]),
+                        instruction_fingerprint=_string(local["instruction_fingerprint"]),
+                        context_fingerprint=_string(local["context_fingerprint"]),
+                    ))
                     continue
                 result, unit = results[identifier]
                 rows.append(make_row(
                     identifier,
-                    result,
+                    _object(result),
                     evidence_fingerprint=evidence_fingerprints[identifier],
                     result_schema_fingerprint="sha256:" + sha256(b"analyze-dif-result/v1"),
-                    profile_fingerprint=state["agent_profile_fingerprint"],
+                    profile_fingerprint=state.get("agent_profile_fingerprint", ""),
                     instruction_fingerprint="sha256:" + sha256(str(selected_profile.get("instructions_version", "")).encode()),
-                    context_fingerprint="sha256:" + sha256(canonical_json(unit["allowed_path_fingerprints"])),
+                    context_fingerprint="sha256:" + sha256(canonical_json(unit.get("allowed_path_fingerprints", []))),
                 ))
             expected = load_classifications(repo)["pointer"]["generation_id"]
-            publish_window(repo, rows, expected_generation_id=expected)
+            _ = publish_window(repo, rows, expected_generation_id=expected)
 
     graph = StateGraph(DiscoverState)
-    graph.add_node("classify-all-dif", run)
-    graph.add_edge(START, "classify-all-dif")
-    graph.add_edge("classify-all-dif", END)
+    _ = graph.add_node("classify-all-dif", run)
+    _ = graph.add_edge(START, "classify-all-dif")
+    _ = graph.add_edge("classify-all-dif", END)
     return graph.compile(checkpointer=saver)
 
 
 def compile_consolidate_graph(
     *,
     repo: Path,
-    saver: Any,
-    executor: Callable[..., dict[str, Any]],
-    profile: dict[str, Any],
+    saver: BaseCheckpointSaver[str],
+    executor: AgentExecutor,
+    profile: dict[str, JsonValue],
     supplement: str,
     timeout_seconds: int,
     cancelled: Callable[[], bool],
     bindings_check: Callable[[], bool],
     plan_root: Path,
-    phase_policies: dict[str, dict[str, Any]] | None = None,
-    profiles_by_role: dict[str, dict[str, Any]] | None = None,
+    phase_policies: dict[str, dict[str, JsonValue]] | None = None,
+    profiles_by_role: dict[str, dict[str, JsonValue]] | None = None,
     register_work: Callable[[str, str, list[str]], None] | None = None,
-    **_unused: Any,
-):
+    **_unused: object,
+) -> CompiledGraph[DiscoverState]:
     """Строит один глобальный MRQ-план и останавливается перед подтверждением."""
 
-    from langgraph.graph import END, START, StateGraph
+    graph_module = _graph_module()
+    END, START, StateGraph = graph_module.END, graph_module.START, graph_module.StateGraph
     from .consolidation import ensure_context_payload, input_snapshot, normalized_records, partition_manifest, plan_from_groups, store_plan
     from .dif_classifications import coverage
 
@@ -1126,7 +1235,7 @@ def compile_consolidate_graph(
             ],
         }
     }
-    policy = policies["form-mrq"]
+    policy = _phase_policy(policies["form-mrq"])
     profiles = profiles_by_role or {"coordinator": profile, "grouper": profile}
     grouper_role = next(row for row in policy["roles"] if row["role_id"] == "grouper")
     coordinator_role = next(row for row in policy["roles"] if row["role_id"] == "coordinator")
@@ -1146,16 +1255,18 @@ def compile_consolidate_graph(
             return {**state, "status": "resumable", "blocker": {"code": "dispatcher.soft_stopped", "message": "dispatcher was stopped", "action": "mrq.consolidate"}}
         if not bindings_check():
             return {**state, "status": "stale", "blocker": {"code": "dispatcher.bindings.stale", "message": "active generations changed", "action": "mrq.consolidate"}}
-        snapshot = input_snapshot(repo)
-        grouper_tokens = profiles["grouper"].get("input_context_tokens")
-        coordinator_tokens = profiles["coordinator"].get("input_context_tokens")
+        snapshot_payload = input_snapshot(repo)
+        snapshot_object: object = snapshot_payload
+        snapshot = _object(snapshot_object)
+        grouper_tokens = _integer(profiles["grouper"].get("input_context_tokens"))
         try:
-            records = normalized_records(snapshot)
-            manifest = partition_manifest(
+            records = normalized_records(snapshot_payload)
+            manifest_payload = partition_manifest(
                 records,
                 grouper_tokens,
                 estimator_version=str(profiles["grouper"].get("context_estimator_version", "utf8-v1")),
             )
+            manifest = _object(manifest_payload)
         except ValueError:
             return {
                 **state, "status": "failed",
@@ -1165,15 +1276,15 @@ def compile_consolidate_graph(
                     "action": "profiles.verify",
                 },
             }
-        partitions: list[list[dict[str, Any]]] = []
-        by_id = {row["record_id"]: row for row in records}
-        for description in manifest["partitions"]:
-            partitions.append([by_id[key] for key in description["record_ids"]])
+        partitions: list[list[dict[str, JsonValue]]] = []
+        by_id = {_string(row["record_id"]): row for row in _objects(records)}
+        for description in _objects(manifest["partitions"]):
+            partitions.append([by_id[key] for key in _strings(description["record_ids"])])
         work_ids = [
             *(f"partition:{index}" for index in range(len(partitions))),
-            *(f"pair:{row['left']}:{row['right']}" for row in manifest["pairs"]),
+            *(f"pair:{row['left']}:{row['right']}" for row in _objects(manifest["pairs"])),
         ]
-        def worker_payload(work_id: str) -> dict[str, Any]:
+        def worker_payload(work_id: str) -> dict[str, JsonValue]:
             kind, *indexes = work_id.split(":")
             selected = [partitions[int(index)] for index in indexes]
             return {
@@ -1203,7 +1314,7 @@ def compile_consolidate_graph(
         if register_work:
             register_work("form-mrq", "grouper", work_ids)
 
-        def propose(work_id: str) -> dict[str, Any]:
+        def propose(work_id: str) -> dict[str, JsonValue]:
             return executor(
                 repo, profiles["grouper"], "mrq.consolidate",
                 worker_payloads[work_id],
@@ -1222,9 +1333,9 @@ def compile_consolidate_graph(
         if set(proposals) != set(work_ids):
             return {**state, "status": "failed", "blocker": {"code": "consolidation.coverage", "message": "partition comparison coverage is incomplete", "action": "mrq.consolidate"}}
         try:
-            candidate_rows: dict[str, dict[str, Any]] = {}
+            candidate_rows: dict[str, dict[str, JsonValue]] = {}
             for work_id in sorted(proposals):
-                for group in proposals[work_id].get("groups", []):
+                for group in _objects(proposals[work_id].get("groups", [])):
                     candidate_id = "CAND-" + sha256(canonical_json({
                         "algorithm": "hierarchical-consolidation/v1",
                         "source_work_id": work_id,
@@ -1238,8 +1349,8 @@ def compile_consolidate_graph(
                         "group": group,
                     }
             if not candidate_rows and any(
-                row["classification"] == "meaning"
-                for row in snapshot["classifications"]
+                row.get("classification") == "meaning"
+                for row in _objects(snapshot["classifications"])
             ):
                 raise ValueError("hierarchical consolidation produced no meaning candidates")
 
@@ -1249,13 +1360,13 @@ def compile_consolidate_graph(
                 candidate_ids[index:index + page_size]
                 for index in range(0, len(candidate_ids), page_size)
             ]
-            link_payloads: dict[str, dict[str, Any]] = {}
+            link_payloads: dict[str, dict[str, JsonValue]] = {}
             expected_relations: dict[str, set[tuple[str, str]]] = {}
             for left_index, left_page in enumerate(pages):
                 for right_index in range(left_index, len(pages)):
                     right_page = pages[right_index]
                     relations = {
-                        tuple(sorted((left, right)))
+                        _ordered_pair(left, right)
                         for left in left_page
                         for right in right_page
                         if left != right
@@ -1271,7 +1382,7 @@ def compile_consolidate_graph(
                             {
                                 "candidate_id": identifier,
                                 "description": {
-                                    key: candidate_rows[identifier]["group"].get(key)
+                                    key: _object(candidate_rows[identifier]["group"]).get(key)
                                     for key in (
                                         "semantic_key", "title", "business_meaning",
                                         "scope", "confidence", "component_keys",
@@ -1279,7 +1390,7 @@ def compile_consolidate_graph(
                                 },
                                 "membership_fingerprint": "sha256:" + sha256(
                                     canonical_json({
-                                        key: candidate_rows[identifier]["group"].get(key, [])
+                                        key: _object(candidate_rows[identifier]["group"]).get(key, [])
                                         for key in ("stable_diff_ids", "supporting_diff_ids")
                                     })
                                 ),
@@ -1290,7 +1401,7 @@ def compile_consolidate_graph(
                             {
                                 "candidate_id": identifier,
                                 "description": {
-                                    key: candidate_rows[identifier]["group"].get(key)
+                                    key: _object(candidate_rows[identifier]["group"]).get(key)
                                     for key in (
                                         "semantic_key", "title", "business_meaning",
                                         "scope", "confidence", "component_keys",
@@ -1298,7 +1409,7 @@ def compile_consolidate_graph(
                                 },
                                 "membership_fingerprint": "sha256:" + sha256(
                                     canonical_json({
-                                        key: candidate_rows[identifier]["group"].get(key, [])
+                                        key: _object(candidate_rows[identifier]["group"]).get(key, [])
                                         for key in ("stable_diff_ids", "supporting_diff_ids")
                                     })
                                 ),
@@ -1312,7 +1423,7 @@ def compile_consolidate_graph(
                 register_work(
                     "form-mrq", "coordinator", sorted(link_payloads)
                 )
-            link_results: dict[str, dict[str, Any]] = {}
+            link_results: dict[str, dict[str, JsonValue]] = {}
             for work_id in sorted(link_payloads):
                 link_results[work_id] = executor(
                     repo,
@@ -1334,13 +1445,13 @@ def compile_consolidate_graph(
 
             decisions: dict[tuple[str, str], str] = {}
             for work_id, expected in expected_relations.items():
-                links = link_results[work_id].get("links", [])
+                links = _objects(link_results[work_id].get("links", []))
                 actual: dict[tuple[str, str], str] = {}
                 for link in links:
-                    relation = tuple(sorted((
+                    relation = _ordered_pair(
                         str(link["left_candidate_id"]),
                         str(link["right_candidate_id"]),
-                    )))
+                    )
                     if relation not in expected or relation in actual:
                         raise ValueError("unknown or duplicate hierarchical candidate relation")
                     actual[relation] = str(link["decision"])
@@ -1360,41 +1471,41 @@ def compile_consolidate_graph(
                 components.setdefault(root(identifier), []).append(identifier)
 
             def combine_group(
-                left: dict[str, Any],
-                right: dict[str, Any],
-                description: dict[str, Any],
-            ) -> dict[str, Any]:
-                stable = sorted(set(left.get("stable_diff_ids", [])) | set(right.get("stable_diff_ids", [])))
+                left: dict[str, JsonValue],
+                right: dict[str, JsonValue],
+                description: dict[str, JsonValue],
+            ) -> dict[str, JsonValue]:
+                stable = sorted(set(_strings(left.get("stable_diff_ids", []))) | set(_strings(right.get("stable_diff_ids", []))))
                 supporting = sorted(
-                    (set(left.get("supporting_diff_ids", [])) | set(right.get("supporting_diff_ids", [])))
+                    (set(_strings(left.get("supporting_diff_ids", []))) | set(_strings(right.get("supporting_diff_ids", []))))
                     - set(stable)
                 )
                 evidence_by_key = {
                     canonical_json(item): item
-                    for item in [*left.get("evidence", []), *right.get("evidence", [])]
+                    for item in [*_objects(left.get("evidence", [])), *_objects(right.get("evidence", []))]
                 }
                 return {
                     **description,
                     "stable_diff_ids": stable,
                     "supporting_diff_ids": supporting,
-                    "component_keys": sorted(set(left.get("component_keys", [])) | set(right.get("component_keys", []))),
-                    "source_mrq_ids": sorted(set(left.get("source_mrq_ids", [])) | set(right.get("source_mrq_ids", []))),
+                    "component_keys": sorted(set(_strings(left.get("component_keys", []))) | set(_strings(right.get("component_keys", [])))),
+                    "source_mrq_ids": sorted(set(_strings(left.get("source_mrq_ids", []))) | set(_strings(right.get("source_mrq_ids", [])))),
                     "evidence": [evidence_by_key[key] for key in sorted(evidence_by_key)],
                 }
 
-            final_groups: list[dict[str, Any]] = []
+            final_groups: list[dict[str, JsonValue]] = []
             reduction_calls = 0
             for component_index, identifiers in enumerate(
                 sorted(components.values(), key=lambda rows: rows[0])
             ):
-                aggregates = [{
+                aggregates: list[dict[str, JsonValue]] = [{
                     "aggregate_id": identifier,
                     "group": candidate_rows[identifier]["group"],
                 } for identifier in sorted(identifiers)]
                 round_index = 0
                 while len(aggregates) > 1:
-                    next_round: list[dict[str, Any]] = []
-                    work_payloads = []
+                    next_round: list[dict[str, JsonValue]] = []
+                    work_payloads: list[tuple[str, dict[str, JsonValue], dict[str, JsonValue], dict[str, JsonValue]]] = []
                     for pair_index in range(0, len(aggregates), 2):
                         if pair_index + 1 == len(aggregates):
                             next_round.append(aggregates[pair_index])
@@ -1407,14 +1518,14 @@ def compile_consolidate_graph(
                             "left": {
                                 "aggregate_id": left["aggregate_id"],
                                 "description": {
-                                    key: left["group"].get(key, "")
+                                    key: _object(left["group"]).get(key, "")
                                     for key in sorted(CONSOLIDATION_REDUCED_FIELDS)
                                 },
                             },
                             "right": {
                                 "aggregate_id": right["aggregate_id"],
                                 "description": {
-                                    key: right["group"].get(key, "")
+                                    key: _object(right["group"]).get(key, "")
                                     for key in sorted(CONSOLIDATION_REDUCED_FIELDS)
                                 },
                             },
@@ -1426,7 +1537,7 @@ def compile_consolidate_graph(
                             [row[0] for row in work_payloads],
                         )
                     for work_id, left, right, payload in work_payloads:
-                        reduced = executor(
+                        reduced = _object(executor(
                             repo,
                             profiles["coordinator"],
                             "mrq.consolidate",
@@ -1434,11 +1545,11 @@ def compile_consolidate_graph(
                             coordinator_role.get("instruction_supplement", ""),
                             timeout_seconds,
                             cancelled,
-                        )["group"]
-                        group = combine_group(left["group"], right["group"], reduced)
+                        )["group"])
+                        group = combine_group(_object(left["group"]), _object(right["group"]), reduced)
                         aggregate_id = "AGG-" + sha256(canonical_json({
                             "algorithm": "hierarchical-consolidation/v1",
-                            "children": sorted((left["aggregate_id"], right["aggregate_id"])),
+                            "children": sorted((_string(left["aggregate_id"]), _string(right["aggregate_id"]))),
                             "description": reduced,
                         }))
                         next_round.append({
@@ -1446,20 +1557,21 @@ def compile_consolidate_graph(
                             "group": group,
                         })
                         reduction_calls += 1
-                    aggregates = sorted(next_round, key=lambda row: row["aggregate_id"])
+                    aggregates = sorted(next_round, key=lambda row: _string(row["aggregate_id"]))
                     round_index += 1
                 if aggregates:
-                    final_groups.append(aggregates[0]["group"])
+                    final_groups.append(_object(aggregates[0]["group"]))
 
+            classification_rows = _objects(snapshot["classifications"])
             noise_by_id = {
-                row["stable_diff_id"]: row
-                for row in snapshot["classifications"]
-                if row["classification"] == "noise_candidate"
+                _string(row["stable_diff_id"]): row
+                for row in classification_rows
+                if row.get("classification") == "noise_candidate"
             }
             grouped_ids = {
                 identifier
                 for group in final_groups
-                for identifier in group.get("stable_diff_ids", [])
+                for identifier in _strings(group.get("stable_diff_ids", []))
             }
             pending_noise = sorted(set(noise_by_id) - grouped_ids)
             approved_noise_ids: list[str] = []
@@ -1486,8 +1598,8 @@ def compile_consolidate_graph(
                     cancelled,
                 )
                 by_id = {
-                    str(row["stable_diff_id"]): row
-                    for row in response.get("decisions", [])
+                    _string(row["stable_diff_id"]): row
+                    for row in _objects(response.get("decisions", []))
                 }
                 if set(by_id) != set(identifiers):
                     raise ValueError("hierarchical noise coverage is incomplete")
@@ -1502,7 +1614,7 @@ def compile_consolidate_graph(
                 approved_noise_ids.extend(identifiers)
                 noise_calls += 1
             plan = plan_from_groups(
-                snapshot,
+                snapshot_payload,
                 final_groups,
                 [noise_by_id[identifier] for identifier in approved_noise_ids],
                 manifest,
@@ -1513,29 +1625,33 @@ def compile_consolidate_graph(
                 **state, "status": "failed",
                 "blocker": {"code": "consolidation.plan_storage", "message": str(exc), "action": "mrq.consolidate"},
             }
+        plan_object: object = plan
+        plan_view = _object(plan_object)
+        outcomes = _object(plan_view["outcomes"])
+        consolidation_plan = _object({
+            "plan_fingerprint": plan_fingerprint,
+            "plan_path": path.relative_to(plan_root).as_posix(),
+            "expected_pointer": snapshot.get("prior_consolidation"),
+            "aggregates": {
+                **{name: len(json_array(value)) for name, value in outcomes.items()},
+                "partition_count": len(json_array(manifest["partitions"])),
+                "pair_count": len(json_array(manifest["pairs"])),
+                "candidate_count": len(candidate_rows),
+                "candidate_page_count": len(pages),
+                "link_page_pair_count": len(link_payloads),
+                "reduction_call_count": reduction_calls,
+                "noise_page_count": noise_calls,
+                "planned_invocation_count": (
+                    _integer(manifest["planned_invocation_count"])
+                    + len(link_payloads)
+                    + reduction_calls
+                    + noise_calls
+                ),
+            },
+        })
         return {
             **state, "status": "blocked",
-            "consolidation_plan": {
-                "plan_fingerprint": plan_fingerprint,
-                "plan_path": path.relative_to(plan_root).as_posix(),
-                "expected_pointer": snapshot["prior_consolidation"],
-                "aggregates": {
-                    **{name: len(plan["outcomes"][name]) for name in plan["outcomes"]},
-                    "partition_count": len(manifest["partitions"]),
-                    "pair_count": len(manifest["pairs"]),
-                    "candidate_count": len(candidate_rows),
-                    "candidate_page_count": len(pages),
-                    "link_page_pair_count": len(link_payloads),
-                    "reduction_call_count": reduction_calls,
-                    "noise_page_count": noise_calls,
-                    "planned_invocation_count": (
-                        manifest["planned_invocation_count"]
-                        + len(link_payloads)
-                        + reduction_calls
-                        + noise_calls
-                    ),
-                },
-            },
+            "consolidation_plan": consolidation_plan,
             "blocker": {
                 "code": "approval.consolidation",
                 "message": "the complete consolidation plan requires explicit approval",
@@ -1544,33 +1660,34 @@ def compile_consolidate_graph(
         }
 
     graph = StateGraph(DiscoverState)
-    graph.add_node("consolidate-all", run)
-    graph.add_edge(START, "consolidate-all")
-    graph.add_edge("consolidate-all", END)
+    _ = graph.add_node("consolidate-all", run)
+    _ = graph.add_edge(START, "consolidate-all")
+    _ = graph.add_edge("consolidate-all", END)
     return graph.compile(checkpointer=saver)
 
 
 def compile_decide_graph(
     *,
     repo: Path,
-    saver: Any,
-    executor: Callable[..., dict[str, Any]],
-    profile: dict[str, Any],
+    saver: BaseCheckpointSaver[str],
+    executor: AgentExecutor,
+    profile: dict[str, JsonValue],
     supplement: str,
     timeout_seconds: int,
     cancelled: Callable[[], bool],
     bindings_check: Callable[[], bool],
-    phase_policy: dict[str, Any] | None = None,
-    profiles_by_role: dict[str, dict[str, Any]] | None = None,
-    load_result: Callable[[str], dict[str, Any] | None] | None = None,
-    save_result: Callable[[str, dict[str, Any]], None] | None = None,
+    phase_policy: dict[str, JsonValue] | None = None,
+    profiles_by_role: dict[str, dict[str, JsonValue]] | None = None,
+    load_result: Callable[[str], dict[str, JsonValue] | None] | None = None,
+    save_result: Callable[[str, dict[str, JsonValue]], None] | None = None,
     register_work: Callable[[str, str, list[str]], None] | None = None,
     reuse_work: Callable[[str, str, str], None] | None = None,
-    record_work: Callable[[str, str, str, str, str, dict[str, Any]], None] | None = None,
-):
+    record_work: Callable[[str, str, str, str, str, dict[str, JsonValue]], None] | None = None,
+) -> CompiledGraph[DecideState]:
     """Компилирует LangGraph исследования цели до границы одобрения."""
 
-    from langgraph.graph import END, START, StateGraph
+    graph_module = _graph_module()
+    END, START, StateGraph = graph_module.END, graph_module.START, graph_module.StateGraph
 
     def select(state: DecideState) -> DecideState:
         return decide_select_mrq(state, repo=repo)
@@ -1578,15 +1695,15 @@ def compile_decide_graph(
     def research(state: DecideState) -> DecideState:
         if state.get("status") == "completed" or cancelled():
             return state
-        active_rows = {item["mrq_id"]: item for item in _decision_mrqs(repo) if item.get("state") != "superseded"}
+        active_rows = {_string(item["mrq_id"]): item for item in _decision_mrqs(repo) if item.get("state") != "superseded"}
         mrqs = [
             mrq_id
-            for mrq_id in (state.get("batch_mrqs") or [state["mrq_id"]])
-            if mrq_id in active_rows and not active_rows[mrq_id].get("migration_decision", {}).get("decision")
+            for mrq_id in (state.get("batch_mrqs") or [state.get("mrq_id", "")])
+            if mrq_id in active_rows and not _object(active_rows[mrq_id].get("migration_decision", {})).get("decision")
         ]
         current = state
         errors: dict[str, str] = {}
-        policy = phase_policy or {"max_concurrency": 4, "roles": [{"role_id": "researcher", "count": 4, "instruction_supplement": supplement}]}
+        policy = _phase_policy(phase_policy or {"max_concurrency": 4, "roles": [{"role_id": "researcher", "count": 4, "instruction_supplement": supplement}]})
         researcher_profile = (profiles_by_role or {}).get("researcher", profile)
         researcher_supplement = next(role.get("instruction_supplement", "") for role in policy["roles"] if role["role_id"] == "researcher")
         if register_work:
@@ -1603,11 +1720,24 @@ def compile_decide_graph(
             if cached is not None:
                 if reuse_work:
                     reuse_work("research-target", "researcher", mrq_id)
-                return cached
+                cached_state = _object(cached)
+                cached_findings = {
+                    key: _objects(value)
+                    for key, value in _object(cached_state.get("findings", {})).items()
+                }
+                return {
+                    **state,
+                    "findings": cached_findings,
+                    "decision_proposal": _object(cached_state["decision_proposal"])
+                    if cached_state.get("decision_proposal") else None,
+                    "status": _string(cached_state.get("status", "running")),
+                    "blocker": _object(cached_state["blocker"])
+                    if cached_state.get("blocker") else None,
+                }
             if record_work and expected.get("reuse_incompatibility"):
                 record_work(
                     "research-target", "researcher", mrq_id, "provider", "queued",
-                    {"reuse": {"status": "incompatible", **expected["reuse_incompatibility"]}},
+                    {"reuse": {"status": "incompatible", **_object(expected["reuse_incompatibility"])}},
                 )
             result = decide_research_one(state, mrq_id, executor=executor, repo=repo, profile=researcher_profile, supplement=researcher_supplement, timeout_seconds=timeout_seconds, cancelled=phase_cancelled, bindings_check=bindings_check)
             if save_result and result.get("decision_proposal"):
@@ -1625,14 +1755,14 @@ def compile_decide_graph(
         )
         findings = dict(state.get("findings", {}))
         envelopes = dict(state.get("research_results", {}))
-        proposals: dict[str, dict[str, Any]] = {}
+        proposals: dict[str, dict[str, JsonValue]] = {}
         for mrq_id, result in completed.items():
             findings.update(result.get("findings", {}))
             work_unit = _research_work_unit(state, mrq_id, repo)
             if work_unit is not None:
                 envelopes[mrq_id] = _result_envelope(state, "research-target", "researcher", work_unit, result, str(researcher_profile.get("instructions_version", "")))
             if result.get("decision_proposal"):
-                proposals[mrq_id] = result["decision_proposal"]
+                proposals[mrq_id] = result.get("decision_proposal") or {}
         if stopped:
             return {**current, "findings": findings, "research_results": envelopes, "status": "resumable", "blocker": {"code": "dispatcher.soft_stopped", "message": "dispatcher was stopped", "action": "mrq.decide-next"}}
         if errors:
@@ -1641,9 +1771,9 @@ def compile_decide_graph(
         return {**current, "findings": findings, "research_results": envelopes, "decision_proposal": proposal, "status": "blocked", "blocker": {"code": "approval.target_decision", "message": "target decision requires explicit local-user approval", "action": "mrq.decide"}}
 
     graph = StateGraph(DecideState)
-    graph.add_node("select-mrq", select)
-    graph.add_node("research-target", research)
-    graph.add_edge(START, "select-mrq")
-    graph.add_edge("select-mrq", "research-target")
-    graph.add_edge("research-target", END)
+    _ = graph.add_node("select-mrq", select)
+    _ = graph.add_node("research-target", research)
+    _ = graph.add_edge(START, "select-mrq")
+    _ = graph.add_edge("select-mrq", "research-target")
+    _ = graph.add_edge("research-target", END)
     return graph.compile(checkpointer=saver)

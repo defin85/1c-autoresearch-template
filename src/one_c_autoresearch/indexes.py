@@ -7,6 +7,7 @@ import selectors
 import signal
 import subprocess
 import shutil
+import sys
 import tempfile
 import time
 import uuid
@@ -14,12 +15,14 @@ from functools import lru_cache
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from collections.abc import Iterator
+from typing import Callable, NotRequired, Protocol, TypedDict, runtime_checkable
 
 from .contracts import (
-    ROLES, atomic_json, canonical_json, confined, file_manifest,
-    normalize_relative, repository_lock, sha256,
+    JsonValue, ROLES, atomic_json, canonical_json, confined, file_manifest,
+    normalize_relative, parse_json_object, repository_lock, sha256,
 )
+from .search_runtime import Closable
 
 CAPABILITIES = (
     "text-search",
@@ -50,7 +53,7 @@ ADAPTER_STATE_LIMIT = 16 * 1024 * 1024
 ADAPTER_INDEX_LIMIT = 8 * 1024 * 1024 * 1024
 PROJECT_STORAGE_LIMIT = 32 * 1024 * 1024 * 1024
 ADAPTER_TIMEOUT_SECONDS = 120
-BSL_SEARCH_SURFACE_V1 = {
+BSL_SEARCH_SURFACE_V1: dict[str, dict[str, dict[str, set[str]]]] = {
     "workspace": {
         "allowed": {
             "search": {"search_code", "status"},
@@ -113,15 +116,397 @@ COMPLETE_SEARCH_OPERATIONS = {
 SCHEMA3_SERVICE_PROFILES = ("lexical", "hybrid")
 
 
+class BackendRow(TypedDict):
+    adapter_id: str
+    engine_version: str
+
+
+class IndexConfig(TypedDict):
+    schema_version: str
+    source_schema_version: str
+    backends: list[BackendRow]
+    routes: dict[str, list[str]]
+    machine_contract_version: NotRequired[str]
+    service_profiles: NotRequired[dict[str, str]]
+
+
+class ConfigCandidate(TypedDict, total=False):
+    schema_version: str
+    machine_contract_version: str
+    backends: list[BackendRow]
+    routes: dict[str, list[str]]
+    service_profiles: dict[str, str]
+
+
+class ConfigPlan(TypedDict):
+    schema_version: str
+    target_schema_version: str
+    current_file_fingerprint: str
+    normalized_file_fingerprint: str
+    normalized_file: str
+    affected_backends: list[str]
+    affected_capabilities: list[str]
+    rebuild_backends: list[str]
+    degraded_routes: list[str]
+    reuse_invalidated: bool
+    plan_fingerprint: str
+
+
+class MigrationPlan(TypedDict):
+    schema_version: str
+    current_file_fingerprint: str
+    normalized_file_fingerprint: str
+    normalized_file: str
+    machine_contract_version: str
+    profile_bindings: dict[str, str]
+    profile_operations: dict[str, list[str]]
+    explicit_routes: dict[str, list[str]]
+    stale_semantic_targets: list[str]
+    v2_reuse_invalidated: bool
+    preserved_v1_inflight: list[str]
+    backup_required: bool
+    build_started: bool
+    plan_fingerprint: str
+
+
+class RollbackPlan(TypedDict):
+    schema_version: str
+    current_file_fingerprint: str
+    restore_file_fingerprint: str
+    v2_inflight_ids: list[str]
+    admission_closure_required: bool
+    inflight_handling_required: bool
+    v2_state_action: str
+    readiness_check_required: bool
+    plan_fingerprint: str
+
+
+class NativeTextEnvelope(TypedDict):
+    schema_version: str
+    text: str
+    returned_bytes: int
+
+
+class Component(TypedDict):
+    component_id: str
+    path: str
+    fingerprint: str
+    representation: str
+    source_generation_id: str
+    engine: str
+    engine_version: str
+    bsl_file_count: int
+
+
+class TargetIdentity(TypedDict):
+    adapter_id: str
+    adapter_version: str
+    engine_version: str
+    repository_instance_fingerprint: str
+    component_id: str
+    component_relative_path: str
+    representation: str
+    component_fingerprint: str
+    source_generation_id: str
+    capability_fingerprint: str
+    modality: NotRequired[str]
+    embedding_identity: NotRequired[str]
+
+
+class PromotedIdentity(TargetIdentity):
+    target_fingerprint: str
+    index_manifest_fingerprint: str
+    index_fingerprint: str
+
+
+class BackendProbe(TypedDict):
+    available: bool
+    capabilities: list[str]
+    executable: NotRequired[str]
+    engine_version: NotRequired[str]
+    contract_version: NotRequired[str]
+    executable_fingerprint: NotRequired[str]
+    capability_fingerprint: NotRequired[str]
+    surface_manifest: NotRequired[dict[str, JsonValue]]
+    failure_code: NotRequired[str]
+    failure_summary: NotRequired[str]
+
+
+class BackendState(TypedDict, total=False):
+    adapter_id: str
+    component_id: str
+    status: str
+    modality: str
+    capabilities: list[str]
+    adapter_version: str
+    capability_fingerprint: str
+    index_fingerprint: str
+    target_fingerprint: str
+    last_validation: str | None
+    contract_version: str
+    index_key: str
+    instance_path: str
+    index_dir: str
+    legacy_adopted: bool
+    embedding_identity: str
+    reference_identity: str
+    readiness_reason: str | None
+    recovery_action: str | None
+    validated_at: str
+
+
+class BackendDecision(TypedDict):
+    capability: str
+    preferred_backend_id: str
+    selected_backend_id: str
+    fallback: bool
+    fallback_reason: str | None
+    skipped: list[dict[str, str]]
+    state: BackendState
+    route_fingerprint: str
+
+
+class CoverageBlocker(TypedDict):
+    component_id: str
+    capability: str
+    backend_ids: list[str]
+
+
+class CoverageDegraded(TypedDict):
+    component_id: str
+    capability: str
+    selected_backend_id: str
+    fallback_reason: str | None
+    skipped: list[dict[str, str]]
+
+
+class Coverage(TypedDict):
+    blockers: list[CoverageBlocker]
+    degraded: list[CoverageDegraded]
+
+
+class RawHit(TypedDict, total=False):
+    component_relative_path: str
+    line: int
+    symbol: str
+    kind: str
+    rank: str
+
+
+class NormalizedHit(TypedDict):
+    backend_id: str
+    adapter_version: str
+    index_fingerprint: str
+    component_id: str
+    source_generation_id: str
+    component_relative_path: str
+    kind: str
+    rank: str
+    line: NotRequired[int]
+    symbol: NotRequired[str]
+
+
+class CliProbe(TypedDict):
+    ready: bool
+    exit_code: int
+    output: str
+
+
+@runtime_checkable
+class ProcessInputStream(Protocol):
+    def write(self, value: str, /) -> int: ...
+    def flush(self) -> None: ...
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class ProcessOutputStream(Protocol):
+    def readline(self) -> str: ...
+
+
+@runtime_checkable
+class FileDescriptorStream(Protocol):
+    def fileno(self) -> int: ...
+
+
+def _process_input_stream(value: object) -> ProcessInputStream:
+    if not isinstance(value, ProcessInputStream):
+        raise RuntimeError("bsl-analyzer broker proxy stdio is unavailable")
+    return value
+
+
+def _process_output_stream(value: object) -> ProcessOutputStream:
+    if not isinstance(value, ProcessOutputStream):
+        raise RuntimeError("bsl-analyzer broker proxy stdio is unavailable")
+    return value
+
+
+class BuildOutcome(TypedDict, total=False):
+    ready: bool
+    exit_code: int
+    output: str
+    error: str
+
+
+def _build_outcome(value: object) -> BuildOutcome | None:
+    raw_value: object = value
+    if not isinstance(value, dict):
+        return None
+    row = parse_json_object(canonical_json(raw_value).decode())
+    result: BuildOutcome = {}
+    ready = row.get("ready")
+    if isinstance(ready, bool):
+        result["ready"] = ready
+    exit_code = row.get("exit_code")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        result["exit_code"] = exit_code
+    for key in ("output", "error"):
+        item = row.get(key)
+        if isinstance(item, str):
+            result[key] = item
+    return result
+
+
+class LegacyStatus(Component):
+    index_key: str
+    status: str
+    last_validation: str | None
+    result: BuildOutcome | None
+
+
+class ToolInstance(TypedDict):
+    version: str
+    status: str
+    path: str
+    reason_code: str
+
+
+class ToolInventory(TypedDict):
+    tool_id: str
+    status: str
+    purpose: str
+    required: bool
+    route_capabilities: list[str]
+    instances: list[ToolInstance]
+
+
+class GcCandidate(TypedDict):
+    target: str
+    instance: str
+    bytes: int
+
+
+class GcPlan(TypedDict):
+    schema_version: str
+    candidates: list[GcCandidate]
+    reclaimed_bytes: int
+    plan_fingerprint: str
+
+
+class PointerComponent(TypedDict, total=False):
+    component_id: str
+    path: str
+    kind: str
+    representation_schema: str
+    fingerprint: str
+    bsl_file_count: int
+
+
+class SourcePointer(TypedDict, total=False):
+    schema_version: str
+    generation_id: str
+    representation_schema: str
+    components: list[PointerComponent]
+
+
+def _source_pointer(path: Path) -> SourcePointer:
+    value = parse_json_object(path.read_text(encoding="utf-8"))
+    generation_id = value.get("generation_id")
+    if not isinstance(generation_id, str):
+        raise ValueError("active source generation is invalid")
+    components = value.get("components", [])
+    if not isinstance(components, list):
+        raise ValueError("active source components are invalid")
+    result: SourcePointer = {"generation_id": generation_id}
+    for key in ("schema_version", "representation_schema"):
+        item = value.get(key)
+        if isinstance(item, str):
+            result[key] = item
+    result["components"] = []
+    for item in components:
+        if not isinstance(item, dict):
+            raise ValueError("active source component is invalid")
+        component: PointerComponent = {}
+        for key in ("component_id", "path", "kind", "representation_schema", "fingerprint"):
+            field = item.get(key)
+            if isinstance(field, str):
+                component[key] = field
+        bsl_file_count = item.get("bsl_file_count")
+        if isinstance(bsl_file_count, int) and not isinstance(bsl_file_count, bool):
+            component["bsl_file_count"] = bsl_file_count
+        result["components"].append(component)
+    return result
+
+
+class ContractAction(TypedDict):
+    name: str
+
+
+class ContractTool(TypedDict):
+    name: str
+    actions: NotRequired[list[ContractAction]]
+    output_schema_version: NotRequired[str]
+    output_schema_fingerprint: NotRequired[str]
+
+
+class ContractProfile(TypedDict):
+    tools: list[ContractTool]
+
+
+class BslContract(TypedDict):
+    contract_version: str
+    build_version: str
+    mcp: dict[str, dict[str, ContractProfile]]
+    transports: NotRequired[dict[str, dict[str, dict[str, JsonValue]]]]
+
+
+def _toml_json(path: Path) -> dict[str, JsonValue]:
+    with path.open("rb") as stream:
+        return _json_object(tomllib.load(stream))
+
+
+def _json_object(value: object) -> dict[str, JsonValue]:
+    return parse_json_object(canonical_json(value).decode())
+
+
+def _index_config(candidate: ConfigCandidate) -> IndexConfig:
+    backends: list[BackendRow] = [
+        {"adapter_id": row["adapter_id"], "engine_version": row["engine_version"]}
+        for row in candidate.get("backends", [])
+    ]
+    routes = {name: list(values) for name, values in candidate.get("routes", {}).items()}
+    result: IndexConfig = {
+        "schema_version": str(candidate.get("schema_version", "")),
+        "source_schema_version": str(candidate.get("schema_version", "")),
+        "backends": backends,
+        "routes": routes,
+    }
+    if "machine_contract_version" in candidate:
+        result["machine_contract_version"] = candidate["machine_contract_version"]
+    if "service_profiles" in candidate:
+        result["service_profiles"] = dict(candidate["service_profiles"])
+    return result
+
+
 class BslSurfaceContractError(RuntimeError):
     def __init__(self, state: str, summary: str):
         super().__init__(summary)
-        self.state = state
+        self.state: str = state
 
 
 def native_text_envelope(
-    result: dict[str, Any], *, max_bytes: int = ADAPTER_OUTPUT_LIMIT
-) -> dict[str, Any]:
+    result: dict[str, JsonValue], *, max_bytes: int = ADAPTER_OUTPUT_LIMIT
+) -> NativeTextEnvelope:
     content = result.get("content")
     if (
         result.get("isError")
@@ -134,6 +519,7 @@ def native_text_envelope(
     ):
         raise RuntimeError("bsl-analyzer returned an invalid text-only response")
     text = content[0]["text"]
+    assert isinstance(text, str)
     if len(text.encode()) > max_bytes:
         raise RuntimeError("bsl-analyzer text-only response exceeds the byte limit")
     return {
@@ -162,10 +548,11 @@ def _backend_environment(
     return environment
 
 
-def _bounded_atomic_json(path: Path, value: dict[str, Any]) -> None:
-    if len(canonical_json(value)) > ADAPTER_STATE_LIMIT:
+def _bounded_atomic_json(path: Path, value: object) -> None:
+    encoded = canonical_json(value)
+    if len(encoded) > ADAPTER_STATE_LIMIT:
         raise RuntimeError("index adapter state exceeds the byte limit")
-    atomic_json(path, value)
+    atomic_json(path, parse_json_object(encoded.decode()))
 
 
 def _tree_size(root: Path) -> int:
@@ -207,24 +594,27 @@ def _fsync_directory(path: Path) -> None:
 
 
 def repository_instance_fingerprint(repo: Path) -> str:
-    project_id = tomllib.loads((repo / "project.toml").read_text(encoding="utf-8"))["project"]["id"]
+    project = _toml_json(repo / "project.toml").get("project")
+    if not isinstance(project, dict):
+        raise ValueError("project.toml project table is missing")
+    project_id = project.get("id")
     return "sha256:" + sha256(canonical_json({
         "project_id": str(project_id),
         "repository_root": str(repo.resolve()),
     }))
 
 
-def load_config(repo: Path, required_capabilities: tuple[str, ...] = ()) -> dict[str, Any]:
-    raw = tomllib.loads((repo / "research/indexing.toml").read_text(encoding="utf-8"))
+def load_config(repo: Path, required_capabilities: tuple[str, ...] = ()) -> IndexConfig:
+    raw = _toml_json(repo / "research/indexing.toml")
     version = str(raw.get("schema_version", "1"))
     if version == "1":
         if set(raw) - {"schema_version", "engine", "engine_version"} or set(raw) < {"engine", "engine_version"}:
             raise ValueError("invalid indexing schema version 1")
         if raw["engine"] != "rlm-tools-bsl" or not str(raw["engine_version"]).strip():
             raise ValueError("invalid legacy indexing backend")
-        backends = [{"adapter_id": "rlm-tools-bsl", "engine_version": str(raw["engine_version"])}]
-        routes = {capability: ["rlm-tools-bsl"] for capability in CAPABILITIES}
-        return {"schema_version": "2", "source_schema_version": "1", "backends": backends, "routes": routes}
+        legacy_backends: list[BackendRow] = [{"adapter_id": "rlm-tools-bsl", "engine_version": str(raw["engine_version"])}]
+        legacy_routes: dict[str, list[str]] = {capability: ["rlm-tools-bsl"] for capability in CAPABILITIES}
+        return {"schema_version": "2", "source_schema_version": "1", "backends": legacy_backends, "routes": legacy_routes}
     expected = (
         {"schema_version", "backends", "routes"}
         if version == "2"
@@ -241,9 +631,10 @@ def load_config(repo: Path, required_capabilities: tuple[str, ...] = ()) -> dict
     routes_raw = raw.get("routes")
     if not isinstance(backend_rows, list) or not backend_rows or not isinstance(routes_raw, dict):
         raise ValueError("indexing backends and routes are required")
-    backends: list[dict[str, str]] = []
+    backends: list[BackendRow] = []
     identifiers: list[str] = []
-    for row in backend_rows:
+    for row_value in backend_rows:
+        row = row_value
         if not isinstance(row, dict) or set(row) != {"adapter_id", "engine_version"}:
             raise ValueError("invalid indexing backend")
         adapter_id = str(row["adapter_id"])
@@ -269,11 +660,11 @@ def load_config(repo: Path, required_capabilities: tuple[str, ...] = ()) -> dict
             or set(members) - set(identifiers)
         ):
             raise ValueError("invalid indexing capability route")
-        routes[capability] = list(members)
+        routes[capability] = [item for item in members if isinstance(item, str)]
     missing = set(required_capabilities) - set(routes)
     if missing:
         raise ValueError(f"missing required indexing routes: {sorted(missing)}")
-    result: dict[str, Any] = {
+    result: IndexConfig = {
         "schema_version": version,
         "source_schema_version": version,
         "backends": backends,
@@ -282,23 +673,24 @@ def load_config(repo: Path, required_capabilities: tuple[str, ...] = ()) -> dict
     if version == "3":
         if not {"code-search-lexical", "code-search-hybrid"} <= set(routes):
             raise ValueError("indexing schema version 3 requires explicit lexical and hybrid routes")
-        profiles = raw["service_profiles"]
+        profiles_value = raw["service_profiles"]
         if (
-            not isinstance(profiles, dict)
-            or set(profiles) != set(SCHEMA3_SERVICE_PROFILES)
+            not isinstance(profiles_value, dict)
+            or set(profiles_value) != set(SCHEMA3_SERVICE_PROFILES)
             or any(
-                not isinstance(profiles[name], str) or not profiles[name].strip()
+                not isinstance(profiles_value.get(name), str) or not str(profiles_value.get(name)).strip()
                 for name in SCHEMA3_SERVICE_PROFILES
             )
-            or len(set(profiles.values())) != len(profiles)
+            or len(set(str(value) for value in profiles_value.values())) != len(profiles_value)
         ):
             raise ValueError("invalid indexing schema version 3 service profiles")
+        profiles = {name: str(profiles_value[name]) for name in SCHEMA3_SERVICE_PROFILES}
         result["machine_contract_version"] = "1.3"
         result["service_profiles"] = dict(profiles)
     return result
 
 
-def serialize_config(config: dict[str, Any]) -> bytes:
+def serialize_config(config: IndexConfig) -> bytes:
     version = str(config.get("schema_version"))
     if version not in {"2", "3"}:
         raise ValueError("only normalized indexing schema versions 2 and 3 can be written")
@@ -321,18 +713,19 @@ def serialize_config(config: dict[str, Any]) -> bytes:
             lines.append(f'{json.dumps(capability)} = [{values}]')
     if version == "3":
         lines.extend(("", "[service_profiles]"))
+        profiles = config.get("service_profiles")
+        if profiles is None:
+            raise ValueError("indexing schema version 3 service profiles are missing")
         for name in SCHEMA3_SERVICE_PROFILES:
-            lines.append(f"{name} = {json.dumps(config['service_profiles'][name])}")
+            lines.append(f"{name} = {json.dumps(profiles[name])}")
     return ("\n".join(lines) + "\n").encode()
 
 
 def _preview_candidate(
     repo: Path,
-    candidate: dict[str, Any],
+    candidate: ConfigCandidate,
     required_capabilities: tuple[str, ...],
-) -> tuple[dict[str, Any], bytes, str]:
-    if not isinstance(candidate, dict):
-        raise ValueError("indexing configuration must be an object")
+) -> tuple[IndexConfig, bytes, str]:
     if candidate == {"schema_version": "1"}:
         current = load_config(repo)
         if (
@@ -357,7 +750,8 @@ def _preview_candidate(
     with tempfile.TemporaryDirectory() as temporary:
         shadow = Path(temporary)
         (shadow / "research").mkdir()
-        (shadow / "research/indexing.toml").write_bytes(serialize_config(candidate))
+        normalized_candidate = _index_config(candidate)
+        _ = (shadow / "research/indexing.toml").write_bytes(serialize_config(normalized_candidate))
         normalized = load_config(shadow, required_capabilities)
     return normalized, serialize_config(normalized), "2"
 
@@ -368,10 +762,10 @@ def config_fingerprint(repo: Path) -> str:
 
 def preview_config(
     repo: Path,
-    candidate: dict[str, Any],
+    candidate: ConfigCandidate,
     expected_file_fingerprint: str,
     required_capabilities: tuple[str, ...] = (),
-) -> dict[str, Any]:
+) -> ConfigPlan:
     if expected_file_fingerprint != config_fingerprint(repo):
         raise RuntimeError("stale indexing configuration fingerprint")
     normalized, encoded, target_schema_version = _preview_candidate(
@@ -379,12 +773,12 @@ def preview_config(
         candidate,
         required_capabilities,
     )
-    normalized.pop("source_schema_version", None)
+    _ = normalized.pop("source_schema_version", None)
     current = load_config(repo)
     current_backend_ids = {item["adapter_id"] for item in current["backends"]}
     candidate_backend_ids = {item["adapter_id"] for item in normalized["backends"]}
     affected = sorted(current_backend_ids | candidate_backend_ids)
-    plan = {
+    plan: ConfigPlan = {
         "schema_version": "indexing-configuration-plan/v1",
         "target_schema_version": target_schema_version,
         "current_file_fingerprint": expected_file_fingerprint,
@@ -403,20 +797,19 @@ def preview_config(
             if current["routes"].get(capability) != normalized["routes"].get(capability)
         ),
         "reuse_invalidated": current != {**normalized, "source_schema_version": current.get("source_schema_version", "2")},
+        "plan_fingerprint": "",
     }
-    return {
-        **plan,
-        "plan_fingerprint": "sha256:" + sha256(canonical_json(plan)),
-    }
+    plan["plan_fingerprint"] = "sha256:" + sha256(canonical_json({key: value for key, value in plan.items() if key != "plan_fingerprint"}))
+    return plan
 
 
 def apply_config(
     repo: Path,
-    candidate: dict[str, Any],
+    candidate: ConfigCandidate,
     expected_file_fingerprint: str,
     expected_plan_fingerprint: str,
     required_capabilities: tuple[str, ...] = (),
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     plan = preview_config(repo, candidate, expected_file_fingerprint, required_capabilities)
     if plan["plan_fingerprint"] != expected_plan_fingerprint:
         raise RuntimeError("stale indexing configuration plan")
@@ -432,10 +825,9 @@ def apply_config(
     }
 
 
-def _schema3_candidate(candidate: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
+def _schema3_candidate(candidate: ConfigCandidate) -> tuple[IndexConfig, bytes]:
     if (
-        not isinstance(candidate, dict)
-        or candidate.get("schema_version") != "3"
+        candidate.get("schema_version") != "3"
         or set(candidate) != {
             "schema_version", "machine_contract_version", "backends", "routes",
             "service_profiles",
@@ -445,33 +837,30 @@ def _schema3_candidate(candidate: dict[str, Any]) -> tuple[dict[str, Any], bytes
     with tempfile.TemporaryDirectory() as temporary:
         shadow = Path(temporary)
         (shadow / "research").mkdir()
-        encoded = serialize_config(candidate)
-        (shadow / "research/indexing.toml").write_bytes(encoded)
+        encoded = serialize_config(_index_config(candidate))
+        _ = (shadow / "research/indexing.toml").write_bytes(encoded)
         normalized = load_config(shadow)
-    normalized.pop("source_schema_version", None)
+    _ = normalized.pop("source_schema_version", None)
     return normalized, serialize_config(normalized)
 
 
 def _validate_schema3_profiles(
     profile_operations: dict[str, list[str]],
 ) -> dict[str, list[str]]:
-    if not isinstance(profile_operations, dict) or set(profile_operations) != set(
+    if set(profile_operations) != set(
         SCHEMA3_SERVICE_PROFILES
     ):
         raise ValueError("lexical and hybrid profile operations are required")
     normalized: dict[str, list[str]] = {}
     for profile, operations in profile_operations.items():
         if (
-            not isinstance(operations, list)
-            or not operations
-            or any(not isinstance(item, str) for item in operations)
+            not operations
             or len(operations) != len(set(operations))
         ):
             raise ValueError("invalid schema 3 profile operations")
         if "find_references" in operations:
             raise ValueError(
-                "find_references is not admitted for new v2 profiles; "
-                "use symbol or graph operations"
+                "find_references is not admitted for new v2 profiles; use symbol or graph operations"
             )
         if set(operations) - COMPLETE_SEARCH_OPERATIONS:
             raise ValueError("unknown schema 3 profile operation")
@@ -481,11 +870,11 @@ def _validate_schema3_profiles(
 
 def preview_schema3_migration(
     repo: Path,
-    candidate: dict[str, Any],
+    candidate: ConfigCandidate,
     expected_file_fingerprint: str,
     profile_operations: dict[str, list[str]],
     v1_inflight_ids: tuple[str, ...] = (),
-) -> dict[str, Any]:
+) -> MigrationPlan:
     if config_fingerprint(repo) != expected_file_fingerprint:
         raise RuntimeError("stale indexing configuration fingerprint")
     current = load_config(repo)
@@ -493,7 +882,7 @@ def preview_schema3_migration(
         raise ValueError("schema 3 migration requires indexing schema version 2")
     normalized, encoded = _schema3_candidate(candidate)
     operations = _validate_schema3_profiles(profile_operations)
-    if any(not isinstance(item, str) or not item for item in v1_inflight_ids):
+    if any(not item for item in v1_inflight_ids):
         raise ValueError("invalid v1 in-flight invocation identifier")
     if len(v1_inflight_ids) != len(set(v1_inflight_ids)):
         raise ValueError("duplicate v1 in-flight invocation identifier")
@@ -512,13 +901,16 @@ def preview_schema3_migration(
         or manifest.get("machine_contract_version") != "1.3"
     ):
         raise RuntimeError("schema 3 requires the complete bsl-analyzer contract 1.3")
-    plan = {
+    service_profiles = normalized.get("service_profiles")
+    if service_profiles is None:
+        raise ValueError("schema 3 requires service profiles")
+    plan: MigrationPlan = {
         "schema_version": "indexing-schema3-migration-plan/v1",
         "current_file_fingerprint": expected_file_fingerprint,
         "normalized_file_fingerprint": "sha256:" + sha256(encoded),
         "normalized_file": encoded.decode(),
         "machine_contract_version": "1.3",
-        "profile_bindings": normalized["service_profiles"],
+        "profile_bindings": service_profiles,
         "profile_operations": operations,
         "explicit_routes": {
             name: normalized["routes"][f"code-search-{name}"]
@@ -529,19 +921,21 @@ def preview_schema3_migration(
         "preserved_v1_inflight": list(v1_inflight_ids),
         "backup_required": True,
         "build_started": False,
+        "plan_fingerprint": "",
     }
-    return {**plan, "plan_fingerprint": "sha256:" + sha256(canonical_json(plan))}
+    plan["plan_fingerprint"] = "sha256:" + sha256(canonical_json({key: value for key, value in plan.items() if key != "plan_fingerprint"}))
+    return plan
 
 
 def apply_schema3_migration(
     repo: Path,
-    candidate: dict[str, Any],
+    candidate: ConfigCandidate,
     expected_file_fingerprint: str,
     expected_plan_fingerprint: str,
     profile_operations: dict[str, list[str]],
     v1_inflight_ids: tuple[str, ...] = (),
     state_root: Path | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     with repository_lock(repo):
         plan = preview_schema3_migration(
             repo, candidate, expected_file_fingerprint, profile_operations,
@@ -576,7 +970,7 @@ def preview_schema3_rollback(
     *,
     v2_inflight_ids: tuple[str, ...] = (),
     purge_v2_state: bool = False,
-) -> dict[str, Any]:
+) -> RollbackPlan:
     if config_fingerprint(repo) != expected_file_fingerprint:
         raise RuntimeError("stale indexing configuration fingerprint")
     if load_config(repo)["source_schema_version"] != "3":
@@ -589,9 +983,9 @@ def preview_schema3_rollback(
     payload = backup.read_bytes()
     if not prior_runtime_schema2_ready(backup):
         raise RuntimeError("schema 2 rollback backup is invalid")
-    if any(not isinstance(item, str) or not item for item in v2_inflight_ids):
+    if any(not item for item in v2_inflight_ids):
         raise ValueError("invalid v2 in-flight invocation identifier")
-    plan = {
+    plan: RollbackPlan = {
         "schema_version": "indexing-schema3-rollback-plan/v1",
         "current_file_fingerprint": expected_file_fingerprint,
         "restore_file_fingerprint": "sha256:" + sha256(payload),
@@ -600,8 +994,10 @@ def preview_schema3_rollback(
         "inflight_handling_required": bool(v2_inflight_ids),
         "v2_state_action": "purge" if purge_v2_state else "retain",
         "readiness_check_required": True,
+        "plan_fingerprint": "",
     }
-    return {**plan, "plan_fingerprint": "sha256:" + sha256(canonical_json(plan))}
+    plan["plan_fingerprint"] = "sha256:" + sha256(canonical_json({key: value for key, value in plan.items() if key != "plan_fingerprint"}))
+    return plan
 
 
 def prior_runtime_schema2_ready(backup: Path) -> bool:
@@ -609,7 +1005,7 @@ def prior_runtime_schema2_ready(backup: Path) -> bool:
         with tempfile.TemporaryDirectory() as temporary:
             shadow = Path(temporary)
             (shadow / "research").mkdir()
-            (shadow / "research/indexing.toml").write_bytes(backup.read_bytes())
+            _ = (shadow / "research/indexing.toml").write_bytes(backup.read_bytes())
             return load_config(shadow)["source_schema_version"] == "2"
     except (OSError, ValueError, KeyError):
         return False
@@ -626,7 +1022,7 @@ def apply_schema3_rollback(
     purge_v2_state: bool = False,
     admission_closed: bool = False,
     inflight_handling: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     with repository_lock(repo):
         plan = preview_schema3_rollback(
             repo, expected_file_fingerprint, state_root,
@@ -682,17 +1078,17 @@ def capability_fingerprint(
 
 def target_identity(
     repo: Path,
-    component: dict[str, Any],
-    backend: dict[str, str],
+    component: Component,
+    backend: BackendRow,
     capabilities: list[str],
     executable_fingerprint: str = "",
     modality: str = "",
     embedding_identity: str = "",
-) -> dict[str, Any]:
+) -> TargetIdentity:
     adapter_id = backend["adapter_id"]
-    return {
+    identity: TargetIdentity = {
         "adapter_id": adapter_id,
-        "adapter_version": BACKEND_CATALOG[adapter_id]["adapter_version"],
+        "adapter_version": str(BACKEND_CATALOG[adapter_id]["adapter_version"]),
         "engine_version": backend["engine_version"],
         "repository_instance_fingerprint": repository_instance_fingerprint(repo),
         "component_id": component["component_id"],
@@ -706,16 +1102,16 @@ def target_identity(
             capabilities,
             executable_fingerprint,
         ),
-        **({"modality": modality} if modality else {}),
-        **(
-            {"embedding_identity": embedding_identity}
-            if embedding_identity else {}
-        ),
     }
+    if modality:
+        identity["modality"] = modality
+    if embedding_identity:
+        identity["embedding_identity"] = embedding_identity
+    return identity
 
 
 def _index_profile_identity(
-    repo: Path, backend: dict[str, str], modality: str
+    repo: Path, backend: BackendRow, modality: str
 ) -> str:
     config = load_config(repo)
     if (
@@ -728,18 +1124,24 @@ def _index_profile_identity(
     if modality != "hybrid":
         raise ValueError("invalid BSL Analyzer index modality")
     from . import search_services
-    profile_id = str(config["service_profiles"]["hybrid"])
-    profile, _secret = search_services._private_profile(repo, profile_id, None)
+    profiles = config.get("service_profiles")
+    if profiles is None:
+        raise RuntimeError("search_services.hybrid_unavailable")
+    profile_id = str(profiles["hybrid"])
+    profile, _secret = search_services.private_profile(repo, profile_id, None)
     if profile.get("kind") != "embedding" or not profile.get("enabled"):
         raise RuntimeError("search_services.hybrid_unavailable")
-    return str(profile["semantic_identity"])
+    semantic_identity = profile.get("semantic_identity")
+    if not isinstance(semantic_identity, str):
+        raise RuntimeError("search_services.hybrid_unavailable")
+    return semantic_identity
 
 
-def target_fingerprint(identity: dict[str, Any]) -> str:
+def target_fingerprint(identity: TargetIdentity) -> str:
     return "sha256:" + sha256(canonical_json(identity))
 
 
-def promoted_identity(identity: dict[str, Any], index_manifest: list[dict[str, Any]]) -> dict[str, Any]:
+def promoted_identity(identity: TargetIdentity, index_manifest: list[dict[str, str | int]]) -> PromotedIdentity:
     manifest_fingerprint = "sha256:" + sha256(canonical_json(index_manifest))
     return {
         **identity,
@@ -753,11 +1155,11 @@ def promoted_identity(identity: dict[str, Any], index_manifest: list[dict[str, A
 
 
 def select_backend(
-    config: dict[str, Any],
+    config: IndexConfig,
     capability: str,
-    component: dict[str, Any],
-    states: list[dict[str, Any]],
-) -> dict[str, Any]:
+    component: Component,
+    states: list[BackendState],
+) -> BackendDecision:
     if capability not in {*CAPABILITIES, *COMPLETE_SEARCH_CAPABILITIES}:
         raise ValueError("unknown indexing capability")
     route = config["routes"].get(capability)
@@ -798,7 +1200,7 @@ def select_backend(
             skipped.append({"adapter_id": adapter_id, "reason": "representation_unsupported"})
             continue
         if state.get("status") == "ready":
-            decision = {
+            decision: BackendDecision = {
                 "capability": capability,
                 "preferred_backend_id": route[0],
                 "selected_backend_id": adapter_id,
@@ -806,6 +1208,7 @@ def select_backend(
                 "fallback_reason": skipped[0]["reason"] if skipped else None,
                 "skipped": skipped,
                 "state": state,
+                "route_fingerprint": "",
             }
             decision["route_fingerprint"] = "sha256:" + sha256(canonical_json({
                 "capability": capability,
@@ -822,12 +1225,12 @@ def select_backend(
 
 
 def route_coverage(
-    config: dict[str, Any],
-    components: list[dict[str, Any]],
-    states: list[dict[str, Any]],
-) -> dict[str, list[dict[str, Any]]]:
-    blockers: list[dict[str, Any]] = []
-    degraded: list[dict[str, Any]] = []
+    config: IndexConfig,
+    components: list[Component],
+    states: list[BackendState],
+) -> Coverage:
+    blockers: list[CoverageBlocker] = []
+    degraded: list[CoverageDegraded] = []
     by_component = {
         component["component_id"]: component
         for component in components
@@ -855,9 +1258,9 @@ def route_coverage(
     return {"blockers": blockers, "degraded": degraded}
 
 
-def normalize_hit(raw: dict[str, Any], decision: dict[str, Any], component: dict[str, Any]) -> dict[str, Any]:
+def normalize_hit(raw: RawHit, decision: BackendDecision, component: Component) -> NormalizedHit:
     allowed = {"component_relative_path", "line", "symbol", "kind", "rank"}
-    if not isinstance(raw, dict) or set(raw) - allowed:
+    if set(raw) - allowed:
         raise ValueError("invalid backend search hit")
     relative = normalize_relative(str(raw.get("component_relative_path", "")))
     if Path(relative).is_absolute():
@@ -866,23 +1269,29 @@ def normalize_hit(raw: dict[str, Any], decision: dict[str, Any], component: dict
     if kind not in {"text", "symbol", "reference", "caller", "callee", "metadata"}:
         raise ValueError("unknown backend hit kind")
     state = decision["state"]
-    result = {
+    adapter_version = state.get("adapter_version")
+    index_fingerprint = state.get("index_fingerprint")
+    if not isinstance(adapter_version, str) or not isinstance(index_fingerprint, str):
+        raise ValueError("ready backend state is incomplete")
+    result: NormalizedHit = {
         "backend_id": decision["selected_backend_id"],
-        "adapter_version": state["adapter_version"],
-        "index_fingerprint": state["index_fingerprint"],
+        "adapter_version": adapter_version,
+        "index_fingerprint": index_fingerprint,
         "component_id": component["component_id"],
         "source_generation_id": component["source_generation_id"],
         "component_relative_path": relative,
         "kind": kind,
         "rank": str(raw.get("rank", ""))[:100],
     }
-    if raw.get("line") is not None:
-        line = int(raw["line"])
+    line_value = raw.get("line")
+    if line_value is not None:
+        line = int(line_value)
         if line <= 0:
             raise ValueError("invalid backend hit line")
         result["line"] = line
-    if raw.get("symbol") is not None:
-        result["symbol"] = str(raw["symbol"])[:500]
+    symbol_value = raw.get("symbol")
+    if symbol_value is not None:
+        result["symbol"] = str(symbol_value)[:500]
     return result
 
 
@@ -903,13 +1312,13 @@ def discover_executable(repo: Path) -> str | None:
 def backend_executable(repo: Path, adapter_id: str) -> str | None:
     if adapter_id == "rlm-tools-bsl":
         return discover_executable(repo)
-    return shutil.which(BACKEND_CATALOG[adapter_id]["executable"])
+    return shutil.which(str(BACKEND_CATALOG[adapter_id]["executable"]))
 
 
 def _bounded_run(
     command: list[str],
     *,
-    timeout_seconds: int = ADAPTER_TIMEOUT_SECONDS,
+    timeout_seconds: int | float = ADAPTER_TIMEOUT_SECONDS,
     input: str | None = None,
     cancelled: Callable[[], bool] | None = None,
     index_dir: Path | None = None,
@@ -919,9 +1328,9 @@ def _bounded_run(
     with tempfile.TemporaryDirectory(prefix="one-c-index-home-") as private_home, tempfile.TemporaryFile() as stdin:
         environment = _backend_environment(Path(private_home), index_dir)
         if input is not None:
-            stdin.write(input.encode())
-            stdin.seek(0)
-        process = subprocess.Popen(
+            _ = stdin.write(input.encode())
+            _ = stdin.seek(0)
+        process: subprocess.Popen[bytes] = subprocess.Popen(
             command,
             stdin=stdin if input is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -932,7 +1341,7 @@ def _bounded_run(
         if process.stdout is None:
             raise RuntimeError("index adapter output is unavailable")
         selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
+        _ = selector.register(process.stdout, selectors.EVENT_READ)
         deadline = time.monotonic() + timeout_seconds
         output = bytearray()
         try:
@@ -961,21 +1370,86 @@ def _bounded_run(
         except (InterruptedError, TimeoutError, RuntimeError):
             os.killpg(process.pid, signal.SIGTERM)
             try:
-                process.wait(timeout=2)
+                _ = process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+                _ = process.wait()
             raise
         finally:
             selector.close()
 
 
-def _bsl_contract(executable: str, configured_version: str) -> dict[str, Any]:
+def _bsl_contract(executable: str, configured_version: str) -> BslContract:
     result = _bounded_run([executable, "contract"])
     try:
-        contract = json.loads(result.stdout)
+        contract_json = parse_json_object(result.stdout)
+        mcp_value = contract_json.get("mcp")
+        if not isinstance(mcp_value, dict):
+            raise ValueError("mcp is missing")
+        mcp = _json_object(mcp_value)
+        profiles_value = mcp.get("profiles")
+        if not isinstance(profiles_value, dict):
+            raise ValueError("profiles are missing")
+        profile_rows = _json_object(profiles_value)
+        typed_profiles: dict[str, ContractProfile] = {}
+        for profile_name, profile_value in profile_rows.items():
+            if not isinstance(profile_value, dict):
+                raise ValueError("invalid profile")
+            profile_row = _json_object(profile_value)
+            tools_value = profile_row.get("tools")
+            if not isinstance(tools_value, list):
+                raise ValueError("profile tools are missing")
+            tools: list[ContractTool] = []
+            for tool_value in tools_value:
+                if not isinstance(tool_value, dict) or not isinstance(tool_value.get("name"), str):
+                    raise ValueError("invalid profile tool")
+                tool_row = _json_object(tool_value)
+                tool_name = tool_row.get("name")
+                if not isinstance(tool_name, str):
+                    raise ValueError("invalid profile tool")
+                tool: ContractTool = {"name": tool_name}
+                actions_value = tool_row.get("actions")
+                if actions_value is not None:
+                    if not isinstance(actions_value, list):
+                        raise ValueError("invalid tool actions")
+                    actions: list[ContractAction] = []
+                    for action_value in actions_value:
+                        if not isinstance(action_value, dict):
+                            raise ValueError("invalid tool actions")
+                        action = _json_object(action_value)
+                        action_name = action.get("name")
+                        if not isinstance(action_name, str):
+                            raise ValueError("invalid tool actions")
+                        actions.append({"name": action_name})
+                    tool["actions"] = actions
+                for key in ("output_schema_version", "output_schema_fingerprint"):
+                    item = tool_row.get(key)
+                    if isinstance(item, str):
+                        tool[key] = item
+                tools.append(tool)
+            typed_profiles[profile_name] = {"tools": tools}
+        contract: BslContract = {
+            "contract_version": str(contract_json.get("contract_version", "")),
+            "build_version": str(contract_json.get("build_version", "")),
+            "mcp": {"profiles": typed_profiles},
+        }
+        transports_value = contract_json.get("transports")
+        if isinstance(transports_value, dict):
+            transport_rows = _json_object(transports_value)
+            transports: dict[str, dict[str, dict[str, JsonValue]]] = {}
+            for transport_name, transport_value in transport_rows.items():
+                if not isinstance(transport_value, dict):
+                    raise ValueError("invalid transport")
+                transport_group = _json_object(transport_value)
+                typed_group: dict[str, dict[str, JsonValue]] = {}
+                for name, settings in transport_group.items():
+                    if not isinstance(settings, dict):
+                        raise ValueError("invalid transport settings")
+                    typed_group[name] = _json_object(settings)
+                transports[transport_name] = typed_group
+            contract["transports"] = transports
         profiles = contract["mcp"]["profiles"]
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("bsl-analyzer returned an invalid machine contract") from exc
     if (
         result.returncode
@@ -1047,9 +1521,9 @@ def _bsl_contract(executable: str, configured_version: str) -> dict[str, Any]:
 
 
 def _bsl_surface_manifest(
-    contract: dict[str, Any], executable_fingerprint: str
-) -> dict[str, Any]:
-    identity = {
+    contract: BslContract, executable_fingerprint: str
+) -> dict[str, JsonValue]:
+    identity: dict[str, JsonValue] = {
         "schema_version": "bsl-search-surface/v1",
         "state": "complete",
         "executable_fingerprint": executable_fingerprint,
@@ -1094,7 +1568,7 @@ def _bsl_surface_manifest(
     return identity
 
 
-def probe_backend(repo: Path, backend: dict[str, str]) -> dict[str, Any]:
+def probe_backend(repo: Path, backend: BackendRow) -> BackendProbe:
     adapter_id = backend["adapter_id"]
     executable = backend_executable(repo, adapter_id)
     if not executable:
@@ -1103,6 +1577,8 @@ def probe_backend(repo: Path, backend: dict[str, str]) -> dict[str, Any]:
         executable_fingerprint = "sha256:" + sha256(
             Path(executable).resolve().read_bytes()
         )
+        surface_manifest: dict[str, JsonValue] | None = None
+        capabilities: list[str]
         if adapter_id == "rlm-tools-bsl":
             actual = cli_version(executable)
             if actual != backend["engine_version"]:
@@ -1116,7 +1592,7 @@ def probe_backend(repo: Path, backend: dict[str, str]) -> dict[str, Any]:
             surface_manifest = _bsl_surface_manifest(
                 contract, executable_fingerprint
             )
-        return {
+        probe_result: BackendProbe = {
             "available": True,
             "executable": executable,
             "engine_version": backend["engine_version"],
@@ -1129,34 +1605,30 @@ def probe_backend(repo: Path, backend: dict[str, str]) -> dict[str, Any]:
                 capabilities,
                 executable_fingerprint,
             ),
-            **(
-                {"surface_manifest": surface_manifest}
-                if adapter_id == "bsl-analyzer"
-                else {}
-            ),
         }
+        if surface_manifest is not None:
+            probe_result["surface_manifest"] = surface_manifest
+        return probe_result
     except Exception as exc:
         surface_state = (
             exc.state if isinstance(exc, BslSurfaceContractError)
             else "incompatible"
         )
-        return {
+        failure_result: BackendProbe = {
             "available": False,
             "failure_code": "backend.contract_incompatible",
             "failure_summary": str(exc)[:500],
             "capabilities": [],
-            **(
-                {"surface_manifest": {
-                    "schema_version": "bsl-search-surface/v1",
-                    "state": surface_state,
-                }}
-                if adapter_id == "bsl-analyzer"
-                else {}
-            ),
         }
+        if adapter_id == "bsl-analyzer":
+            failure_result["surface_manifest"] = {
+                "schema_version": "bsl-search-surface/v1",
+                "state": surface_state,
+            }
+        return failure_result
 
 
-def backend_tool_inventory(repo: Path) -> list[dict[str, Any]]:
+def backend_tool_inventory(repo: Path) -> list[ToolInventory]:
     config = load_config(repo)
     configured = {item["adapter_id"]: item for item in config["backends"]}
     required = {
@@ -1167,11 +1639,11 @@ def backend_tool_inventory(repo: Path) -> list[dict[str, Any]]:
         )
         for adapter_id in BACKEND_CATALOG
     }
-    tools: list[dict[str, Any]] = []
+    tools: list[ToolInventory] = []
     for adapter_id in sorted(BACKEND_CATALOG):
         executable = backend_executable(repo, adapter_id)
         backend = configured.get(adapter_id)
-        instances: list[dict[str, Any]] = []
+        instances: list[ToolInstance] = []
         status = "unavailable"
         if executable and backend:
             probe = probe_backend(repo, backend)
@@ -1232,31 +1704,45 @@ def validate_engine_version(repo: Path, executable: str) -> str:
     return actual
 
 
-def discover(repo: Path) -> list[dict[str, Any]]:
-    pointer = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
-    generation = str(pointer["generation_id"])
+def discover(repo: Path) -> list[Component]:
+    pointer = _source_pointer(repo / "research/active-source-generation.json")
+    generation_value = pointer.get("generation_id")
+    if not isinstance(generation_value, str):
+        raise ValueError("active source generation is invalid")
+    generation = generation_value
     root = confined(repo / "sources/generations", generation)
     config = load_config(repo)
     legacy_backend = next((item for item in config["backends"] if item["adapter_id"] == "rlm-tools-bsl"), config["backends"][0])
+    candidates: list[tuple[str, Path, str, str | None, int | None]]
     if pointer.get("schema_version") == "2":
-        candidates = [
-            (item["component_id"], confined(root, item["path"]) / "source" if item["kind"] in {"epf", "erf", "source-tree"} else confined(root, item["path"]), item["representation_schema"], item.get("fingerprint"), item.get("bsl_file_count"))
-            for item in pointer.get("components", [])
-        ]
+        candidates = []
+        for item in pointer.get("components", []):
+            component_id = item.get("component_id")
+            component_path = item.get("path")
+            kind = item.get("kind")
+            representation = item.get("representation_schema")
+            if not all(isinstance(value, str) for value in (component_id, component_path, kind, representation)):
+                raise ValueError("active source component is invalid")
+            assert isinstance(component_id, str) and isinstance(component_path, str) and isinstance(kind, str) and isinstance(representation, str)
+            base = confined(root, component_path)
+            candidates.append((component_id, base / "source" if kind in {"epf", "erf", "source-tree"} else base, representation, item.get("fingerprint"), item.get("bsl_file_count")))
     elif pointer.get("schema_version") == "1" and pointer.get("representation_schema") in {"xml-hierarchical", "v8unpack", "edt-project"}:
         candidates = []
         for role in ROLES:
             role_root = confined(root, role)
-            candidates.append((f"{role}:configuration", role_root / "configuration", pointer["representation_schema"], None, None))
+            representation = pointer.get("representation_schema")
+            if not isinstance(representation, str):
+                raise ValueError("active source representation is invalid")
+            candidates.append((f"{role}:configuration", role_root / "configuration", representation, None, None))
             extensions = role_root / "extensions"
             if extensions.is_dir():
-                candidates.extend((f"{role}:extension:{item.name.lower()}", item, pointer["representation_schema"], None, None) for item in extensions.iterdir() if item.is_dir())
+                candidates.extend((f"{role}:extension:{item.name.lower()}", item, representation, None, None) for item in extensions.iterdir() if item.is_dir())
             external = role_root / "external"
             if external.is_dir():
-                candidates.extend((f"{role}:external:{item.name}", item / "source", pointer["representation_schema"], None, None) for item in external.iterdir() if item.is_dir())
+                candidates.extend((f"{role}:external:{item.name}", item / "source", representation, None, None) for item in external.iterdir() if item.is_dir())
     else:
         raise ValueError(f"unsupported source representation for indexing: {pointer.get('representation_schema')}")
-    result: list[dict[str, Any]] = []
+    result: list[Component] = []
     for component_id, component_root, representation, fingerprint, bsl_file_count in sorted(candidates):
         if not component_root.is_dir():
             continue
@@ -1275,7 +1761,7 @@ def discover(repo: Path) -> list[dict[str, Any]]:
     return sorted(result, key=lambda item: item["component_id"])
 
 
-def index_key(repo: Path, component: dict[str, Any]) -> str:
+def index_key(repo: Path, component: Component) -> str:
     preimage = {key: component[key] for key in ("component_id", "path", "fingerprint", "representation", "source_generation_id", "engine", "engine_version")}
     preimage["repository_instance_fingerprint"] = repository_instance_fingerprint(repo)
     return sha256(canonical_json(preimage))
@@ -1283,7 +1769,7 @@ def index_key(repo: Path, component: dict[str, Any]) -> str:
 
 def required_component_ids(repo: Path, paths: list[str], roles: tuple[str, ...]) -> list[str]:
     available = {item["component_id"] for item in discover(repo)}
-    result = set()
+    result: set[str] = set()
     for value in paths:
         parts = value.replace("\\", "/").split("/")
         selected_roles = roles
@@ -1310,14 +1796,14 @@ def canonical_evidence(repo: Path, component_id: str, relative_path: str) -> dic
     path = confined(component_root, normalize_relative(relative_path))
     if not path.is_file() or path.is_symlink():
         raise ValueError("index navigation does not resolve to a canonical source file")
-    role, kind, *identity = component_id.split(":")
+    _role, kind, *identity = component_id.split(":")
     prefix = "configuration" if kind == "configuration" else f"extensions/{identity[0]}" if kind == "extension" else f"external/{identity[0]}/source"
     return {"path": f"{prefix}/{path.relative_to(component_root).as_posix()}", "fingerprint": "sha256:" + sha256(path.read_bytes()), "source_generation_id": component["source_generation_id"], "component_id": component_id}
 
 
 def cli_probe(
     executable: str, path: Path, index_dir: Path | None = None
-) -> dict[str, Any]:
+) -> CliProbe:
     result = _bounded_run(
         [executable, "index", "info", str(path)], index_dir=index_dir
     )
@@ -1325,7 +1811,7 @@ def cli_probe(
     return {"ready": result.returncode == 0 and "Status:   fresh" in output, "exit_code": result.returncode, "output": output}
 
 
-def cli_build(executable: str, path: Path, _component_id: str, timeout_seconds: int = 1800, index_dir: Path | None = None) -> dict[str, Any]:
+def cli_build(executable: str, path: Path, _component_id: str, timeout_seconds: int | float = 1800, index_dir: Path | None = None) -> CliProbe:
     result = _bounded_run(
         [executable, "index", "build", str(path)],
         timeout_seconds=timeout_seconds,
@@ -1335,7 +1821,7 @@ def cli_build(executable: str, path: Path, _component_id: str, timeout_seconds: 
     return {"ready": result.returncode == 0 and probe["ready"], "exit_code": result.returncode, "output": result.stdout}
 
 
-def _versioned_structured_content(result: dict[str, Any]) -> dict[str, Any]:
+def _versioned_structured_content(result: dict[str, JsonValue]) -> dict[str, JsonValue]:
     structured = result.get("structuredContent")
     version = (
         str(structured.get("schema_version", ""))
@@ -1352,18 +1838,18 @@ def _versioned_structured_content(result: dict[str, Any]) -> dict[str, Any]:
         )
     ):
         raise RuntimeError("bsl-analyzer returned an unsupported structured schema")
-    return structured
+    return dict(structured)
 
 
 def _bsl_mcp(
     executable: str,
     source_dir: Path,
-    calls: list[tuple[str, dict[str, Any], bool]],
-    timeout_seconds: int = ADAPTER_TIMEOUT_SECONDS,
+    calls: list[tuple[str, dict[str, JsonValue], bool]],
+    timeout_seconds: int | float = ADAPTER_TIMEOUT_SECONDS,
     cancelled: Callable[[], bool] | None = None,
     environment: dict[str, str] | None = None,
-    owned_resource: Any | None = None,
-) -> list[dict[str, Any]]:
+    owned_resource: Closable | None = None,
+) -> list[dict[str, JsonValue]]:
     from .search_runtime import supervised_workspace_proxy
 
     environment = environment or _backend_environment(source_dir.parent / ".runtime-home")
@@ -1378,39 +1864,43 @@ def _bsl_mcp(
     )
     proxy = proxy_context.__enter__()
     try:
-        process = subprocess.Popen(
+        process: subprocess.Popen[str] = subprocess.Popen(
             proxy["command"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
             env=proxy["environment"],
             start_new_session=True,
             bufsize=1,
         )
     except BaseException:
-        proxy_context.__exit__(*__import__("sys").exc_info())
+        _ = proxy_context.__exit__(*sys.exc_info())
         raise
-    if process.stdin is None or process.stdout is None:
-        raise RuntimeError("bsl-analyzer broker proxy stdio is unavailable")
+    stdin_stream = _process_input_stream(process.stdin)
+    stdout_stream = _process_output_stream(process.stdout)
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
+    selector_target = stdout_stream.fileno() if isinstance(
+        stdout_stream, FileDescriptorStream
+    ) else 0
+    _ = selector.register(selector_target, selectors.EVENT_READ)
     deadline = time.monotonic() + timeout_seconds
     output_bytes = 0
     next_id = 1
 
-    def send(method: str, params: dict[str, Any] | None = None, *, notify: bool = False) -> dict[str, Any]:
+    def send(method: str, params: dict[str, JsonValue] | None = None, *, notify: bool = False) -> dict[str, JsonValue]:
         nonlocal next_id, output_bytes
         identifier = next_id
         next_id += 1
-        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        payload: dict[str, JsonValue] = {"jsonrpc": "2.0", "method": method}
         if not notify:
             payload["id"] = identifier
         if params is not None:
             payload["params"] = params
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        process.stdin.write(encoded + "\n")
-        process.stdin.flush()
+        _ = stdin_stream.write(encoded + "\n")
+        stdin_stream.flush()
         if notify:
             return {}
         while True:
@@ -1419,25 +1909,26 @@ def _bsl_mcp(
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not selector.select(remaining):
                 raise TimeoutError("bsl-analyzer MCP request timed out")
-            line = process.stdout.readline()
+            line = stdout_stream.readline()
             if not line:
                 raise RuntimeError("bsl-analyzer MCP exited before replying")
             output_bytes += len(line.encode())
             if output_bytes > ADAPTER_OUTPUT_LIMIT:
                 raise RuntimeError("bsl-analyzer MCP output limit exceeded")
             try:
-                response = json.loads(line)
-            except json.JSONDecodeError:
+                response = parse_json_object(line)
+            except ValueError:
                 continue
             if response.get("id") != identifier:
                 continue
             if response.get("error"):
                 raise RuntimeError("bsl-analyzer MCP request failed")
-            return response.get("result") or {}
+            response_result = response.get("result")
+            return dict(response_result) if isinstance(response_result, dict) else {}
 
-    results: list[dict[str, Any]] = []
+    results: list[dict[str, JsonValue]] = []
     try:
-        send(
+        _ = send(
             "initialize",
             {
                 "protocolVersion": "2025-06-18",
@@ -1445,18 +1936,21 @@ def _bsl_mcp(
                 "clientInfo": {"name": "one-c-autoresearch", "version": "1"},
             },
         )
-        send("notifications/initialized", notify=True)
+        _ = send("notifications/initialized", notify=True)
         for tool, arguments, wait_ready in calls:
             attempts = 80 if wait_ready else 1
+            result: dict[str, JsonValue] = {}
             for attempt in range(attempts):
                 result = send("tools/call", {"name": tool, "arguments": arguments})
-                structured = (
-                    _versioned_structured_content(result)
-                    if wait_ready
-                    else result.get("structuredContent")
-                )
-                if not wait_ready and not isinstance(structured, dict):
-                    native_text_envelope(result)
+                if wait_ready:
+                    structured = _versioned_structured_content(result)
+                else:
+                    structured_value = result.get("structuredContent")
+                    if isinstance(structured_value, dict):
+                        structured = dict(structured_value)
+                    else:
+                        _ = native_text_envelope(result)
+                        structured = {}
                 if (
                     not wait_ready
                     or structured.get("state") == "ready"
@@ -1472,19 +1966,19 @@ def _bsl_mcp(
     finally:
         selector.close()
         try:
-            process.stdin.close()
+            stdin_stream.close()
         except OSError:
             pass
         try:
-            process.wait(timeout=2)
+            _ = process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGTERM)
             try:
-                process.wait(timeout=2)
+                _ = process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-        proxy_context.__exit__(None, None, None)
+                _ = process.wait()
+        _ = proxy_context.__exit__(None, None, None)
 
 
 def _operational_path(repo: Path, state_root: Path | None = None) -> Path:
@@ -1507,7 +2001,7 @@ def capture_schema2_backup(
     payload = path.read_bytes()
     if str(tomllib.loads(payload.decode()).get("schema_version")) != "2":
         raise ValueError("pre-migration backup requires indexing schema version 2")
-    load_config(repo)
+    _ = load_config(repo)
     backup = _operational_root(repo, state_root) / "migrations/pre-schema3-indexing.toml"
     if backup.exists():
         if backup.is_symlink() or backup.read_bytes() != payload:
@@ -1525,7 +2019,7 @@ def capture_schema2_backup(
 
 def storage_diagnostics(
     repo: Path, state_root: Path | None = None
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     root = _operational_root(repo, state_root)
     used = _tree_size(root)
     return {
@@ -1538,14 +2032,14 @@ def storage_diagnostics(
 
 def preview_index_gc(
     repo: Path, state_root: Path | None = None
-) -> dict[str, Any]:
+) -> GcPlan:
     root = _operational_root(repo, state_root)
-    candidates: list[dict[str, Any]] = []
+    candidates: list[GcCandidate] = []
     for target in sorted((root / "targets").iterdir()) if (root / "targets").is_dir() else []:
         current_path = target / "current.json"
         current = ""
         if current_path.is_file():
-            current = str(json.loads(current_path.read_text())["instance"])
+            current = str(parse_json_object(current_path.read_text())["instance"])
         instances = target / "instances"
         for instance in sorted(instances.iterdir()) if instances.is_dir() else []:
             relative = instance.relative_to(target).as_posix()
@@ -1556,15 +2050,14 @@ def preview_index_gc(
                 "instance": instance.name,
                 "bytes": _tree_size(instance),
             })
-    plan = {
+    plan: GcPlan = {
         "schema_version": "index-storage-gc-plan/v1",
         "candidates": candidates,
         "reclaimed_bytes": sum(item["bytes"] for item in candidates),
+        "plan_fingerprint": "",
     }
-    return {
-        **plan,
-        "plan_fingerprint": "sha256:" + sha256(canonical_json(plan)),
-    }
+    plan["plan_fingerprint"] = "sha256:" + sha256(canonical_json({key: value for key, value in plan.items() if key != "plan_fingerprint"}))
+    return plan
 
 
 def apply_index_gc(
@@ -1573,7 +2066,7 @@ def apply_index_gc(
     *,
     confirmed: bool,
     state_root: Path | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     if not confirmed:
         raise ValueError("index storage cleanup requires confirmation")
     with repository_lock(repo):
@@ -1594,13 +2087,16 @@ def apply_index_gc(
         }
 
 
-def _copy_private_source(source: Path, target: Path) -> list[dict[str, Any]]:
+def _copy_private_source(source: Path, target: Path) -> list[dict[str, str | int]]:
     source_manifest = file_manifest(source)
     target.mkdir(parents=True)
     for item in source_manifest:
-        destination = confined(target, item["path"])
+        relative_path = item["path"]
+        if not isinstance(relative_path, str):
+            raise ValueError("source manifest path is invalid")
+        destination = confined(target, relative_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(confined(source, item["path"]).read_bytes())
+        _ = destination.write_bytes(confined(source, relative_path).read_bytes())
     if file_manifest(target) != source_manifest:
         raise RuntimeError("private index mirror differs from canonical source")
     return source_manifest
@@ -1614,10 +2110,12 @@ def _acquire_target_lease(lease_path: Path, token: str) -> None:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if lease_path.is_file():
             try:
-                saved = json.loads(lease_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                saved = parse_json_object(lease_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
                 saved = {}
-            if process_identity_alive(saved.get("process_identity")):
+            identity_value = saved.get("process_identity")
+            process_identity_value = dict(identity_value) if isinstance(identity_value, dict) else None
+            if process_identity_alive(process_identity_value):
                 raise RuntimeError("index target build is already leased")
             lease_path.unlink(missing_ok=True)
         descriptor = os.open(lease_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -1634,17 +2132,20 @@ def _acquire_target_lease(lease_path: Path, token: str) -> None:
 
 def build_backend_index(
     repo: Path,
-    component: dict[str, Any],
-    backend: dict[str, str],
+    component: Component,
+    backend: BackendRow,
     *,
     state_root: Path | None = None,
-    timeout_seconds: int = 1800,
+    timeout_seconds: int | float = 1800,
     cancelled: Callable[[], bool] | None = None,
     modality: str = "lexical",
-) -> dict[str, Any]:
+) -> BackendState:
     probe = probe_backend(repo, backend)
     if not probe["available"]:
         raise RuntimeError(str(probe.get("failure_code")))
+    executable_value = probe.get("executable")
+    if not isinstance(executable_value, str):
+        raise RuntimeError("backend executable is missing from probe")
     embedding_identity = _index_profile_identity(repo, backend, modality)
     identity = target_identity(
         repo,
@@ -1671,7 +2172,8 @@ def build_backend_index(
         if cancelled and cancelled():
             raise InterruptedError("index build was cancelled")
         source_manifest = _copy_private_source(source_root, mirror)
-        executable = str(probe["executable"])
+        executable = executable_value
+        rlm_index_dir: Path | None = None
         if backend["adapter_id"] == "rlm-tools-bsl":
             rlm_index_dir = staging / "index"
             outcome = _bounded_run(
@@ -1692,10 +2194,15 @@ def build_backend_index(
             )
             broker = None
             if modality == "hybrid":
-                profile_id = str(load_config(repo)["service_profiles"]["hybrid"])
-                profile, _secret = search_services._private_profile(
+                profiles = load_config(repo).get("service_profiles")
+                if profiles is None:
+                    raise RuntimeError("search_services.hybrid_unavailable")
+                profile_id = str(profiles["hybrid"])
+                profile, _secret = search_services.private_profile(
                     repo, profile_id, None
                 )
+                if profile["kind"] != "embedding":
+                    raise RuntimeError("search_services.hybrid_unavailable")
                 broker = search_services.EmbeddingBroker(
                     repo, profile_id, operation="build"
                 )
@@ -1707,7 +2214,7 @@ def build_backend_index(
                     broker_environment=broker_environment,
                 )
                 environment["ONE_C_EMBEDDING_IDENTITY"] = embedding_identity
-            _bsl_mcp(
+            _ = _bsl_mcp(
                 executable,
                 mirror,
                 [
@@ -1741,7 +2248,7 @@ def build_backend_index(
                 {**item, "path": f"index/{item['path']}"}
                 for item in file_manifest(rlm_index_dir)
             ]
-            if backend["adapter_id"] == "rlm-tools-bsl"
+            if backend["adapter_id"] == "rlm-tools-bsl" and rlm_index_dir is not None
             else [
                 item
                 for item in mirror_manifest
@@ -1770,14 +2277,14 @@ def build_backend_index(
         if _tree_size(_operational_root(repo, state_root)) > PROJECT_STORAGE_LIMIT:
             raise RuntimeError("index project storage quota exceeded")
         _fsync_tree(staging)
-        lease = json.loads(lease_path.read_text(encoding="utf-8"))
+        lease = parse_json_object(lease_path.read_text(encoding="utf-8"))
         if lease.get("token") != token:
             raise RuntimeError("index target lease was fenced")
         if cancelled and cancelled():
             raise InterruptedError("index build was cancelled")
         if instance.exists():
             shutil.rmtree(staging)
-            saved = json.loads((instance / "state.json").read_text(encoding="utf-8"))
+            saved = parse_json_object((instance / "state.json").read_text(encoding="utf-8"))
             if (
                 saved.get("identity") != promoted
                 or saved.get("source_manifest") != source_manifest
@@ -1796,15 +2303,17 @@ def build_backend_index(
                 "instance": f"instances/{instance_key}",
             },
         )
-        return {
+        result: BackendState = {
             "adapter_id": backend["adapter_id"],
-            **({"modality": modality} if backend["adapter_id"] == "bsl-analyzer" else {}),
             "component_id": component["component_id"],
             "status": "ready",
             "index_fingerprint": promoted["index_fingerprint"],
             "target_fingerprint": target_fingerprint(identity),
             "last_validation": validated_at,
         }
+        if backend["adapter_id"] == "bsl-analyzer":
+            result["modality"] = modality
+        return result
     except Exception:
         if staging.exists():
             quarantine = target_root / "quarantine"
@@ -1813,23 +2322,26 @@ def build_backend_index(
         raise
     finally:
         try:
-            lease = json.loads(lease_path.read_text(encoding="utf-8"))
+            lease = parse_json_object(lease_path.read_text(encoding="utf-8"))
             if lease.get("token") == token:
                 lease_path.unlink()
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             pass
 
 
 def ready_backend_state(
     repo: Path,
-    component: dict[str, Any],
-    backend: dict[str, str],
+    component: Component,
+    backend: BackendRow,
     *,
     state_root: Path | None = None,
     modality: str = "lexical",
-) -> dict[str, Any] | None:
+) -> BackendState | None:
     probe = probe_backend(repo, backend)
     if not probe["available"]:
+        return None
+    contract_value = probe.get("contract_version")
+    if not isinstance(contract_value, str):
         return None
     try:
         embedding_identity = _index_profile_identity(repo, backend, modality)
@@ -1859,13 +2371,16 @@ def ready_backend_state(
         )
         if legacy is None:
             return None
+        capability_value = probe.get("capability_fingerprint")
+        if not isinstance(capability_value, str):
+            return None
         source_root = confined(
             repo / "sources/generations" / component["source_generation_id"],
             component["path"],
         )
         index_fingerprint = "sha256:" + sha256(canonical_json({
             "legacy_index_key": legacy["index_key"],
-            "capability_fingerprint": probe["capability_fingerprint"],
+            "capability_fingerprint": capability_value,
         }))
         return {
             "status": "ready",
@@ -1875,17 +2390,25 @@ def ready_backend_state(
             "target_fingerprint": target_fingerprint(identity),
             "last_validation": legacy.get("last_validation"),
             "capabilities": probe["capabilities"],
-            "contract_version": probe["contract_version"],
+            "contract_version": contract_value,
             "legacy_adopted": True,
         }
     try:
-        current = json.loads(pointer.read_text(encoding="utf-8"))
-        instance = confined(target_root, current["instance"])
-        saved = json.loads((instance / "state.json").read_text(encoding="utf-8"))
+        current = parse_json_object(pointer.read_text(encoding="utf-8"))
+        instance_value = current.get("instance")
+        if not isinstance(instance_value, str):
+            return None
+        instance = confined(target_root, instance_value)
+        saved = parse_json_object((instance / "state.json").read_text(encoding="utf-8"))
+        saved_identity = saved.get("identity")
+        source_manifest_value = saved.get("source_manifest")
+        index_manifest_value = saved.get("index_manifest")
+        if not isinstance(saved_identity, dict) or not isinstance(source_manifest_value, list) or not isinstance(index_manifest_value, list):
+            return None
         if (
             saved.get("status") != "ready"
-            or saved.get("identity", {}).get("target_fingerprint") != target_fingerprint(identity)
-            or saved.get("identity", {}).get("index_fingerprint") != current.get("index_fingerprint")
+            or saved_identity.get("target_fingerprint") != target_fingerprint(identity)
+            or saved_identity.get("index_fingerprint") != current.get("index_fingerprint")
         ):
             return None
         mirror = instance / "source"
@@ -1893,42 +2416,60 @@ def ready_backend_state(
             repo / "sources/generations" / component["source_generation_id"],
             component["path"],
         )
-        if file_manifest(source_root) != saved["source_manifest"]:
+        if file_manifest(source_root) != source_manifest_value:
             return None
         index_dir = instance / "index"
         if backend["adapter_id"] == "rlm-tools-bsl":
-            expected_index = [
-                {**item, "path": item["path"].removeprefix("index/")}
-                for item in saved["index_manifest"]
-            ]
+            expected_index: list[dict[str, str | int]] = []
+            for item_value in index_manifest_value:
+                if not isinstance(item_value, dict) or not isinstance(item_value.get("path"), str):
+                    return None
+                item: dict[str, str | int] = {}
+                for key, value in item_value.items():
+                    if not isinstance(value, (str, int)) or isinstance(value, bool):
+                        return None
+                    item[key] = value
+                item["path"] = str(item["path"]).removeprefix("index/")
+                expected_index.append(item)
             if not index_dir.is_dir() or file_manifest(index_dir) != expected_index:
                 return None
-        return {
+        current_fingerprint = current.get("index_fingerprint")
+        if not isinstance(current_fingerprint, str):
+            return None
+        validation_value = saved.get("last_validation")
+        last_validation = validation_value if isinstance(validation_value, str) else None
+        state: BackendState = {
             "status": "ready",
             "instance_path": str(mirror),
             "index_dir": str(index_dir) if index_dir.is_dir() else "",
-            "index_fingerprint": current["index_fingerprint"],
+            "index_fingerprint": current_fingerprint,
             "target_fingerprint": target_fingerprint(identity),
-            "last_validation": saved.get("last_validation"),
+            "last_validation": last_validation,
             "capabilities": probe["capabilities"],
-            "contract_version": probe["contract_version"],
-            **(
-                {"embedding_identity": embedding_identity}
-                if embedding_identity else {}
-            ),
+            "contract_version": contract_value,
         }
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        if embedding_identity:
+            state["embedding_identity"] = embedding_identity
+        return state
+    except (OSError, KeyError, TypeError, ValueError):
         return None
 
 
-def _nested_dicts(value: Any):
+def _nested_dicts(value: JsonValue) -> Iterator[dict[str, JsonValue]]:
     if isinstance(value, dict):
-        yield value
+        yield dict(value)
         for child in value.values():
             yield from _nested_dicts(child)
     elif isinstance(value, list):
         for child in value:
             yield from _nested_dicts(child)
+
+
+def _request_limit(request: dict[str, JsonValue]) -> int:
+    value = request.get("max_results", 1)
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        raise ValueError("source_search.max_results_invalid")
+    return int(value)
 
 
 def _bsl_hits(
@@ -1937,9 +2478,9 @@ def _bsl_hits(
     operation: str,
     query: str,
     limit: int,
-    timeout_seconds: int,
+    timeout_seconds: int | float,
     cancelled: Callable[[], bool] | None = None,
-) -> list[dict[str, Any]]:
+) -> list[RawHit]:
     budget = max(128, min(8192, limit * 256))
     if operation == "search_text":
         results = _bsl_mcp(
@@ -2018,15 +2559,15 @@ def _bsl_hits(
         kind = "metadata"
     else:
         raise ValueError("source_search.operation_forbidden")
-    hits: list[dict[str, Any]] = []
-    for row in _nested_dicts([
-        _versioned_structured_content(result)
-        for result in results
-    ]):
+    hits: list[RawHit] = []
+    structured_results: list[JsonValue] = [
+        _versioned_structured_content(result) for result in results
+    ]
+    for row in _nested_dicts(structured_results):
         path = row.get("path") or row.get("relativePath") or row.get("file")
         if not isinstance(path, str) or not path:
             continue
-        hit: dict[str, Any] = {
+        hit: RawHit = {
             "component_relative_path": path.replace("\\", "/"),
             "kind": kind,
         }
@@ -2042,11 +2583,11 @@ def _bsl_hits(
     return hits
 
 
-def _bsl_workspace_request(request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def _bsl_workspace_request(request: dict[str, JsonValue]) -> tuple[str, dict[str, JsonValue]]:
     operation = str(request["operation"])
-    limit = min(int(request.get("max_results", 1)), 100)
+    limit = min(_request_limit(request), 100)
     budget = max(128, min(8192, limit * 256))
-    arguments: dict[str, Any] = {"max_output_tokens": budget}
+    arguments: dict[str, JsonValue] = {"max_output_tokens": budget}
     if operation.startswith("code."):
         arguments.update(
             action="search_code", query=str(request["query"]), limit=min(limit, 50)
@@ -2100,14 +2641,14 @@ def _bsl_component_path(value: str, mirror: Path) -> str:
 
 
 def _bsl_workspace_items(
-    result: dict[str, Any], operation: str, mirror: Path, limit: int
-) -> tuple[list[dict[str, Any]], set[str]]:
+    result: dict[str, JsonValue], operation: str, mirror: Path, limit: int
+) -> tuple[list[dict[str, JsonValue]], set[str]]:
     structured = result.get("structuredContent")
     if not isinstance(structured, dict):
         envelope = native_text_envelope(result)
         try:
-            parsed = json.loads(envelope["text"])
-        except json.JSONDecodeError:
+            parsed = parse_json_object(envelope["text"])
+        except ValueError:
             parsed = None
         if isinstance(parsed, dict) and str(parsed.get("schema_version", "")).startswith("1"):
             structured = parsed
@@ -2118,7 +2659,7 @@ def _bsl_workspace_items(
                 "text": envelope["text"],
             }], set()
     else:
-        _versioned_structured_content(result)
+        _ = _versioned_structured_content(result)
     modalities = {
         str(row[key]).lower()
         for row in _nested_dicts(structured)
@@ -2126,11 +2667,11 @@ def _bsl_workspace_items(
         if isinstance(row.get(key), str)
         and str(row[key]).lower() in {"l", "lexical", "s", "semantic", "h", "hybrid"}
     }
-    items: list[dict[str, Any]] = []
+    items: list[dict[str, JsonValue]] = []
     seen: set[bytes] = set()
     forbidden_text = {"text", "snippet", "body", "source", "content", "code"}
     for row in _nested_dicts(structured):
-        item: dict[str, Any] | None = None
+        item: dict[str, JsonValue] | None = None
         path = row.get("path") or row.get("relativePath") or row.get("file")
         if isinstance(path, str) and path:
             item = {
@@ -2199,12 +2740,12 @@ def _bsl_workspace_items(
 def _bsl_workspace_query(
     executable: str,
     mirror: Path,
-    request: dict[str, Any],
-    timeout_seconds: int,
+    request: dict[str, JsonValue],
+    timeout_seconds: int | float,
     cancelled: Callable[[], bool] | None = None,
     environment: dict[str, str] | None = None,
-    owned_resource: Any | None = None,
-) -> dict[str, Any]:
+    owned_resource: Closable | None = None,
+) -> dict[str, JsonValue]:
     operation = str(request["operation"])
     tool, arguments = _bsl_workspace_request(request)
     result = _bsl_mcp(
@@ -2213,7 +2754,7 @@ def _bsl_workspace_query(
         owned_resource,
     )[0]
     items, modalities = _bsl_workspace_items(
-        result, operation, mirror, int(request.get("max_results", 1))
+        result, operation, mirror, _request_limit(request)
     )
     if operation == "code.search_lexical" and modalities not in (
         {"l"}, {"lexical"},
@@ -2227,25 +2768,29 @@ def _bsl_workspace_query(
         raise RuntimeError("source_search.semantic_modality_unavailable")
     return {
         "items": items,
-        "truncated": len(items) >= int(request.get("max_results", 1)),
+        "truncated": len(items) >= _request_limit(request),
         "modalities": sorted(modalities),
     }
 
 
 def query_backend(
     repo: Path,
-    decision: dict[str, Any],
-    request: dict[str, Any],
+    decision: BackendDecision,
+    request: dict[str, JsonValue],
     *,
     state_root: Path | None = None,
-    timeout_seconds: int = ADAPTER_TIMEOUT_SECONDS,
+    timeout_seconds: int | float = ADAPTER_TIMEOUT_SECONDS,
     cancelled: Callable[[], bool] | None = None,
-) -> list[dict[str, Any]] | dict[str, Any]:
+) -> list[RawHit] | dict[str, JsonValue]:
     adapter_id = decision["selected_backend_id"]
+    component_value = request.get("component_id")
+    operation_value = request.get("operation")
+    if not isinstance(component_value, str) or not isinstance(operation_value, str):
+        raise ValueError("source_search.request_invalid")
     component = next(
         item
         for item in discover(repo)
-        if item["component_id"] == request["component_id"]
+        if item["component_id"] == component_value
     )
     backend = next(
         item for item in load_config(repo)["backends"]
@@ -2253,7 +2798,7 @@ def query_backend(
     )
     modality = (
         "hybrid"
-        if request.get("operation") == "code.search_hybrid"
+        if operation_value == "code.search_hybrid"
         else "lexical"
     )
     ready = ready_backend_state(
@@ -2261,19 +2806,24 @@ def query_backend(
     )
     if ready is None:
         raise RuntimeError("source_search.index_stale")
-    if ready["index_fingerprint"] != decision["state"]["index_fingerprint"]:
+    ready_fingerprint = ready.get("index_fingerprint")
+    decision_fingerprint = decision["state"].get("index_fingerprint")
+    instance_path = ready.get("instance_path")
+    if not isinstance(ready_fingerprint, str) or not isinstance(decision_fingerprint, str) or not isinstance(instance_path, str):
+        raise RuntimeError("source_search.index_stale")
+    if ready_fingerprint != decision_fingerprint:
         raise RuntimeError("source_search.index_stale")
     executable = backend_executable(repo, adapter_id)
     if not executable:
         raise RuntimeError("source_search.backend_unavailable")
-    mirror = Path(ready["instance_path"])
+    mirror = Path(instance_path)
     query = str(request.get("query", ""))
-    limit = int(request["max_results"])
+    limit = _request_limit(request)
     if adapter_id == "bsl-analyzer":
-        if str(request["operation"]).startswith(
+        if operation_value.startswith(
             ("code.", "symbol.", "graph.", "metadata.", "diagnostics.")
         ):
-            operation = str(request["operation"])
+            operation = operation_value
             base_environment = _backend_environment(
                 mirror.parent / ".runtime-home"
             )
@@ -2288,9 +2838,11 @@ def query_backend(
                 )
             from . import search_services
             profile_id = str(load_config(repo).get("service_profiles", {}).get("hybrid", ""))
-            profile, _secret = search_services._private_profile(
+            profile, _secret = search_services.private_profile(
                 repo, profile_id, state_root
             )
+            if profile["kind"] != "embedding":
+                raise RuntimeError("search_services.hybrid_unavailable")
             broker = search_services.EmbeddingBroker(
                 repo, profile_id, operation="query", base=state_root
             )
@@ -2301,24 +2853,26 @@ def query_backend(
                 profile=profile,
                 broker_environment=broker_environment,
             )
-            environment["ONE_C_EMBEDDING_IDENTITY"] = profile[
-                "semantic_identity"
-            ]
+            semantic_identity = profile.get("semantic_identity")
+            if not isinstance(semantic_identity, str):
+                raise RuntimeError("search_services.hybrid_unavailable")
+            environment["ONE_C_EMBEDDING_IDENTITY"] = semantic_identity
             result = _bsl_workspace_query(
                 executable, mirror, request, timeout_seconds, cancelled,
                 environment, broker,
             )
-            result["embedding_identity"] = profile["semantic_identity"]
+            result["embedding_identity"] = semantic_identity
             return result
         return _bsl_hits(
             executable,
             mirror,
-            str(request["operation"]),
+            operation_value,
             query,
             limit,
             timeout_seconds,
             cancelled,
         )
+    index_dir_value = ready.get("index_dir")
     result = _bounded_run(
         [
             executable,
@@ -2332,13 +2886,13 @@ def query_backend(
         ],
         timeout_seconds=timeout_seconds,
         cancelled=cancelled,
-        index_dir=Path(ready["index_dir"]) if ready.get("index_dir") else None,
+        index_dir=Path(index_dir_value) if isinstance(index_dir_value, str) and index_dir_value else None,
     )
     if cancelled and cancelled():
         raise InterruptedError("source search was cancelled")
     try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
+        payload = parse_json_object(result.stdout)
+    except ValueError as exc:
         raise RuntimeError("rlm-tools-bsl returned invalid JSON") from exc
     if result.returncode or payload.get("status") != "available":
         raise RuntimeError("source_search.backend_query_failed")
@@ -2350,18 +2904,25 @@ def query_backend(
         "find_callees": "callee",
         "navigate_metadata": "metadata",
     }
-    hits = []
-    for row in payload.get("candidates", [])[:limit]:
+    hits: list[RawHit] = []
+    candidates_value = payload.get("candidates", [])
+    if not isinstance(candidates_value, list):
+        raise RuntimeError("source_search.backend_result_invalid")
+    for row in candidates_value[:limit]:
         if not isinstance(row, dict) or not isinstance(row.get("relativePath"), str):
             raise RuntimeError("source_search.backend_result_invalid")
-        hit: dict[str, Any] = {
-            "component_relative_path": row["relativePath"],
-            "kind": kind_by_operation[str(request["operation"])],
+        relative_path = row.get("relativePath")
+        assert isinstance(relative_path, str)
+        hit: RawHit = {
+            "component_relative_path": relative_path,
+            "kind": kind_by_operation[operation_value],
         }
-        if isinstance(row.get("startLine"), int) and row["startLine"] >= 0:
-            hit["line"] = row["startLine"] + 1
-        if isinstance(row.get("symbolName"), str) and row["symbolName"]:
-            hit["symbol"] = row["symbolName"]
+        start_line = row.get("startLine")
+        if isinstance(start_line, int) and not isinstance(start_line, bool) and start_line >= 0:
+            hit["line"] = start_line + 1
+        symbol_name = row.get("symbolName")
+        if isinstance(symbol_name, str) and symbol_name:
+            hit["symbol"] = symbol_name
         hits.append(hit)
     return hits
 
@@ -2374,9 +2935,9 @@ def ensure_configured(
     rebuild: bool = False,
     confirmed: bool = False,
     state_root: Path | None = None,
-    timeout_seconds: int = 1800,
+    timeout_seconds: int | float = 1800,
     cancelled: Callable[[], bool] | None = None,
-) -> list[dict[str, Any]]:
+) -> list[BackendState]:
     if rebuild and not confirmed:
         raise ValueError("index rebuild requires explicit confirmation")
     components = {item["component_id"]: item for item in discover(repo)}
@@ -2385,18 +2946,16 @@ def ensure_configured(
     selected_backends = list(backend_ids or backends)
     if set(selected_components) - set(components) or set(selected_backends) - set(backends):
         raise ValueError("unknown index component or backend selection")
-    results: list[dict[str, Any]] = []
+    results: list[BackendState] = []
     for component_id in selected_components:
         component = components[component_id]
         if component["bsl_file_count"] == 0:
-            results.extend(
-                {
+            for adapter_id in selected_backends:
+                results.append({
                     "component_id": component_id,
                     "adapter_id": adapter_id,
                     "status": "not_indexable",
-                }
-                for adapter_id in selected_backends
-            )
+                })
             continue
         for adapter_id in selected_backends:
             backend = backends[adapter_id]
@@ -2412,12 +2971,11 @@ def ensure_configured(
                     modality=modality,
                 )
                 if ready and not rebuild:
-                    results.append({
-                        "component_id": component_id,
-                        "adapter_id": adapter_id,
-                        **({"modality": modality} if len(modalities) > 1 else {}),
-                        **ready,
-                    })
+                    ready["component_id"] = component_id
+                    ready["adapter_id"] = adapter_id
+                    if len(modalities) > 1:
+                        ready["modality"] = modality
+                    results.append(ready)
                     continue
                 results.append(
                     build_backend_index(
@@ -2452,7 +3010,7 @@ def validate_configured(
     component_ids: list[str] | None = None,
     backend_ids: list[str] | None = None,
     state_root: Path | None = None,
-) -> list[dict[str, Any]]:
+) -> list[BackendState]:
     components = {item["component_id"]: item for item in discover(repo)}
     backends = {item["adapter_id"]: item for item in load_config(repo)["backends"]}
     selected_components = sorted(component_ids or components)
@@ -2460,7 +3018,7 @@ def validate_configured(
     if set(selected_components) - set(components) or set(selected_backends) - set(backends):
         raise ValueError("unknown index component or backend selection")
     validated_at = datetime.now(timezone.utc).isoformat()
-    results: list[dict[str, Any]] = []
+    results: list[BackendState] = []
     for component_id in selected_components:
         component = components[component_id]
         for adapter_id in selected_backends:
@@ -2484,14 +3042,17 @@ def validate_configured(
                     repo, component, backend, state_root=state_root,
                     modality=modality,
                 )
-                results.append({
+                ready_fingerprint = ready.get("index_fingerprint") if ready else None
+                result: BackendState = {
                     "component_id": component_id,
                     "adapter_id": adapter_id,
-                    **({"modality": modality} if len(modalities) > 1 else {}),
                     "status": "ready" if ready else "not_ready",
-                    "index_fingerprint": ready["index_fingerprint"] if ready else "",
+                    "index_fingerprint": ready_fingerprint if isinstance(ready_fingerprint, str) else "",
                     "validated_at": validated_at,
-                })
+                }
+                if len(modalities) > 1:
+                    result["modality"] = modality
+                results.append(result)
     if (
         load_config(repo)["source_schema_version"] == "3"
         and "bsl-analyzer" in selected_backends
@@ -2502,11 +3063,11 @@ def validate_configured(
     return results
 
 
-def _reference_index_target(
+def _reference_index_target_impl(
     repo: Path,
-    backend: dict[str, Any],
+    backend: BackendRow,
     state_root: Path | None = None,
-) -> tuple[Path, str, dict[str, Any], Path]:
+) -> tuple[Path, str, BackendProbe, Path]:
     executable = backend_executable(repo, "bsl-analyzer")
     probe = probe_backend(repo, backend)
     surface_identity = str(
@@ -2533,19 +3094,33 @@ def _reference_index_target(
     return Path(executable), identity, probe, root
 
 
+_reference_index_target = _reference_index_target_impl
+
+
+def reference_index_target(
+    repo: Path,
+    backend: BackendRow,
+    state_root: Path | None = None,
+) -> tuple[Path, str, BackendProbe, Path]:
+    return _reference_index_target(repo, backend, state_root)
+
+
 def reference_index_status(
     repo: Path,
-    backend: dict[str, Any],
+    backend: BackendRow,
     *,
     state_root: Path | None = None,
-) -> dict[str, Any]:
+) -> BackendState:
     from . import reference_search
     try:
-        _executable, identity, probe, root = _reference_index_target(
+        _executable, identity, probe, root = reference_index_target(
             repo, backend, state_root
         )
-        reference_search.current_reference_index(
-            root, probe["executable_fingerprint"]
+        executable_fingerprint = probe.get("executable_fingerprint")
+        if not isinstance(executable_fingerprint, str):
+            raise RuntimeError("reference_search.surface_incompatible")
+        _ = reference_search.current_reference_index(
+            root, executable_fingerprint
         )
         return {
             "component_id": "reference:bundled",
@@ -2568,33 +3143,37 @@ def reference_index_status(
 
 def ensure_reference_index(
     repo: Path,
-    backend: dict[str, Any],
+    backend: BackendRow,
     *,
     state_root: Path | None = None,
     rebuild: bool = False,
     cancelled: Callable[[], bool] | None = None,
-) -> dict[str, Any]:
+) -> BackendState:
     from . import reference_search
     current = reference_index_status(repo, backend, state_root=state_root)
-    if current["status"] == "ready" and not rebuild:
+    if current.get("status") == "ready" and not rebuild:
         return current
     staging: Path | None = None
     try:
-        executable, identity, probe, root = _reference_index_target(
+        executable, identity, probe, root = reference_index_target(
             repo, backend, state_root
         )
+        executable_fingerprint = probe.get("executable_fingerprint")
+        engine_version = probe.get("engine_version")
+        if not isinstance(executable_fingerprint, str) or not isinstance(engine_version, str):
+            raise RuntimeError("reference_search.surface_incompatible")
         corpus = {
             "source": "selected-build-bundled",
             "corpus_fingerprint": "sha256:" + sha256(canonical_json({
                 "source": "selected-build-bundled",
-                "executable_fingerprint": probe["executable_fingerprint"],
+                "executable_fingerprint": executable_fingerprint,
             })),
-            "build_version": probe["engine_version"],
+            "build_version": engine_version,
         }
         staging = reference_search.stage_reference_index(
-            root, probe["executable_fingerprint"], corpus
+            root, executable_fingerprint, corpus
         )
-        reference_search.execute_reference(
+        _ = reference_search.execute_reference(
             executable,
             staging,
             {
@@ -2604,7 +3183,7 @@ def ensure_reference_index(
             },
             cancelled=cancelled,
         )
-        reference_search.promote_reference_index(staging, {
+        _ = reference_search.promote_reference_index(staging, {
             "state": "ready",
             "cancelled": False,
             "download_attempts": 0,
@@ -2632,22 +3211,23 @@ def ensure_reference_index(
         }
 
 
-def statuses(repo: Path, state_root: Path | None = None, probe: Callable[[Path], dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+def statuses(repo: Path, state_root: Path | None = None, probe: Callable[[Path], CliProbe] | None = None) -> list[LegacyStatus]:
     state_root = state_root or Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "one-c-autoresearch/indexes"
-    prior_states = []
-    for path in state_root.glob("*/state.json") if state_root.is_dir() else []:
+    prior_states: list[dict[str, JsonValue]] = []
+    state_paths: Iterator[Path] = iter(state_root.glob("*/state.json")) if state_root.is_dir() else iter(())
+    for path in state_paths:
         try:
-            prior_states.append(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError):
+            prior_states.append(parse_json_object(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
             continue
-    rows = []
+    rows: list[LegacyStatus] = []
     for component in discover(repo):
         key = index_key(repo, component); state = state_root / key / "state.json"
-        saved: dict[str, Any] = {}
+        saved: dict[str, JsonValue] = {}
         if state.is_file():
             try:
-                saved = json.loads(state.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                saved = parse_json_object(state.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
                 pass
         if component["bsl_file_count"] == 0:
             status = "not_indexable"
@@ -2659,14 +3239,18 @@ def statuses(repo: Path, state_root: Path | None = None, probe: Callable[[Path],
                 for prior in prior_states
             ) else "missing"
         else:
-            status = saved.get("status", "failed") if saved.get("index_key") == key else "stale"
-        rows.append({**component, "index_key": key, "status": status, "last_validation": saved.get("last_validation"), "result": saved.get("result")})
+            status_value = saved.get("status", "failed") if saved.get("index_key") == key else "stale"
+            status = status_value if isinstance(status_value, str) else "failed"
+        validation_value = saved.get("last_validation")
+        result_value = saved.get("result")
+        build_result = _build_outcome(result_value)
+        rows.append({**component, "index_key": key, "status": status, "last_validation": validation_value if isinstance(validation_value, str) else None, "result": build_result})
     return rows
 
 
-def backend_statuses(repo: Path, state_root: Path | None = None) -> list[dict[str, Any]]:
+def backend_statuses(repo: Path, state_root: Path | None = None) -> list[dict[str, JsonValue]]:
     config = load_config(repo)
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, JsonValue]] = []
     for backend in config["backends"]:
         adapter_id = backend["adapter_id"]
         backend_probe = probe_backend(repo, backend)
@@ -2701,7 +3285,8 @@ def backend_statuses(repo: Path, state_root: Path | None = None) -> list[dict[st
                     "ready" if promoted else
                     "unavailable" if not backend_probe["available"] else "missing"
                 )
-                index_fingerprint = promoted["index_fingerprint"] if promoted else ""
+                promoted_fingerprint = promoted.get("index_fingerprint") if promoted else None
+                index_fingerprint = promoted_fingerprint if isinstance(promoted_fingerprint, str) else ""
                 readiness_reason = None
                 recovery_action = None
                 if status == "unavailable":
@@ -2735,11 +3320,11 @@ def backend_statuses(repo: Path, state_root: Path | None = None) -> list[dict[st
                         if readiness_reason == "index.stale"
                         else "ensure_index"
                     )
-                rows.append({
+                rows.append(_json_object({
                     **component,
                     "adapter_id": adapter_id,
                     **({"modality": modality} if len(modalities) > 1 else {}),
-                    "adapter_version": BACKEND_CATALOG[adapter_id]["adapter_version"],
+                    "adapter_version": str(BACKEND_CATALOG[adapter_id]["adapter_version"]),
                     "engine_version": backend["engine_version"],
                     "capabilities": capabilities,
                     "route_priorities": {
@@ -2766,12 +3351,12 @@ def backend_statuses(repo: Path, state_root: Path | None = None) -> list[dict[st
                     "legacy_adopted": bool(promoted and promoted.get("legacy_adopted")),
                     "failure_code": backend_probe.get("failure_code") if status == "unavailable" else None,
                     "failure_summary": backend_probe.get("failure_summary") if status == "unavailable" else None,
-                })
+                }))
     return rows
 
 
-def ensure(repo: Path, builder: Callable[[Path, str], dict[str, Any]], *, selected: list[str] | None = None, rebuild: bool = False, confirmed: bool = False, state_root: Path | None = None, probe: Callable[[Path], dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    pointer = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+def ensure(repo: Path, builder: Callable[[Path, str], BuildOutcome], *, selected: list[str] | None = None, rebuild: bool = False, confirmed: bool = False, state_root: Path | None = None, probe: Callable[[Path], CliProbe] | None = None) -> list[LegacyStatus]:
+    pointer = parse_json_object((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
     if pointer.get("schema_version") == "1":
         raise ValueError("new index builds require routed source schema version 2")
     if rebuild and not confirmed:
@@ -2781,8 +3366,11 @@ def ensure(repo: Path, builder: Callable[[Path, str], dict[str, Any]], *, select
     wanted = sorted(selected or available)
     if set(wanted) - set(available):
         raise ValueError("unknown component selection")
-    results = []
-    source_root = repo / "sources/generations" / json.loads((repo / "research/active-source-generation.json").read_text())["generation_id"]
+    results: list[LegacyStatus] = []
+    generation_id = pointer.get("generation_id")
+    if not isinstance(generation_id, str):
+        raise ValueError("active source generation is invalid")
+    source_root = repo / "sources/generations" / generation_id
     for component_id in wanted:
         item = available[component_id]
         if item["status"] == "not_indexable" or item["status"] == "ready" and not rebuild:
@@ -2790,6 +3378,7 @@ def ensure(repo: Path, builder: Callable[[Path, str], dict[str, Any]], *, select
         state_path = state_root / item["index_key"] / "state.json"
         identity = {key: item[key] for key in ("component_id", "path", "fingerprint", "representation", "source_generation_id", "engine", "engine_version")}
         atomic_json(state_path, {"schema_version": "1", "index_key": item["index_key"], "status": "building", **identity})
+        outcome: BuildOutcome
         try:
             outcome = builder(confined(source_root, item["path"]), item["component_id"])
             status = "ready" if outcome.get("ready") else "failed"

@@ -7,9 +7,7 @@ import fcntl
 import itertools
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-
-from .contracts import atomic_bytes, atomic_json, canonical_json, reject_secrets, sha256
+from .contracts import JsonValue, atomic_bytes, atomic_json, canonical_json, parse_json_object, reject_secrets, sha256
 
 
 EVENT_LIMIT = 10_000
@@ -43,7 +41,7 @@ REQUIRED_PAYLOAD = {
 }
 
 
-def process_identity(pid: int | None = None) -> dict[str, Any] | None:
+def process_identity(pid: int | None = None) -> dict[str, JsonValue] | None:
     pid = pid or os.getpid()
     try:
         fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(") ", 1)[1].split()
@@ -53,16 +51,16 @@ def process_identity(pid: int | None = None) -> dict[str, Any] | None:
         return None
 
 
-def process_identity_alive(identity: dict[str, Any] | None) -> bool:
+def process_identity_alive(identity: dict[str, JsonValue] | None) -> bool:
     if not isinstance(identity, dict) or set(identity) != {"pid", "start_time", "boot_id"}:
         return False
     try:
-        return process_identity(int(identity["pid"])) == identity
+        return process_identity(int(str(identity["pid"]))) == identity
     except (TypeError, ValueError):
         return False
 
 
-def redact(value: Any) -> Any:
+def redact(value: JsonValue) -> JsonValue:
     if isinstance(value, dict):
         return {key: ("[not retained]" if key.lower() in {"reasoning", "private_reasoning", "chain_of_thought"} else "***" if any(word in key.lower() for word in ("password", "token", "secret", "private_key")) else redact(child)) for key, child in value.items()}
     if isinstance(value, list):
@@ -75,14 +73,32 @@ def redact(value: Any) -> Any:
     return value
 
 
+def _object(value: JsonValue, message: str = "expected object") -> dict[str, JsonValue]:
+    if not isinstance(value, dict):
+        raise ValueError(message)
+    return value
+
+
+def _objects(value: JsonValue) -> list[dict[str, JsonValue]]:
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError("expected object array")
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _sequence(value: JsonValue) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("invalid event sequence")
+    return value
+
+
 class EventStore:
     def __init__(self, root: Path, project_id: str):
-        self.root = root / project_id
+        self.root: Path = root / project_id
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.events_path = self.root / "events.jsonl"
-        self.lock_path = self.root / ".events.lock"
+        self.events_path: Path = self.root / "events.jsonl"
+        self.lock_path: Path = self.root / ".events.lock"
 
-    def prepare_run(self, run_id: str, execution_snapshot: dict[str, Any]) -> str:
+    def prepare_run(self, run_id: str, execution_snapshot: dict[str, JsonValue]) -> str:
         """Атомарно создаёт неизменяемую безопасную часть файла запуска."""
 
         reject_secrets(execution_snapshot, "execution snapshot")
@@ -92,7 +108,7 @@ class EventStore:
         with self.lock_path.open("a+b") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             if path.is_file():
-                prior = json.loads(path.read_text(encoding="utf-8"))
+                prior = parse_json_object(path.read_text(encoding="utf-8"))
                 if prior.get("run_id") != run_id or prior.get("execution_snapshot_fingerprint") != fingerprint or canonical_json(prior.get("execution_snapshot")) != encoded:
                     raise RuntimeError("run execution snapshot is immutable")
                 return fingerprint
@@ -106,18 +122,18 @@ class EventStore:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             if not path.is_file():
                 return False
-            value = json.loads(path.read_text(encoding="utf-8"))
+            value = parse_json_object(path.read_text(encoding="utf-8"))
             if value.get("events"):
                 return False
             path.unlink()
             return True
 
-    def run_snapshot(self, run_id: str) -> dict[str, Any] | None:
+    def run_snapshot(self, run_id: str) -> dict[str, JsonValue] | None:
         """Читает файл запуска и проверяет неизменяемый снимок."""
 
         path = self.root / "runs" / f"{sha256(run_id.encode())}.json"
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
+            value = parse_json_object(path.read_text(encoding="utf-8"))
             snapshot = value["execution_snapshot"]
             fingerprint = "sha256:" + sha256(canonical_json(snapshot))
         except (FileNotFoundError, OSError, KeyError, json.JSONDecodeError, TypeError):
@@ -126,14 +142,15 @@ class EventStore:
             return None
         return value
 
-    def emit(self, event_type: str, run_id: str, payload: dict[str, Any], **hierarchy: Any) -> dict[str, Any]:
+    def emit(self, event_type: str, run_id: str, payload: dict[str, JsonValue], **hierarchy: JsonValue) -> dict[str, JsonValue]:
         if event_type not in EVENT_TYPES:
             raise ValueError(f"unsupported workflow event type: {event_type}")
-        if not run_id or not isinstance(payload, dict):
+        if not run_id:
             raise ValueError("workflow event requires run ID and object payload")
         if event_type.startswith("job.") and not hierarchy.get("job_id"):
             raise ValueError("job event requires job ID")
-        if (event_type.startswith("step.") or event_type in {"log.append", "approval.required"}) and (not hierarchy.get("job_id") or not hierarchy.get("step_id") or not isinstance(hierarchy.get("attempt"), int) or hierarchy["attempt"] < 1):
+        attempt = hierarchy.get("attempt")
+        if (event_type.startswith("step.") or event_type in {"log.append", "approval.required"}) and (not hierarchy.get("job_id") or not hierarchy.get("step_id") or not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1):
             raise ValueError("step event requires job, step, and positive attempt")
         if event_type in {"run.finished", "job.finished", "step.finished"} and payload.get("status") not in TERMINAL_STATUSES:
             raise ValueError("terminal workflow event requires a terminal status")
@@ -150,10 +167,7 @@ class EventStore:
                     "tool_versions",
                 }
                 if missing_snapshot_fields := required_snapshot_fields - set(payload):
-                    raise ValueError(
-                        "dispatcher run event is missing execution metadata: "
-                        f"{sorted(missing_snapshot_fields)}"
-                    )
+                    raise ValueError(f"dispatcher run event is missing execution metadata: {sorted(missing_snapshot_fields)}")
         missing = REQUIRED_PAYLOAD[event_type] - set(payload)
         if missing:
             raise ValueError(f"workflow event {event_type} is missing payload fields: {sorted(missing)}")
@@ -166,22 +180,23 @@ class EventStore:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             return self._emit_locked(event_type, run_id, payload, **hierarchy)
 
-    def _emit_locked(self, event_type: str, run_id: str, payload: dict[str, Any], **hierarchy: Any) -> dict[str, Any]:
+    def _emit_locked(self, event_type: str, run_id: str, payload: dict[str, JsonValue], **hierarchy: JsonValue) -> dict[str, JsonValue]:
         events = self.events()
-        cleaned = redact(payload)
+        cleaned = _object(redact(payload))
         transition_key = cleaned.get("transition_key")
         if transition_key:
             snapshot_path = self.root / "runs" / f"{sha256(run_id.encode())}.json"
             try:
-                run_events = json.loads(
+                run_snapshot = parse_json_object(
                     snapshot_path.read_text(encoding="utf-8")
-                ).get("events", [])
+                )
+                run_events = _objects(run_snapshot.get("events", []))
             except (FileNotFoundError, OSError, json.JSONDecodeError):
                 run_events = []
             duplicate = next(
                 (
                     event for event in [*events, *run_events]
-                    if event.get("payload", {}).get("transition_key") == transition_key
+                    if _object(event.get("payload", {})).get("transition_key") == transition_key
                 ),
                 None,
             )
@@ -193,32 +208,32 @@ class EventStore:
             fingerprint = sha256(encoded); artifact = artifacts / f"{fingerprint}.json"
             atomic_bytes(artifact, encoded)
             reference = {"truncated": True, "artifact": str(artifact.relative_to(self.root))}
-            summary = {}
+            summary: dict[str, JsonValue] = {}
             for key in REQUIRED_PAYLOAD[event_type]:
                 value = cleaned[key]
                 summary[key] = value if len(canonical_json(value)) <= 1024 else reference
             cleaned = {**summary, **reference, "original_size": len(encoded)}
         sequence_path = self.root / "sequence.json"
         try:
-            sequence = int(json.loads(sequence_path.read_text(encoding="utf-8"))["sequence"]) + 1
+            sequence = int(str(parse_json_object(sequence_path.read_text(encoding="utf-8"))["sequence"])) + 1
         except (FileNotFoundError, OSError, ValueError, KeyError, json.JSONDecodeError):
-            sequence = events[-1]["sequence"] + 1 if events else 1
-        event = {"schema_version": "workflow-event/v1", "sequence": sequence, "timestamp": datetime.now(timezone.utc).isoformat(), "type": event_type, "run_id": run_id, "job_id": hierarchy.get("job_id"), "step_id": hierarchy.get("step_id"), "attempt": hierarchy.get("attempt"), "payload": cleaned}
+            sequence = _sequence(events[-1]["sequence"]) + 1 if events else 1
+        event: dict[str, JsonValue] = {"schema_version": "workflow-event/v1", "sequence": sequence, "timestamp": datetime.now(timezone.utc).isoformat(), "type": event_type, "run_id": run_id, "job_id": hierarchy.get("job_id"), "step_id": hierarchy.get("step_id"), "attempt": hierarchy.get("attempt"), "payload": cleaned}
         events.append(event); events = events[-EVENT_LIMIT:]
         temporary = self.events_path.with_suffix(".tmp")
         with temporary.open("wb") as stream:
-            for item in events: stream.write(canonical_json(item) + b"\n")
+            for item in events: _ = stream.write(canonical_json(item) + b"\n")
             stream.flush(); os.fsync(stream.fileno())
         os.replace(temporary, self.events_path)
         atomic_json(sequence_path, {"schema_version": "1", "sequence": sequence})
         snapshot_path = self.root / "runs" / f"{sha256(run_id.encode())}.json"
         try:
-            prior_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8")); history = prior_snapshot["events"]
+            prior_snapshot = parse_json_object(snapshot_path.read_text(encoding="utf-8")); history = _objects(prior_snapshot["events"])
         except (FileNotFoundError, OSError, KeyError, json.JSONDecodeError):
             prior_snapshot = {}; history = []
         history = [*history, event][-1000:]
         identity = cleaned.get("process_identity") if event_type == "run.created" else prior_snapshot.get("process_identity")
-        snapshot = {"schema_version": "2" if "execution_snapshot" in prior_snapshot else "1", "run_id": run_id, "last_sequence": sequence, "status": prior_snapshot.get("status", "running") if event_type.startswith("invocation.") else cleaned.get("status", "running"), "process_identity": identity, "events": history}
+        snapshot: dict[str, JsonValue] = {"schema_version": "2" if "execution_snapshot" in prior_snapshot else "1", "run_id": run_id, "last_sequence": sequence, "status": prior_snapshot.get("status", "running") if event_type.startswith("invocation.") else cleaned.get("status", "running"), "process_identity": identity, "events": history}
         if "execution_snapshot" in prior_snapshot:
             snapshot["execution_snapshot"] = prior_snapshot["execution_snapshot"]
             snapshot["execution_snapshot_fingerprint"] = prior_snapshot["execution_snapshot_fingerprint"]
@@ -226,23 +241,23 @@ class EventStore:
         snapshot_path.chmod(0o600)
         return event
 
-    def events(self) -> list[dict[str, Any]]:
+    def events(self) -> list[dict[str, JsonValue]]:
         if not self.events_path.is_file():
             return []
-        return [json.loads(line) for line in self.events_path.read_text(encoding="utf-8").splitlines() if line]
+        return [parse_json_object(line) for line in self.events_path.read_text(encoding="utf-8").splitlines() if line]
 
-    def accepted(self, key: str) -> dict[str, Any] | None:
+    def accepted(self, key: str) -> dict[str, JsonValue] | None:
         path = self.root / "accepted" / f"{sha256(key.encode())}.json"
-        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+        return parse_json_object(path.read_text(encoding="utf-8")) if path.is_file() else None
 
-    def accept(self, key: str, result: dict[str, Any]) -> None:
+    def accept(self, key: str, result: dict[str, JsonValue]) -> None:
         atomic_json(self.root / "accepted" / f"{sha256(key.encode())}.json", {"schema_version": "1", "key": key, "result": result})
 
-    def proposal(self, key: str) -> dict[str, Any] | None:
+    def proposal(self, key: str) -> dict[str, JsonValue] | None:
         path = self.root / "proposals" / f"{sha256(key.encode())}.json"
-        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+        return parse_json_object(path.read_text(encoding="utf-8")) if path.is_file() else None
 
-    def save_proposal(self, key: str, operation: str, profile: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def save_proposal(self, key: str, operation: str, profile: str, payload: dict[str, JsonValue]) -> dict[str, JsonValue]:
         reject_secrets(payload, "agent proposal")
         value = {"schema_version": "1", "key": key, "operation": operation, "agent_profile": profile, "payload": redact(payload)}
         atomic_json(self.root / "proposals" / f"{sha256(key.encode())}.json", value)
@@ -251,72 +266,77 @@ class EventStore:
     def cancel(self, run_id: str, actor: str) -> None:
         atomic_json(self.root / "cancellations" / f"{sha256(run_id.encode())}.json", {"schema_version": "1", "run_id": run_id, "actor": actor, "timestamp": datetime.now(timezone.utc).isoformat()})
 
-    def cancellation(self, run_id: str) -> dict[str, Any] | None:
+    def cancellation(self, run_id: str) -> dict[str, JsonValue] | None:
         path = self.root / "cancellations" / f"{sha256(run_id.encode())}.json"
-        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+        return parse_json_object(path.read_text(encoding="utf-8")) if path.is_file() else None
 
     def reconcile(self) -> list[str]:
-        interrupted = []
+        interrupted: list[str] = []
         runs = self.root / "runs"
         for path in sorted(runs.glob("*.json")) if runs.is_dir() else []:
-            snapshot = json.loads(path.read_text(encoding="utf-8"))
+            snapshot = parse_json_object(path.read_text(encoding="utf-8"))
             if snapshot.get("status") != "running":
                 continue
             identity = snapshot.get("process_identity")
-            if identity and process_identity(identity.get("pid")) == identity:
+            identity_object = _object(identity) if identity else None
+            pid = identity_object.get("pid") if identity_object else None
+            if identity_object and isinstance(pid, int) and not isinstance(pid, bool) and process_identity(pid) == identity_object:
                 continue
             run_id = snapshot["run_id"]
-            payload = {
+            if not isinstance(run_id, str):
+                raise ValueError("invalid run ID")
+            payload: dict[str, JsonValue] = {
                 "status": "interrupted",
                 "error_class": "process_identity_lost",
                 "message": "run owner is no longer active",
                 "duration_seconds": 0.0,
             }
             if execution := snapshot.get("execution_snapshot"):
+                execution_object = _object(execution)
                 payload.update(
                     {
                         "execution_snapshot_fingerprint": snapshot.get("execution_snapshot_fingerprint", ""),
-                        "policy_source": execution.get("policy_source", "current-policy"),
-                        "tool_versions": {"codex": execution.get("codex_version", "")},
+                        "policy_source": execution_object.get("policy_source", "current-policy"),
+                        "tool_versions": {"codex": execution_object.get("codex_version", "")},
                     }
                 )
-            self.emit("run.finished", run_id, payload)
+            _ = self.emit("run.finished", run_id, payload)
             interrupted.append(run_id)
         return interrupted
 
-    def replay(self, cursor: int, limit: int = 500, *, tail: bool = False) -> dict[str, Any]:
+    def replay(self, cursor: int, limit: int = 500, *, tail: bool = False) -> dict[str, JsonValue]:
         if not 1 <= limit <= 500:
             raise ValueError("event page limit must be 1..500")
-        events = self.events(); earliest = events[0]["sequence"] if events else cursor + 1
+        events = self.events(); earliest = _sequence(events[0]["sequence"]) if events else cursor + 1
         if events and cursor and cursor < earliest - 1:
-            snapshots = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((self.root / "runs").glob("*.json"))] if (self.root / "runs").is_dir() else []
-            remaining = 500; bounded = []
+            snapshots = [parse_json_object(path.read_text(encoding="utf-8")) for path in sorted((self.root / "runs").glob("*.json"))] if (self.root / "runs").is_dir() else []
+            remaining = 500; bounded: list[dict[str, JsonValue]] = []
             for snapshot in reversed(snapshots):
-                history = snapshot.get("events", [])[-remaining:]
+                history = _objects(snapshot.get("events", []))[-remaining:]
                 bounded.append({**snapshot, "events": history})
                 remaining -= len(history)
                 if remaining <= 0: break
-            next_cursor = max((event["sequence"] for snapshot in bounded for event in snapshot.get("events", [])), default=earliest - 1)
+            next_cursor = max((_sequence(event["sequence"]) for snapshot in bounded for event in _objects(snapshot.get("events", []))), default=earliest - 1)
             return {"resync_required": True, "earliest_sequence": earliest, "events": [], "snapshot": list(reversed(bounded)), "next_cursor": next_cursor}
-        page = events[-limit:] if tail and cursor == 0 else [item for item in events if item["sequence"] > cursor][:limit]
-        return {"resync_required": False, "earliest_sequence": earliest, "events": page, "next_cursor": page[-1]["sequence"] if page else cursor}
+        page = events[-limit:] if tail and cursor == 0 else [item for item in events if _sequence(item["sequence"]) > cursor][:limit]
+        return {"resync_required": False, "earliest_sequence": earliest, "events": page, "next_cursor": _sequence(page[-1]["sequence"]) if page else cursor}
 
-    def append_log(self, run_id: str, attempt: int, data: bytes) -> dict[str, Any]:
+    def append_log(self, run_id: str, attempt: int, data: bytes) -> dict[str, JsonValue]:
         root = self.root / "logs" / sha256(run_id.encode()); root.mkdir(parents=True, exist_ok=True)
         data = str(redact(data.decode("utf-8", errors="replace"))).encode()
         path = root / f"{attempt}.log"; current = path.stat().st_size if path.exists() else 0
         accepted = max(0, min(len(data), LOG_LIMIT - current))
-        with path.open("ab") as stream: stream.write(data[:accepted])
+        with path.open("ab") as stream: _ = stream.write(data[:accepted])
         discarded = len(data) - accepted
         metadata_path = path.with_suffix(".json")
         try:
-            previous = int(json.loads(metadata_path.read_text(encoding="utf-8"))["discarded_bytes"])
+            previous = int(str(parse_json_object(metadata_path.read_text(encoding="utf-8"))["discarded_bytes"]))
         except (FileNotFoundError, OSError, ValueError, KeyError, json.JSONDecodeError):
             previous = 0
         atomic_json(metadata_path, {"schema_version": "1", "discarded_bytes": previous + discarded})
         return {"path": str(path.relative_to(self.root)), "accepted_bytes": accepted, "discarded_bytes": previous + discarded}
 
-    def read_log(self, run_id: str, attempt: int, offset: int = 0, limit: int = 500) -> dict[str, Any]:
+    def read_log(self, run_id: str, attempt: int, offset: int = 0, limit: int = 500) -> dict[str, JsonValue]:
         if offset < 0 or not 1 <= limit <= 500:
             raise ValueError("log page must use non-negative offset and limit 1..500")
         path = self.root / "logs" / sha256(run_id.encode()) / f"{attempt}.log"
@@ -324,7 +344,7 @@ class EventStore:
             return {"offset": offset, "lines": [], "has_more": False}
         metadata = path.with_suffix(".json")
         try:
-            discarded = int(json.loads(metadata.read_text(encoding="utf-8"))["discarded_bytes"])
+            discarded = int(str(parse_json_object(metadata.read_text(encoding="utf-8"))["discarded_bytes"]))
         except (FileNotFoundError, OSError, ValueError, KeyError, json.JSONDecodeError):
             discarded = 0
         with path.open(encoding="utf-8", errors="replace") as stream:

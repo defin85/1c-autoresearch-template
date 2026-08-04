@@ -18,21 +18,108 @@ MRQ в ограниченные пакеты, чтобы один исследо
 from __future__ import annotations
 
 import csv
-import json
 import os
 import re
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import NotRequired, TypedDict
 
-from .contracts import atomic_json, canonical_json, repository_lock, sha256
+from .contracts import JsonValue, atomic_json, canonical_json, parse_json_object, repository_lock, sha256
 
 
 SCHEMA_VERSION = "1"
 WINDOW_ALGORITHM_VERSION = "1"
 MAX_BATCH_SIZE = 16
 MRQB_ID_PATTERN = re.compile(r"^MRQB-[0-9A-F]{16}$")
+
+
+class SourceEvidence(TypedDict):
+    path: str
+    fingerprint: str
+    stable_diff_id: NotRequired[str]
+
+
+class SourceCustomization(TypedDict):
+    business_meaning: str
+    scope: str
+    evidence: list[SourceEvidence]
+
+
+class MRQRow(TypedDict):
+    mrq_id: str
+    state: str
+    semantic_key: NotRequired[str]
+    title: NotRequired[str]
+    source_customization: SourceCustomization
+
+
+class MRQRecord(TypedDict):
+    mrq_id: str
+    semantic_key: str
+    title: str
+    business_meaning: str
+    scope: str
+    primary_dif_ids: list[str]
+    supporting_dif_ids: list[str]
+    source_component_ids: list[str]
+    source_evidence: list[dict[str, JsonValue]]
+
+
+def _string(value: JsonValue) -> str:
+    if not isinstance(value, str):
+        raise ValueError("expected JSON string")
+    return value
+
+
+def _objects(value: JsonValue) -> list[dict[str, JsonValue]]:
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError("expected JSON object array")
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _object(value: JsonValue) -> dict[str, JsonValue]:
+    if not isinstance(value, dict):
+        raise ValueError("expected JSON object")
+    return value
+
+
+def _strings(value: JsonValue) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("expected JSON string array")
+    return [item for item in value if isinstance(item, str)]
+
+
+def _mrq_row(value: dict[str, JsonValue]) -> MRQRow:
+    source = value.get("source_customization")
+    if not isinstance(source, dict):
+        source = {}
+    raw_evidence = source.get("evidence", [])
+    if not isinstance(raw_evidence, list):
+        raise ValueError("invalid MRQ source evidence")
+    evidence: list[SourceEvidence] = []
+    for item in raw_evidence:
+        if not isinstance(item, dict):
+            raise ValueError("invalid MRQ source evidence")
+        evidence_item: SourceEvidence = {
+            "path": _string(item.get("path", "")),
+            "fingerprint": _string(item.get("fingerprint", "")),
+        }
+        if "stable_diff_id" in item:
+            evidence_item["stable_diff_id"] = _string(item["stable_diff_id"])
+        evidence.append(evidence_item)
+    return {
+        "mrq_id": _string(value.get("mrq_id", "")),
+        "state": _string(value.get("state", "")),
+        "semantic_key": _string(value.get("semantic_key", "")),
+        "title": _string(value.get("title", "")),
+        "source_customization": {
+            "business_meaning": _string(source.get("business_meaning", "")),
+            "scope": _string(source.get("scope", "")),
+            "evidence": evidence,
+        },
+    }
 
 
 @dataclass(frozen=True)
@@ -51,7 +138,7 @@ class MRQBatch:
     basis: str
     anchor_component_ids: tuple[str, ...]
 
-    def canonical_payload(self) -> dict[str, Any]:
+    def canonical_payload(self) -> dict[str, JsonValue]:
         return {
             "schema_version": SCHEMA_VERSION,
             "batch_id": self.batch_id,
@@ -85,7 +172,7 @@ def validate_batch_id(identifier: str, mrq_ids: Iterable[str]) -> None:
         raise ValueError(f"invalid MRQ batch ID format: {identifier}")
 
 
-def _batch_key(mrq: dict[str, Any]) -> tuple[Any, ...]:
+def _batch_key(mrq: MRQRow) -> tuple[str, str, tuple[str, ...]]:
     """Ключ предварительной группировки по существующим полям MRQ.
 
     Используются только канонические поля, разрешённые ``spec.md``:
@@ -93,15 +180,15 @@ def _batch_key(mrq: dict[str, Any]) -> tuple[Any, ...]:
     вспомогательные DIF, доказательства и идентификаторы исходных компонентов.
     """
 
-    source = mrq.get("source_customization", {}) or {}
-    evidence = source.get("evidence", []) or []
-    components = tuple(sorted({str(item.get("path", "")).split("/")[0] for item in evidence if item.get("path")}))
-    scope = str(source.get("scope", "")).strip()
-    business = str(source.get("business_meaning", "")).strip()
+    source = mrq["source_customization"]
+    evidence = source["evidence"]
+    components = tuple(sorted({item["path"].split("/")[0] for item in evidence if item["path"]}))
+    scope = source["scope"].strip()
+    business = source["business_meaning"].strip()
     return (scope, business, components)
 
 
-def classify(mrq_rows: list[dict[str, Any]], *, max_batch_size: int = MAX_BATCH_SIZE) -> list[MRQBatch]:
+def classify(mrq_rows: list[MRQRow], *, max_batch_size: int = MAX_BATCH_SIZE) -> list[MRQBatch]:
     """Детерминированно разбивает активные MRQ на пакеты исследования цели.
 
     Правила (по ``spec.md`` «Классификация готовых MRQ для исследования цели»):
@@ -125,7 +212,7 @@ def classify(mrq_rows: list[dict[str, Any]], *, max_batch_size: int = MAX_BATCH_
         return []
     # лексикографическая сортировка по MRQ-ID обеспечивает стабильность
     active.sort(key=lambda row: str(row.get("mrq_id", "")))
-    groups: dict[tuple[Any, ...], list[str]] = {}
+    groups: dict[tuple[JsonValue, ...], list[str]] = {}
     for row in active:
         key = _batch_key(row)
         if not any(value for value in key):
@@ -148,28 +235,28 @@ def classify(mrq_rows: list[dict[str, Any]], *, max_batch_size: int = MAX_BATCH_
     return batches
 
 
-def _anchor_components(active: list[dict[str, Any]], mrq_ids: list[str]) -> tuple[str, ...]:
+def _anchor_components(active: list[MRQRow], mrq_ids: list[str]) -> tuple[str, ...]:
     by_id = {str(row.get("mrq_id")): row for row in active}
     components: set[str] = set()
     for identifier in mrq_ids:
-        row = by_id.get(identifier, {})
-        for evidence in (row.get("source_customization", {}) or {}).get("evidence", []) or []:
-            path = str(evidence.get("path", ""))
+        row = by_id[identifier]
+        for evidence in row["source_customization"]["evidence"]:
+            path = evidence["path"]
             if path:
                 components.add(path.split("/")[0])
     return tuple(sorted(components))
 
 
-def _group_basis(active: list[dict[str, Any]], mrq_ids: list[str]) -> str:
+def _group_basis(active: list[MRQRow], mrq_ids: list[str]) -> str:
     by_id = {str(row.get("mrq_id")): row for row in active}
-    scopes = {(by_id.get(identifier, {}).get("source_customization", {}) or {}).get("scope", "").strip() for identifier in mrq_ids}
+    scopes = {by_id[identifier]["source_customization"]["scope"].strip() for identifier in mrq_ids}
     scopes.discard("")
     if len(scopes) == 1:
         return f"shared scope: {next(iter(scopes))}"
     return "standalone MRQ without provable linkage"
 
 
-def _ensure_disjoint_coverage(batches: list[MRQBatch], active: list[dict[str, Any]]) -> None:
+def _ensure_disjoint_coverage(batches: list[MRQBatch], active: list[MRQRow]) -> None:
     seen: dict[str, str] = {}
     expected = {str(row.get("mrq_id")) for row in active}
     covered: set[str] = set()
@@ -198,27 +285,27 @@ def assign(mrq_id: str, batches: list[MRQBatch]) -> MRQBatch | None:
     return None
 
 
-def _jsonl(path: Path) -> list[dict[str, Any]]:
+def _jsonl(path: Path) -> list[dict[str, JsonValue]]:
     if not path.is_file():
         return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [parse_json_object(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def _source_inputs(repo: Path, generation_id: str | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, str]], list[dict[str, Any]]]:
-    pointer = json.loads((repo / "research/active-generation.json").read_text(encoding="utf-8"))
+def _source_inputs(repo: Path, generation_id: str | None = None) -> tuple[dict[str, JsonValue], list[MRQRow], list[dict[str, JsonValue]], dict[str, dict[str, str]], list[dict[str, JsonValue]]]:
+    pointer = parse_json_object((repo / "research/active-generation.json").read_text(encoding="utf-8"))
     generation_id = generation_id or str(pointer.get("canonical_generation_id") or "")
     root = repo / "analysis/migration-requirements/generations" / generation_id
-    mrqs = [row for row in _jsonl(root / "mrq.jsonl") if row.get("state") != "superseded"]
+    mrqs = [row for row in map(_mrq_row, _jsonl(root / "mrq.jsonl")) if row["state"] != "superseded"]
     dispositions = _jsonl(root / "dispositions.jsonl")
-    diff_pointer = json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
+    diff_pointer = parse_json_object((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
     diff_root = repo / "analysis/indexes/generations" / str(diff_pointer.get("generation_id") or "")
     with (diff_root / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
         diffs = {row["stable_diff_id"]: row for row in csv.DictReader(stream)}
-    source_pointer = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
-    return pointer, mrqs, dispositions, diffs, list(source_pointer.get("components", []))
+    source_pointer = parse_json_object((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+    return pointer, mrqs, dispositions, diffs, _objects(source_pointer.get("components", []))
 
 
-def _component_id(evidence: dict[str, Any], diffs: dict[str, dict[str, str]], components: list[dict[str, Any]]) -> str:
+def _component_id(evidence: dict[str, JsonValue], diffs: dict[str, dict[str, str]], components: list[dict[str, JsonValue]]) -> str:
     stable_diff_id = str(evidence.get("stable_diff_id") or "")
     fact = diffs.get(stable_diff_id)
     if fact is None:
@@ -238,47 +325,50 @@ def _component_id(evidence: dict[str, Any], diffs: dict[str, dict[str, str]], co
     return str(winners[0]["component_id"])
 
 
-def source_mrq_payload(repo: Path, generation_id: str | None = None) -> tuple[str, str, list[dict[str, Any]]]:
+def source_mrq_payload(repo: Path, generation_id: str | None = None) -> tuple[str, str, list[MRQRecord]]:
     """Возвращает канонический предобраз и отпечаток разрешённых исходных полей MRQ."""
 
     from .consolidation import load_active as load_consolidation
-    consolidated = load_consolidation(repo)
-    if consolidated["pointer"]["state"] == "active":
-        evidence_by_mrq: dict[str, list[dict[str, Any]]] = {}
-        for row in consolidated["mrq"]["evidence.jsonl"]:
-            evidence_by_mrq.setdefault(row["mrq_id"], []).append(row)
-        records = []
-        for mrq in consolidated["mrq"]["mrq.jsonl"]:
-            evidence = sorted(evidence_by_mrq.get(mrq["mrq_id"], []), key=canonical_json)
+    consolidated = parse_json_object(canonical_json(load_consolidation(repo)).decode())
+    consolidated_pointer = _object(consolidated["pointer"])
+    consolidated_mrq = _object(consolidated["mrq"])
+    if consolidated_pointer["state"] == "active":
+        evidence_by_mrq: dict[str, list[dict[str, JsonValue]]] = {}
+        for row in _objects(consolidated_mrq["evidence.jsonl"]):
+            evidence_by_mrq.setdefault(_string(row["mrq_id"]), []).append(row)
+        records: list[MRQRecord] = []
+        for mrq in _objects(consolidated_mrq["mrq.jsonl"]):
+            mrq_id = _string(mrq["mrq_id"])
+            evidence = sorted(evidence_by_mrq.get(mrq_id, []), key=canonical_json)
             records.append({
-                "mrq_id": mrq["mrq_id"],
-                "semantic_key": mrq.get("semantic_key", ""),
-                "title": mrq.get("title", ""),
-                "business_meaning": mrq.get("business_meaning", ""),
-                "scope": mrq.get("scope", ""),
-                "primary_dif_ids": sorted({item["stable_diff_id"] for item in evidence}),
+                "mrq_id": mrq_id,
+                "semantic_key": _string(mrq.get("semantic_key", "")),
+                "title": _string(mrq.get("title", "")),
+                "business_meaning": _string(mrq.get("business_meaning", "")),
+                "scope": _string(mrq.get("scope", "")),
+                "primary_dif_ids": sorted({_string(item["stable_diff_id"]) for item in evidence}),
                 "supporting_dif_ids": [],
                 "source_component_ids": [],
                 "source_evidence": evidence,
             })
         payload = {"schema_version": SCHEMA_VERSION, "window_algorithm_version": WINDOW_ALGORITHM_VERSION, "mrqs": records}
-        return consolidated["pointer"]["mrq_generation_id"], "sha256:" + sha256(canonical_json(payload)), records
+        return _string(consolidated_pointer["mrq_generation_id"]), "sha256:" + sha256(canonical_json(payload)), records
 
     pointer, mrqs, dispositions, diffs, components = _source_inputs(repo, generation_id)
-    relations: dict[str, list[dict[str, Any]]] = {}
+    relations: dict[str, list[dict[str, JsonValue]]] = {}
     for row in dispositions:
         relations.setdefault(str(row.get("mrq_id") or ""), []).append(row)
-    records: list[dict[str, Any]] = []
+    records = []
     for mrq in sorted(mrqs, key=lambda row: str(row.get("mrq_id") or "")):
         mrq_id = str(mrq.get("mrq_id") or "")
-        source = mrq.get("source_customization", {}) or {}
-        evidence = [
+        source = mrq["source_customization"]
+        evidence: list[dict[str, JsonValue]] = [
             {
                 "path": str(item.get("path") or ""),
                 "fingerprint": str(item.get("fingerprint") or ""),
                 "stable_diff_id": str(item.get("stable_diff_id") or ""),
             }
-            for item in source.get("evidence", []) or []
+            for item in source["evidence"]
         ]
         evidence.sort(key=lambda item: (item["path"], item["fingerprint"], item["stable_diff_id"]))
         source_component_ids = sorted({_component_id(item, diffs, components) for item in evidence})
@@ -287,8 +377,8 @@ def source_mrq_payload(repo: Path, generation_id: str | None = None) -> tuple[st
             "mrq_id": mrq_id,
             "semantic_key": str(mrq.get("semantic_key") or ""),
             "title": str(mrq.get("title") or ""),
-            "business_meaning": str(source.get("business_meaning") or ""),
-            "scope": str(source.get("scope") or ""),
+            "business_meaning": source["business_meaning"],
+            "scope": source["scope"],
             "primary_dif_ids": sorted(str(item["stable_diff_id"]) for item in owned if item.get("primary") is True),
             "supporting_dif_ids": sorted(str(item["stable_diff_id"]) for item in owned if item.get("primary") is False),
             "source_component_ids": source_component_ids,
@@ -298,68 +388,72 @@ def source_mrq_payload(repo: Path, generation_id: str | None = None) -> tuple[st
     return generation_id or str(pointer.get("canonical_generation_id") or ""), "sha256:" + sha256(canonical_json(payload)), records
 
 
-def stable_windows(records: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+def stable_windows(records: list[MRQRecord]) -> list[list[MRQRecord]]:
     """Группирует и режет разрешённые MRQ на стабильные окна не более 16."""
 
-    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str, tuple[str, ...]], list[MRQRecord]] = {}
     for record in records:
-        key: tuple[Any, ...] = (
+        key = (
             record["scope"],
             record["business_meaning"],
             tuple(record["source_component_ids"]),
         )
         if not any(key):
-            key = ("__standalone__", record["mrq_id"])
+            key = ("__standalone__", record["mrq_id"], ())
         groups.setdefault(key, []).append(record)
-    windows: list[list[dict[str, Any]]] = []
+    windows: list[list[MRQRecord]] = []
     for group in groups.values():
         ordered = sorted(group, key=lambda item: item["mrq_id"])
         windows.extend(ordered[start:start + MAX_BATCH_SIZE] for start in range(0, len(ordered), MAX_BATCH_SIZE))
     return sorted(windows, key=lambda window: window[0]["mrq_id"])
 
 
-def _batch_row(batch: MRQBatch) -> dict[str, Any]:
+def _batch_row(batch: MRQBatch) -> dict[str, JsonValue]:
     payload = batch.canonical_payload()
     payload["full_fingerprint"] = "sha256:" + sha256(canonical_json(payload))
     return payload
 
 
-def validate_rows(rows: list[dict[str, Any]], records: list[dict[str, Any]]) -> None:
+def validate_rows(rows: list[dict[str, JsonValue]], records: list[MRQRecord]) -> None:
     batches = [
         MRQBatch(
             batch_id=str(row.get("batch_id") or ""),
-            mrq_ids=tuple(row.get("mrq_ids") or []),
+            mrq_ids=tuple(_strings(row.get("mrq_ids", []))),
             basis=str(row.get("basis") or ""),
-            anchor_component_ids=tuple(row.get("anchor_component_ids") or []),
+            anchor_component_ids=tuple(_strings(row.get("anchor_component_ids", []))),
         )
         for row in rows
     ]
-    active = [{"mrq_id": record["mrq_id"]} for record in records]
+    active = [_mrq_row({"mrq_id": record["mrq_id"], "state": "active", "source_customization": {}}) for record in records]
     _ensure_disjoint_coverage(batches, active)
     identifiers: dict[str, str] = {}
     for row, batch in zip(rows, batches):
         expected = _batch_row(batch)
         if row != expected:
             raise ValueError(f"MRQ batch fingerprint or fields mismatch: {batch.batch_id}")
-        previous = identifiers.setdefault(batch.batch_id, expected["full_fingerprint"])
-        if previous != expected["full_fingerprint"]:
+        expected_fingerprint = _string(expected["full_fingerprint"])
+        previous = identifiers.setdefault(batch.batch_id, expected_fingerprint)
+        if previous != expected_fingerprint:
             raise ValueError(f"MRQ batch shortened ID collision: {batch.batch_id}")
 
 
-def publish(repo: Path, batches: list[MRQBatch], expected_source_mrq_fingerprint: str) -> dict[str, Any]:
+def publish(repo: Path, batches: list[MRQBatch], expected_source_mrq_fingerprint: str) -> dict[str, JsonValue]:
     """Атомарно публикует проверенное content-addressed поколение пакетов."""
 
     with repository_lock(repo):
+        legacy_pointer_path = repo / "research/active-generation.json"
+        legacy_pointer: dict[str, JsonValue] = {}
         origin_id, current_fingerprint, records = source_mrq_payload(repo)
         if current_fingerprint != expected_source_mrq_fingerprint:
             raise RuntimeError("stale source MRQ fingerprint")
         from .consolidation import load_active as load_consolidation
-        aggregate = load_consolidation(repo)["pointer"]
+        aggregate_state = parse_json_object(canonical_json(load_consolidation(repo)).decode())
+        aggregate = _object(aggregate_state["pointer"])
         if aggregate["state"] == "active":
             existing_id = aggregate.get("batch_generation_id")
             if existing_id and aggregate.get("batch_input_fingerprint") == current_fingerprint:
-                load_active(repo)
-                root = repo / "analysis/migration-requirements/batch-generations" / existing_id
+                _ = load_active(repo)
+                root = repo / "analysis/migration-requirements/batch-generations" / _string(existing_id)
                 payload = (root / "batches.jsonl").read_bytes()
                 return {
                     "generation_id": existing_id,
@@ -368,11 +462,10 @@ def publish(repo: Path, batches: list[MRQBatch], expected_source_mrq_fingerprint
                     "origin_canonical_generation_id": origin_id,
                 }
         else:
-            legacy_pointer_path = repo / "research/active-generation.json"
-            legacy_pointer = json.loads(legacy_pointer_path.read_text(encoding="utf-8"))
+            legacy_pointer = parse_json_object(legacy_pointer_path.read_text(encoding="utf-8"))
             existing = legacy_pointer.get("batch_generation")
-            if existing and existing.get("source_mrq_fingerprint") == current_fingerprint:
-                load_active(repo)
+            if isinstance(existing, dict) and existing.get("source_mrq_fingerprint") == current_fingerprint:
+                _ = load_active(repo)
                 return existing
         rows = [_batch_row(batch) for batch in batches]
         validate_rows(rows, records)
@@ -394,11 +487,11 @@ def publish(repo: Path, batches: list[MRQBatch], expected_source_mrq_fingerprint
             staging_parent.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(dir=staging_parent) as temporary:
                 staging = Path(temporary)
-                (staging / "batches.jsonl").write_bytes(payload)
+                _ = (staging / "batches.jsonl").write_bytes(payload)
                 atomic_json(staging / "manifest.json", {**manifest_preimage, "generation_id": generation_id})
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(staging, destination)
-        binding = {
+        binding: dict[str, JsonValue] = {
             "generation_id": generation_id,
             "result_fingerprint": result_fingerprint,
             "source_mrq_fingerprint": current_fingerprint,
@@ -406,9 +499,9 @@ def publish(repo: Path, batches: list[MRQBatch], expected_source_mrq_fingerprint
         }
         if aggregate["state"] == "active":
             from .consolidation import replace_downstream_binding
-            replace_downstream_binding(
+            _ = replace_downstream_binding(
                 repo, "batch", generation_id, current_fingerprint,
-                expected_transaction_id=aggregate["transaction_id"],
+                expected_transaction_id=_string(aggregate["transaction_id"]),
                 already_locked=True,
             )
         else:
@@ -420,18 +513,25 @@ def load_active(repo: Path) -> list[MRQBatch]:
     """Проверяет активную привязку и возвращает только опубликованные пакеты."""
 
     from .consolidation import load_active as load_consolidation
-    pointer = load_consolidation(repo)["pointer"]
+    state = parse_json_object(canonical_json(load_consolidation(repo)).decode())
+    pointer = _object(state["pointer"])
+    origin_id = ""
+    source_fingerprint = ""
+    records: list[MRQRecord] = []
+    generation_id = ""
+    binding: dict[str, JsonValue] = {}
     if pointer["state"] != "active":
-        legacy = json.loads((repo / "research/active-generation.json").read_text(encoding="utf-8"))
-        binding = legacy.get("batch_generation")
-        if not isinstance(binding, dict):
+        legacy = parse_json_object((repo / "research/active-generation.json").read_text(encoding="utf-8"))
+        raw_binding = legacy.get("batch_generation")
+        if not isinstance(raw_binding, dict):
             raise ValueError("active MRQ batch generation is missing")
+        binding = raw_binding
         origin_id, source_fingerprint, records = source_mrq_payload(repo)
         if binding.get("source_mrq_fingerprint") != source_fingerprint:
             raise ValueError("active MRQ batch generation is stale")
         generation_id = str(binding.get("generation_id") or "")
     else:
-        binding = None
+        binding = {}
     if not pointer.get("batch_generation_id"):
         if pointer["state"] == "active":
             raise ValueError("active MRQ batch generation is missing")
@@ -442,9 +542,9 @@ def load_active(repo: Path) -> list[MRQBatch]:
         generation_id = str(pointer["batch_generation_id"])
         binding = {"generation_id": generation_id, "source_mrq_fingerprint": source_fingerprint, "origin_canonical_generation_id": origin_id}
     root = repo / "analysis/migration-requirements/batch-generations" / generation_id
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest = parse_json_object((root / "manifest.json").read_text(encoding="utf-8"))
     payload = (root / "batches.jsonl").read_bytes()
-    rows = [json.loads(line) for line in payload.splitlines() if line.strip()]
+    rows = [parse_json_object(line.decode()) for line in payload.splitlines() if line.strip()]
     expected_manifest = {
         "schema_version": SCHEMA_VERSION,
         "origin_canonical_generation_id": str(binding.get("origin_canonical_generation_id") or origin_id),
@@ -459,6 +559,11 @@ def load_active(repo: Path) -> list[MRQBatch]:
         raise ValueError("active MRQ batch manifest is corrupt")
     validate_rows(rows, records)
     return [
-        MRQBatch(row["batch_id"], tuple(row["mrq_ids"]), row["basis"], tuple(row["anchor_component_ids"]))
+        MRQBatch(
+            _string(row["batch_id"]),
+            tuple(_strings(row["mrq_ids"])),
+            _string(row["basis"]),
+            tuple(_strings(row["anchor_component_ids"])),
+        )
         for row in rows
     ]

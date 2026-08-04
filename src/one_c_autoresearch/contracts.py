@@ -10,9 +10,10 @@ import subprocess
 import tempfile
 import threading
 import unicodedata
+from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Protocol, TypeAlias, runtime_checkable
 
 
 SCHEMA_VERSION = "1"
@@ -23,10 +24,96 @@ SECRET_KEYS = re.compile(r"(?:password|passwd|pwd|token|secret|private[_-]?key)"
 SAFE_SECRET_LIKE_KEYS = {"input_context_tokens"}
 _PROCESS_REPOSITORY_LOCKS: dict[str, threading.RLock] = {}
 _PROCESS_REPOSITORY_LOCKS_GUARD = threading.Lock()
-_HELD_REPOSITORY_LOCKS = threading.local()
+class _HeldRepositoryLocks(threading.local):
+    def __init__(self) -> None:
+        self.identities: set[str] = set()
 
 
-def canonical_json(value: Any) -> bytes:
+_HELD_REPOSITORY_LOCKS = _HeldRepositoryLocks()
+JsonValue: TypeAlias = None | bool | int | float | str | Sequence["JsonValue"] | Mapping[str, "JsonValue"]
+
+
+@runtime_checkable
+class _JsonDecoder(Protocol):
+    def decode(self, text: str) -> object: ...
+
+
+@runtime_checkable
+class _ObjectIterable(Protocol):
+    def __iter__(self) -> Iterator[object]: ...
+
+
+@runtime_checkable
+class _ObjectMapping(Protocol):
+    def items(self) -> Iterable[tuple[object, object]]: ...
+
+
+def _decode(decoder: object, text: str) -> object:
+    if not isinstance(decoder, _JsonDecoder):
+        raise RuntimeError("invalid JSON decoder")
+    return decoder.decode(text)
+
+
+def _opaque(value: object) -> object:
+    return value
+
+
+def _is_list(value: object) -> bool:
+    return isinstance(value, list)
+
+
+def _is_dict(value: object) -> bool:
+    return isinstance(value, dict)
+
+
+def _items(value: object) -> Iterator[object]:
+    if not isinstance(value, _ObjectIterable):
+        raise ValueError("expected iterable")
+    return iter(value)
+
+
+def _mapping_items(value: object) -> Iterable[tuple[object, object]]:
+    if not isinstance(value, _ObjectMapping):
+        raise ValueError("expected mapping")
+    return value.items()
+
+
+def parse_json(text: str) -> JsonValue:
+    return _json_value(_decode(_opaque(json.JSONDecoder()), text))
+
+
+def parse_json_object(text: str) -> dict[str, JsonValue]:
+    return json_object(parse_json(text))
+
+
+def json_object(value: object) -> dict[str, JsonValue]:
+    value = _json_value(value)
+    if not isinstance(value, dict):
+        raise ValueError("expected a JSON object")
+    return value
+
+
+def json_array(value: object) -> list[JsonValue]:
+    value = _json_value(value)
+    if not isinstance(value, list):
+        raise ValueError("expected a JSON array")
+    return value
+
+
+def _json_value(value: object) -> JsonValue:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if _is_list(value):
+        return [_json_value(item) for item in _items(value)]
+    if _is_dict(value):
+        items = list(_mapping_items(value))
+        if not all(isinstance(key, str) for key, _child in items):
+            raise ValueError("JSON object keys must be strings")
+        return {str(key): _json_value(child) for key, child in items}
+    raise ValueError(f"unsupported JSON value: {type(value).__name__}")
+
+
+def canonical_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
 
 
@@ -34,7 +121,7 @@ def sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def content_id(prefix: str, preimage: dict[str, Any]) -> str:
+def content_id(prefix: str, preimage: Mapping[str, object]) -> str:
     return prefix + sha256(canonical_json(preimage))[:16].upper()
 
 
@@ -81,9 +168,9 @@ def confined(root: Path, value: str | Path) -> Path:
     return candidate
 
 
-def file_manifest(root: Path) -> list[dict[str, Any]]:
+def file_manifest(root: Path) -> list[dict[str, str | int]]:
     root = root.resolve()
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, str | int]] = []
     inode_seen: set[tuple[int, int]] = set()
     for path in sorted(root.rglob("*"), key=lambda item: _nfc(item.relative_to(root).as_posix())):
         mode = path.lstat().st_mode
@@ -133,7 +220,7 @@ def require_tracked_clean(repo: Path, paths: list[Path]) -> None:
         raise ValueError("canonical paths are dirty relative to HEAD")
 
 
-def reject_secrets(value: Any, location: str = "root") -> None:
+def reject_secrets(value: JsonValue, location: str = "root") -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             if str(key).lower() not in SAFE_SECRET_LIKE_KEYS and SECRET_KEYS.search(str(key)) and child not in (None, "", [], {}):
@@ -144,7 +231,7 @@ def reject_secrets(value: Any, location: str = "root") -> None:
             reject_secrets(child, f"{location}[{index}]")
 
 
-def validate_unique_ids(items: list[dict[str, Any]], id_key: str, preimage_key: str) -> None:
+def validate_unique_ids(items: list[dict[str, JsonValue]], id_key: str, preimage_key: str) -> None:
     by_id: dict[str, bytes] = {}
     by_preimage: dict[bytes, str] = {}
     for item in items:
@@ -159,12 +246,12 @@ def validate_unique_ids(items: list[dict[str, Any]], id_key: str, preimage_key: 
 
 
 @contextmanager
-def repository_lock(repo: Path, timeout_seconds: float = 0) -> Iterator[None]:
+def repository_lock(repo: Path, timeout_seconds: float = 0) -> Generator[None, None, None]:
     identity = sha256(str(repo.resolve()).encode())
     with _PROCESS_REPOSITORY_LOCKS_GUARD:
         process_lock = _PROCESS_REPOSITORY_LOCKS.setdefault(identity, threading.RLock())
     with process_lock:
-        held = getattr(_HELD_REPOSITORY_LOCKS, "identities", set())
+        held = _HELD_REPOSITORY_LOCKS.identities
         if identity in held:
             raise RuntimeError("repository writer is busy")
         lock_dir = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir())) / "one-c-autoresearch-locks"
@@ -186,7 +273,7 @@ def repository_lock(repo: Path, timeout_seconds: float = 0) -> Iterator[None]:
             os.close(fd)
 
 
-def atomic_json(path: Path, value: Any) -> None:
+def atomic_json(path: Path, value: object) -> None:
     atomic_bytes(path, canonical_json(value) + b"\n")
 
 
@@ -195,7 +282,7 @@ def atomic_bytes(path: Path, value: bytes) -> None:
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
-            stream.write(value)
+            _ = stream.write(value)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
