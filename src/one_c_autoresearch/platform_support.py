@@ -61,10 +61,6 @@ def lock_file(stream: BinaryIO, *, nonblocking: bool = False) -> None:
     lock_fd(stream.fileno(), nonblocking=nonblocking)
 
 
-def unlock_file(stream: BinaryIO) -> None:
-    unlock_fd(stream.fileno())
-
-
 def sync_directory(path: Path) -> None:
     if _is_windows():
         return

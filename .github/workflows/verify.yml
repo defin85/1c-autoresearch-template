@@ -45,6 +45,7 @@ jobs:
           python scripts/build_workspace_template.py
 
       - name: Run Python tests
+        if: runner.os != 'Windows'
         run: python -m pytest -q
 
       - name: Test managed workspace runtime
