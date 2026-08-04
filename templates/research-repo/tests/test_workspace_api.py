@@ -67,7 +67,8 @@ def test_source_acquisition_continues_automatic_pipeline(tmp_path: Path, monkeyp
     assert calls[0]["select"].__self__.__class__ is Service
 
 
-def test_legacy_agent_profile_can_be_explicitly_resaved(tmp_path: Path) -> None:
+def test_legacy_agent_profile_can_be_explicitly_resaved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("one_c_autoresearch.user_state.codex_model_capabilities", lambda: {})
     app = create_app(tmp_path / "state", [REPO], testing=True)
     headers = {"Origin": "http://testserver", "Idempotency-Key": "bookmark"}
     with TestClient(app) as client:

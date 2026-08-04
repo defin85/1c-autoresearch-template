@@ -179,6 +179,7 @@ def test_prepare_zone_uses_latest_verified_operation_run(tmp_path: Path) -> None
 
 
 def test_dispatcher_projection_probes_codex_once_for_all_roles(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("one_c_autoresearch.user_state.codex_model_capabilities", lambda: {})
     state = tmp_path / "state"
     save_agent_profiles(
         REPO,
@@ -386,6 +387,7 @@ def test_dispatcher_section_is_not_part_of_canonical_fingerprint(tmp_path: Path)
 
 
 def test_retry_recovers_same_run_after_owner_dies_post_lease(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("one_c_autoresearch.user_state.codex_model_capabilities", lambda: {})
     state = tmp_path / "state"
     monkeypatch.setattr("one_c_autoresearch.agents.resolve_execution_snapshot", _test_execution_snapshot)
     monkeypatch.setattr(

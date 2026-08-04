@@ -47,8 +47,8 @@
 <!-- GOAL_CURSOR -->
 - [ ] 7.4 Run BasedPyright on Ubuntu, Windows and macOS with the pinned version and review platform-specific branches.
   - Этап цикла: финальная проверка
-  - Состояние шага: локальные Linux, Windows и Darwin дают 0/0/0; опубликованный прогон выявил и позволил исправить переносимость тестов шаблона
-  - Следующее действие: опубликовать исправление и дождаться зеленых заданий трех ОС
+  - Состояние шага: полный набор и глубокая проверка проходят на Python 3.11 без команды Codex; предыдущий Windows BasedPyright был отменен fail-fast
+  - Следующее действие: опубликовать изоляцию тестов и дождаться полного зеленого прогона
   - Файлы шага: `.github/workflows/verify.yml`, `pyproject.toml`, `uv.lock`
 - [x] 7.5 Run `openspec validate eliminate-python-type-checking-baseline --strict --no-interactive`, `openspec validate --all --strict`, `git diff --check`, and direct final diff and artifact review.
 
@@ -61,3 +61,4 @@
 - [x] 8.5 Удалить выявленную повторным Ponytail-ревью неиспользуемую обертку разблокировки файла.
 - [x] 8.6 Не запускать заведомо POSIX-зависимый полный набор исполнения на Windows в матрице, сохранив обязательную проверку BasedPyright на всех трех ОС.
 - [x] 8.7 Восстановить относительные пути тестов канонического шаблона, чтобы глубокая проверка свежего репозитория работала вне исходного дерева.
+- [x] 8.8 Изолировать тесты профилей агентов от наличия локальной команды Codex в окружении CI.
