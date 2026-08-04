@@ -97,6 +97,15 @@ type IndexConfiguration = {
   routes: Record<string, string[]>;
   service_profiles?: { lexical: string; hybrid: string };
 };
+type CleanupPlan = {
+  candidates: { target: string; instance: string; bytes: number }[];
+  reclaimed_bytes: number;
+  plan_fingerprint: string;
+};
+
+const formatBytes = (bytes: number) => bytes < 1024
+  ? `${bytes.toLocaleString("ru-RU")} байт`
+  : `${(bytes / 1024 ** (bytes < 1024 ** 2 ? 1 : bytes < 1024 ** 3 ? 2 : 3)).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} ${bytes < 1024 ** 2 ? "КБ" : bytes < 1024 ** 3 ? "МБ" : "ГБ"}`;
 
 type SearchServiceProfile = {
   kind: "embedding" | "its";
@@ -2481,7 +2490,7 @@ export function Indexes({
   const [backendTools, setBackendTools] = useState<Record<string, unknown>[]>([]);
   const [referenceReadiness, setReferenceReadiness] = useState<Record<string, unknown>>();
   const [storage, setStorage] = useState<{ used_bytes: number; quota_bytes: number; available_bytes: number }>();
-  const [cleanupPreview, setCleanupPreview] = useState<Record<string, unknown>>();
+  const [cleanupPreview, setCleanupPreview] = useState<CleanupPlan>();
   const refresh = useCallback(
     () => {
       setLoading(true);
@@ -2687,7 +2696,7 @@ export function Indexes({
   const previewCleanup = async () => {
     setBusy(true); setError("");
     try {
-      setCleanupPreview(await api<Record<string, unknown>>(`/projects/${project.id}/indexes/storage-cleanup-preview`));
+      setCleanupPreview(await api<CleanupPlan>(`/projects/${project.id}/indexes/storage-cleanup-preview`));
     } catch (error) { setError((error as Error).message); }
     finally { setBusy(false); }
   };
@@ -2742,10 +2751,21 @@ export function Indexes({
         Справочный индекс: {JSON.stringify(referenceReadiness)}
       </Alert>}
       <Stack direction="row" spacing={1}>
-        <Button disabled={busy} onClick={() => void previewCleanup()}>Просмотреть очистку хранилища</Button>
-        <Button color="warning" disabled={busy || !cleanupPreview} onClick={() => void applyCleanup()}>Удалить перечисленные неактивные индексы</Button>
+        <Button disabled={busy} onClick={() => void previewCleanup()}>Найти неактивные индексы</Button>
+        <Button color="warning" disabled={busy || !cleanupPreview?.candidates.length} onClick={() => void applyCleanup()}>
+          Удалить неактивные индексы
+        </Button>
       </Stack>
-      {cleanupPreview && <Alert severity="warning"><Box component="pre" sx={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(cleanupPreview, null, 2)}</Box></Alert>}
+      {cleanupPreview && (cleanupPreview.candidates.length === 0
+        ? <Alert severity="success">Неактивных индексов нет. Очистка не требуется.</Alert>
+        : <Alert severity="warning">
+            <Typography>Найдено неактивных копий: {cleanupPreview.candidates.length.toLocaleString("ru-RU")}. Можно освободить {formatBytes(cleanupPreview.reclaimed_bytes)}.</Typography>
+            <Box component="ul" sx={{ mb: 0 }}>
+              {cleanupPreview.candidates.map((item) => <li key={`${item.target}:${item.instance}`}>
+                <Box component="code">{item.instance}</Box> — {formatBytes(item.bytes)}
+              </li>)}
+            </Box>
+          </Alert>)}
       <Accordion>
         <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
           <Typography fontWeight={700}>Настройка адаптеров и маршрутов</Typography>

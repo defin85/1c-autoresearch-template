@@ -496,6 +496,26 @@ test("index workspace shows loading instead of a false empty configuration", asy
   expect(screen.getAllByLabelText("Версия движка", { selector: "input" })[1]).toHaveValue("0.2.65");
 });
 
+test("index cleanup preview explains removable copies without raw JSON", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string) => Promise.resolve({
+    ok: true,
+    json: async () => url.endsWith("/indexes")
+      ? { items: [], configuration: { schema_version: "2", backends: [], routes: {} }, configuration_fingerprint: "sha256:config" }
+      : url.endsWith("/search-services")
+        ? { profiles: [], state_fingerprint: "sha256:services" }
+        : { candidates: [{ target: "target-a", instance: "old-copy", bytes: 1048576 }], reclaimed_bytes: 1048576, plan_fingerprint: "sha256:plan" },
+  })));
+  render(<Indexes
+    project={{ id: "p", name: "p", root: "/repo" }}
+    snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
+  />);
+  fireEvent.click(await screen.findByRole("button", { name: "Найти неактивные индексы" }));
+  expect(await screen.findByText("Найдено неактивных копий: 1. Можно освободить 1 МБ.")).toBeInTheDocument();
+  expect(screen.getByText("old-copy")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Удалить неактивные индексы" })).toBeEnabled();
+  expect(screen.queryByText(/sha256:plan/)).not.toBeInTheDocument();
+});
+
 test("schema 3 rollback requires a reviewed preview and confirmation", async () => {
   const fetchMock = vi.fn().mockImplementation((url: string) =>
     Promise.resolve({
