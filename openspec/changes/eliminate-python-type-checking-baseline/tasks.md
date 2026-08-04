@@ -47,9 +47,9 @@
 <!-- GOAL_CURSOR -->
 - [ ] 7.4 Run BasedPyright on Ubuntu, Windows and macOS with the pinned version and review platform-specific branches.
   - Этап цикла: финальная проверка
-  - Состояние шага: локальное моделирование Linux, Windows и Darwin дает 0/0/0; одинаковая проверка настроена в GitHub Actions, но текущие 18 коммитов не опубликованы
-  - Следующее действие: после явного разрешения опубликовать проверочную ветку и дождаться зеленых заданий трех ОС
-  - Файлы шага: .github/workflows/verify.yml
+  - Состояние шага: локальные Linux, Windows и Darwin дают 0/0/0; опубликованный прогон выявил и позволил исправить переносимость тестов шаблона
+  - Следующее действие: опубликовать исправление и дождаться зеленых заданий трех ОС
+  - Файлы шага: `.github/workflows/verify.yml`, `pyproject.toml`, `uv.lock`
 - [x] 7.5 Run `openspec validate eliminate-python-type-checking-baseline --strict --no-interactive`, `openspec validate --all --strict`, `git diff --check`, and direct final diff and artifact review.
 
 ## Разрывы ревью
@@ -60,3 +60,4 @@
 - [x] 8.4 Исправить платформенные ветви, чтобы BasedPyright давал ноль ошибок и предупреждений при `--pythonplatform Windows`, не ослабляя общую конфигурацию.
 - [x] 8.5 Удалить выявленную повторным Ponytail-ревью неиспользуемую обертку разблокировки файла.
 - [x] 8.6 Не запускать заведомо POSIX-зависимый полный набор исполнения на Windows в матрице, сохранив обязательную проверку BasedPyright на всех трех ОС.
+- [x] 8.7 Восстановить относительные пути тестов канонического шаблона, чтобы глубокая проверка свежего репозитория работала вне исходного дерева.

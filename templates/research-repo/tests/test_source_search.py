@@ -10,7 +10,7 @@ import pytest
 from one_c_autoresearch import indexes, source_search
 
 
-REPO = Path(__file__).parents[1] / "templates/research-repo"
+REPO = Path(__file__).parents[1]
 requires_source_generation = pytest.mark.skipif(
     not (REPO / "research/active-source-generation.json").is_file(),
     reason="requires a concrete research repository source generation",
