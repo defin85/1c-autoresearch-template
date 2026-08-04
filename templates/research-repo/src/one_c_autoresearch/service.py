@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import json
-import importlib
 import tomllib
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
 from collections.abc import Callable, Iterable
-from typing import Protocol, TypedDict, final, runtime_checkable
+from typing import TypedDict, final
 
 from . import diffs, indexes, mrq, sources, workflow
-from .contracts import ROLES, JsonValue, atomic_bytes, atomic_json, canonical_json, json_object, parse_json, parse_json_object, reject_secrets, repository_lock, sha256
+from .contracts import ROLES, JsonValue, atomic_bytes, atomic_json, canonical_json, json_object, owned_function, parse_json, parse_json_object, reject_secrets, repository_lock, sha256
 
 
 JsonObject = dict[str, JsonValue]
@@ -22,21 +21,9 @@ class Staged(TypedDict, total=False):
     diff: diffs.DiffPointer
 
 
-@runtime_checkable
-class _StageRecompute(Protocol):
-    def active_pointers(self, repo: Path, *, recover: bool = True) -> dict[str, JsonObject | None]: ...
-
-
-@runtime_checkable
-class _SourceAcquirer(Protocol):
-    def acquire(self, repo: Path, platform: Path, connections: dict[str, sources.ConnectionProfile], *, routing_preview: JsonObject, timeout_seconds: int, upload_drafts: Path | None, cancelled: sources.CancelCallback | None, progress: sources.ProgressCallback | None, activate: bool) -> sources.SourcePointer: ...
-
-
 def _active_pointers(repo: Path) -> dict[str, JsonObject | None]:
-    module = importlib.import_module(".stage_recompute", __package__)
-    if not isinstance(module, _StageRecompute):
-        raise RuntimeError("invalid stage recompute module")
-    return module.active_pointers(repo)
+    pointers = json_object(owned_function(".stage_recompute", "active_pointers")(repo))
+    return {name: json_object(pointer) if pointer is not None else None for name, pointer in pointers.items()}
 
 
 def _objects(value: JsonValue) -> list[JsonObject]:
@@ -462,14 +449,13 @@ class ApplicationService:
         preview_path = self.routing_previews / f"{preview_id}.json"
         if not preview_path.is_file():
             raise RuntimeError("routing_preview_stale")
-        preview = parse_json_object(preview_path.read_text(encoding="utf-8"))
+        raw_preview = parse_json_object(preview_path.read_text(encoding="utf-8"))
         from .user_state import workspace_id
-        if preview.get("project_id") != workspace_id(self.repo) or preview.get("status") != "ready" or preview.get("routing_plan_fingerprint") != payload.get("routing_plan_fingerprint"):
+        if raw_preview.get("project_id") != workspace_id(self.repo) or raw_preview.get("status") != "ready" or raw_preview.get("routing_plan_fingerprint") != payload.get("routing_plan_fingerprint"):
             raise RuntimeError("routing_preview_stale")
-        if datetime.fromisoformat(str(preview.get("expires_at", ""))) <= datetime.now(timezone.utc):
+        if datetime.fromisoformat(str(raw_preview.get("expires_at", ""))) <= datetime.now(timezone.utc):
             raise RuntimeError("routing_preview_stale")
-        if not isinstance(sources, _SourceAcquirer):
-            raise RuntimeError("invalid source acquisition module")
+        preview = sources.routing_preview(raw_preview)
         result = sources.acquire(self.repo, platform, self.connections, routing_preview=preview, timeout_seconds=_integer(payload.get("timeout_seconds", 1800)), upload_drafts=self.upload_drafts, cancelled=self._cancelled, progress=self.progress, activate=self._staged is None)
         if self._staged is not None:
             self._staged["source"] = result

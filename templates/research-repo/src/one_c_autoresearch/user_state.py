@@ -1,25 +1,15 @@
 from __future__ import annotations
 
 import json
-import importlib
 import shutil
 import subprocess
 from functools import lru_cache
 from pathlib import Path
-from typing import Protocol, runtime_checkable
-from .contracts import JsonValue, atomic_bytes, parse_json_object, sha256
-
-
-@runtime_checkable
-class _SourceSearchModule(Protocol):
-    def validate_profile_policy(self, value: object) -> object: ...
+from .contracts import JsonValue, atomic_bytes, owned_function, parse_json_object, sha256
 
 
 def _validate_profile_policy(value: object) -> None:
-    module = importlib.import_module(".source_search", __package__)
-    if not isinstance(module, _SourceSearchModule):
-        raise RuntimeError("source search module has an incompatible runtime interface")
-    _ = module.validate_profile_policy(value)
+    _ = owned_function(".source_search", "validate_profile_policy")(value)
 
 
 @lru_cache(maxsize=1)

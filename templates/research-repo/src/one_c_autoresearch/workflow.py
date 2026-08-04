@@ -1,32 +1,18 @@
 from __future__ import annotations
 
 import csv
-import importlib
 import json
 import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
-from .contracts import JsonValue, ROLES, canonical_json, json_array, json_object, parse_json_object, reject_secrets, sha256
+from .contracts import JsonValue, ROLES, canonical_json, json_array, json_object, owned_function, parse_json_object, reject_secrets, sha256
 from . import __version__
 
 if TYPE_CHECKING:
     from .sqlite_state import DispatcherStore
-
-
-@runtime_checkable
-class _StageRecomputeModule(Protocol):
-    def active_pointers(self, repo: Path, *, recover: bool = True) -> dict[str, object | None]: ...
-    def recover_active_publication(self, repo: Path) -> object: ...
-
-
-def _stage_recompute() -> _StageRecomputeModule:
-    module = importlib.import_module(".stage_recompute", __package__)
-    if not isinstance(module, _StageRecomputeModule):
-        raise RuntimeError("invalid stage recompute module")
-    return module
 
 
 class AgentRole(TypedDict):
@@ -610,7 +596,7 @@ def _diff_blockers(repo: Path) -> list[Blocker]:
 
 
 def _active_rows(repo: Path) -> tuple[list[dict[str, str]], list[dict[str, JsonValue]], list[dict[str, JsonValue]], list[dict[str, JsonValue]]]:
-    pointers = _stage_recompute().active_pointers(repo)
+    pointers = json_object(owned_function(".stage_recompute", "active_pointers")(repo))
     diff_pointer = _object(pointers["diff"])
     diff_root = repo / "analysis/indexes/generations" / str(diff_pointer.get("generation_id"))
     with (diff_root / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
@@ -688,7 +674,7 @@ def semantic_diff_context(repo: Path, stable_diff_id: str, fact: dict[str, JsonV
 
 def status(repo: Path, *, deep: bool = True) -> WorkflowSnapshot:
     repo = repo.resolve()
-    _ = _stage_recompute().recover_active_publication(repo)
+    _ = owned_function(".stage_recompute", "recover_active_publication")(repo)
     _ = validate_workflow(repo)
     checks = [_project_blockers(repo), _source_blockers(repo, deep=deep), _diff_blockers(repo)]
     if not any(checks):

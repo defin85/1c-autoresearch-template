@@ -283,6 +283,7 @@ def test_application_service_stages_real_writer_operations_until_pointer_transac
     service.rlm_executable = None
     monkeypatch.setattr("one_c_autoresearch.workflow.state_fingerprint", lambda _repo: "wf")
     monkeypatch.setattr("one_c_autoresearch.stage_recompute.state_fingerprint", lambda _repo: "wf")
+    monkeypatch.setattr("one_c_autoresearch.sources.routing_preview", lambda value: value)
     source = {"generation_id": "new-source"}
     diff = {"generation_id": "new-diff", "source_generation_id": "new-source"}
     monkeypatch.setattr("one_c_autoresearch.sources.acquire", lambda *args, activate, **kwargs: source if activate is False else pytest.fail("source activated early"))

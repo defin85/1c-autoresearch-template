@@ -6,12 +6,11 @@ import re
 import subprocess
 import tempfile
 import json
-import importlib
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Protocol, TypedDict, runtime_checkable
+from typing import TypedDict
 
-from .contracts import JsonValue, atomic_json, canonical_json, comparison_id, confined, content_id, diff_id, normalize_relative, parse_json, parse_json_object, repository_lock, require_tracked_clean, sha256
+from .contracts import JsonValue, atomic_json, canonical_json, comparison_id, confined, content_id, diff_id, normalize_relative, owned_function, parse_json, parse_json_object, repository_lock, require_tracked_clean, sha256
 from .extension_analyzer import Dependency, Detail, DiffEvidence, MainMatch
 from .source_routing import RoutingGroup, RoutingManifest, RoutingMember
 from .sources import ComponentRecord
@@ -109,16 +108,8 @@ class SourcePointer(TypedDict, total=False):
     source_comparison_epoch_fingerprint: str
 
 
-@runtime_checkable
-class _StageRecompute(Protocol):
-    def recover_active_publication(self, repo: Path) -> object: ...
-
-
 def _recover_active_publication(repo: Path) -> None:
-    module = importlib.import_module(".stage_recompute", __package__)
-    if not isinstance(module, _StageRecompute):
-        raise RuntimeError("invalid stage recompute module")
-    _ = module.recover_active_publication(repo)
+    _ = owned_function(".stage_recompute", "recover_active_publication")(repo)
 
 
 def _evidence(value: object) -> DiffEvidence:

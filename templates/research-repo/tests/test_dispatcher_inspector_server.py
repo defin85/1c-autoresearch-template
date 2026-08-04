@@ -24,7 +24,7 @@ from one_c_autoresearch.workspace_api import (
 from one_c_autoresearch.workflow import _analyze_aggregates, _dispatcher_items
 
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[1] / "templates/research-repo"
 
 
 def _bookmark(client: TestClient) -> dict:

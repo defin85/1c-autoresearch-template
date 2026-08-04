@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-import importlib
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Iterable, Mapping
-from typing import Callable, NotRequired, Protocol, TypedDict, runtime_checkable
+from typing import Callable, NotRequired, TypedDict
 
-from .contracts import JsonValue, SECRET_KEYS, atomic_json, canonical_json, json_array, json_object, parse_json, parse_json_object, repository_lock, sha256
+from .contracts import JsonValue, SECRET_KEYS, atomic_json, canonical_json, json_array, json_object, owned_function, parse_json, parse_json_object, repository_lock, sha256
 from .diffs import diff_pointer, source_pointer as diff_source_pointer
 from .sources import ConnectionProfile, ExtensionInfo, source_pointer
 
@@ -56,23 +55,25 @@ class StagePlan(TypedDict):
 
 
 class StageRun(TypedDict, total=False):
+    run_id: str
+    idempotency_key_fingerprint: str
+    request_fingerprint: str
+    lease_token: str
     boundary: str
     status: str
     steps: list[StageStep]
     result: dict[str, object]
     plan: StagePlan
-
-
-@runtime_checkable
-class WorkflowModule(Protocol):
-    def state_fingerprint(self, repo: Path) -> str: ...
+    predecessor_run_id: str | None
+    created_at: str
+    updated_at: str
 
 
 def state_fingerprint(repo: Path) -> str:
-    module = importlib.import_module("one_c_autoresearch.workflow")
-    if not isinstance(module, WorkflowModule):
-        raise RuntimeError("workflow module has an incompatible runtime interface")
-    return module.state_fingerprint(repo)
+    value = owned_function(".workflow", "state_fingerprint")(repo)
+    if not isinstance(value, str):
+        raise RuntimeError("workflow state fingerprint is invalid")
+    return value
 
 
 def _object(value: object) -> dict[str, JsonValue]:
@@ -174,6 +175,42 @@ def _stage_steps(value: object) -> list[StageStep]:
     return [_stage_step(item) for item in json_array(value)]
 
 
+def stage_plan(value: object) -> StagePlan:
+    raw = _object(value)
+    plan = StagePlan(
+        schema_version=_string(raw.get("schema_version", "")),
+        boundary=_string(raw.get("boundary", "")),
+        workflow_fingerprint=_string(raw.get("workflow_fingerprint", "")),
+        active_pointers=_pointer_set(raw.get("active_pointers", {})),
+        steps=_stage_steps(raw.get("steps", [])),
+        required_confirmations=_strings(raw.get("required_confirmations", [])),
+        possible_results=_strings(raw.get("possible_results", [])),
+        manual_stop=None if raw.get("manual_stop") is None else _string(raw["manual_stop"]),
+        source_inputs=None if raw.get("source_inputs") is None else _object(raw["source_inputs"]),
+        projection_fingerprint=None if raw.get("projection_fingerprint") is None else _string(raw["projection_fingerprint"]),
+    )
+    if "plan_fingerprint" in raw:
+        plan["plan_fingerprint"] = _string(raw["plan_fingerprint"])
+    return plan
+
+
+def stage_run(value: object) -> StageRun:
+    raw = _object(value)
+    run = StageRun()
+    for key in ("run_id", "idempotency_key_fingerprint", "request_fingerprint", "lease_token", "boundary", "status", "created_at", "updated_at"):
+        if key in raw:
+            run[key] = _string(raw[key])
+    if "steps" in raw:
+        run["steps"] = _stage_steps(raw["steps"])
+    if "result" in raw:
+        run["result"] = dict(_object(raw["result"]))
+    if "plan" in raw:
+        run["plan"] = stage_plan(raw["plan"])
+    if "predecessor_run_id" in raw:
+        run["predecessor_run_id"] = None if raw["predecessor_run_id"] is None else _string(raw["predecessor_run_id"])
+    return run
+
+
 def _plan_with_steps(plan: StagePlan, steps: list[StageStep]) -> StagePlan:
     result = StagePlan(
         schema_version=plan["schema_version"],
@@ -197,6 +234,10 @@ class StageExecutionError(RuntimeError):
     def __init__(self, message: str, steps: list[StageStep]) -> None:
         super().__init__(message)
         self.steps = steps
+
+
+def exception_steps(exc: object) -> list[StageStep]:
+    return exc.steps if isinstance(exc, StageExecutionError) else []
 
 
 def fingerprint(value: object) -> str:

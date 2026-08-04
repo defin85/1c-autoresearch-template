@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import os
-import importlib
 import tempfile
 from collections.abc import Iterable
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Protocol, TypedDict, runtime_checkable
+from typing import TypedDict
 
-from .contracts import JsonValue, atomic_json, canonical_json, content_id, json_object, parse_json, parse_json_object, repository_lock, sha256
+from .contracts import JsonValue, atomic_json, canonical_json, content_id, json_object, owned_function, parse_json, parse_json_object, repository_lock, sha256
 POINTER = "research/active-consolidation-generation.json"
 MRQ_FILES = ("mrq.jsonl", "dispositions.jsonl", "evidence.jsonl", "lineage.jsonl")
 JsonObject = dict[str, JsonValue]
@@ -62,19 +61,6 @@ class PartitionManifest(TypedDict):
     partitions: list[JsonObject]
     pairs: list[dict[str, int]]
     planned_invocation_count: int
-
-
-@runtime_checkable
-class _DecisionGenerations(Protocol):
-    def consolidation_input_fingerprint(self, pointer: object) -> str: ...
-    def validate_generation(self, repo: Path, generation_id: str, *, allowed_mrq_ids: set[str]) -> object: ...
-
-
-def _decision_generations() -> _DecisionGenerations:
-    module = importlib.import_module(".decision_generations", __package__)
-    if not isinstance(module, _DecisionGenerations):
-        raise RuntimeError("invalid decision generations module")
-    return module
 
 
 def fingerprint(value: object) -> str:
@@ -248,9 +234,11 @@ def load_active(repo: Path, *, allow_legacy: bool = False) -> JsonObject:
         raise ValueError("active consolidation bindings are stale")
     mrq = validate_generation(repo, _string(pointer["mrq_generation_id"]), _object(bindings))
     if pointer.get("decision_generation_id"):
-        decisions = _decision_generations()
-        _ = decisions.validate_generation(repo, _string(pointer["decision_generation_id"]), allowed_mrq_ids={_string(row["mrq_id"]) for row in _objects(mrq["mrq.jsonl"])})
-        if pointer["decision_input_fingerprint"] != decisions.consolidation_input_fingerprint(pointer):
+        _ = owned_function(".decision_generations", "validate_generation")(repo, _string(pointer["decision_generation_id"]), allowed_mrq_ids={_string(row["mrq_id"]) for row in _objects(mrq["mrq.jsonl"])})
+        input_fingerprint = owned_function(".decision_generations", "consolidation_input_fingerprint")(pointer)
+        if not isinstance(input_fingerprint, str):
+            raise RuntimeError("decision input fingerprint is invalid")
+        if pointer["decision_input_fingerprint"] != input_fingerprint:
             raise ValueError("stale decision generation binding")
     return {"pointer": pointer, "mrq": mrq}
 

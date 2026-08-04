@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import os
-import importlib
 import re
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import NotRequired, Protocol, TypedDict, runtime_checkable
+from typing import NotRequired, TypedDict
 
-from .contracts import DECISIONS, MRQ_STATES, JsonValue, atomic_json, canonical_json, mrq_id, parse_json_object, repository_lock, require_tracked_clean, sha256, validate_unique_ids
+from .contracts import DECISIONS, MRQ_STATES, JsonValue, atomic_json, canonical_json, mrq_id, owned_function, parse_json_object, repository_lock, require_tracked_clean, sha256, validate_unique_ids
 
 
 FILES = ("mrq.jsonl", "dispositions.jsonl", "evidence.jsonl", "lineage.jsonl", "approvals.jsonl")
@@ -18,26 +17,19 @@ CONFIDENCE = {"low", "medium", "high"}
 AGREEMENT_STATES = {"pending_review", "changes_requested", "approved"}
 
 
-@runtime_checkable
-class _StageRecomputeModule(Protocol):
-    def recover_active_publication(self, repo: Path) -> str | None: ...
-    def compatibility_fingerprint(
-        self,
-        mrq: Mapping[str, object],
-        dispositions: Iterable[Mapping[str, object]],
-        diff_facts: Mapping[str, Mapping[str, object]],
-        coverage: Mapping[str, Mapping[str, object]],
-        approvals: Iterable[Mapping[str, object]],
-    ) -> str: ...
-
-
-def _stage_recompute() -> _StageRecomputeModule:
-    module = importlib.import_module(".stage_recompute", __package__)
-    if not isinstance(module, _StageRecomputeModule):
-        raise RuntimeError("stage recompute module has an incompatible runtime interface")
-    return module
-
-
+def _compatibility_fingerprint(
+    mrq: Mapping[str, object],
+    dispositions: Iterable[Mapping[str, object]],
+    diff_facts: Mapping[str, Mapping[str, object]],
+    coverage: Mapping[str, Mapping[str, object]],
+    approvals: Iterable[Mapping[str, object]],
+) -> str:
+    value = owned_function(".stage_recompute", "compatibility_fingerprint")(
+        mrq, dispositions, diff_facts, coverage, approvals,
+    )
+    if not isinstance(value, str):
+        raise RuntimeError("compatibility fingerprint is invalid")
+    return value
 class EvidenceRef(TypedDict, total=False):
     path: str
     fingerprint: str
@@ -431,7 +423,7 @@ def active(
     diff_candidate: dict[str, JsonValue] | None = None,
 ) -> ActiveResult:
     if pointer_candidate is None:
-        _ = _stage_recompute().recover_active_publication(repo)
+        _ = owned_function(".stage_recompute", "recover_active_publication")(repo)
     pointer_path = repo / "research/active-generation.json"
     pointer = pointer_candidate or parse_json_object(pointer_path.read_text(encoding="utf-8"))
     generation = pointer.get("canonical_generation_id")
@@ -693,7 +685,6 @@ def revalidate_unchanged(repo: Path, new_source: dict[str, JsonValue], new_diff:
         coverage = {item["customer_diff_id"]: {key: item[key] for key in ("customer_diff_id", "target_diff_ids", "coverage_status", "evidence_ref")} for item in csv.DictReader(stream)}
     with (repo / "analysis/indexes/generations" / previous_diff_id / "target-coverage.csv").open(encoding="utf-8", newline="") as stream:
         old_coverage = {item["customer_diff_id"]: {key: item[key] for key in ("customer_diff_id", "target_diff_ids", "coverage_status", "evidence_ref")} for item in csv.DictReader(stream)}
-    compatibility_fingerprint = _stage_recompute().compatibility_fingerprint
     compatibility: dict[str, str] = {}
     compatible: set[str] = set()
     affected_reasons: dict[str, list[str]] = {}
@@ -720,8 +711,8 @@ def revalidate_unchanged(repo: Path, new_source: dict[str, JsonValue], new_diff:
             if (customer_diff_id := value.get("customer_diff_id")) is not None
             and (row := coverage.get(customer_diff_id)) is not None
         ]
-        old_fp = compatibility_fingerprint(item, relations, {key: {name: value for name, value in fact.items() if name != "source_generation"} for key, fact in old_facts.items()}, old_coverage, rows["approvals.jsonl"])
-        new_fp = compatibility_fingerprint(candidate_item, candidate_relations, {key: {name: value for name, value in fact.items() if name != "source_generation"} for key, fact in facts.items()}, coverage, rows["approvals.jsonl"])
+        old_fp = _compatibility_fingerprint(item, relations, {key: {name: value for name, value in fact.items() if name != "source_generation"} for key, fact in old_facts.items()}, old_coverage, rows["approvals.jsonl"])
+        new_fp = _compatibility_fingerprint(candidate_item, candidate_relations, {key: {name: value for name, value in fact.items() if name != "source_generation"} for key, fact in facts.items()}, coverage, rows["approvals.jsonl"])
         source_ok = all(
             (stable_diff_id := evidence.get("stable_diff_id")) is not None
             and (fact := facts.get(stable_diff_id)) is not None

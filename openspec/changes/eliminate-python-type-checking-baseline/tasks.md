@@ -37,17 +37,22 @@
 
 - [x] 6.1 Run BasedPyright without `baselineFile` and prove zero errors, zero warnings and zero notes across every production module.
 - [x] 6.2 Delete `.basedpyright/baseline.json` and the `baselineFile` setting and add verification that rejects either artifact, ignored diagnostics, rule downgrades and production-source exclusions.
-<!-- GOAL_CURSOR -->
-- [ ] 6.3 Confirm the final code contains no broad `Any`, unchecked cast, fake protocol or shadow stub introduced only to satisfy the checker.
-  - Этап цикла: исправление
-  - Состояние шага: независимое ревью выявило одноразовые Protocol-интерфейсы собственных модулей; прямые локальные импорты возвращают циклы BasedPyright и не приняты
-  - Следующее действие: вынести общие конкретные типы в одного владельца и убрать одноразовые интерфейсы без циклов импортов
-  - Файлы шага: src/one_c_autoresearch/contracts.py, src/one_c_autoresearch/workflow.py, src/one_c_autoresearch/mrq.py, src/one_c_autoresearch/stage_recompute.py, src/one_c_autoresearch/service.py, src/one_c_autoresearch/sources.py, src/one_c_autoresearch/diffs.py
+- [x] 6.3 Confirm the final code contains no broad `Any`, unchecked cast, fake protocol or shadow stub introduced only to satisfy the checker.
 
 ## 7. Synchronize and release-verify
 
 - [x] 7.1 Run target doctor, strict doctor where the fixture is publication-complete, the full Python suite and the unsuppressed type check.
-- [ ] 7.2 Preview and fingerprint canonical synchronization, apply the unchanged plan, and prove normalized two-way parity for runtime source, configuration, lockfile and verification commands.
+- [x] 7.2 Preview and fingerprint canonical synchronization, apply the unchanged plan, and prove normalized two-way parity for runtime source, configuration, lockfile and verification commands.
 - [x] 7.3 Run template, doctor, fresh-repository, package, distribution, frontend and browser gates required by the release matrix.
+<!-- GOAL_CURSOR -->
 - [ ] 7.4 Run BasedPyright on Ubuntu, Windows and macOS with the pinned version and review platform-specific branches.
+  - Этап цикла: финальная проверка
+  - Состояние шага: Ubuntu локально проходит; одинаковая проверка настроена в GitHub Actions для трех ОС, но текущие коммиты еще не опубликованы
+  - Следующее действие: проверить доступность удаленного запуска без изменения опубликованной ветки либо запросить разрешение на push
+  - Файлы шага: .github/workflows/verify.yml
 - [ ] 7.5 Run `openspec validate eliminate-python-type-checking-baseline --strict --no-interactive`, `openspec validate --all --strict`, `git diff --check`, and direct final diff and artifact review.
+
+## Разрывы ревью
+
+- [x] 8.1 Удалить одноразовые `Protocol`-интерфейсы собственных модулей, введенные только для прохождения проверки типов, не возвращая циклы импортов.
+- [x] 8.2 Определить и доказать нормализованный паритет собранных статических файлов между целевым репозиторием и каноническим runtime без перезаписи несвязанных пользовательских изменений.

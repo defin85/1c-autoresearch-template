@@ -13,7 +13,7 @@ from one_c_autoresearch.sources import draft_fingerprint, extension_scope_status
 from one_c_autoresearch.user_state import load_connections
 
 
-REPO = Path(__file__).parents[1]
+REPO = Path(__file__).parents[1] / "templates/research-repo"
 
 def test_event_replay_can_open_at_the_current_tail(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events", "project")

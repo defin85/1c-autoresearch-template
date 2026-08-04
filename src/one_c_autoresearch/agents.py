@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import importlib
 import os
 import shutil
 import subprocess
@@ -9,9 +8,9 @@ import sys
 from hashlib import sha256
 from collections.abc import Callable
 from pathlib import Path
-from typing import IO, Protocol, runtime_checkable
+from typing import IO
 
-from .contracts import JsonValue, atomic_json, canonical_json, normalize_relative, parse_json_object, reject_secrets
+from .contracts import JsonValue, atomic_json, canonical_json, json_array, normalize_relative, owned_function, owned_value, parse_json_object, reject_secrets
 from .sources import run_command
 
 _run_command = run_command
@@ -122,51 +121,6 @@ def _reserve_bytes(function: object, policy: dict[str, JsonValue]) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError("reserve estimator returned a non-integer value")
     return value
-
-
-class ReserveEstimator(Protocol):
-    def __call__(self, policy: dict[str, JsonValue], /) -> int: ...
-
-
-class PolicyResolver(Protocol):
-    def __call__(
-        self,
-        repo: Path,
-        profile: dict[str, JsonValue],
-        role_id: str,
-        work_unit: dict[str, JsonValue],
-        /,
-    ) -> object: ...
-
-
-@runtime_checkable
-class SourceSearchModule(Protocol):
-    POLICY_VERSION: str
-    dynamic_reserve_bytes: ReserveEstimator
-    resolve_policy: PolicyResolver
-
-
-class ActiveStateResolver(Protocol):
-    def __call__(self, repo: Path, /) -> tuple[object, str]: ...
-
-
-@runtime_checkable
-class StageRecomputeModule(Protocol):
-    active_state: ActiveStateResolver
-
-
-def _source_search_module() -> SourceSearchModule:
-    module: object = importlib.import_module(".source_search", __package__)
-    if not isinstance(module, SourceSearchModule):
-        raise RuntimeError("source-search module contract is unavailable")
-    return module
-
-
-def _stage_recompute_module() -> StageRecomputeModule:
-    module: object = importlib.import_module(".stage_recompute", __package__)
-    if not isinstance(module, StageRecomputeModule):
-        raise RuntimeError("stage recompute module contract is unavailable")
-    return module
 
 
 def _subprocess_runner(
@@ -471,7 +425,7 @@ def prepare_context_envelope(
         "prompt": prompt,
         "response_schema": schema,
     })
-    dynamic_reserve_bytes = _source_search_module().dynamic_reserve_bytes
+    dynamic_reserve_bytes = owned_function(".source_search", "dynamic_reserve_bytes")
     source_search_policies = _object(execution_snapshot.get("source_search_policies") or {})
     search_policy = source_search_policies.get(
         f"{phase_id}:{role_id}"
@@ -672,7 +626,9 @@ def validate_execution_snapshot(repo: Path, snapshot: dict[str, JsonValue]) -> N
     }
     if instructions != expected_instructions:
         raise RuntimeError("agent instruction changed after the execution snapshot was created")
-    policy_version = _source_search_module().POLICY_VERSION
+    policy_version = owned_value(".source_search", "POLICY_VERSION")
+    if not isinstance(policy_version, str):
+        raise RuntimeError("source-search policy version is unavailable")
     policies = _object(snapshot.get("source_search_policies", {}))
     if any(
         not isinstance(policy, dict)
@@ -711,7 +667,10 @@ def resolve_execution_snapshot(
         raise RuntimeError("codex executable version is unavailable")
     phases = _objects(step.get("agent_phases", []))
     try:
-        raw_pointers, workflow_fingerprint = _stage_recompute_module().active_state(repo)
+        active_state = json_array(owned_function(".stage_recompute", "active_state")(repo))
+        if len(active_state) != 2 or not isinstance(active_state[1], str):
+            raise RuntimeError("stage recompute active state is invalid")
+        raw_pointers, workflow_fingerprint = active_state
         pointers = _object(raw_pointers)
     except (OSError, ValueError, KeyError):
         # Узкие модульные вызовы без проектного контракта всё равно получают
@@ -719,7 +678,7 @@ def resolve_execution_snapshot(
         pointers, workflow_fingerprint = {}, "sha256:" + sha256(canonical_json(step)).hexdigest()
     safe_profiles: dict[str, dict[str, JsonValue]] = {}
     source_search_policies: dict[str, dict[str, JsonValue]] = {}
-    resolve_policy = _source_search_module().resolve_policy
+    resolve_policy = owned_function(".source_search", "resolve_policy")
     search_work_unit: dict[str, JsonValue] = {}
     paths_value = work_unit.get("allowed_paths")
     if isinstance(paths_value, list):

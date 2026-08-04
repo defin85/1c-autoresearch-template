@@ -4,7 +4,6 @@ import argparse
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol, runtime_checkable
 
 from .contracts import JsonValue, json_object, parse_json
 from .service import ApplicationService
@@ -30,18 +29,6 @@ class CLIArgs(argparse.Namespace):
     role: str = "target_cf"
     preview_id: str = ""
     selection_file: str | None = None
-
-
-@runtime_checkable
-class MigrationAPI(Protocol):
-    def start_migration(self, repo: Path, *, repository_fingerprint: str, workflow_fingerprint: str, owner: str) -> object: ...
-    def execute(self, repo: Path, migration_id: str, *, workflow_v4: bytes) -> object: ...
-
-
-def _migration_api(value: object) -> MigrationAPI:
-    if not isinstance(value, MigrationAPI):
-        raise RuntimeError("workflow migration module has an incompatible runtime interface")
-    return value
 
 
 def _connections(value: dict[str, dict[str, JsonValue]]) -> dict[str, ConnectionProfile]:
@@ -152,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "migrate-workflow-v4":
         from .contracts import sha256
         from . import workflow_migration
-        migration = _migration_api(workflow_migration)
+        migration = workflow_migration
         workflow_bytes = (repo / args.workflow_v4).read_bytes() if not Path(args.workflow_v4).is_absolute() else Path(args.workflow_v4).read_bytes()
         workflow_fingerprint = "sha256:" + sha256((repo / "research/workflow.toml").read_bytes())
         repository_fingerprint = "sha256:" + sha256(str(repo).encode())

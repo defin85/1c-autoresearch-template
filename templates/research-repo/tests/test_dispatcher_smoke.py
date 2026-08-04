@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[1] / "templates/research-repo"
 
 
 def _codex_available() -> bool:

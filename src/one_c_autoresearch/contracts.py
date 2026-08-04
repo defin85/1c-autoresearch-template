@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -10,7 +11,7 @@ import subprocess
 import tempfile
 import threading
 import unicodedata
-from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol, TypeAlias, runtime_checkable
@@ -31,6 +32,19 @@ class _HeldRepositoryLocks(threading.local):
 
 _HELD_REPOSITORY_LOCKS = _HeldRepositoryLocks()
 JsonValue: TypeAlias = None | bool | int | float | str | Sequence["JsonValue"] | Mapping[str, "JsonValue"]
+
+
+def owned_value(module_name: str, name: str) -> object:
+    module = importlib.import_module(module_name, __package__)
+    namespace: dict[str, object] = module.__dict__
+    return namespace.get(name)
+
+
+def owned_function(module_name: str, name: str) -> Callable[..., object]:
+    value = owned_value(module_name, name)
+    if not callable(value):
+        raise RuntimeError(f"{module_name}.{name} is unavailable")
+    return value
 
 
 @runtime_checkable

@@ -24,7 +24,7 @@ from one_c_autoresearch.agents import EVIDENCE_SCHEMA, ENVIRONMENT_KEYS, EXEC_AR
 from one_c_autoresearch.sqlite_state import DispatcherStore, LEASE_EXPIRY_SECONDS
 
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[1] / "templates/research-repo"
 
 
 def _fake_bindings(work_unit_id: str = "DIF-AAA", *, workflow_fingerprint: str = "sha256:abc") -> DispatcherBindings:

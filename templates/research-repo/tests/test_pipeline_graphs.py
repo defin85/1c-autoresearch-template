@@ -56,11 +56,11 @@ def _bootstrap_repo(tmp_path: Path, customer_diffs: list[dict[str, str]], *, wit
     research = repo / "research"
     research.mkdir(parents=True)
     (repo / "project.toml").write_text('[project]\nid="t"\nproduct="t"\nbaseline_version="1"\ntarget_version="1"\nnext_vendor_version="1"\ndescription="t"\n', encoding="utf-8")
-    (research / "workflow.toml").write_bytes((Path(__file__).resolve().parents[1] / "research/workflow.toml").read_bytes())
+    (research / "workflow.toml").write_bytes((Path(__file__).resolve().parents[1] / "templates/research-repo" / "research/workflow.toml").read_bytes())
     (research / "infobases.toml").write_text('schema_version = "1"\n', encoding="utf-8")
     (research / "external-artifacts.toml").write_text('schema_version = "1"\n', encoding="utf-8")
     (research / "indexing.toml").write_text('schema_version = "1"\nengine = "rlm-tools-bsl"\nengine_version = "1.28.1"\n', encoding="utf-8")
-    (research / "forbidden-authorities.json").write_bytes((Path(__file__).resolve().parents[1] / "research/forbidden-authorities.json").read_bytes())
+    (research / "forbidden-authorities.json").write_bytes((Path(__file__).resolve().parents[1] / "templates/research-repo" / "research/forbidden-authorities.json").read_bytes())
     source_id = "a" * 64
     diff_id = "b" * 64
     source_pointer = {

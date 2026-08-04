@@ -9,7 +9,7 @@ from one_c_autoresearch.source_search_bridge import _v2_provenance
 from one_c_autoresearch.sqlite_state import DispatcherStore
 
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[1] / "templates/research-repo"
 
 
 def _policy() -> dict[str, object]:

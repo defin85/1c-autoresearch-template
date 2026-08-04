@@ -12,7 +12,7 @@ import pytest
 
 from one_c_autoresearch import diffs
 from one_c_autoresearch.contracts import canonical_json, external_id, repository_lock, sha256
-from one_c_autoresearch.sources import LEGACY_PROFILES, NORMALIZER_VERSION, PROFILES, _acquire_verified, _extract_source_tree, _run_command, _toolchain_versions, acquire, adapter_plan, build_routing_preview, clean_payload, configuration_identity, normalize_extension_decisions, normalize_payload, preflight_connection, publish, publish_routed, routing_bindings, serialize_infobases, stream_upload, validate_active, validate_role_contract
+from one_c_autoresearch.sources import LEGACY_PROFILES, NORMALIZER_VERSION, PROFILES, _acquire_verified, _extract_source_tree, _run_command, _toolchain_versions, acquire, adapter_plan, build_routing_preview, clean_payload, configuration_identity, normalize_extension_decisions, normalize_payload, preflight_connection, publish, publish_routed, routing_bindings, routing_preview, serialize_infobases, stream_upload, validate_active, validate_role_contract
 from one_c_autoresearch.service import ApplicationService
 
 
@@ -125,6 +125,7 @@ def test_routing_preview_blocks_unreviewed_extension_without_export(tmp_path: Pa
         profile["tested_fingerprint"] = "sha256:" + sha256(canonical_json(profile))
         profiles[role] = profile
     preview = build_routing_preview(tmp_path, tmp_path, profiles, run=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("export must not start")))
+    assert routing_preview(json.loads(json.dumps(preview))) == preview
     assert preview["blockers"] == [{
         "code": "extension_scope_required",
         "uuid": extension["uuid"],

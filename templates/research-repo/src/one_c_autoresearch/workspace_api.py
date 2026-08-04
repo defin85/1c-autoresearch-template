@@ -4,7 +4,6 @@ import base64
 import json
 import os
 import fcntl
-import importlib
 import re
 import shutil
 import sqlite3
@@ -16,7 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import AsyncGenerator, Callable
-from typing import Annotated, ClassVar, Literal, Protocol, runtime_checkable
+from typing import Annotated, ClassVar, Literal
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -24,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.base import RequestResponseEndpoint
 
-from .contracts import JsonValue, canonical_json, confined, json_object, parse_json, parse_json_object, repository_lock, sha256
+from .contracts import JsonValue, canonical_json, confined, json_object, owned_function, parse_json, parse_json_object, repository_lock, sha256
 from . import sources
 from .events import EventStore, RETRYABLE_RUN_STATUSES
 from .external_folder import PreviewStore, Selection
@@ -104,60 +103,12 @@ def _connections(values: dict[str, dict[str, JsonValue]]) -> dict[str, sources.C
     return result
 
 
-@runtime_checkable
-class _ConsolidationModule(Protocol):
-    def load_active(self, repo: Path, *, allow_legacy: bool = False) -> JsonObject: ...
-    def fingerprint(self, value: object) -> str: ...
-    def approve_plan(self, repo: Path, plan: JsonObject, expected_pointer: JsonObject, approval: JsonObject) -> JsonObject: ...
-
-
-@runtime_checkable
-class _StageExecutor(Protocol):
-    def execute(self, repo: Path, plan: JsonObject, *, lease_token: str, cancelled: Callable[[], bool], emit: Callable[[str, JsonObject], object], operational_root: Path, predecessor_run: JsonObject | None = None) -> JsonObject: ...
-
-
-@runtime_checkable
-class _ExceptionSteps(Protocol):
-    steps: list[JsonObject]
-
-
-@runtime_checkable
-class _IndexesRuntime(Protocol):
-    def route_coverage(self, config: object, components: object, states: list[JsonObject]) -> JsonObject: ...
-    def file_manifest(self, root: Path) -> list[JsonObject]: ...
-
-
-@runtime_checkable
-class _WorkflowRuntime(Protocol):
-    def attach_dispatcher(self, snapshot: JsonObject, repo: Path, base: Path | None = None) -> dict[str, object]: ...
-
-
-def _indexes_runtime() -> _IndexesRuntime:
-    module = importlib.import_module(".indexes", __package__)
-    if not isinstance(module, _IndexesRuntime):
-        raise RuntimeError("invalid indexes module")
-    return module
-
-
 def _attach_dispatcher(snapshot: JsonObject, repo: Path, base: Path) -> dict[str, object]:
-    module = importlib.import_module(".workflow", __package__)
-    if not isinstance(module, _WorkflowRuntime):
-        raise RuntimeError("invalid workflow module")
-    return module.attach_dispatcher(snapshot, repo, base)
+    return dict(_object(owned_function(".workflow", "attach_dispatcher")(snapshot, repo, base)))
 
 
 def _load_consolidation(repo: Path) -> JsonObject:
-    module = importlib.import_module(".consolidation", __package__)
-    if not isinstance(module, _ConsolidationModule):
-        raise RuntimeError("invalid consolidation module")
-    return module.load_active(repo)
-
-
-def _consolidation_module() -> _ConsolidationModule:
-    module = importlib.import_module(".consolidation", __package__)
-    if not isinstance(module, _ConsolidationModule):
-        raise RuntimeError("invalid consolidation module")
-    return module
+    return _object(owned_function(".consolidation", "load_active")(repo))
 
 
 def _encode_dispatcher_cursor(payload: JsonObject) -> str:
@@ -1183,10 +1134,19 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                         return True
                     with DispatcherStore(project, operational) as check_store:
                         return not check_store.renew_stage_lease(run_id, lease_token)
-                stage_module = importlib.import_module(".stage_recompute", __package__)
-                if not isinstance(stage_module, _StageExecutor):
-                    raise RuntimeError("invalid stage recompute module")
-                result = stage_module.execute(project, plan, lease_token=lease_token, cancelled=lease_is_lost, emit=emit, operational_root=operational, predecessor_run=predecessor)
+                def stage_emit(kind: str, payload: JsonObject) -> None:
+                    _ = emit(kind, payload)
+                typed_plan = owned_function(".stage_recompute", "stage_plan")(plan)
+                typed_predecessor = owned_function(".stage_recompute", "stage_run")(predecessor) if predecessor is not None else None
+                result = _object(owned_function(".stage_recompute", "execute")(
+                    project,
+                    typed_plan,
+                    lease_token=lease_token,
+                    cancelled=lease_is_lost,
+                    emit=stage_emit,
+                    operational_root=operational,
+                    predecessor_run=typed_predecessor,
+                ))
                 if lease_is_lost():
                     raise RuntimeError("stage recompute lease lost")
                 if result.get("status") == "awaiting_manual_work":
@@ -1219,7 +1179,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                     "error_class": type(exc).__name__,
                     "message": "stage recompute failed",
                     "boundary": body.boundary,
-                    "steps": exc.steps if isinstance(exc, _ExceptionSteps) else [],
+                    "steps": _objects(owned_function(".stage_recompute", "exception_steps")(exc)),
                 }
             with DispatcherStore(project, operational) as store:
                 current = store.finish_stage_recompute(run_id, lease_token, status, result)
@@ -1663,14 +1623,14 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                         ):
                             raise RuntimeError("dispatcher lease was fenced before noise approval persistence")
                     elif action == "approve-consolidation":
-                        consolidation = _consolidation_module()
                         relative = str(saved.get("plan_path", ""))
                         plan_path = (operational / "projects" / project_id / relative).resolve()
                         plan_root = (operational / "projects" / project_id / "consolidation-plans").resolve()
                         if plan_root not in plan_path.parents or not plan_path.is_file():
                             raise ValueError("dispatcher consolidation plan is missing")
                         plan = parse_json_object(plan_path.read_text(encoding="utf-8"))
-                        if consolidation.fingerprint(plan) != saved.get("plan_fingerprint"):
+                        plan_fingerprint = owned_function(".consolidation", "fingerprint")(plan)
+                        if not isinstance(plan_fingerprint, str) or plan_fingerprint != saved.get("plan_fingerprint"):
                             raise RuntimeError("dispatcher consolidation plan fingerprint is stale")
                         approval_fence()
                         expected_pointer = _object(saved["expected_pointer"])
@@ -1691,7 +1651,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                             },
                             "plan_fingerprint": saved["plan_fingerprint"],
                         }
-                        pointer = consolidation.approve_plan(project, plan, expected_pointer, consolidation_approval)
+                        pointer = _object(owned_function(".consolidation", "approve_plan")(project, plan, expected_pointer, consolidation_approval))
                         summary = {
                             "mrq_generation_id": pointer["mrq_generation_id"],
                             "plan_fingerprint": pointer["plan_fingerprint"],
@@ -2225,9 +2185,9 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             "items": items,
             "configuration": configuration,
             "configuration_fingerprint": indexes.config_fingerprint(project),
-            "route_health": _indexes_runtime().route_coverage(
+            "route_health": _object(owned_function(".indexes", "route_coverage")(
                 configuration, indexes.discover(project), backend_states,
-            ),
+            )),
             "storage_root": _string(storage["root"]),
             "storage": storage,
             "backend_tools": indexes.backend_tool_inventory(project),
@@ -2364,10 +2324,10 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         project = repo(project_id)
         components = indexes.discover(project)
         manifests = [
-            _indexes_runtime().file_manifest(
+            _objects(owned_function(".indexes", "file_manifest")(
                 project / "sources/generations" / component["source_generation_id"]
                 / component["path"]
-            )
+            ))
             for component in components
         ]
         files = [item for manifest in manifests for item in manifest]

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import importlib
 import os
 import shutil
 import tempfile
@@ -14,11 +13,11 @@ import unicodedata
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from pathlib import Path
-from typing import IO, BinaryIO, NotRequired, Protocol, TypedDict, runtime_checkable
+from typing import IO, BinaryIO, NotRequired, Protocol, TypedDict
 
-from .contracts import JsonValue, ROLES, atomic_json, canonical_json, confined, external_id, file_manifest, json_object, normalize_relative, parse_json, parse_json_object, reject_secrets, repository_lock, require_tracked_clean as validate_tracked_clean, sha256
+from .contracts import JsonValue, ROLES, atomic_json, canonical_json, confined, external_id, file_manifest, json_object, normalize_relative, owned_function, parse_json, parse_json_object, reject_secrets, repository_lock, require_tracked_clean as validate_tracked_clean, sha256
 
-from .source_routing import ComponentMember, ExtensionObservation, ExtensionScope, FormProbe, RoutingGroup, RoutingManifest
+from .source_routing import ComponentMember, ExtensionObservation, ExtensionScope, FormProbe, FormRecord, RoutingGroup, RoutingManifest
 
 
 EXPORTERS = ("ibcmd", "designer")
@@ -76,16 +75,6 @@ def _default_run(
         result.stdout.decode(),
         result.stderr.decode(),
     )
-
-
-@runtime_checkable
-class _WorkflowModule(Protocol):
-    def state_fingerprint(self, repo: Path) -> str: ...
-
-
-@runtime_checkable
-class _StageRecomputeModule(Protocol):
-    def recover_active_publication(self, repo: Path) -> object: ...
 
 
 class ExtensionInfo(TypedDict):
@@ -197,6 +186,59 @@ class RoutingBlocker(TypedDict):
     uuid: str
     roles: dict[str, ExtensionObservation]
     action: str
+
+
+def routing_preview(value: dict[str, JsonValue]) -> RoutingPreview:
+    scope = json_object(value.get("extension_scope"))
+    return {
+        "schema_version": _string(value.get("schema_version")),
+        "bindings": _string_map(value.get("bindings")),
+        "extension_scope": {
+            "extensions": [
+                {
+                    "uuid": _string(row.get("uuid")),
+                    "decision": _string(row.get("decision")),
+                    "rationale": _string(row.get("rationale")),
+                    "dormant": _boolean(row.get("dormant")),
+                    "roles": {
+                        role: {
+                            "present": _boolean(observation.get("present")),
+                            "name": _string(observation.get("name")),
+                            "version": _string(observation.get("version")),
+                            "active": _boolean(observation.get("active")),
+                        }
+                        for role, observation in ((name, json_object(item)) for name, item in json_object(row.get("roles")).items())
+                    },
+                }
+                for row in _objects(scope.get("extensions"))
+            ],
+            "included": _strings(scope.get("included")),
+            "excluded": _strings(scope.get("excluded")),
+            "dormant": _strings(scope.get("dormant")),
+            "unreviewed": _strings(scope.get("unreviewed")),
+        },
+        "blockers": [
+            {
+                "code": _string(row.get("code")),
+                "uuid": _string(row.get("uuid")),
+                "roles": {
+                    role: {
+                        "present": _boolean(observation.get("present")),
+                        "name": _string(observation.get("name")),
+                        "version": _string(observation.get("version")),
+                        "active": _boolean(observation.get("active")),
+                    }
+                    for role, observation in ((name, json_object(item)) for name, item in json_object(row.get("roles")).items())
+                },
+                "action": _string(row.get("action")),
+            }
+            for row in _objects(value.get("blockers"))
+        ],
+        "probe_results": [_form_probe(row) for row in _objects(value.get("probe_results"))],
+        "routing_manifest": _routing_manifest(json_object(value.get("routing_manifest"))),
+        "required_tools": _strings(value.get("required_tools")),
+        "routing_plan_fingerprint": _string(value.get("routing_plan_fingerprint")),
+    }
 
 
 class ComponentBase(TypedDict):
@@ -437,6 +479,29 @@ def _routing_manifest(value: dict[str, JsonValue]) -> RoutingManifest:
         "routing_contract_version": _string(value.get("routing_contract_version")),
         "groups": [_routing_group(item) for item in _objects(value["groups"])],
         "routing_manifest_fingerprint": _string(value["routing_manifest_fingerprint"]),
+    }
+
+
+def _form_probe(value: object) -> FormProbe:
+    row = json_object(value)
+    records: list[FormRecord] = []
+    for item in _objects(row.get("records")):
+        record = FormRecord(
+            component_id=_string(item.get("component_id")),
+            form_id=_string(item.get("form_id")),
+            classification=_string(item.get("classification")),
+            marker=_string(item.get("marker")),
+        )
+        if "unknown_structure_sha256" in item:
+            record["unknown_structure_sha256"] = _string(item["unknown_structure_sha256"])
+        records.append(record)
+    return {
+        "schema_version": _string(row.get("schema_version")),
+        "probe_contract_version": _string(row.get("probe_contract_version")),
+        "component_id": _string(row.get("component_id")),
+        "records": records,
+        "form_counts": _integer_map(row.get("form_counts")),
+        "probe_fingerprint": _string(row.get("probe_fingerprint")),
     }
 
 
@@ -1042,16 +1107,16 @@ def draft_fingerprint(root: Path) -> str:
 
 def routing_bindings(repo: Path, connections: dict[str, ConnectionProfile], upload_drafts: Path | None) -> dict[str, str]:
     from .source_routing import PROBE_CONTRACT_VERSION
-    workflow = importlib.import_module(".workflow", __package__)
-    if not isinstance(workflow, _WorkflowModule):
-        raise RuntimeError("workflow module has an incompatible runtime interface")
+    workflow_state = owned_function(".workflow", "state_fingerprint")(repo)
+    if not isinstance(workflow_state, str):
+        raise RuntimeError("workflow state fingerprint is invalid")
     safe_connections = {
         name: {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}}
         for name, profile in sorted(connections.items())
     }
     return {
         "workflow": "sha256:" + sha256((repo / "research/workflow.toml").read_bytes()),
-        "workflow_state": workflow.state_fingerprint(repo),
+        "workflow_state": workflow_state,
         "infobases": "sha256:" + sha256((repo / "research/infobases.toml").read_bytes()),
         "external_artifacts": "sha256:" + sha256((repo / "research/external-artifacts.toml").read_bytes()),
         "connections": "sha256:" + sha256(canonical_json(safe_connections)),
@@ -1561,10 +1626,7 @@ def validate_active(
     current: bool = True,
 ) -> SourcePointer:
     if candidate is None and current:
-        stage_recompute = importlib.import_module(".stage_recompute", __package__)
-        if not isinstance(stage_recompute, _StageRecomputeModule):
-            raise RuntimeError("stage recompute module has an incompatible runtime interface")
-        _ = stage_recompute.recover_active_publication(repo)
+        _ = owned_function(".stage_recompute", "recover_active_publication")(repo)
     deep = deep or require_tracked_clean
     pointer_path = repo / "research/active-source-generation.json"
     pointer = candidate or source_pointer(parse_json_object(pointer_path.read_text(encoding="utf-8")))
