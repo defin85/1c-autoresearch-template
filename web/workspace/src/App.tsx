@@ -89,6 +89,85 @@ type SourceSearchPolicy = {
   max_returned_bytes_per_call: number;
   max_total_returned_bytes: number;
 };
+
+type IndexConfiguration = {
+  schema_version: string;
+  machine_contract_version?: string;
+  backends: { adapter_id: string; engine_version: string }[];
+  routes: Record<string, string[]>;
+  service_profiles?: { lexical: string; hybrid: string };
+};
+
+type SearchServiceProfile = {
+  kind: "embedding" | "its";
+  label: string;
+  enabled: boolean;
+  endpoint?: string;
+  provider?: string;
+  model?: string;
+  dimension?: number;
+  ca_bundle_id?: string | null;
+  build_limits?: {
+    requests: number;
+    input_bytes: number;
+    vectors: number;
+    concurrency: number;
+    batch: number;
+    elapsed_seconds: number;
+  };
+};
+
+const INDEX_BACKENDS = {
+  "rlm-tools-bsl": "RLM Tools BSL",
+  "bsl-analyzer": "BSL Analyzer",
+} as const;
+
+const INDEX_CAPABILITIES: Record<string, string> = {
+  "text-search": "Поиск по тексту",
+  "symbol-definition": "Определение символа",
+  "symbol-references": "Использования символа",
+  callers: "Вызывающие методы",
+  callees: "Вызываемые методы",
+  "metadata-navigation": "Навигация по метаданным",
+  "code-search-lexical": "Лексический поиск по коду",
+  "code-search-hybrid": "Векторный поиск по коду",
+};
+
+function ConfigurationPlanSummary({ plan }: { plan: Record<string, unknown> }) {
+  const rebuild = Array.isArray(plan.rebuild_backends) ? plan.rebuild_backends.map(String) : [];
+  const changedRoutes = Array.isArray(plan.degraded_routes) ? plan.degraded_routes.map(String) : [];
+  return <Alert severity={rebuild.length || changedRoutes.length || plan.reuse_invalidated ? "warning" : "success"}>
+    <Stack spacing={0.75}>
+      <Typography fontWeight={700}>Настройки корректны и готовы к применению</Typography>
+      <Typography variant="body2">Формат настроек: версия {String(plan.target_schema_version ?? "не определена")}.</Typography>
+      <Typography variant="body2">
+        {rebuild.length
+          ? `Потребуется перестроить: ${rebuild.map((item) => INDEX_BACKENDS[item as keyof typeof INDEX_BACKENDS] ?? item).join(", ")}.`
+          : "Перестроение индексов не требуется."}
+      </Typography>
+      <Typography variant="body2">
+        {changedRoutes.length
+          ? `Изменятся маршруты: ${changedRoutes.map((item) => INDEX_CAPABILITIES[item] ?? item).join(", ")}.`
+          : "Маршруты поиска не изменятся."}
+      </Typography>
+      <Typography variant="body2">
+        {plan.reuse_invalidated ? "Существующие индексы нельзя будет использовать повторно." : "Существующие индексы останутся пригодны."}
+      </Typography>
+      <Accordion variant="outlined">
+        <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
+          <Typography variant="body2">Технические сведения</Typography>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Typography component="div" variant="caption" sx={{ overflowWrap: "anywhere" }}>
+            Текущий файл: {String(plan.current_file_fingerprint ?? "—")}<br />
+            Новый файл: {String(plan.normalized_file_fingerprint ?? "—")}<br />
+            Проверенный план: {String(plan.plan_fingerprint ?? "—")}
+          </Typography>
+        </AccordionDetails>
+      </Accordion>
+    </Stack>
+  </Alert>;
+}
 const SOURCE_SEARCH_OPERATION_GROUPS: Record<string, string[]> = {
   "Код": ["code.search_lexical", "code.search_hybrid"],
   "Символы": ["symbol.info", "symbol.info_at"],
@@ -2374,9 +2453,10 @@ export function Indexes({
   const [items, setItems] = useState<SourceIndex[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [pendingMode, setPendingMode] = useState<"ensure" | "rebuild" | "validate">();
-  const [configurationText, setConfigurationText] = useState("");
+  const [configuration, setConfiguration] = useState<IndexConfiguration>();
   const [configurationSchema, setConfigurationSchema] = useState("");
   const [configurationFingerprint, setConfigurationFingerprint] = useState("");
   const [configurationPreview, setConfigurationPreview] = useState<Record<string, unknown>>();
@@ -2387,29 +2467,32 @@ export function Indexes({
   const [serviceProfiles, setServiceProfiles] = useState<Record<string, unknown>[]>([]);
   const [serviceFingerprint, setServiceFingerprint] = useState("");
   const [profileId, setProfileId] = useState("embedding-default");
-  const [profileText, setProfileText] = useState(JSON.stringify({
+  const [profile, setProfile] = useState<SearchServiceProfile>({
     kind: "embedding", label: "Основной векторный поиск", enabled: true,
     endpoint: "http://127.0.0.1:8080/v1", provider: "openai-compatible",
     model: "embedding", dimension: 1536, ca_bundle_id: null,
     build_limits: { requests: 10000, input_bytes: 536870912, vectors: 1000000, concurrency: 4, batch: 256, elapsed_seconds: 1800 },
-  }, null, 2));
+  });
   const [profileSecret, setProfileSecret] = useState("");
   const [profileAcknowledged, setProfileAcknowledged] = useState(false);
   const [profilePreview, setProfilePreview] = useState<Record<string, unknown>>();
   const [profilePreviewKey, setProfilePreviewKey] = useState("");
   const [runtimeBackends, setRuntimeBackends] = useState<Record<string, unknown>[]>([]);
+  const [backendTools, setBackendTools] = useState<Record<string, unknown>[]>([]);
   const [referenceReadiness, setReferenceReadiness] = useState<Record<string, unknown>>();
   const [storage, setStorage] = useState<{ used_bytes: number; quota_bytes: number; available_bytes: number }>();
   const [cleanupPreview, setCleanupPreview] = useState<Record<string, unknown>>();
   const refresh = useCallback(
-    () => Promise.all([
-      api<{ items: SourceIndex[]; configuration: Record<string, unknown>; configuration_fingerprint: string; storage_root: string; storage?: { used_bytes: number; quota_bytes: number; available_bytes: number }; route_health: { blockers: Record<string, unknown>[]; degraded: Record<string, unknown>[] }; runtime_backends?: Record<string, unknown>[]; reference_readiness?: Record<string, unknown> }>(`/projects/${project.id}/indexes`),
+    () => {
+      setLoading(true);
+      return Promise.all([
+      api<{ items: SourceIndex[]; configuration: Record<string, unknown>; configuration_fingerprint: string; storage_root: string; storage?: { used_bytes: number; quota_bytes: number; available_bytes: number }; route_health: { blockers: Record<string, unknown>[]; degraded: Record<string, unknown>[] }; runtime_backends?: Record<string, unknown>[]; backend_tools?: Record<string, unknown>[]; reference_readiness?: Record<string, unknown> }>(`/projects/${project.id}/indexes`),
       api<{ profiles: Record<string, unknown>[]; state_fingerprint: string }>(`/projects/${project.id}/search-services`),
     ])
         .then(([value, services]) => {
           setItems(value.items);
           setRouteHealth(value.route_health ?? { blockers: [], degraded: [] });
-          setConfigurationText(JSON.stringify(value.configuration, null, 2));
+          setConfiguration(value.configuration as IndexConfiguration);
           setConfigurationSchema(String(value.configuration.schema_version ?? ""));
           setConfigurationFingerprint(value.configuration_fingerprint);
           setStorageRoot(value.storage_root);
@@ -2420,16 +2503,40 @@ export function Indexes({
           setProfilePreview(undefined);
           setProfileSecret("");
           setRuntimeBackends(value.runtime_backends ?? []);
+          setBackendTools(value.backend_tools ?? []);
           setReferenceReadiness(value.reference_readiness);
           setStorage(value.storage);
           setCleanupPreview(undefined);
         })
-        .catch((error) => setError(error.message)),
+        .catch((error) => setError(error.message))
+        .finally(() => setLoading(false));
+    },
     [project.id],
   );
   useEffect(() => {
     void refresh();
   }, [refresh]);
+  const editConfiguration = (next: IndexConfiguration) => {
+    setConfiguration(next);
+    setConfigurationPreview(undefined);
+    setRollbackPreview(undefined);
+  };
+  const editProfile = (patch: Partial<SearchServiceProfile>) => {
+    setProfile((current) => ({ ...current, ...patch }));
+    setProfilePreview(undefined);
+  };
+  const removeBackend = (adapterId: string) => {
+    if (!configuration || configuration.backends.length < 2) return;
+    const backends = configuration.backends.filter((item) => item.adapter_id !== adapterId);
+    editConfiguration({
+      ...configuration,
+      backends,
+      routes: Object.fromEntries(Object.entries(configuration.routes).map(([capability, members]) => {
+        const remaining = members.filter((member) => member !== adapterId);
+        return [capability, remaining.length ? remaining : [backends[0].adapter_id]];
+      })),
+    });
+  };
   const run = async (mode: "ensure" | "rebuild" | "validate") => {
     if (
       mode === "rebuild" &&
@@ -2464,13 +2571,14 @@ export function Indexes({
     }
   };
   const previewConfiguration = async () => {
+    if (!configuration) return;
     setBusy(true);
     setError("");
     try {
       const value = await api<Record<string, unknown>>(`/projects/${project.id}/indexes/configuration-preview`, {
         method: "POST",
         body: JSON.stringify({
-          configuration: JSON.parse(configurationText),
+          configuration,
           expected_file_fingerprint: configurationFingerprint,
         }),
       });
@@ -2482,7 +2590,7 @@ export function Indexes({
     }
   };
   const applyConfiguration = async () => {
-    if (!configurationPreview) return;
+    if (!configurationPreview || !configuration) return;
     setBusy(true);
     setError("");
     try {
@@ -2492,7 +2600,7 @@ export function Indexes({
         body: JSON.stringify({
           operation: "indexes.configure",
           payload: {
-            configuration: JSON.parse(configurationText),
+            configuration,
             expected_file_fingerprint: configurationFingerprint,
             expected_plan_fingerprint: configurationPreview.plan_fingerprint,
           },
@@ -2548,7 +2656,7 @@ export function Indexes({
         headers: { ...mutationHeaders(), "Idempotency-Key": key },
         body: JSON.stringify({
           profile_id: profileId,
-          profile: JSON.parse(profileText),
+          profile,
           expected_state_fingerprint: serviceFingerprint,
           acknowledged: profileAcknowledged,
           secret: profileSecret || null,
@@ -2595,9 +2703,22 @@ export function Indexes({
     } catch (error) { setError((error as Error).message); }
     finally { setBusy(false); }
   };
+  if (!configuration) {
+    return <Stack spacing={2} role="status" aria-live="polite">
+      {error && <Alert severity="error">{error}</Alert>}
+      {loading && <>
+        <LinearProgress />
+        <Typography>Загружаем состояние индексов и доступных движков…</Typography>
+      </>}
+    </Stack>;
+  }
   return (
     <Stack spacing={2}>
       {error && <Alert severity="error">{error}</Alert>}
+      {loading && <Stack spacing={0.5} role="status" aria-live="polite">
+        <LinearProgress />
+        <Typography variant="body2">Обновляем состояние индексов…</Typography>
+      </Stack>}
       <Alert severity="info">
         Индексы — одноразовое ускорение в пользовательском каталоге;
         канонические доказательства остаются в репозитории.
@@ -2631,26 +2752,111 @@ export function Indexes({
         </AccordionSummary>
         <AccordionDetails>
           <Stack spacing={1}>
-            <TextField
-              label="Типизированная конфигурация"
-              multiline
-              minRows={10}
-              value={configurationText}
-              onChange={(event) => {
-                setConfigurationText(event.target.value);
-                setConfigurationPreview(undefined);
-                setRollbackPreview(undefined);
-              }}
-            />
+            <Typography variant="body2" color="text.secondary">
+              Выберите используемые движки и порядок, в котором они будут применяться.
+            </Typography>
+            {configuration?.backends.map((backend, index) => <Card key={backend.adapter_id} variant="outlined">
+              <CardContent>
+                <Stack spacing={1}>
+                  <Typography fontWeight={700}>
+                    {INDEX_BACKENDS[backend.adapter_id as keyof typeof INDEX_BACKENDS] ?? backend.adapter_id}
+                  </Typography>
+                  <TextField
+                    label="Версия движка"
+                    value={backend.engine_version}
+                    onChange={(event) => editConfiguration({
+                      ...configuration,
+                      backends: configuration.backends.map((item, itemIndex) => itemIndex === index
+                        ? { ...item, engine_version: event.target.value }
+                        : item),
+                    })}
+                  />
+                  {configuration.backends.length > 1 && <Button
+                    color="error"
+                    sx={{ alignSelf: "flex-start" }}
+                    onClick={() => removeBackend(backend.adapter_id)}
+                  >
+                    Отключить движок
+                  </Button>}
+                </Stack>
+              </CardContent>
+            </Card>)}
+            <Stack direction="row" spacing={1}>
+              {Object.entries(INDEX_BACKENDS).filter(([adapterId]) => !configuration?.backends.some((item) => item.adapter_id === adapterId)).map(([adapterId, label]) => {
+                const tool = backendTools.find((item) => item.tool_id === adapterId);
+                const instance = Array.isArray(tool?.instances) ? tool.instances[0] as Record<string, unknown> | undefined : undefined;
+                const version = String(instance?.version ?? "");
+                return <Stack key={adapterId} spacing={0.25} alignItems="flex-start">
+                  <Button
+                    variant="outlined"
+                    disabled={!version}
+                    onClick={() => configuration && editConfiguration({
+                      ...configuration,
+                      backends: [...configuration.backends, { adapter_id: adapterId, engine_version: version }],
+                    })}
+                  >
+                    Подключить {label}
+                  </Button>
+                  <Typography variant="caption" color={version ? "text.secondary" : "error"}>
+                    {version ? `Обнаружена версия ${version}` : "Исполняемый файл не обнаружен"}
+                  </Typography>
+                </Stack>;
+              })}
+            </Stack>
+            <Accordion variant="outlined">
+              <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
+                <Typography fontWeight={700}>Расширенные настройки маршрутов</Typography>
+              </AccordionSummary>
+              <AccordionDetails>
+                <Stack spacing={1.5}>
+                  <Alert severity="info">
+                    Первый движок — основной, следующие используются только при его недоступности.
+                  </Alert>
+                  {configuration && Object.entries(configuration.routes).map(([capability, adapters]) => <FormControl key={capability} fullWidth>
+                    <InputLabel>{INDEX_CAPABILITIES[capability] ?? capability}</InputLabel>
+                    <Select
+                      multiple
+                      label={INDEX_CAPABILITIES[capability] ?? capability}
+                      value={adapters}
+                      renderValue={(value) => value.join(" → ")}
+                      onChange={(event) => editConfiguration({
+                        ...configuration,
+                        routes: {
+                          ...configuration.routes,
+                          [capability]: typeof event.target.value === "string"
+                            ? event.target.value.split(",")
+                            : event.target.value,
+                        },
+                      })}
+                    >
+                      {configuration.backends.map((backend) => <MenuItem key={backend.adapter_id} value={backend.adapter_id}>
+                        <Checkbox checked={adapters.includes(backend.adapter_id)} />
+                        {INDEX_BACKENDS[backend.adapter_id as keyof typeof INDEX_BACKENDS] ?? backend.adapter_id}
+                      </MenuItem>)}
+                    </Select>
+                  </FormControl>)}
+                  {configuration?.service_profiles && <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+                    <TextField
+                      fullWidth
+                      label="Профиль лексического поиска"
+                      value={configuration.service_profiles.lexical}
+                      onChange={(event) => editConfiguration({ ...configuration, service_profiles: { ...configuration.service_profiles!, lexical: event.target.value } })}
+                    />
+                    <TextField
+                      fullWidth
+                      label="Профиль векторного поиска"
+                      value={configuration.service_profiles.hybrid}
+                      onChange={(event) => editConfiguration({ ...configuration, service_profiles: { ...configuration.service_profiles!, hybrid: event.target.value } })}
+                    />
+                  </Stack>}
+                </Stack>
+              </AccordionDetails>
+            </Accordion>
             <Stack direction="row" spacing={1}>
               <Button disabled={busy} onClick={() => void previewConfiguration()}>Проверить изменения</Button>
               <Button variant="contained" disabled={busy || !configurationPreview} onClick={() => void applyConfiguration()}>Применить проверенный план</Button>
             </Stack>
-            {configurationPreview && <Alert severity="warning">
-              <Box component="pre" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
-                {JSON.stringify(configurationPreview, null, 2)}
-              </Box>
-            </Alert>}
+            {configurationPreview && <ConfigurationPlanSummary plan={configurationPreview} />}
             {configurationSchema === "3" && <>
               <FormControlLabel
                 control={<Checkbox checked={purgeV2State} onChange={(event) => {
@@ -2682,7 +2888,40 @@ export function Indexes({
               Настроено: {serviceProfiles.length}. Адреса и секреты сервер не возвращает.
             </Typography>
             <TextField label="Идентификатор профиля" value={profileId} onChange={(event) => { setProfileId(event.target.value); setProfilePreview(undefined); }} />
-            <TextField label="Параметры профиля" multiline minRows={8} value={profileText} onChange={(event) => { setProfileText(event.target.value); setProfilePreview(undefined); }} />
+            <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+              <FormControl fullWidth>
+                <InputLabel>Назначение</InputLabel>
+                <Select value={profile.kind} label="Назначение" onChange={(event) => editProfile({ kind: event.target.value as "embedding" | "its" })}>
+                  <MenuItem value="embedding">Векторный поиск</MenuItem>
+                  <MenuItem value="its">Помощник ИТС</MenuItem>
+                </Select>
+              </FormControl>
+              <TextField fullWidth label="Название" value={profile.label} onChange={(event) => editProfile({ label: event.target.value })} />
+            </Stack>
+            <FormControlLabel control={<Checkbox checked={profile.enabled} onChange={(event) => editProfile({ enabled: event.target.checked })} />} label="Профиль включён" />
+            {profile.kind === "embedding" && <>
+              <TextField label="Адрес сервиса" helperText="OpenAI-совместимый адрес, например http://127.0.0.1:8080/v1" value={profile.endpoint ?? ""} onChange={(event) => editProfile({ endpoint: event.target.value })} />
+              <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+                <TextField fullWidth label="Модель" value={profile.model ?? ""} onChange={(event) => editProfile({ model: event.target.value })} />
+                <TextField fullWidth label="Размерность вектора" type="number" value={profile.dimension ?? ""} onChange={(event) => editProfile({ dimension: Number(event.target.value) })} />
+              </Stack>
+              <Accordion variant="outlined">
+                <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
+                  <Typography fontWeight={700}>Расширенные ограничения построения</Typography>
+                </AccordionSummary>
+                <AccordionDetails>
+                  <Stack direction={{ xs: "column", sm: "row" }} spacing={1} flexWrap="wrap">
+                    {profile.build_limits && Object.entries(profile.build_limits).map(([name, value]) => <TextField
+                      key={name}
+                      label={{ requests: "Запросов", input_bytes: "Входных байт", vectors: "Векторов", concurrency: "Параллельность", batch: "Размер пакета", elapsed_seconds: "Время, секунд" }[name] ?? name}
+                      type="number"
+                      value={value}
+                      onChange={(event) => editProfile({ build_limits: { ...profile.build_limits!, [name]: Number(event.target.value) } })}
+                    />)}
+                  </Stack>
+                </AccordionDetails>
+              </Accordion>
+            </>}
             <TextField label="Новый секрет (необязательно при сохранении)" type="password" autoComplete="new-password" value={profileSecret} onChange={(event) => { setProfileSecret(event.target.value); setProfilePreview(undefined); }} />
             <FormControlLabel control={<Checkbox checked={profileAcknowledged} onChange={(event) => { setProfileAcknowledged(event.target.checked); setProfilePreview(undefined); }} />} label="Подтверждаю указанную в плане передачу данных внешнему сервису" />
             <Stack direction="row" spacing={1}>

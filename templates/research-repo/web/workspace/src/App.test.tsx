@@ -453,6 +453,49 @@ test("index validation is an explicit progress-visible action", async () => {
   });
 });
 
+test("index workspace shows loading instead of a false empty configuration", async () => {
+  let finishIndexes!: (value: unknown) => void;
+  const indexesResponse = new Promise((resolve) => { finishIndexes = resolve; });
+  const fetchMock = vi.fn().mockImplementation((url: string) =>
+    url.endsWith("/indexes")
+      ? indexesResponse
+      : Promise.resolve({
+          ok: true,
+          json: async () => ({ profiles: [], state_fingerprint: "sha256:services" }),
+        }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  render(<Indexes
+    project={{ id: "p", name: "p", root: "/repo" }}
+    snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
+  />);
+  expect(screen.getByText("Загружаем состояние индексов и доступных движков…")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /Подключить/ })).not.toBeInTheDocument();
+  finishIndexes({
+    ok: true,
+    json: async () => ({
+      items: [],
+      configuration: {
+        schema_version: "2",
+        backends: [{ adapter_id: "rlm-tools-bsl", engine_version: "1.30.1+v8unpack.1" }],
+        routes: { "text-search": ["rlm-tools-bsl"] },
+      },
+      backend_tools: [{
+        tool_id: "bsl-analyzer",
+        status: "detected",
+        instances: [{ version: "0.2.65", status: "detected", path: "/tools/bsl-analyzer" }],
+      }],
+      configuration_fingerprint: "sha256:config",
+    }),
+  });
+  expect(await screen.findByText("Настройка адаптеров и маршрутов")).toBeInTheDocument();
+  expect(screen.queryByText("Загружаем состояние индексов и доступных движков…")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByText("Настройка адаптеров и маршрутов"));
+  expect(screen.getByText("Обнаружена версия 0.2.65")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Подключить BSL Analyzer" }));
+  expect(screen.getAllByLabelText("Версия движка", { selector: "input" })[1]).toHaveValue("0.2.65");
+});
+
 test("schema 3 rollback requires a reviewed preview and confirmation", async () => {
   const fetchMock = vi.fn().mockImplementation((url: string) =>
     Promise.resolve({
@@ -594,8 +637,15 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
   expect(screen.getByText(/Деградированные маршруты/)).toBeInTheDocument();
   expect(screen.getByText(/\/state\/one-c-autoresearch\/indexes-v2\/repository/)).toBeInTheDocument();
   fireEvent.click(screen.getByText("Настройка адаптеров и маршрутов"));
+  expect(screen.getAllByLabelText("Версия движка", { selector: "input" })[0]).toHaveValue("0.2.63");
+  expect(screen.getAllByRole("button", { name: "Отключить движок" })).toHaveLength(2);
+  expect(screen.getByText("Расширенные настройки маршрутов")).toBeInTheDocument();
+  expect(screen.queryByLabelText("Типизированная конфигурация")).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Проверить изменения" }));
-  expect(await screen.findByText(/degraded_routes/)).toBeInTheDocument();
+  expect(await screen.findByText("Настройки корректны и готовы к применению")).toBeInTheDocument();
+  expect(screen.getByText("Перестроение индексов не требуется.")).toBeInTheDocument();
+  expect(screen.getByText("Изменятся маршруты: Поиск по тексту.")).toBeInTheDocument();
+  expect(screen.queryByText(/degraded_routes/)).not.toBeInTheDocument();
   expect(screen.getByRole("button", {
     name: "Применить проверенный план",
   })).toBeEnabled();
