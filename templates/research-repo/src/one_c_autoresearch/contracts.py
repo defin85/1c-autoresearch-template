@@ -11,10 +11,10 @@ import subprocess
 import tempfile
 import threading
 import unicodedata
-from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Protocol, TypeAlias, runtime_checkable
+from typing import Protocol, TypeAlias, TypeGuard, runtime_checkable
 
 
 SCHEMA_VERSION = "1"
@@ -52,16 +52,6 @@ class _JsonDecoder(Protocol):
     def decode(self, text: str) -> object: ...
 
 
-@runtime_checkable
-class _ObjectIterable(Protocol):
-    def __iter__(self) -> Iterator[object]: ...
-
-
-@runtime_checkable
-class _ObjectMapping(Protocol):
-    def items(self) -> Iterable[tuple[object, object]]: ...
-
-
 def _decode(decoder: object, text: str) -> object:
     if not isinstance(decoder, _JsonDecoder):
         raise RuntimeError("invalid JSON decoder")
@@ -72,24 +62,12 @@ def _opaque(value: object) -> object:
     return value
 
 
-def _is_list(value: object) -> bool:
+def _is_list(value: object) -> TypeGuard[list[object]]:
     return isinstance(value, list)
 
 
-def _is_dict(value: object) -> bool:
+def _is_dict(value: object) -> TypeGuard[dict[object, object]]:
     return isinstance(value, dict)
-
-
-def _items(value: object) -> Iterator[object]:
-    if not isinstance(value, _ObjectIterable):
-        raise ValueError("expected iterable")
-    return iter(value)
-
-
-def _mapping_items(value: object) -> Iterable[tuple[object, object]]:
-    if not isinstance(value, _ObjectMapping):
-        raise ValueError("expected mapping")
-    return value.items()
 
 
 def parse_json(text: str) -> JsonValue:
@@ -118,9 +96,9 @@ def _json_value(value: object) -> JsonValue:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if _is_list(value):
-        return [_json_value(item) for item in _items(value)]
+        return [_json_value(item) for item in value]
     if _is_dict(value):
-        items = list(_mapping_items(value))
+        items = list(value.items())
         if not all(isinstance(key, str) for key, _child in items):
             raise ValueError("JSON object keys must be strings")
         return {str(key): _json_value(child) for key, child in items}

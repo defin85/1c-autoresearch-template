@@ -44,15 +44,17 @@
 - [x] 7.1 Run target doctor, strict doctor where the fixture is publication-complete, the full Python suite and the unsuppressed type check.
 - [x] 7.2 Preview and fingerprint canonical synchronization, apply the unchanged plan, and prove normalized two-way parity for runtime source, configuration, lockfile and verification commands.
 - [x] 7.3 Run template, doctor, fresh-repository, package, distribution, frontend and browser gates required by the release matrix.
-<!-- GOAL_CURSOR -->
 - [ ] 7.4 Run BasedPyright on Ubuntu, Windows and macOS with the pinned version and review platform-specific branches.
-  - Этап цикла: финальная проверка
-  - Состояние шага: Ubuntu локально проходит; одинаковая проверка настроена в GitHub Actions для трех ОС, но текущие коммиты еще не опубликованы
-  - Следующее действие: проверить доступность удаленного запуска без изменения опубликованной ветки либо запросить разрешение на push
-  - Файлы шага: .github/workflows/verify.yml
 - [ ] 7.5 Run `openspec validate eliminate-python-type-checking-baseline --strict --no-interactive`, `openspec validate --all --strict`, `git diff --check`, and direct final diff and artifact review.
 
 ## Разрывы ревью
 
-- [x] 8.1 Удалить одноразовые `Protocol`-интерфейсы собственных модулей, введенные только для прохождения проверки типов, не возвращая циклы импортов.
+<!-- GOAL_CURSOR -->
+- [ ] 8.1 Удалить одноразовые `Protocol`-интерфейсы собственных модулей, введенные только для прохождения проверки типов, не возвращая циклы импортов.
+  - Этап цикла: исправление
+  - Состояние шага: независимое ревью обнаружило, что `owned_function()` скрывает сигнатуры 25 внутренних вызовов; задача повторно открыта
+  - Следующее действие: заменить динамические вызовы конкретными типизированными границами и устранить возникающие циклы импортов минимальными локальными переносами
+  - Файлы шага: src/one_c_autoresearch/contracts.py, src/one_c_autoresearch/agents.py, src/one_c_autoresearch/mrq.py, src/one_c_autoresearch/sources.py, src/one_c_autoresearch/workspace_api.py
 - [x] 8.2 Определить и доказать нормализованный паритет собранных статических файлов между целевым репозиторием и каноническим runtime без перезаписи несвязанных пользовательских изменений.
+- [x] 8.3 Заменить одноразовые протоколы встроенных контейнеров на прямое сужение типов и синхронизировать исправление во всех трех поверхностях.
+- [ ] 8.4 Исправить платформенные ветви, чтобы BasedPyright давал ноль ошибок и предупреждений при `--pythonplatform Windows`, не ослабляя общую конфигурацию.
