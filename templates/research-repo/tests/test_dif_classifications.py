@@ -34,6 +34,24 @@ def _row(identifier: str, kind: str = "meaning", *, whole_component: bool = Fals
     )
 
 
+def test_make_row_preserves_optional_evidence_diff_identity() -> None:
+    row = make_row(
+        "DIF-0000000000000001",
+        {
+            "kind": "meaning",
+            "semantic_hints": [],
+            "evidence": [{"path": "a", "fingerprint": FP, "stable_diff_id": "DIF-0000000000000001"}],
+            "rationale": "evidence",
+        },
+        evidence_fingerprint=FP,
+        result_schema_fingerprint=FP,
+        profile_fingerprint=FP,
+        instruction_fingerprint=FP,
+        context_fingerprint=FP,
+    )
+    assert row["evidence"][0]["stable_diff_id"] == "DIF-0000000000000001"
+
+
 @pytest.fixture
 def repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     rows = [

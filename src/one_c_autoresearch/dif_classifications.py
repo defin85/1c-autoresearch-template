@@ -4,7 +4,7 @@ import os
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from .contracts import JsonValue, atomic_json, canonical_json, confined, parse_json_object, repository_lock, sha256
 from .diffs import INVENTORY_HEADER, read_csv, validate_active as validate_diff
@@ -24,6 +24,7 @@ POINTER = "research/active-dif-classification-generation.json"
 class Evidence(TypedDict):
     path: str
     fingerprint: str
+    stable_diff_id: NotRequired[str]
 
 
 class ClassificationRow(TypedDict):
@@ -76,10 +77,13 @@ def _evidence(value: JsonValue) -> list[Evidence]:
     for item in value:
         if not isinstance(item, dict):
             raise ValueError("invalid evidence")
-        result.append({
+        evidence: Evidence = {
             "path": _string(item.get("path"), "evidence path"),
             "fingerprint": _string(item.get("fingerprint"), "evidence fingerprint"),
-        })
+        }
+        if "stable_diff_id" in item:
+            evidence["stable_diff_id"] = _string(item["stable_diff_id"], "evidence stable DIF ID")
+        result.append(evidence)
     return result
 
 
