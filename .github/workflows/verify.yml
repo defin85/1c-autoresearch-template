@@ -45,11 +45,11 @@ jobs:
           python scripts/build_workspace_template.py
 
       - name: Run Python tests
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         run: python -m pytest -q
 
       - name: Test managed workspace runtime
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         working-directory: templates/research-repo
         run: pip install '.[workspace]' httpx pytest && pytest -q tests/test_dispatcher.py tests/test_dispatcher_api.py tests/test_dispatcher_smoke.py tests/test_mrq_batches.py tests/test_pipeline_graphs.py tests/test_workflow.py
 

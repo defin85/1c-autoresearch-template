@@ -47,9 +47,9 @@
 <!-- GOAL_CURSOR -->
 - [ ] 7.4 Run BasedPyright on Ubuntu, Windows and macOS with the pinned version and review platform-specific branches.
   - Этап цикла: финальная проверка
-  - Состояние шага: полный набор и глубокая проверка проходят на Python 3.11 без команды Codex; предыдущий Windows BasedPyright был отменен fail-fast
-  - Следующее действие: опубликовать изоляцию тестов и дождаться полного зеленого прогона
-  - Файлы шага: `.github/workflows/verify.yml`, `pyproject.toml`, `uv.lock`
+  - Состояние шага: BasedPyright фактически прошел на трех ОС; выпуск и Linux-проверки зелёные, условие Linux-зависимого набора уточнено
+  - Следующее действие: опубликовать условие матрицы и дождаться полностью зеленого прогона
+  - Файлы шага: `.github/workflows/verify.yml`
 - [x] 7.5 Run `openspec validate eliminate-python-type-checking-baseline --strict --no-interactive`, `openspec validate --all --strict`, `git diff --check`, and direct final diff and artifact review.
 
 ## Разрывы ревью
@@ -62,3 +62,4 @@
 - [x] 8.6 Не запускать заведомо POSIX-зависимый полный набор исполнения на Windows в матрице, сохранив обязательную проверку BasedPyright на всех трех ОС.
 - [x] 8.7 Восстановить относительные пути тестов канонического шаблона, чтобы глубокая проверка свежего репозитория работала вне исходного дерева.
 - [x] 8.8 Изолировать тесты профилей агентов от наличия локальной команды Codex в окружении CI.
+- [x] 8.9 Ограничить Linux-зависимые тесты исполнения платформой Linux, сохранив BasedPyright и переносимые проверки шаблона на трех ОС.
