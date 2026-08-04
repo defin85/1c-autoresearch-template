@@ -32,6 +32,7 @@ from .contracts import (
     repository_lock,
     sha256,
 )
+from .platform_support import current_uid
 from .user_state import state_root, workspace_id
 
 
@@ -172,7 +173,7 @@ def _read_json(path: Path) -> JsonObject:
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
-            or metadata.st_uid != os.getuid()
+            or (current_uid() is not None and metadata.st_uid != current_uid())
             or metadata.st_mode & 0o077
         ):
             raise ValueError("search_services.unsafe_state_file")

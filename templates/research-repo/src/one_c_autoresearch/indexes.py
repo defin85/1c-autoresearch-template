@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import fcntl
 import selectors
-import signal
 import subprocess
 import shutil
 import sys
@@ -15,6 +13,8 @@ from functools import lru_cache
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .platform_support import lock_file, sync_directory, terminate_process
 from collections.abc import Iterator
 from typing import Callable, NotRequired, Protocol, TypedDict, runtime_checkable
 
@@ -571,26 +571,19 @@ def _fsync_tree(root: Path) -> None:
     for path in sorted(root.rglob("*"), reverse=True):
         if path.is_symlink():
             raise ValueError("index storage symlink is forbidden")
-        descriptor = os.open(
-            path, os.O_RDONLY | (os.O_DIRECTORY if path.is_dir() else 0)
-        )
+        if path.is_dir():
+            sync_directory(path)
+            continue
+        descriptor = os.open(path, os.O_RDONLY)
         try:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(root)
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(path)
 
 
 def repository_instance_fingerprint(repo: Path) -> str:
@@ -1368,11 +1361,11 @@ def _bounded_run(
                 "",
             )
         except (InterruptedError, TimeoutError, RuntimeError):
-            os.killpg(process.pid, signal.SIGTERM)
+            terminate_process(process)
             try:
                 _ = process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                terminate_process(process, force=True)
                 _ = process.wait()
             raise
         finally:
@@ -1975,11 +1968,11 @@ def _bsl_mcp(
         try:
             _ = process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
+            terminate_process(process)
             try:
                 _ = process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                terminate_process(process, force=True)
                 _ = process.wait()
         _ = proxy_context.__exit__(None, None, None)
 
@@ -2110,7 +2103,7 @@ def _acquire_target_lease(lease_path: Path, token: str) -> None:
 
     lock_path = lease_path.with_suffix(".lock")
     with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        lock_file(lock)
         if lease_path.is_file():
             try:
                 saved = parse_json_object(lease_path.read_text(encoding="utf-8"))

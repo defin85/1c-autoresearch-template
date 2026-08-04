@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import fcntl
 import re
 import shutil
 import sqlite3
@@ -14,6 +13,8 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from .platform_support import lock_file
 from collections.abc import AsyncGenerator, Callable
 from typing import Annotated, ClassVar, Literal
 
@@ -471,7 +472,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         result_path = store.root / ("idempotency-" + sha256(idempotency_key.encode()) + ".json")
         lock_path = result_path.with_suffix(".lock")
         with lock_path.open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lock_file(lock)
             if result_path.is_file():
                 result = parse_json_object(result_path.read_text(encoding="utf-8")); result["snapshot"] = service.snapshot(); return result
             if body.expected_fingerprint != service.snapshot()["workflow_fingerprint"]: raise RuntimeError("stale workflow fingerprint")
@@ -563,7 +564,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         store = EventStore(operational / "projects", project_id)
         result_path = store.root / ("idempotency-until-" + sha256(idempotency_key.encode()) + ".json")
         with result_path.with_suffix(".lock").open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lock_file(lock)
             if result_path.is_file():
                 result = parse_json_object(result_path.read_text(encoding="utf-8")); result["snapshot"] = service.snapshot(); return result
             if body.expected_fingerprint != service.snapshot()["workflow_fingerprint"]: raise RuntimeError("stale workflow fingerprint")
@@ -1270,7 +1271,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         action_lock = None
         if action not in {"approve-consolidation", "approve-decision"}:
             action_lock = action_result_path.with_suffix(".lock").open("a+b")
-            fcntl.flock(action_lock.fileno(), fcntl.LOCK_EX)
+            lock_file(action_lock)
             if action != "retry" and action_result_path.is_file():
                 cached = parse_json_object(action_result_path.read_text(encoding="utf-8"))
                 action_lock.close()
@@ -1575,7 +1576,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                         raise RuntimeError("dispatcher lease was fenced before the canonical effect")
                 result_path = action_result_path
                 with result_path.with_suffix(".lock").open("a+b") as lock:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    lock_file(lock)
                     if result_path.is_file():
                         return parse_json_object(result_path.read_text(encoding="utf-8"))
                     saved = proposal_payload
@@ -1866,7 +1867,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         preview_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         store = EventStore(operational / "projects", project_id)
         with (preview_root / ".lock").open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lock_file(lock)
             for old_path in preview_root.glob("*.json"):
                 previous = parse_json_object(old_path.read_text(encoding="utf-8"))
                 if previous.get("status") in {"pending", "running"}:
@@ -1884,7 +1885,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
         def worker() -> None:
             with (preview_root / ".lock").open("a+b") as lock:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                lock_file(lock)
                 record = parse_json_object(path.read_text(encoding="utf-8"))
                 if record["status"] == "cancelled" or store.cancellation(preview_id):
                     return
@@ -1892,14 +1893,14 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             cancelled = lambda: bool(store.cancellation(preview_id)) or parse_json_object(path.read_text(encoding="utf-8")).get("status") == "cancelled"
             def update_progress(progress: dict[str, object]) -> None:
                 with (preview_root / ".lock").open("a+b") as lock:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    lock_file(lock)
                     current = parse_json_object(path.read_text(encoding="utf-8"))
                     if current.get("status") in {"pending", "running"}:
                         current["progress"] = _value(progress)
                         atomic_json(path, current)
             def finish(value: JsonObject) -> None:
                 with (preview_root / ".lock").open("a+b") as lock:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    lock_file(lock)
                     current = parse_json_object(path.read_text(encoding="utf-8"))
                     if current.get("status") == "cancelled":
                         return
@@ -1949,7 +1950,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             raise HTTPException(404, "routing preview not found")
         from .contracts import atomic_json
         with (path.parent / ".lock").open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lock_file(lock)
             record = parse_json_object(path.read_text(encoding="utf-8"))
             if record.get("status") in {"pending", "running"}:
                 store = EventStore(operational / "projects", project_id)
@@ -2067,7 +2068,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         from .contracts import atomic_json
         path = operational / "projects" / project_id / "folder-idempotency" / f"{sha256((operation + ':' + key).encode())}.json"; path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with path.with_suffix(".lock").open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lock_file(lock)
             if path.is_file(): return parse_json_object(path.read_text(encoding="utf-8"))
             value = _object(invoke()); atomic_json(path, value); return value
 
@@ -2090,7 +2091,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         mutation(request, idempotency_key)
         from .contracts import atomic_json
         cached = operational / "projects" / project_id / "folder-idempotency" / f"{sha256(('upload:' + str(idempotency_key)).encode())}.json"; cached.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        cache_lock = cached.with_suffix(".lock").open("a+b"); fcntl.flock(cache_lock.fileno(), fcntl.LOCK_EX)
+        cache_lock = cached.with_suffix(".lock").open("a+b"); lock_file(cache_lock)
         if cached.is_file():
             value = parse_json_object(cached.read_text(encoding="utf-8")); cache_lock.close(); return value
         store = folder_store(project_id); preview = store.load(preview_id)
@@ -2388,7 +2389,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         result_path = store.root / ("idempotency-action-" + sha256(idempotency_key.encode()) + ".json")
         lock_path = result_path.with_suffix(".lock")
         with lock_path.open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lock_file(lock)
             if result_path.is_file():
                 prior = parse_json_object(result_path.read_text(encoding="utf-8"))
                 if prior["status"] == "completed": return prior["result"]

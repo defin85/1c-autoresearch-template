@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import fcntl
 import itertools
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .platform_support import lock_file
 from .contracts import JsonValue, atomic_bytes, atomic_json, canonical_json, parse_json_object, reject_secrets, sha256
 
 
@@ -106,7 +107,7 @@ class EventStore:
         fingerprint = "sha256:" + sha256(encoded)
         path = self.root / "runs" / f"{sha256(run_id.encode())}.json"
         with self.lock_path.open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lock_file(lock)
             if path.is_file():
                 prior = parse_json_object(path.read_text(encoding="utf-8"))
                 if prior.get("run_id") != run_id or prior.get("execution_snapshot_fingerprint") != fingerprint or canonical_json(prior.get("execution_snapshot")) != encoded:
@@ -119,7 +120,7 @@ class EventStore:
     def remove_prepared_run(self, run_id: str) -> bool:
         path = self.root / "runs" / f"{sha256(run_id.encode())}.json"
         with self.lock_path.open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lock_file(lock)
             if not path.is_file():
                 return False
             value = parse_json_object(path.read_text(encoding="utf-8"))
@@ -177,7 +178,7 @@ class EventStore:
         if "duration_seconds" in payload and (not isinstance(payload["duration_seconds"], (int, float)) or payload["duration_seconds"] < 0):
             raise ValueError("workflow event duration must be non-negative")
         with self.lock_path.open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lock_file(lock)
             return self._emit_locked(event_type, run_id, payload, **hierarchy)
 
     def _emit_locked(self, event_type: str, run_id: str, payload: dict[str, JsonValue], **hierarchy: JsonValue) -> dict[str, JsonValue]:

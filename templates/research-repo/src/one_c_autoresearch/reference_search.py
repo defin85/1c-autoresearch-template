@@ -5,13 +5,14 @@ import hashlib
 import io
 import os
 import selectors
-import signal
 import shutil
 import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
+
+from .platform_support import sync_directory, terminate_process
 from types import TracebackType
 from typing import TypedDict
 
@@ -214,18 +215,15 @@ def _fsync_tree(root: Path) -> None:
     for path in sorted(root.rglob("*"), reverse=True):
         if path.is_symlink():
             raise ValueError("reference_search.index_symlink_forbidden")
-        descriptor = os.open(
-            path, os.O_RDONLY | (os.O_DIRECTORY if path.is_dir() else 0)
-        )
+        if path.is_dir():
+            sync_directory(path)
+            continue
+        descriptor = os.open(path, os.O_RDONLY)
         try:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    sync_directory(root)
 
 
 def promote_reference_index(staging: Path, result: Mapping[str, object]) -> Path:
@@ -496,11 +494,11 @@ def _mcp_call(
         try:
             _ = process.wait(timeout=1)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
+            terminate_process(process)
             try:
                 _ = process.wait(timeout=1)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                terminate_process(process, force=True)
                 _ = process.wait()
 
 

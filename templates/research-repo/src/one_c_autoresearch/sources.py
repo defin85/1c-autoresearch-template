@@ -7,7 +7,6 @@ import tempfile
 import tomllib
 import subprocess
 import re
-import signal
 import time
 import unicodedata
 from collections.abc import Callable, Mapping
@@ -18,6 +17,7 @@ from typing import IO, BinaryIO, NotRequired, Protocol, TypedDict
 from .contracts import JsonValue, ROLES, atomic_json, canonical_json, confined, external_id, file_manifest, json_object, normalize_relative, owned_function, parse_json, parse_json_object, reject_secrets, repository_lock, require_tracked_clean as validate_tracked_clean, sha256
 
 from .source_routing import ComponentMember, ExtensionObservation, ExtensionScope, FormProbe, FormRecord, RoutingGroup, RoutingManifest
+from .platform_support import terminate_process
 
 
 EXPORTERS = ("ibcmd", "designer")
@@ -785,9 +785,9 @@ def run_command(
         start_new_session=os.name == "posix",
     )
 
-    def stop(sig: signal.Signals) -> None:
+    def stop(force: bool = False) -> None:
         try:
-            os.killpg(process.pid, sig) if os.name == "posix" else process.send_signal(sig)
+            terminate_process(process, force=force)
         except ProcessLookupError:
             pass
 
@@ -799,14 +799,14 @@ def run_command(
         except subprocess.TimeoutExpired:
             first_communicate = False
             if cancelled():
-                stop(signal.SIGTERM)
+                stop()
                 try:
                     _ = process.communicate(timeout=5)
                 except subprocess.TimeoutExpired:
-                    stop(signal.SIGKILL); _ = process.communicate()
+                    stop(force=True); _ = process.communicate()
                 raise InterruptedError("source acquisition cancelled")
             if timeout is not None and time.monotonic() - started >= timeout:
-                stop(signal.SIGKILL); _ = process.communicate()
+                stop(force=True); _ = process.communicate()
                 raise subprocess.TimeoutExpired(command, timeout)
 
 

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import fcntl
 import json
 import os
 import shutil
-import signal
 import subprocess
 import threading
 import time
@@ -14,6 +12,8 @@ from collections.abc import Callable, Generator, Mapping
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Protocol, TypedDict
+
+from .platform_support import clone_file, current_uid, process_group, terminate_process_identity
 
 
 SCHEMA_VERSION = "search-runtime/v1"
@@ -182,11 +182,7 @@ def create_serving_workspace(
                 continue
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             with source.open("rb") as input_stream, target.open("xb") as output_stream:
-                try:
-                    _ = fcntl.ioctl(
-                        output_stream.fileno(), 0x40049409, input_stream.fileno()
-                    )
-                except OSError:
+                if not clone_file(input_stream, output_stream):
                     # ponytail: full private copy is the safe fallback on filesystems
                     # without FICLONE; expose storage pressure through the project quota.
                     _ = input_stream.seek(0)
@@ -215,7 +211,7 @@ def process_identity(pid: int) -> ProcessIdentity:
         fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(") ", 1)[1].split()
         return {
             "pid": pid,
-            "process_group": os.getpgid(pid),
+            "process_group": process_group(pid),
             "start_time": fields[19],
             "boot_id": Path("/proc/sys/kernel/random/boot_id")
             .read_text(encoding="utf-8")
@@ -289,7 +285,7 @@ def supervised_workspace_proxy(
     )
     runtime_root = target_root / "runtime" / key
     socket_base = Path(
-        os.environ.get("XDG_RUNTIME_DIR", f"/tmp/one-c-autoresearch-{os.getuid()}")
+        os.environ.get("XDG_RUNTIME_DIR", f"/tmp/one-c-autoresearch-{current_uid() or 0}")
     )
     socket_root = socket_base / "one-c-autoresearch" / key[:16]
     deadline = time.monotonic() + timeout_seconds
@@ -405,14 +401,14 @@ def terminate_process_group(
     if not process_identity_alive(identity):
         return "identity_mismatch"
     group = int(identity["process_group"])
-    os.killpg(group, signal.SIGTERM)
+    terminate_process_identity(int(identity["pid"]), group)
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
         if not process_identity_alive(identity):
             return "terminated"
         time.sleep(min(0.02, max(0, deadline - time.monotonic())))
     if process_identity_alive(identity):
-        os.killpg(group, signal.SIGKILL)
+        terminate_process_identity(int(identity["pid"]), group, force=True)
     return "killed"
 
 

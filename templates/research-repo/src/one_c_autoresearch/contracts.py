@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import importlib
 import json
@@ -15,6 +14,8 @@ from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol, TypeAlias, TypeGuard, runtime_checkable
+
+from .platform_support import lock_fd, unlock_fd
 
 
 SCHEMA_VERSION = "1"
@@ -250,9 +251,8 @@ def repository_lock(repo: Path, timeout_seconds: float = 0) -> Generator[None, N
         lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(lock_dir / f"{identity}.lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if timeout_seconds == 0 else 0)
             try:
-                fcntl.flock(fd, flags)
+                lock_fd(fd, nonblocking=timeout_seconds == 0)
             except BlockingIOError as exc:
                 raise RuntimeError("repository writer is busy") from exc
             _HELD_REPOSITORY_LOCKS.identities = {*held, identity}
@@ -261,7 +261,7 @@ def repository_lock(repo: Path, timeout_seconds: float = 0) -> Generator[None, N
             finally:
                 _HELD_REPOSITORY_LOCKS.identities = held
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            unlock_fd(fd)
             os.close(fd)
 
 
