@@ -14,7 +14,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import IO, BinaryIO, NotRequired, Protocol, TypedDict
 
-from .contracts import JsonValue, ROLES, atomic_json, canonical_json, confined, external_id, file_manifest, json_object, normalize_relative, owned_function, parse_json, parse_json_object, reject_secrets, repository_lock, require_tracked_clean as validate_tracked_clean, sha256
+from .contracts import JsonValue, ROLES, atomic_json, canonical_json, confined, external_id, file_manifest, json_object, normalize_relative, parse_json, parse_json_object, recover_stage_publication, reject_secrets, repository_lock, require_tracked_clean as validate_tracked_clean, sha256, workflow_state_fingerprint
 
 from .source_routing import ComponentMember, ExtensionObservation, ExtensionScope, FormProbe, FormRecord, RoutingGroup, RoutingManifest
 from .platform_support import terminate_process
@@ -1107,9 +1107,7 @@ def draft_fingerprint(root: Path) -> str:
 
 def routing_bindings(repo: Path, connections: dict[str, ConnectionProfile], upload_drafts: Path | None) -> dict[str, str]:
     from .source_routing import PROBE_CONTRACT_VERSION
-    workflow_state = owned_function(".workflow", "state_fingerprint")(repo)
-    if not isinstance(workflow_state, str):
-        raise RuntimeError("workflow state fingerprint is invalid")
+    workflow_state = workflow_state_fingerprint(repo)
     safe_connections = {
         name: {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}}
         for name, profile in sorted(connections.items())
@@ -1626,7 +1624,7 @@ def validate_active(
     current: bool = True,
 ) -> SourcePointer:
     if candidate is None and current:
-        _ = owned_function(".stage_recompute", "recover_active_publication")(repo)
+        recover_stage_publication(repo)
     deep = deep or require_tracked_clean
     pointer_path = repo / "research/active-source-generation.json"
     pointer = candidate or source_pointer(parse_json_object(pointer_path.read_text(encoding="utf-8")))

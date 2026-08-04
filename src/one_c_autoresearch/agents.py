@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import IO
 
-from .contracts import JsonValue, atomic_json, canonical_json, json_array, normalize_relative, owned_function, owned_value, parse_json_object, reject_secrets
+from .contracts import JsonValue, atomic_json, canonical_json, normalize_relative, parse_json_object, reject_secrets, resolve_source_search_policy, source_search_policy_version, source_search_reserve_bytes, stage_active_state
 from .sources import run_command
 
 _run_command = run_command
@@ -112,15 +112,6 @@ def _strings(value: object, message: str = "expected string array") -> list[str]
     ):
         raise ValueError(message)
     return [item for item in normalized if isinstance(item, str)]
-
-
-def _reserve_bytes(function: object, policy: dict[str, JsonValue]) -> int:
-    if not callable(function):
-        raise TypeError("reserve estimator is not callable")
-    value = function(policy)
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise TypeError("reserve estimator returned a non-integer value")
-    return value
 
 
 def _subprocess_runner(
@@ -425,12 +416,11 @@ def prepare_context_envelope(
         "prompt": prompt,
         "response_schema": schema,
     })
-    dynamic_reserve_bytes = owned_function(".source_search", "dynamic_reserve_bytes")
     source_search_policies = _object(execution_snapshot.get("source_search_policies") or {})
     search_policy = source_search_policies.get(
         f"{phase_id}:{role_id}"
     )
-    dynamic_bytes = _reserve_bytes(dynamic_reserve_bytes, _object(search_policy)) if search_policy else 0
+    dynamic_bytes = source_search_reserve_bytes(_object(search_policy)) if search_policy else 0
     if profile.get("context_estimator_version") != CONTEXT_ESTIMATOR_VERSION:
         raise ValueError("agent context estimator is unsupported")
     capacity = profile.get("input_context_tokens")
@@ -626,9 +616,7 @@ def validate_execution_snapshot(repo: Path, snapshot: dict[str, JsonValue]) -> N
     }
     if instructions != expected_instructions:
         raise RuntimeError("agent instruction changed after the execution snapshot was created")
-    policy_version = owned_value(".source_search", "POLICY_VERSION")
-    if not isinstance(policy_version, str):
-        raise RuntimeError("source-search policy version is unavailable")
+    policy_version = source_search_policy_version()
     policies = _object(snapshot.get("source_search_policies", {}))
     if any(
         not isinstance(policy, dict)
@@ -667,18 +655,13 @@ def resolve_execution_snapshot(
         raise RuntimeError("codex executable version is unavailable")
     phases = _objects(step.get("agent_phases", []))
     try:
-        active_state = json_array(owned_function(".stage_recompute", "active_state")(repo))
-        if len(active_state) != 2 or not isinstance(active_state[1], str):
-            raise RuntimeError("stage recompute active state is invalid")
-        raw_pointers, workflow_fingerprint = active_state
-        pointers = _object(raw_pointers)
+        pointers, workflow_fingerprint = stage_active_state(repo)
     except (OSError, ValueError, KeyError):
         # Узкие модульные вызовы без проектного контракта всё равно получают
         # закрытый снимок; рабочий API всегда проходит validate_project_contract.
         pointers, workflow_fingerprint = {}, "sha256:" + sha256(canonical_json(step)).hexdigest()
     safe_profiles: dict[str, dict[str, JsonValue]] = {}
     source_search_policies: dict[str, dict[str, JsonValue]] = {}
-    resolve_policy = owned_function(".source_search", "resolve_policy")
     search_work_unit: dict[str, JsonValue] = {}
     paths_value = work_unit.get("allowed_paths")
     if isinstance(paths_value, list):
@@ -707,7 +690,7 @@ def resolve_execution_snapshot(
             search_profile: dict[str, JsonValue] = {}
             if "source_search" in profile:
                 search_profile["source_search"] = profile["source_search"]
-            policy = resolve_policy(
+            policy = resolve_source_search_policy(
                 repo, search_profile, str(role["role_id"]), search_work_unit
             )
             if policy is not None:

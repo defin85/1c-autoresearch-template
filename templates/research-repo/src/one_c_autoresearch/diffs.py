@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TypedDict
 
-from .contracts import JsonValue, atomic_json, canonical_json, comparison_id, confined, content_id, diff_id, normalize_relative, owned_function, parse_json, parse_json_object, repository_lock, require_tracked_clean, sha256
+from .contracts import JsonValue, atomic_json, canonical_json, comparison_id, confined, content_id, diff_id, normalize_relative, parse_json, parse_json_object, recover_stage_publication, repository_lock, require_tracked_clean, sha256
 from .extension_analyzer import Dependency, Detail, DiffEvidence, MainMatch
 from .source_routing import RoutingGroup, RoutingManifest, RoutingMember
 from .sources import ComponentRecord
@@ -109,7 +109,7 @@ class SourcePointer(TypedDict, total=False):
 
 
 def _recover_active_publication(repo: Path) -> None:
-    _ = owned_function(".stage_recompute", "recover_active_publication")(repo)
+    recover_stage_publication(repo)
 
 
 def _evidence(value: object) -> DiffEvidence:

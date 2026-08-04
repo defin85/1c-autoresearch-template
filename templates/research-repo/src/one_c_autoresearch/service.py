@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable
 from typing import TypedDict, final
 
 from . import diffs, indexes, mrq, sources, workflow
-from .contracts import ROLES, JsonValue, atomic_bytes, atomic_json, canonical_json, json_object, owned_function, parse_json, parse_json_object, reject_secrets, repository_lock, sha256
+from .contracts import ROLES, JsonValue, atomic_bytes, atomic_json, canonical_json, json_object, parse_json, parse_json_object, reject_secrets, repository_lock, sha256, stage_active_pointers
 
 
 JsonObject = dict[str, JsonValue]
@@ -22,7 +22,7 @@ class Staged(TypedDict, total=False):
 
 
 def _active_pointers(repo: Path) -> dict[str, JsonObject | None]:
-    pointers = json_object(owned_function(".stage_recompute", "active_pointers")(repo))
+    pointers = stage_active_pointers(repo)
     return {name: json_object(pointer) if pointer is not None else None for name, pointer in pointers.items()}
 
 
@@ -76,7 +76,7 @@ def _index_candidate(value: JsonValue) -> indexes.ConfigCandidate:
     return result
 
 
-def _backend_state(value: JsonObject) -> indexes.BackendState:
+def backend_state(value: JsonObject) -> indexes.BackendState:
     result: indexes.BackendState = {}
     if "adapter_id" in value: result["adapter_id"] = _string(value["adapter_id"])
     if "component_id" in value: result["component_id"] = _string(value["component_id"])
@@ -273,7 +273,7 @@ class ApplicationService:
         if canonical and canonical["action"] in {"mrq.discover-next", "mrq.decide-next"}:
             components = indexes.discover(self.repo)
             if components:
-                statuses = [_backend_state(row) for row in indexes.backend_statuses(self.repo)]
+                statuses = [backend_state(row) for row in indexes.backend_statuses(self.repo)]
                 config = indexes.load_config(self.repo)
                 profiles = getattr(self, "agent_profiles", None)
                 if profiles is not None:

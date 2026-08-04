@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NotRequired, TypedDict
 
-from .contracts import DECISIONS, MRQ_STATES, JsonValue, atomic_json, canonical_json, mrq_id, owned_function, parse_json_object, repository_lock, require_tracked_clean, sha256, validate_unique_ids
+from .contracts import DECISIONS, MRQ_STATES, JsonValue, atomic_json, canonical_json, mrq_id, parse_json_object, recover_stage_publication, repository_lock, require_tracked_clean, sha256, stage_compatibility_fingerprint, validate_unique_ids
 
 
 FILES = ("mrq.jsonl", "dispositions.jsonl", "evidence.jsonl", "lineage.jsonl", "approvals.jsonl")
@@ -24,12 +24,9 @@ def _compatibility_fingerprint(
     coverage: Mapping[str, Mapping[str, object]],
     approvals: Iterable[Mapping[str, object]],
 ) -> str:
-    value = owned_function(".stage_recompute", "compatibility_fingerprint")(
+    return stage_compatibility_fingerprint(
         mrq, dispositions, diff_facts, coverage, approvals,
     )
-    if not isinstance(value, str):
-        raise RuntimeError("compatibility fingerprint is invalid")
-    return value
 class EvidenceRef(TypedDict, total=False):
     path: str
     fingerprint: str
@@ -423,7 +420,7 @@ def active(
     diff_candidate: dict[str, JsonValue] | None = None,
 ) -> ActiveResult:
     if pointer_candidate is None:
-        _ = owned_function(".stage_recompute", "recover_active_publication")(repo)
+        recover_stage_publication(repo)
     pointer_path = repo / "research/active-generation.json"
     pointer = pointer_candidate or parse_json_object(pointer_path.read_text(encoding="utf-8"))
     generation = pointer.get("canonical_generation_id")

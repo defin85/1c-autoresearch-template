@@ -24,12 +24,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.base import RequestResponseEndpoint
 
-from .contracts import JsonValue, canonical_json, confined, json_object, owned_function, parse_json, parse_json_object, repository_lock, sha256
+from .contracts import JsonValue, attach_workflow_dispatcher, canonical_json, confined, file_manifest, json_object, parse_json, parse_json_object, repository_lock, sha256
 from . import sources
 from .events import EventStore, RETRYABLE_RUN_STATUSES
 from .external_folder import PreviewStore, Selection
 from .dispatcher import DispatcherCoordinator
-from .service import ApplicationService
+from .service import ApplicationService, backend_state
 from .sqlite_state import DispatcherStore
 
 
@@ -105,11 +105,12 @@ def _connections(values: dict[str, dict[str, JsonValue]]) -> dict[str, sources.C
 
 
 def _attach_dispatcher(snapshot: JsonObject, repo: Path, base: Path) -> dict[str, object]:
-    return dict(_object(owned_function(".workflow", "attach_dispatcher")(snapshot, repo, base)))
+    return attach_workflow_dispatcher(snapshot, repo, base)
 
 
 def _load_consolidation(repo: Path) -> JsonObject:
-    return _object(owned_function(".consolidation", "load_active")(repo))
+    from .consolidation import load_active
+    return load_active(repo)
 
 
 def _encode_dispatcher_cursor(payload: JsonObject) -> str:
@@ -995,6 +996,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
     @app.post("/api/v1/projects/{project_id}/stage-recompute/runs", status_code=202)
     def run_stage_recompute(project_id: str, body: StageRunBody, request: Request, idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None):
+        from .stage_recompute import exception_steps, execute, stage_plan, stage_run
         mutation(request, idempotency_key)
         project = repo(project_id)
         from .workflow_migration import guard_mutation
@@ -1137,9 +1139,9 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                         return not check_store.renew_stage_lease(run_id, lease_token)
                 def stage_emit(kind: str, payload: JsonObject) -> None:
                     _ = emit(kind, payload)
-                typed_plan = owned_function(".stage_recompute", "stage_plan")(plan)
-                typed_predecessor = owned_function(".stage_recompute", "stage_run")(predecessor) if predecessor is not None else None
-                result = _object(owned_function(".stage_recompute", "execute")(
+                typed_plan = stage_plan(plan)
+                typed_predecessor = stage_run(predecessor) if predecessor is not None else None
+                result = _object(execute(
                     project,
                     typed_plan,
                     lease_token=lease_token,
@@ -1180,7 +1182,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                     "error_class": type(exc).__name__,
                     "message": "stage recompute failed",
                     "boundary": body.boundary,
-                    "steps": _objects(owned_function(".stage_recompute", "exception_steps")(exc)),
+                    "steps": _objects(exception_steps(exc)),
                 }
             with DispatcherStore(project, operational) as store:
                 current = store.finish_stage_recompute(run_id, lease_token, status, result)
@@ -1624,14 +1626,15 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                         ):
                             raise RuntimeError("dispatcher lease was fenced before noise approval persistence")
                     elif action == "approve-consolidation":
+                        from .consolidation import approve_plan, fingerprint as consolidation_fingerprint
                         relative = str(saved.get("plan_path", ""))
                         plan_path = (operational / "projects" / project_id / relative).resolve()
                         plan_root = (operational / "projects" / project_id / "consolidation-plans").resolve()
                         if plan_root not in plan_path.parents or not plan_path.is_file():
                             raise ValueError("dispatcher consolidation plan is missing")
                         plan = parse_json_object(plan_path.read_text(encoding="utf-8"))
-                        plan_fingerprint = owned_function(".consolidation", "fingerprint")(plan)
-                        if not isinstance(plan_fingerprint, str) or plan_fingerprint != saved.get("plan_fingerprint"):
+                        plan_fingerprint = consolidation_fingerprint(plan)
+                        if plan_fingerprint != saved.get("plan_fingerprint"):
                             raise RuntimeError("dispatcher consolidation plan fingerprint is stale")
                         approval_fence()
                         expected_pointer = _object(saved["expected_pointer"])
@@ -1652,7 +1655,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                             },
                             "plan_fingerprint": saved["plan_fingerprint"],
                         }
-                        pointer = _object(owned_function(".consolidation", "approve_plan")(project, plan, expected_pointer, consolidation_approval))
+                        pointer = approve_plan(project, plan, expected_pointer, consolidation_approval)
                         summary = {
                             "mrq_generation_id": pointer["mrq_generation_id"],
                             "plan_fingerprint": pointer["plan_fingerprint"],
@@ -2173,7 +2176,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         configuration = indexes.load_config(project)
         _ = configuration.pop("source_schema_version", None)
         items = ApplicationService(project).index_statuses()
-        backend_states = indexes.backend_statuses(project)
+        backend_states = [backend_state(row) for row in indexes.backend_statuses(project)]
         bsl = next(
             (
                 backend for backend in configuration["backends"]
@@ -2186,7 +2189,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             "items": items,
             "configuration": configuration,
             "configuration_fingerprint": indexes.config_fingerprint(project),
-            "route_health": _object(owned_function(".indexes", "route_coverage")(
+            "route_health": _object(indexes.route_coverage(
                 configuration, indexes.discover(project), backend_states,
             )),
             "storage_root": _string(storage["root"]),
@@ -2325,7 +2328,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         project = repo(project_id)
         components = indexes.discover(project)
         manifests = [
-            _objects(owned_function(".indexes", "file_manifest")(
+            _objects(file_manifest(
                 project / "sources/generations" / component["source_generation_id"]
                 / component["path"]
             ))

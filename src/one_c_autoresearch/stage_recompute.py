@@ -7,7 +7,7 @@ from pathlib import Path
 from collections.abc import Iterable, Mapping
 from typing import Callable, NotRequired, TypedDict
 
-from .contracts import JsonValue, SECRET_KEYS, atomic_json, canonical_json, json_array, json_object, owned_function, parse_json, parse_json_object, repository_lock, sha256
+from .contracts import JsonValue, SECRET_KEYS, atomic_json, canonical_json, json_array, json_object, parse_json, parse_json_object, repository_lock, sha256, workflow_state_fingerprint
 from .diffs import diff_pointer, source_pointer as diff_source_pointer
 from .sources import ConnectionProfile, ExtensionInfo, source_pointer
 
@@ -70,10 +70,7 @@ class StageRun(TypedDict, total=False):
 
 
 def state_fingerprint(repo: Path) -> str:
-    value = owned_function(".workflow", "state_fingerprint")(repo)
-    if not isinstance(value, str):
-        raise RuntimeError("workflow state fingerprint is invalid")
-    return value
+    return workflow_state_fingerprint(repo)
 
 
 def _object(value: object) -> dict[str, JsonValue]:

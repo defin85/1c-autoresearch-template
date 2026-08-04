@@ -5,11 +5,11 @@ import shutil
 import subprocess
 from functools import lru_cache
 from pathlib import Path
-from .contracts import JsonValue, atomic_bytes, owned_function, parse_json_object, sha256
+from .contracts import JsonValue, atomic_bytes, parse_json_object, sha256, validate_source_search_profile
 
 
 def _validate_profile_policy(value: object) -> None:
-    _ = owned_function(".source_search", "validate_profile_policy")(value)
+    validate_source_search_profile(value)
 
 
 @lru_cache(maxsize=1)

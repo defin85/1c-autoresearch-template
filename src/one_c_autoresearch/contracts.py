@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import threading
 import unicodedata
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol, TypeAlias, TypeGuard, runtime_checkable
@@ -35,17 +35,119 @@ _HELD_REPOSITORY_LOCKS = _HeldRepositoryLocks()
 JsonValue: TypeAlias = None | bool | int | float | str | Sequence["JsonValue"] | Mapping[str, "JsonValue"]
 
 
-def owned_value(module_name: str, name: str) -> object:
+def _is_tuple(value: object) -> TypeGuard[tuple[object, ...]]:
+    return isinstance(value, tuple)
+
+
+def _owned_value(module_name: str, name: str) -> object:
     module = importlib.import_module(module_name, __package__)
     namespace: dict[str, object] = module.__dict__
     return namespace.get(name)
 
 
-def owned_function(module_name: str, name: str) -> Callable[..., object]:
-    value = owned_value(module_name, name)
+def _owned_call(module_name: str, name: str, *args: object, **kwargs: object) -> object:
+    value = _owned_value(module_name, name)
     if not callable(value):
         raise RuntimeError(f"{module_name}.{name} is unavailable")
+    return value(*args, **kwargs)
+
+
+def workflow_state_fingerprint(repo: Path) -> str:
+    value = _owned_call(".workflow", "state_fingerprint", repo)
+    if not isinstance(value, str):
+        raise RuntimeError("workflow state fingerprint is invalid")
     return value
+
+
+def recover_stage_publication(repo: Path) -> None:
+    value = _owned_call(".stage_recompute", "recover_active_publication", repo)
+    if value is not None and not isinstance(value, str):
+        raise RuntimeError("stage publication recovery result is invalid")
+
+
+def stage_active_pointers(repo: Path) -> dict[str, JsonValue]:
+    return json_object(_owned_call(".stage_recompute", "active_pointers", repo))
+
+
+def stage_active_state(repo: Path) -> tuple[dict[str, JsonValue], str]:
+    value = _owned_call(".stage_recompute", "active_state", repo)
+    if not _is_tuple(value):
+        raise RuntimeError("stage recompute active state is invalid")
+    items: tuple[object, ...] = value
+    if len(items) != 2 or not isinstance(items[1], str):
+        raise RuntimeError("stage recompute active state is invalid")
+    return json_object(items[0]), items[1]
+
+
+def stage_compatibility_fingerprint(
+    mrq: Mapping[str, object],
+    dispositions: Iterable[Mapping[str, object]],
+    diff_facts: Mapping[str, Mapping[str, object]],
+    coverage: Mapping[str, Mapping[str, object]],
+    approvals: Iterable[Mapping[str, object]],
+) -> str:
+    value = _owned_call(
+        ".stage_recompute", "compatibility_fingerprint",
+        mrq, dispositions, diff_facts, coverage, approvals,
+    )
+    if not isinstance(value, str):
+        raise RuntimeError("compatibility fingerprint is invalid")
+    return value
+
+
+def validate_source_search_profile(value: object) -> None:
+    result = _owned_call(".source_search", "validate_profile_policy", value)
+    if not isinstance(result, dict):
+        raise RuntimeError("source-search profile policy is invalid")
+
+
+def source_search_reserve_bytes(policy: Mapping[str, object]) -> int:
+    value = _owned_call(".source_search", "dynamic_reserve_bytes", policy)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise RuntimeError("source-search reserve is invalid")
+    return value
+
+
+def source_search_policy_version() -> str:
+    value = _owned_value(".source_search", "POLICY_VERSION")
+    if not isinstance(value, str):
+        raise RuntimeError("source-search policy version is unavailable")
+    return value
+
+
+def resolve_source_search_policy(
+    repo: Path,
+    profile: Mapping[str, object],
+    role_id: str,
+    work_unit: Mapping[str, object],
+) -> dict[str, JsonValue] | None:
+    value = _owned_call(".source_search", "resolve_policy", repo, profile, role_id, work_unit)
+    return None if value is None else json_object(value)
+
+
+def validate_decision_generation(repo: Path, generation_id: str, allowed_mrq_ids: set[str]) -> None:
+    value = _owned_call(
+        ".decision_generations", "validate_generation", repo, generation_id,
+        allowed_mrq_ids=allowed_mrq_ids,
+    )
+    if not isinstance(value, dict):
+        raise RuntimeError("decision generation validation result is invalid")
+
+
+def decision_consolidation_fingerprint(pointer: Mapping[str, object]) -> str:
+    value = _owned_call(".decision_generations", "consolidation_input_fingerprint", pointer)
+    if not isinstance(value, str):
+        raise RuntimeError("decision input fingerprint is invalid")
+    return value
+
+
+def attach_workflow_dispatcher(snapshot: Mapping[str, object], repo: Path, base: Path) -> dict[str, object]:
+    value = _owned_call(".workflow", "attach_dispatcher", snapshot, repo, base)
+    if not _is_dict(value):
+        raise RuntimeError("workflow dispatcher projection is invalid")
+    if not all(isinstance(key, str) for key in value):
+        raise RuntimeError("workflow dispatcher projection keys are invalid")
+    return {str(key): item for key, item in value.items()}
 
 
 @runtime_checkable
