@@ -16,14 +16,19 @@ import time
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Literal, NotRequired, TypedDict, final
+from typing_extensions import override
 from urllib.parse import urlsplit
 
 from .contracts import (
     SECRET_KEYS,
+    JsonValue,
     atomic_json,
     canonical_json,
     confined,
+    json_object,
+    parse_json,
+    parse_json_object,
     repository_lock,
     sha256,
 )
@@ -36,8 +41,8 @@ MAX_REQUEST_BYTES = 1_048_576
 MAX_RESPONSE_BYTES = 4_194_304
 MAX_VECTORS = 256
 MAX_DEADLINE_SECONDS = 60.0
-PROBE_LIMITS = {"requests": 1, "input_bytes": 65_536, "vectors": 1, "elapsed_seconds": 10.0}
-QUERY_LIMITS = {"requests": 1, "input_bytes": 65_536, "vectors": 1, "elapsed_seconds": 30.0}
+PROBE_LIMITS: OperationLimits = {"requests": 1, "input_bytes": 65_536, "vectors": 1, "elapsed_seconds": 10.0}
+QUERY_LIMITS: OperationLimits = {"requests": 1, "input_bytes": 65_536, "vectors": 1, "elapsed_seconds": 30.0}
 BUILD_MAXIMA = {
     "requests": 10_000,
     "input_bytes": 512 * 1024 * 1024,
@@ -48,6 +53,97 @@ BUILD_MAXIMA = {
 }
 APPROVED_CA_BUNDLES: dict[str, Path] = {}
 ITS_ENDPOINT = "https://code.1c.ai"
+
+
+class BuildLimits(TypedDict):
+    requests: int
+    input_bytes: int
+    vectors: int
+    concurrency: int
+    batch: int
+    elapsed_seconds: float
+
+
+class OperationLimits(TypedDict):
+    requests: int
+    input_bytes: int
+    vectors: int
+    elapsed_seconds: float
+
+
+class ItsProfile(TypedDict):
+    kind: Literal["its"]
+    label: str
+    enabled: bool
+    credential: NotRequired[str | None]
+    secret_version: NotRequired[str | None]
+    service_identity: NotRequired[str]
+    disclosure_acknowledged: NotRequired[bool]
+
+
+class EmbeddingProfile(TypedDict):
+    kind: Literal["embedding"]
+    label: str
+    enabled: bool
+    provider: Literal["openai-compatible"]
+    endpoint: str
+    endpoint_class: Literal["public_https", "loopback_http"]
+    model: str
+    dimension: int
+    ca_bundle_id: str | None
+    build_limits: BuildLimits
+    max_request_bytes: int
+    max_response_bytes: int
+    max_vectors: int
+    deadline_seconds: float
+    credential: NotRequired[str | None]
+    secret_version: NotRequired[str | None]
+    endpoint_hmac: NotRequired[str]
+    semantic_identity: NotRequired[str]
+
+
+StoredProfile = ItsProfile | EmbeddingProfile
+JsonObject = dict[str, JsonValue]
+
+
+class AppliedOperation(TypedDict):
+    plan_fingerprint: str
+    actor: str
+    result: JsonObject
+
+
+class SearchState(TypedDict):
+    schema_version: Literal["search-services/v1"]
+    identity_key: str
+    profiles: dict[str, StoredProfile]
+    applied: dict[str, AppliedOperation]
+
+
+class ModalityStatus(TypedDict):
+    ready: bool
+    reason: str | None
+
+
+class HybridStatus(ModalityStatus):
+    embedding_identity: str | None
+
+
+class SearchReadiness(TypedDict):
+    lexical: ModalityStatus
+    hybrid: HybridStatus
+
+
+class ProfilePreview(TypedDict):
+    schema: Literal["search-services-profile-preview/v1"]
+    project: str
+    actor: str
+    idempotency_key: str
+    expires_at: int
+    identity_key: str
+    profile_id: str
+    profile: StoredProfile
+    plan: JsonObject
+    plan_fingerprint: str
 
 
 def _root(repo: Path, base: Path | None = None) -> Path:
@@ -65,7 +161,7 @@ def _root(repo: Path, base: Path | None = None) -> Path:
     return root
 
 
-def _read_json(path: Path) -> dict[str, Any]:
+def _read_json(path: Path) -> JsonObject:
     if path.is_symlink():
         raise ValueError("search_services.unsafe_state_file")
     if not path.exists():
@@ -82,16 +178,14 @@ def _read_json(path: Path) -> dict[str, Any]:
             raise ValueError("search_services.unsafe_state_file")
         with os.fdopen(descriptor, encoding="utf-8") as stream:
             descriptor = -1
-            value = json.load(stream)
+            value = parse_json_object(stream.read())
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if not isinstance(value, dict):
-        raise ValueError("search_services.invalid_state")
     return value
 
 
-def _write_json(path: Path, value: dict[str, Any]) -> None:
+def _write_json(path: Path, value: object) -> None:
     if path.is_symlink():
         raise ValueError("search_services.unsafe_state_file")
     atomic_json(path, value)
@@ -102,7 +196,7 @@ def _path(repo: Path, base: Path | None = None) -> Path:
     return _root(repo, base) / "search-services.json"
 
 
-def _empty_state(identity_key: str | None = None) -> dict[str, Any]:
+def _empty_state(identity_key: str | None = None) -> SearchState:
     return {
         "schema_version": SCHEMA_VERSION,
         "identity_key": identity_key or secrets.token_hex(32),
@@ -111,21 +205,36 @@ def _empty_state(identity_key: str | None = None) -> dict[str, Any]:
     }
 
 
-def _state(repo: Path, base: Path | None = None) -> dict[str, Any]:
+def _state(repo: Path, base: Path | None = None) -> SearchState:
     value = _read_json(_path(repo, base))
     if not value:
         return _empty_state()
-    if (
-        value.get("schema_version") != SCHEMA_VERSION
-        or not isinstance(value.get("identity_key"), str)
-        or not isinstance(value.get("profiles"), dict)
-        or not isinstance(value.get("applied"), dict)
-    ):
+    identity_key = value.get("identity_key")
+    profiles_value = value.get("profiles")
+    applied_value = value.get("applied")
+    if value.get("schema_version") != SCHEMA_VERSION or not isinstance(identity_key, str):
         raise ValueError("search_services.invalid_state")
-    return value
+    profiles_object = json_object(profiles_value)
+    profiles = {profile_id: _stored_profile(profile) for profile_id, profile in profiles_object.items()}
+    applied_object = json_object(applied_value)
+    applied: dict[str, AppliedOperation] = {}
+    for key, operation_value in applied_object.items():
+        operation = json_object(operation_value)
+        fingerprint = operation.get("plan_fingerprint")
+        actor = operation.get("actor")
+        result = json_object(operation.get("result"))
+        if not isinstance(fingerprint, str) or not isinstance(actor, str):
+            raise ValueError("search_services.invalid_state")
+        applied[key] = {"plan_fingerprint": fingerprint, "actor": actor, "result": result}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "identity_key": identity_key,
+        "profiles": profiles,
+        "applied": applied,
+    }
 
 
-def _normalized_endpoint(value: str) -> tuple[str, str]:
+def _normalized_endpoint(value: str) -> tuple[str, Literal["public_https", "loopback_http"]]:
     parsed = urlsplit(value)
     if (
         parsed.scheme not in {"http", "https"}
@@ -152,7 +261,7 @@ def _normalized_endpoint(value: str) -> tuple[str, str]:
 
 def _addresses(host: str, port: int, scheme: str) -> list[str]:
     try:
-        values = sorted({item[4][0] for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)})
+        values = sorted({str(item[4][0]) for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)})
     except socket.gaierror as exc:
         raise RuntimeError("search_services.endpoint_unavailable") from exc
     if not values:
@@ -166,31 +275,32 @@ def _addresses(host: str, port: int, scheme: str) -> list[str]:
     return values
 
 
-def _validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
+def _validate_profile(
+    profile: dict[str, object], *, verify_address: bool = True,
+) -> ItsProfile | EmbeddingProfile:
     if set(profile) - {
         "kind", "label", "endpoint", "model", "dimension", "max_request_bytes",
         "max_response_bytes", "max_vectors", "deadline_seconds", "provider",
         "enabled", "ca_bundle_id", "build_limits",
     }:
         raise ValueError("search_services.invalid_profile")
-    if profile.get("kind") not in {"embedding", "its"} or not str(profile.get("label", "")).strip():
+    kind = profile.get("kind")
+    label = profile.get("label")
+    if kind not in {"embedding", "its"} or not isinstance(label, str) or not label.strip():
         raise ValueError("search_services.invalid_profile")
-    result = {
-        "kind": profile["kind"],
-        "label": str(profile["label"]).strip(),
-        "enabled": profile.get("enabled", True),
-    }
-    if not isinstance(result["enabled"], bool):
+    enabled = profile.get("enabled", True)
+    if not isinstance(enabled, bool):
         raise ValueError("search_services.invalid_profile")
-    if profile["kind"] == "its":
-        return result
+    if kind == "its":
+        return {"kind": "its", "label": label.strip(), "enabled": enabled}
     endpoint, endpoint_class = _normalized_endpoint(str(profile.get("endpoint", "")))
     parsed_endpoint = urlsplit(endpoint)
-    _addresses(
-        parsed_endpoint.hostname or "",
-        parsed_endpoint.port or (443 if parsed_endpoint.scheme == "https" else 80),
-        parsed_endpoint.scheme,
-    )
+    if verify_address:
+        _ = _addresses(
+            parsed_endpoint.hostname or "",
+            parsed_endpoint.port or (443 if parsed_endpoint.scheme == "https" else 80),
+            parsed_endpoint.scheme,
+        )
     model = str(profile.get("model", "")).strip()
     dimension = profile.get("dimension")
     if not model or not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0:
@@ -198,14 +308,19 @@ def _validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
     provider = profile.get("provider", "openai-compatible")
     ca_bundle_id = profile.get("ca_bundle_id")
     if provider != "openai-compatible" or (
-        ca_bundle_id is not None and ca_bundle_id not in APPROVED_CA_BUNDLES
+        ca_bundle_id is not None
+        and (not isinstance(ca_bundle_id, str) or ca_bundle_id not in APPROVED_CA_BUNDLES)
     ):
         raise ValueError("search_services.invalid_profile")
-    build_limits = profile.get("build_limits")
-    if not isinstance(build_limits, dict) or set(build_limits) != set(BUILD_MAXIMA):
+    try:
+        build_limits_value = json_object(profile.get("build_limits"))
+    except ValueError as exc:
+        raise ValueError("search_services.invalid_profile") from exc
+
+    if set(build_limits_value) != set(BUILD_MAXIMA):
         raise ValueError("search_services.invalid_profile")
     for name, maximum in BUILD_MAXIMA.items():
-        value = build_limits[name]
+        value = build_limits_value[name]
         if (
             not isinstance(value, (int, float))
             or isinstance(value, bool)
@@ -214,7 +329,7 @@ def _validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
             or name != "elapsed_seconds" and not isinstance(value, int)
         ):
             raise ValueError("search_services.invalid_profile")
-    limits = {
+    limits: dict[str, tuple[object, int | float]] = {
         "max_request_bytes": (profile.get("max_request_bytes", MAX_REQUEST_BYTES), MAX_REQUEST_BYTES),
         "max_response_bytes": (profile.get("max_response_bytes", MAX_RESPONSE_BYTES), MAX_RESPONSE_BYTES),
         "max_vectors": (profile.get("max_vectors", MAX_VECTORS), MAX_VECTORS),
@@ -229,16 +344,119 @@ def _validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
             or name != "deadline_seconds" and not isinstance(value, int)
         ):
             raise ValueError("search_services.invalid_profile")
-        result[name] = value
+    requests = build_limits_value["requests"]
+    input_bytes = build_limits_value["input_bytes"]
+    vectors = build_limits_value["vectors"]
+    concurrency = build_limits_value["concurrency"]
+    batch = build_limits_value["batch"]
+    elapsed_seconds = build_limits_value["elapsed_seconds"]
+    assert isinstance(requests, int) and not isinstance(requests, bool)
+    assert isinstance(input_bytes, int) and not isinstance(input_bytes, bool)
+    assert isinstance(vectors, int) and not isinstance(vectors, bool)
+    assert isinstance(concurrency, int) and not isinstance(concurrency, bool)
+    assert isinstance(batch, int) and not isinstance(batch, bool)
+    assert isinstance(elapsed_seconds, (int, float)) and not isinstance(elapsed_seconds, bool)
+    max_request_bytes = limits["max_request_bytes"][0]
+    max_response_bytes = limits["max_response_bytes"][0]
+    max_vectors = limits["max_vectors"][0]
+    deadline_seconds = limits["deadline_seconds"][0]
+    assert isinstance(max_request_bytes, int) and not isinstance(max_request_bytes, bool)
+    assert isinstance(max_response_bytes, int) and not isinstance(max_response_bytes, bool)
+    assert isinstance(max_vectors, int) and not isinstance(max_vectors, bool)
+    assert isinstance(deadline_seconds, (int, float)) and not isinstance(deadline_seconds, bool)
     return {
-        **result,
-        "provider": provider,
+        "kind": "embedding",
+        "label": label.strip(),
+        "enabled": enabled,
+        "provider": "openai-compatible",
         "endpoint": endpoint,
         "endpoint_class": endpoint_class,
         "model": model,
         "dimension": dimension,
         "ca_bundle_id": ca_bundle_id,
-        "build_limits": build_limits,
+        "build_limits": {
+            "requests": requests, "input_bytes": input_bytes, "vectors": vectors,
+            "concurrency": concurrency, "batch": batch, "elapsed_seconds": float(elapsed_seconds),
+        },
+        "max_request_bytes": max_request_bytes,
+        "max_response_bytes": max_response_bytes,
+        "max_vectors": max_vectors,
+        "deadline_seconds": float(deadline_seconds),
+    }
+
+
+def _stored_profile(value: JsonValue) -> StoredProfile:
+    source = json_object(value)
+    public_keys = {
+        "kind", "label", "endpoint", "model", "dimension", "max_request_bytes",
+        "max_response_bytes", "max_vectors", "deadline_seconds", "provider", "enabled",
+        "ca_bundle_id", "build_limits",
+    }
+    public_profile: dict[str, object] = {}
+    for key in public_keys:
+        child = source.get(key)
+        if key in source:
+            public_profile[key] = child
+    normalized = _validate_profile(public_profile, verify_address=False)
+    credential = source.get("credential")
+    secret_version = source.get("secret_version")
+    if credential is not None and not isinstance(credential, str):
+        raise ValueError("search_services.invalid_state")
+    if secret_version is not None and not isinstance(secret_version, str):
+        raise ValueError("search_services.invalid_state")
+    if credential is not None:
+        normalized["credential"] = credential
+    if secret_version is not None:
+        normalized["secret_version"] = secret_version
+    if normalized["kind"] == "its":
+        service_identity = source.get("service_identity")
+        acknowledged = source.get("disclosure_acknowledged")
+        if service_identity is not None:
+            if not isinstance(service_identity, str):
+                raise ValueError("search_services.invalid_state")
+            normalized["service_identity"] = service_identity
+        if acknowledged is not None:
+            if not isinstance(acknowledged, bool):
+                raise ValueError("search_services.invalid_state")
+            normalized["disclosure_acknowledged"] = acknowledged
+        return normalized
+    endpoint_hmac = source.get("endpoint_hmac")
+    semantic = source.get("semantic_identity")
+    if endpoint_hmac is not None:
+        if not isinstance(endpoint_hmac, str):
+            raise ValueError("search_services.invalid_state")
+        normalized["endpoint_hmac"] = endpoint_hmac
+    if semantic is not None:
+        if not isinstance(semantic, str):
+            raise ValueError("search_services.invalid_state")
+        normalized["semantic_identity"] = semantic
+    return normalized
+
+
+def _profile_preview(value: JsonObject) -> ProfilePreview:
+    strings = {
+        key: value.get(key)
+        for key in ("project", "actor", "idempotency_key", "identity_key", "profile_id", "plan_fingerprint")
+    }
+    expires_at = value.get("expires_at")
+    if (
+        value.get("schema") != "search-services-profile-preview/v1"
+        or any(not isinstance(child, str) for child in strings.values())
+        or not isinstance(expires_at, int)
+        or isinstance(expires_at, bool)
+    ):
+        raise ValueError("search_services.preview_invalid_or_expired")
+    return {
+        "schema": "search-services-profile-preview/v1",
+        "project": str(strings["project"]),
+        "actor": str(strings["actor"]),
+        "idempotency_key": str(strings["idempotency_key"]),
+        "expires_at": expires_at,
+        "identity_key": str(strings["identity_key"]),
+        "profile_id": str(strings["profile_id"]),
+        "profile": _stored_profile(value.get("profile")),
+        "plan": json_object(value.get("plan")),
+        "plan_fingerprint": str(strings["plan_fingerprint"]),
     }
 
 
@@ -246,46 +464,73 @@ def _endpoint_hmac(key: str, endpoint: str) -> str:
     return "hmac-sha256:" + hmac.new(bytes.fromhex(key), endpoint.encode(), "sha256").hexdigest()
 
 
-def semantic_identity(profile: dict[str, Any]) -> str:
-    required = {
-        "provider", "endpoint_hmac", "model", "dimension", "secret_version",
-    }
-    if profile.get("kind") != "embedding" or not required <= set(profile):
+def semantic_identity(profile: EmbeddingProfile) -> str:
+    if "endpoint_hmac" not in profile or "secret_version" not in profile:
         raise ValueError("search_services.semantic_identity_unavailable")
+    endpoint_hmac = profile["endpoint_hmac"]
+    secret_version = profile["secret_version"]
     return "sha256:" + sha256(canonical_json({
         "schema": "embedding-identity/v1",
         "provider": profile["provider"],
-        "endpoint_hmac": profile["endpoint_hmac"],
+        "endpoint_hmac": endpoint_hmac,
         "model": profile["model"],
         "dimension": profile["dimension"],
         "protocol": "openai-embeddings/v1",
-        "secret_version": profile["secret_version"],
+        "secret_version": secret_version,
     }))
 
 
-def _projection(profile_id: str, profile: dict[str, Any]) -> dict[str, Any]:
-    visible = {
-        key: value for key, value in profile.items()
-        if key not in {"credential", "endpoint", "endpoint_hmac"}
+def _projection(profile_id: str, profile: StoredProfile) -> JsonObject:
+    visible: JsonObject = {
+        "kind": profile["kind"], "label": profile["label"], "enabled": profile["enabled"],
     }
+    secret_version = profile.get("secret_version")
+    if secret_version is not None:
+        visible["secret_version"] = secret_version
+    if profile["kind"] == "embedding":
+        semantic = profile.get("semantic_identity")
+        if semantic is not None:
+            visible["semantic_identity"] = semantic
+        limits = profile["build_limits"]
+        visible.update({
+            "provider": profile["provider"], "endpoint_class": profile["endpoint_class"],
+            "model": profile["model"], "dimension": profile["dimension"],
+            "ca_bundle_id": profile["ca_bundle_id"],
+            "build_limits": {
+                "requests": limits["requests"], "input_bytes": limits["input_bytes"],
+                "vectors": limits["vectors"], "concurrency": limits["concurrency"],
+                "batch": limits["batch"], "elapsed_seconds": limits["elapsed_seconds"],
+            },
+            "max_request_bytes": profile["max_request_bytes"],
+            "max_response_bytes": profile["max_response_bytes"], "max_vectors": profile["max_vectors"],
+            "deadline_seconds": profile["deadline_seconds"],
+        })
+    else:
+        service_identity = profile.get("service_identity")
+        acknowledgement = profile.get("disclosure_acknowledged")
+        if service_identity is not None:
+            visible["service_identity"] = service_identity
+        if acknowledgement is not None:
+            visible["disclosure_acknowledged"] = acknowledgement
+    endpoint_hmac = profile.get("endpoint_hmac") if profile["kind"] == "embedding" else None
     return {
         "profile_id": profile_id,
         **visible,
         "credential_configured": bool(profile.get("credential")),
         "endpoint_hmac_prefix": (
-            profile["endpoint_hmac"][:20] if profile.get("endpoint_hmac") else None
+            endpoint_hmac[:20] if endpoint_hmac else None
         ),
     }
 
 
-def list_profiles(repo: Path, base: Path | None = None) -> list[dict[str, Any]]:
+def list_profiles(repo: Path, base: Path | None = None) -> list[JsonObject]:
     return [
         _projection(profile_id, profile)
         for profile_id, profile in sorted(_state(repo, base)["profiles"].items())
     ]
 
 
-def _state_fingerprint(state: dict[str, Any]) -> str:
+def _state_fingerprint(state: SearchState) -> str:
     profiles = {
         profile_id: {
             key: value for key, value in profile.items()
@@ -303,67 +548,80 @@ def state_fingerprint(repo: Path, base: Path | None = None) -> str:
     return _state_fingerprint(_state(repo, base))
 
 
-def _validate_disclosure(value: dict[str, Any], build_limits: dict[str, Any]) -> dict[str, Any]:
+def _validate_disclosure(value: object, build_limits: BuildLimits) -> JsonObject:
+    value = json_object(value)
     if set(value) != {
         "components", "file_count", "source_bytes", "estimated_requests",
         "estimated_input_bytes", "estimated_vectors", "cost",
     }:
         raise ValueError("search_services.invalid_disclosure")
     components = value["components"]
-    integers = {
-        "file_count": value["file_count"],
-        "source_bytes": value["source_bytes"],
-        "estimated_requests": value["estimated_requests"],
-        "estimated_input_bytes": value["estimated_input_bytes"],
-        "estimated_vectors": value["estimated_vectors"],
-    }
+    integer_values = [value[key] for key in (
+        "file_count", "source_bytes", "estimated_requests", "estimated_input_bytes", "estimated_vectors",
+    )]
     if (
         not isinstance(components, list)
-        or components != sorted(set(components))
         or any(not isinstance(item, str) or not item for item in components)
-        or any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in integers.values())
-        or integers["estimated_requests"] > build_limits["requests"]
-        or integers["estimated_input_bytes"] > build_limits["input_bytes"]
-        or integers["estimated_vectors"] > build_limits["vectors"]
+        or any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in integer_values)
     ):
         raise ValueError("search_services.invalid_disclosure")
-    cost = value["cost"]
-    if not isinstance(cost, dict) or cost.get("kind") not in {"known", "unknown"}:
+    cost_value = json_object(value["cost"])
+    if cost_value.get("kind") not in {"known", "unknown"}:
         raise ValueError("search_services.invalid_disclosure")
-    if cost["kind"] == "known":
+    if cost_value["kind"] == "known":
         if (
-            set(cost) != {"kind", "amount", "currency"}
-            or not isinstance(cost["amount"], (int, float))
-            or isinstance(cost["amount"], bool)
-            or cost["amount"] < 0
-            or not isinstance(cost["currency"], str)
-            or not cost["currency"]
+            set(cost_value) != {"kind", "amount", "currency"}
+            or not isinstance(cost_value["amount"], (int, float))
+            or isinstance(cost_value["amount"], bool)
+            or cost_value["amount"] < 0
+            or not isinstance(cost_value["currency"], str)
+            or not cost_value["currency"]
         ):
             raise ValueError("search_services.invalid_disclosure")
-    elif set(cost) != {"kind"}:
+    elif set(cost_value) != {"kind"}:
         raise ValueError("search_services.invalid_disclosure")
-    return value
+    components_list = [item for item in components if isinstance(item, str)]
+    if components_list != sorted(set(components_list)):
+        raise ValueError("search_services.invalid_disclosure")
+    file_count, source_bytes, estimated_requests, estimated_input_bytes, estimated_vectors = integer_values
+    assert all(isinstance(item, int) and not isinstance(item, bool) for item in integer_values)
+    assert isinstance(estimated_requests, int) and isinstance(estimated_input_bytes, int) and isinstance(estimated_vectors, int)
+    if (
+        estimated_requests > build_limits["requests"]
+        or estimated_input_bytes > build_limits["input_bytes"]
+        or estimated_vectors > build_limits["vectors"]
+    ):
+        raise ValueError("search_services.invalid_disclosure")
+    cost: JsonObject = dict(cost_value)
+    return {
+        "components": components_list,
+        "file_count": file_count,
+        "source_bytes": source_bytes,
+        "estimated_requests": estimated_requests,
+        "estimated_input_bytes": estimated_input_bytes,
+        "estimated_vectors": estimated_vectors,
+        "cost": cost,
+    }
 
 
 def preview_profile(
     repo: Path,
     profile_id: str,
-    profile: dict[str, Any],
+    profile: dict[str, object],
     *,
     actor: str,
     idempotency_key: str,
     expected_state_fingerprint: str,
-    disclosure: dict[str, Any],
+    disclosure: dict[str, object],
     acknowledged: bool,
     secret: str | None = None,
     base: Path | None = None,
     ttl_seconds: int = 300,
-) -> dict[str, Any]:
+) -> JsonObject:
     if (
         not PROFILE_ID.fullmatch(profile_id)
         or not actor
         or not idempotency_key
-        or not isinstance(ttl_seconds, int)
         or not 1 <= ttl_seconds <= 900
     ):
         raise ValueError("search_services.invalid_preview")
@@ -372,9 +630,9 @@ def preview_profile(
     current_fingerprint = _state_fingerprint(current_state)
     if expected_state_fingerprint != current_fingerprint:
         raise RuntimeError("search_services.state_changed")
-    current = current_state["profiles"].get(profile_id, {})
-    credential = current.get("credential")
-    secret_version = current.get("secret_version")
+    current = current_state["profiles"].get(profile_id)
+    credential = current.get("credential") if current is not None else None
+    secret_version = current.get("secret_version") if current is not None else None
     if secret is not None:
         if not secret:
             raise ValueError("search_services.empty_secret")
@@ -385,14 +643,16 @@ def preview_profile(
             raise ValueError("search_services.disclosure_acknowledgement_required")
         if not credential:
             raise ValueError("search_services.its_token_required")
-        proposed = {
-            **normalized,
+        proposed: StoredProfile = {
+            "kind": "its",
+            "label": normalized["label"],
+            "enabled": normalized["enabled"],
             "credential": credential,
             "secret_version": secret_version,
             "service_identity": ITS_ENDPOINT,
             "disclosure_acknowledged": True,
         }
-        plan = {
+        its_plan: JsonObject = {
             "schema": "search-services-profile-plan/v1",
             "project": workspace_id(repo),
             "actor": actor,
@@ -408,30 +668,30 @@ def preview_profile(
             "expected_state_fingerprint": current_fingerprint,
         }
         return _store_preview(
-            repo, base, current_state, profile_id, proposed, plan,
+            repo, base, current_state, profile_id, proposed, its_plan,
             actor, idempotency_key, ttl_seconds,
         )
     if normalized["endpoint_class"] == "public_https" and not acknowledged:
         raise ValueError("search_services.disclosure_acknowledgement_required")
-    disclosure = _validate_disclosure(disclosure, normalized["build_limits"])
-    proposed = {
-        **normalized,
-        "credential": credential,
-        "secret_version": secret_version,
-        "endpoint_hmac": _endpoint_hmac(current_state["identity_key"], normalized["endpoint"]),
-    }
+    normalized_disclosure = _validate_disclosure(disclosure, normalized["build_limits"])
+    assert normalized["kind"] == "embedding"
+    proposed = normalized.copy()
+    proposed["credential"] = credential
+    proposed["secret_version"] = secret_version
+    proposed["endpoint_hmac"] = _endpoint_hmac(current_state["identity_key"], normalized["endpoint"])
     proposed["semantic_identity"] = semantic_identity(proposed)
-    impact = {
-        "semantic_rebuild_required": current.get("semantic_identity") != proposed["semantic_identity"],
-        "search_reuse_invalidated": current.get("semantic_identity") != proposed["semantic_identity"],
+    current_identity = current.get("semantic_identity") if current and current["kind"] == "embedding" else None
+    impact: JsonObject = {
+        "semantic_rebuild_required": current_identity != proposed["semantic_identity"],
+        "search_reuse_invalidated": current_identity != proposed["semantic_identity"],
         "build_started": False,
     }
-    plan = {
+    plan: JsonObject = {
         "schema": "search-services-profile-plan/v1",
         "project": workspace_id(repo),
         "actor": actor,
         "profile": _projection(profile_id, proposed),
-        "disclosure": disclosure,
+        "disclosure": normalized_disclosure,
         "external_disclosure_acknowledged": acknowledged,
         "impact": impact,
         "expected_state_fingerprint": current_fingerprint,
@@ -445,19 +705,19 @@ def preview_profile(
 def _store_preview(
     repo: Path,
     base: Path | None,
-    current_state: dict[str, Any],
+    current_state: SearchState,
     profile_id: str,
-    proposed: dict[str, Any],
-    plan: dict[str, Any],
+    proposed: StoredProfile,
+    plan: JsonObject,
     actor: str,
     idempotency_key: str,
     ttl_seconds: int,
-) -> dict[str, Any]:
+) -> JsonObject:
     plan_fingerprint = "sha256:" + sha256(canonical_json({
         **plan,
         **(
-            {"endpoint_hmac": proposed["endpoint_hmac"]}
-            if proposed.get("endpoint_hmac") else {}
+            {"endpoint_hmac": endpoint_hmac}
+            if (endpoint_hmac := proposed.get("endpoint_hmac") if proposed["kind"] == "embedding" else None) else {}
         ),
     }))
     preview_id = secrets.token_urlsafe(24)
@@ -492,7 +752,7 @@ def apply_profile(
     expected_state_fingerprint: str,
     plan_fingerprint: str,
     base: Path | None = None,
-) -> dict[str, Any]:
+) -> JsonObject:
     if not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", preview_id):
         raise ValueError("search_services.invalid_preview")
     applied = _state(repo, base)["applied"].get(idempotency_key)
@@ -504,19 +764,21 @@ def apply_profile(
             raise ValueError("search_services.idempotency_conflict")
         return applied["result"]
     preview_path = _root(repo, base) / f".search-services-preview-{preview_id}.json"
-    preview = _read_json(preview_path)
-    if not preview:
+    preview_value = _read_json(preview_path)
+    if not preview_value:
         applied = _state(repo, base)["applied"].get(idempotency_key)
         if applied and applied["plan_fingerprint"] == plan_fingerprint and applied["actor"] == actor:
             return applied["result"]
+        raise ValueError("search_services.preview_invalid_or_expired")
+    preview = _profile_preview(preview_value)
+    expected_preview_fingerprint = preview["plan"].get("expected_state_fingerprint")
     if (
-        preview.get("schema") != "search-services-profile-preview/v1"
-        or preview.get("project") != workspace_id(repo)
-        or preview.get("actor") != actor
-        or preview.get("idempotency_key") != idempotency_key
-        or preview.get("plan_fingerprint") != plan_fingerprint
-        or preview.get("plan", {}).get("expected_state_fingerprint") != expected_state_fingerprint
-        or time.time() >= preview.get("expires_at", 0)
+        preview["project"] != workspace_id(repo)
+        or preview["actor"] != actor
+        or preview["idempotency_key"] != idempotency_key
+        or preview["plan_fingerprint"] != plan_fingerprint
+        or expected_preview_fingerprint != expected_state_fingerprint
+        or time.time() >= preview["expires_at"]
     ):
         raise ValueError("search_services.preview_invalid_or_expired")
     with repository_lock(repo):
@@ -535,7 +797,7 @@ def apply_profile(
             raise RuntimeError("search_services.state_changed")
         if preview["profile"]["kind"] == "embedding":
             endpoint = urlsplit(preview["profile"]["endpoint"])
-            _addresses(
+            _ = _addresses(
                 endpoint.hostname or "",
                 endpoint.port or (443 if endpoint.scheme == "https" else 80),
                 endpoint.scheme,
@@ -543,11 +805,12 @@ def apply_profile(
         if not exists:
             state["identity_key"] = preview["identity_key"]
         state["profiles"][preview["profile_id"]] = preview["profile"]
-        result = {
+        impact = json_object(preview["plan"].get("impact"))
+        result: JsonObject = {
             "status": "applied",
             "state_fingerprint": "",
             "profile": _projection(preview["profile_id"], preview["profile"]),
-            "impact": preview["plan"]["impact"],
+            "impact": impact,
         }
         state["applied"][idempotency_key] = {
             "plan_fingerprint": plan_fingerprint,
@@ -561,7 +824,7 @@ def apply_profile(
         return result
 
 
-def _private_profile(repo: Path, profile_id: str, base: Path | None) -> tuple[dict[str, Any], str | None]:
+def private_profile(repo: Path, profile_id: str, base: Path | None) -> tuple[StoredProfile, str | None]:
     profile = _state(repo, base)["profiles"].get(profile_id)
     if not profile:
         raise KeyError("search_services.profile_not_found")
@@ -570,7 +833,7 @@ def _private_profile(repo: Path, profile_id: str, base: Path | None) -> tuple[di
 
 def selected_profile(
     repo: Path, kind: str, base: Path | None = None
-) -> tuple[str, dict[str, Any], str | None]:
+) -> tuple[str, StoredProfile, str | None]:
     matches = [
         (profile_id, profile)
         for profile_id, profile in sorted(_state(repo, base)["profiles"].items())
@@ -582,14 +845,14 @@ def selected_profile(
     return profile_id, profile, profile.get("credential")
 
 
-def _request_payload(body: bytes, profile: dict[str, Any]) -> tuple[bytes, int]:
+def _request_payload(body: bytes, profile: EmbeddingProfile) -> tuple[bytes, int]:
     if len(body) > profile["max_request_bytes"]:
         raise ValueError("search_services.request_too_large")
     try:
-        value = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = json_object(parse_json(body.decode("utf-8")))
+    except (UnicodeDecodeError, ValueError) as exc:
         raise ValueError("search_services.invalid_request") from exc
-    if not isinstance(value, dict) or set(value) - {"input", "model", "encoding_format"}:
+    if set(value) - {"input", "model", "encoding_format"}:
         raise ValueError("search_services.invalid_request")
     inputs = value.get("input")
     inputs = [inputs] if isinstance(inputs, str) else inputs
@@ -602,21 +865,23 @@ def _request_payload(body: bytes, profile: dict[str, Any]) -> tuple[bytes, int]:
         or value.get("encoding_format", "float") != "float"
     ):
         raise ValueError("search_services.invalid_request")
+    assert isinstance(inputs, list)
+    string_inputs = [item for item in inputs if isinstance(item, str)]
     return json.dumps(
-        {"input": inputs, "model": profile["model"], "encoding_format": "float"},
+        {"input": string_inputs, "model": profile["model"], "encoding_format": "float"},
         ensure_ascii=False, separators=(",", ":"),
-    ).encode(), len(inputs)
+    ).encode(), len(string_inputs)
 
 
-def _normalized_response(body: bytes, profile: dict[str, Any], expected: int) -> bytes:
+def _normalized_response(body: bytes, profile: EmbeddingProfile, expected: int) -> bytes:
     try:
-        value = json.loads(body)
+        value = json_object(parse_json(body.decode("utf-8")))
         rows = value["data"]
-    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError) as exc:
         raise RuntimeError("search_services.invalid_response") from exc
     if not isinstance(rows, list) or len(rows) != expected:
         raise RuntimeError("search_services.invalid_response")
-    normalized = []
+    normalized: list[JsonObject] = []
     for index, row in enumerate(rows):
         vector = row.get("embedding") if isinstance(row, dict) else None
         if (
@@ -630,7 +895,12 @@ def _normalized_response(body: bytes, profile: dict[str, Any], expected: int) ->
             )
         ):
             raise RuntimeError("search_services.invalid_response")
-        normalized.append({"object": "embedding", "index": index, "embedding": vector})
+        assert isinstance(vector, list)
+        numeric_vector: list[int | float] = []
+        for item in vector:
+            if isinstance(item, (int, float)) and not isinstance(item, bool):
+                numeric_vector.append(item)
+        normalized.append({"object": "embedding", "index": index, "embedding": numeric_vector})
     return json.dumps(
         {"object": "list", "data": normalized, "model": profile["model"]},
         separators=(",", ":"),
@@ -641,7 +911,7 @@ def analyzer_environment(
     inherited: dict[str, str],
     *,
     modality: str,
-    profile: dict[str, Any] | None = None,
+    profile: EmbeddingProfile | None = None,
     broker_environment: dict[str, str] | None = None,
 ) -> dict[str, str]:
     environment = {
@@ -676,10 +946,10 @@ def analyzer_environment(
 def search_readiness(
     *,
     lexical_index_ready: bool,
-    profile: dict[str, Any] | None,
+    profile: EmbeddingProfile | None,
     semantic_index_identity: str | None,
     probe_identity: str | None,
-) -> dict[str, Any]:
+) -> SearchReadiness:
     expected = profile.get("semantic_identity") if profile else None
     hybrid_reason = None
     if not profile or not profile.get("enabled"):
@@ -701,7 +971,7 @@ def search_readiness(
     }
 
 
-def require_search_modality(requested: str, readiness: dict[str, Any]) -> str:
+def require_search_modality(requested: str, readiness: SearchReadiness) -> str:
     if requested not in {"lexical", "hybrid"}:
         raise ValueError("search_services.invalid_modality")
     if not readiness[requested]["ready"]:
@@ -709,8 +979,9 @@ def require_search_modality(requested: str, readiness: dict[str, Any]) -> str:
     return requested
 
 
+@final
 class EmbeddingBudget:
-    def __init__(self, limits: dict[str, Any]):
+    def __init__(self, limits: OperationLimits):
         self.limits = limits
         self.started = time.monotonic()
         self.requests = 0
@@ -735,7 +1006,7 @@ class EmbeddingBudget:
     def deadline(self) -> float:
         return self.started + self.limits["elapsed_seconds"]
 
-    def diagnostics(self) -> dict[str, Any]:
+    def diagnostics(self) -> dict[str, int | float]:
         return {
             "requests": self.requests,
             "input_bytes": self.input_bytes,
@@ -746,6 +1017,7 @@ class EmbeddingBudget:
         }
 
 
+@final
 class _RetryableUpstream(RuntimeError):
     def __init__(self, status: int, retry_after: str | None):
         super().__init__(f"search_services.upstream_http_{status}")
@@ -766,6 +1038,7 @@ def _retry_delay(value: str | None, deadline: float) -> float:
     return min(delay, max(0.0, deadline - time.monotonic()))
 
 
+@final
 class EmbeddingBroker:
     def __init__(
         self,
@@ -775,7 +1048,7 @@ class EmbeddingBroker:
         operation: str = "query",
         base: Path | None = None,
     ):
-        profile, upstream_secret = _private_profile(repo, profile_id, base)
+        profile, upstream_secret = private_profile(repo, profile_id, base)
         if profile["kind"] != "embedding":
             raise ValueError("search_services.not_embedding_profile")
         self.profile = profile
@@ -796,6 +1069,9 @@ class EmbeddingBroker:
         broker = self
 
         class Handler(BaseHTTPRequestHandler):
+            connection: socket.socket
+
+            @override
             def setup(self) -> None:
                 super().setup()
                 self.connection.settimeout(broker.profile["deadline_seconds"])
@@ -833,7 +1109,7 @@ class EmbeddingBroker:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(result)))
                 self.end_headers()
-                self.wfile.write(result)
+                _ = self.wfile.write(result)
 
             def _error(self, status: int, code: str) -> None:
                 result = json.dumps({"error": {"code": code}}, separators=(",", ":")).encode()
@@ -841,9 +1117,10 @@ class EmbeddingBroker:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(result)))
                 self.end_headers()
-                self.wfile.write(result)
+                _ = self.wfile.write(result)
 
-            def log_message(self, format: str, *args: Any) -> None:
+            @override
+            def log_message(self, format: str, *args: object) -> None:
                 return
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -861,10 +1138,17 @@ class EmbeddingBroker:
         elif operation == "query":
             limits = QUERY_LIMITS
         elif operation == "build":
-            limits = self.profile["build_limits"]
+            build_limits = self.profile["build_limits"]
+            limits = OperationLimits(
+                requests=build_limits["requests"], input_bytes=build_limits["input_bytes"],
+                vectors=build_limits["vectors"], elapsed_seconds=build_limits["elapsed_seconds"],
+            )
         else:
             raise ValueError("search_services.invalid_embedding_operation")
-        return EmbeddingBudget(dict(limits))
+        return EmbeddingBudget(OperationLimits(
+            requests=limits["requests"], input_bytes=limits["input_bytes"],
+            vectors=limits["vectors"], elapsed_seconds=limits["elapsed_seconds"],
+        ))
 
     def forward(
         self,
@@ -921,9 +1205,10 @@ class EmbeddingBroker:
         if parsed.scheme == "https":
             try:
                 context = ssl.create_default_context()
-                if self.profile.get("ca_bundle_id"):
+                ca_bundle_id = self.profile["ca_bundle_id"]
+                if ca_bundle_id:
                     context.load_verify_locations(
-                        cafile=str(APPROVED_CA_BUNDLES[self.profile["ca_bundle_id"]]),
+                        cafile=str(APPROVED_CA_BUNDLES[ca_bundle_id]),
                     )
                 connection = context.wrap_socket(
                     connection, server_hostname=parsed.hostname,
@@ -934,7 +1219,7 @@ class EmbeddingBroker:
         with self._sockets_lock:
             self._sockets.add(connection)
         try:
-            if ipaddress.ip_address(connection.getpeername()[0]) != ipaddress.ip_address(address):
+            if connection.getpeername()[0] != address:
                 raise RuntimeError("search_services.endpoint_address_changed")
             path = "/v1/embeddings"
             host = parsed.hostname or ""
@@ -1008,7 +1293,7 @@ class EmbeddingBroker:
             self._thread.join(timeout=2)
 
     def __enter__(self) -> EmbeddingBroker:
-        self.start()
+        _ = self.start()
         return self
 
     def __exit__(self, *args: object) -> None:

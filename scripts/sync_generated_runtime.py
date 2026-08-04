@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 FILES = (
-    ".basedpyright/baseline.json", "AGENTS.md", "README.md", "pyproject.toml", "uv.lock",
+    "AGENTS.md", "README.md", "pyproject.toml", "uv.lock",
     "docs/operator/dispatcher-inspector-rollback.md", "docs/operator/source-search.md",
     "research/workflow.toml", "research/indexing.toml", "research/forbidden-authorities.json",
     "tests/test_external_folder.py", "tests/test_source_routing.py", "tests/test_source_tools.py",

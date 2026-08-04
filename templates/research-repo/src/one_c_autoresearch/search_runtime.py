@@ -10,9 +10,10 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable, Generator, Mapping
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Protocol, TypedDict
 
 
 SCHEMA_VERSION = "search-runtime/v1"
@@ -24,7 +25,55 @@ MAX_IDLE_TTL_SECONDS = 300
 ORPHAN_GRACE_SECONDS = 30
 ADDRESS_SPACE_BYTES = 16 * 1024**3
 TERM_GRACE_SECONDS = 2
-_BACKENDS: dict[str, dict[str, Any]] = {}
+
+class ProcessIdentity(TypedDict):
+    pid: int
+    process_group: int
+    start_time: str
+    boot_id: str
+
+
+class DaemonSpec(TypedDict):
+    command: list[str]
+    environment: dict[str, str]
+    start_new_session: bool
+    address_space_bytes: int
+
+
+class ProxySpec(TypedDict):
+    command: list[str]
+    environment: dict[str, str]
+    auto_launch: bool
+    stdio_fallback: bool
+    expected_backend_pid: int
+
+
+class BrokerSpecs(TypedDict):
+    daemon: DaemonSpec
+    proxy: ProxySpec
+
+
+class Closable(Protocol):
+    def close(self) -> object: ...
+
+
+class BackendEntry(TypedDict):
+    process: subprocess.Popen[bytes]
+    identity: ProcessIdentity
+    project: str
+    target: str
+    state: str
+    admission_open: bool
+    last_traffic_at: float
+    specs: BrokerSpecs
+    promoted_source: str
+    promoted_digest: str
+    serving_root: str
+    sessions: int
+    owned_resource: Closable | None
+
+
+_BACKENDS: dict[str, BackendEntry] = {}
 _BACKENDS_LOCK = threading.Lock()
 
 
@@ -80,7 +129,7 @@ def broker_specs(
     environment: Mapping[str, str],
     *,
     idle_ttl_seconds: int = MAX_IDLE_TTL_SECONDS,
-) -> dict[str, Any]:
+) -> BrokerSpecs:
     if not 0 < idle_ttl_seconds <= MAX_IDLE_TTL_SECONDS or backend_pid <= 0:
         raise ValueError("search_runtime.invalid_broker_limits")
     common = [
@@ -134,13 +183,13 @@ def create_serving_workspace(
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             with source.open("rb") as input_stream, target.open("xb") as output_stream:
                 try:
-                    fcntl.ioctl(
+                    _ = fcntl.ioctl(
                         output_stream.fileno(), 0x40049409, input_stream.fileno()
                     )
                 except OSError:
                     # ponytail: full private copy is the safe fallback on filesystems
                     # without FICLONE; expose storage pressure through the project quota.
-                    input_stream.seek(0)
+                    _ = input_stream.seek(0)
                     shutil.copyfileobj(input_stream, output_stream)
             target.chmod(0o600)
     except BaseException:
@@ -161,7 +210,7 @@ def verify_promoted_unchanged(promoted: Path, expected_digest: str) -> None:
         raise RuntimeError("search_runtime.promoted_instance_changed")
 
 
-def process_identity(pid: int) -> dict[str, Any]:
+def process_identity(pid: int) -> ProcessIdentity:
     try:
         fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(") ", 1)[1].split()
         return {
@@ -176,15 +225,15 @@ def process_identity(pid: int) -> dict[str, Any]:
         raise RuntimeError("search_runtime.process_identity_unavailable") from exc
 
 
-def process_identity_alive(identity: Mapping[str, Any]) -> bool:
+def process_identity_alive(identity: ProcessIdentity) -> bool:
     try:
         return process_identity(int(identity["pid"])) == dict(identity)
     except (KeyError, TypeError, ValueError, RuntimeError):
         return False
 
 
-def launch_backend(spec: Mapping[str, Any]) -> tuple[subprocess.Popen[bytes], dict[str, Any]]:
-    ceiling = int(spec.get("address_space_bytes", ADDRESS_SPACE_BYTES))
+def launch_backend(spec: DaemonSpec) -> tuple[subprocess.Popen[bytes], ProcessIdentity]:
+    ceiling = spec["address_space_bytes"]
     limiter = shutil.which("prlimit")
     if not limiter:
         raise RuntimeError("search_runtime.prlimit_unavailable")
@@ -225,8 +274,8 @@ def supervised_workspace_proxy(
     *,
     timeout_seconds: float,
     serving_copy: bool = True,
-    owned_resource: Any | None = None,
-) -> Iterator[dict[str, Any]]:
+    owned_resource: Closable | None = None,
+) -> Generator[ProxySpec, None, None]:
     """Return one required-broker proxy spec backed by a supervised shared daemon."""
     if not promoted_source.is_dir() or promoted_source.is_symlink():
         raise ValueError("search_runtime.invalid_promoted_instance")
@@ -257,15 +306,16 @@ def supervised_workspace_proxy(
                 ):
                     other["state"] = "superseded"
                     other["admission_open"] = False
-            entry = _BACKENDS.get(key)
+            entry: BackendEntry | None = _BACKENDS.get(key)
             if entry and not process_identity_alive(entry["identity"]):
-                if entry.get("owned_resource") is not None:
-                    entry["owned_resource"].close()
+                resource = entry["owned_resource"]
+                if resource is not None:
+                    _ = resource.close()
                 verify_promoted_unchanged(
                     Path(entry["promoted_source"]), entry["promoted_digest"]
                 )
                 shutil.rmtree(Path(entry["serving_root"]), ignore_errors=True)
-                _BACKENDS.pop(key, None)
+                _ = _BACKENDS.pop(key, None)
                 entry = None
             if entry is None:
                 if serving_copy:
@@ -290,40 +340,40 @@ def supervised_workspace_proxy(
                     process, identity = launch_backend(provisional["daemon"])
                 except BaseException:
                     if owned_resource is not None:
-                        owned_resource.close()
+                        _ = owned_resource.close()
                     raise
                 specs = broker_specs(
                     executable, serving_source, process.pid, daemon_environment
                 )
-                entry = {
-                    "process": process,
-                    "identity": identity,
-                    "project": project,
-                    "target": str(promoted_source.resolve()),
-                    "state": "warm",
-                    "admission_open": True,
-                    "last_traffic_at": time.monotonic(),
-                    "specs": specs,
-                    "promoted_source": str(
+                entry = BackendEntry(
+                    process=process,
+                    identity=identity,
+                    project=project,
+                    target=str(promoted_source.resolve()),
+                    state="warm",
+                    admission_open=True,
+                    last_traffic_at=time.monotonic(),
+                    specs=specs,
+                    promoted_source=str(
                         promoted_source.parent if serving_copy else promoted_source
                     ),
-                    "promoted_digest": promoted_digest,
-                    "serving_root": str(runtime_root),
-                    "sessions": 0,
-                    "owned_resource": owned_resource,
-                }
+                    promoted_digest=promoted_digest,
+                    serving_root=str(runtime_root),
+                    sessions=0,
+                    owned_resource=owned_resource,
+                )
                 _BACKENDS[key] = entry
             elif owned_resource is not None:
-                owned_resource.close()
+                _ = owned_resource.close()
             entry["sessions"] += 1
             entry["state"] = "warm"
             entry["last_traffic_at"] = time.monotonic()
         try:
             if time.monotonic() >= deadline:
                 raise TimeoutError("search_runtime.backend_start_deadline")
-            yield dict(entry["specs"]["proxy"])
+            yield entry["specs"]["proxy"]
         finally:
-            drained: dict[str, Any] | None = None
+            drained: BackendEntry | None = None
             with _BACKENDS_LOCK:
                 current = _BACKENDS.get(key)
                 if current:
@@ -338,18 +388,19 @@ def supervised_workspace_proxy(
                     if current["sessions"] == 0 and (
                         not serving_copy or not current.get("admission_open", True)
                     ):
-                        _BACKENDS.pop(key, None)
+                        _ = _BACKENDS.pop(key, None)
                         drained = current
             if drained:
-                terminate_process_group(drained["identity"])
-                if drained.get("owned_resource") is not None:
-                    drained["owned_resource"].close()
+                _ = terminate_process_group(drained["identity"])
+                resource = drained["owned_resource"]
+                if resource is not None:
+                    _ = resource.close()
                 shutil.rmtree(runtime_root, ignore_errors=True)
                 shutil.rmtree(socket_root, ignore_errors=True)
 
 
 def terminate_process_group(
-    identity: Mapping[str, Any], *, grace_seconds: float = TERM_GRACE_SECONDS
+    identity: ProcessIdentity, *, grace_seconds: float = TERM_GRACE_SECONDS
 ) -> str:
     if not process_identity_alive(identity):
         return "identity_mismatch"
@@ -367,19 +418,19 @@ def terminate_process_group(
 
 class Admission:
     def __init__(self) -> None:
-        self._condition = threading.Condition()
+        self._condition: threading.Condition = threading.Condition()
         self._residents: dict[tuple[str, str], int] = {}
         self._calls: dict[str, int] = {}
 
-    def _wait(self, allowed: Any, deadline: float) -> None:
+    def _wait(self, allowed: Callable[[], bool], deadline: float) -> None:
         while not allowed():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("search_runtime.admission_deadline")
-            self._condition.wait(remaining)
+            _ = self._condition.wait(remaining)
 
     @contextmanager
-    def resident(self, project: str, target: str, deadline: float) -> Iterator[None]:
+    def resident(self, project: str, target: str, deadline: float) -> Generator[None, None, None]:
         key = (project, target)
         with self._condition:
             if any(existing_target == target and existing_project != project for existing_project, existing_target in self._residents):
@@ -403,10 +454,10 @@ class Admission:
                     self._residents[key] = remaining
                 else:
                     del self._residents[key]
-                self._condition.notify_all()
+                _ = self._condition.notify_all()
 
     @contextmanager
-    def call(self, project: str, deadline: float) -> Iterator[None]:
+    def call(self, project: str, deadline: float) -> Generator[None, None, None]:
         with self._condition:
             self._wait(
                 lambda: self._calls.get(project, 0) < PROJECT_CALL_LIMIT
@@ -421,7 +472,7 @@ class Admission:
                 self._calls[project] -= 1
                 if not self._calls[project]:
                     del self._calls[project]
-                self._condition.notify_all()
+                _ = self._condition.notify_all()
 
 
 _ADMISSION = Admission()
@@ -429,11 +480,11 @@ _ADMISSION = Admission()
 
 class Session:
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.state = "active"
-        self.result: Any = None
+        self._lock: threading.Lock = threading.Lock()
+        self.state: str = "active"
+        self.result: object | None = None
 
-    def settle(self, result: Any) -> bool:
+    def settle(self, result: object) -> bool:
         with self._lock:
             if self.state != "active":
                 return False
@@ -459,13 +510,13 @@ class BackendLifecycle:
     ) -> None:
         if not 0 < idle_ttl_seconds <= MAX_IDLE_TTL_SECONDS:
             raise ValueError("search_runtime.invalid_idle_ttl")
-        self.target_fingerprint = target_fingerprint
-        self.started_at = started_at
+        self.target_fingerprint: str = target_fingerprint
+        self.started_at: float = started_at
         self.last_traffic_at: float | None = None
-        self.idle_ttl_seconds = idle_ttl_seconds
-        self.active_sessions = 0
-        self.state = "warm"
-        self.admission_open = True
+        self.idle_ttl_seconds: int = idle_ttl_seconds
+        self.active_sessions: int = 0
+        self.state: str = "warm"
+        self.admission_open: bool = True
         self.terminal_cause: str | None = None
 
     def traffic(self, now: float) -> None:
@@ -506,7 +557,7 @@ class BackendLifecycle:
         self.state = "superseded"
         self.terminal_cause = "target_superseded"
 
-    def diagnostic(self) -> dict[str, Any]:
+    def diagnostic(self) -> dict[str, object]:
         return {
             "target_fingerprint": self.target_fingerprint,
             "state": self.state,
@@ -521,13 +572,13 @@ def quarantine_path(path: Path, quarantine_root: Path, cause: str) -> Path | Non
         return None
     quarantine_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     destination = quarantine_root / f"{path.name}-{cause}-{uuid.uuid4().hex}"
-    path.replace(destination)
+    _ = path.replace(destination)
     return destination
 
 
 def reconcile_restart(
-    target_root: Path, recorded_identity: Mapping[str, Any] | None
-) -> dict[str, Any]:
+    target_root: Path, recorded_identity: ProcessIdentity | None
+) -> dict[str, object]:
     terminal = "not_running"
     if recorded_identity:
         terminal = terminate_process_group(recorded_identity)
@@ -550,7 +601,7 @@ def reconcile_restart(
     }
 
 
-def runtime_diagnostics() -> list[dict[str, Any]]:
+def runtime_diagnostics() -> list[dict[str, object]]:
     with _BACKENDS_LOCK:
         return [
             {
@@ -584,10 +635,11 @@ def shutdown_project_backends(project: str) -> int:
             if entry.get("project") == project
         ]
         for key, _entry in selected:
-            _BACKENDS.pop(key, None)
+            _ = _BACKENDS.pop(key, None)
     for _key, entry in selected:
-        terminate_process_group(entry["identity"])
-        if entry.get("owned_resource") is not None:
-            entry["owned_resource"].close()
+        _ = terminate_process_group(entry["identity"])
+        resource = entry["owned_resource"]
+        if resource is not None:
+            _ = resource.close()
         shutil.rmtree(Path(entry["serving_root"]), ignore_errors=True)
     return len(selected)

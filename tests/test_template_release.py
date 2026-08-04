@@ -26,12 +26,12 @@ def test_python_type_check_policy_is_pinned_without_source_suppressions() -> Non
     expected = {
         "include": ["src/one_c_autoresearch"],
         "pythonVersion": "3.11",
-        "baselineFile": ".basedpyright/baseline.json",
     }
     for project_root in (ROOT, ROOT / "templates/research-repo"):
         project = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
         assert project["tool"]["basedpyright"] == expected
         assert project["dependency-groups"]["dev"] == ["basedpyright==1.39.9"]
+        assert not (project_root / ".basedpyright" / "baseline.json").exists()
         for path in (project_root / "src/one_c_autoresearch").rglob("*.py"):
             text = path.read_text(encoding="utf-8")
             assert "# type: ignore" not in text

@@ -6,10 +6,15 @@ import re
 import subprocess
 import tempfile
 import json
+import importlib
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Protocol, TypedDict, runtime_checkable
 
-from .contracts import atomic_json, canonical_json, comparison_id, confined, content_id, diff_id, normalize_relative, repository_lock, require_tracked_clean, sha256
+from .contracts import JsonValue, atomic_json, canonical_json, comparison_id, confined, content_id, diff_id, normalize_relative, parse_json, parse_json_object, repository_lock, require_tracked_clean, sha256
+from .extension_analyzer import Dependency, Detail, DiffEvidence, MainMatch
+from .source_routing import RoutingGroup, RoutingManifest, RoutingMember
+from .sources import ComponentRecord
 
 
 INVENTORY_HEADER = ("stable_diff_id", "comparison_id", "source_generation", "before_role", "after_role", "change_type", "path", "object_kind", "object_name", "area", "before_fingerprint", "after_fingerprint", "content_fingerprint")
@@ -46,7 +51,265 @@ INTERVENTION_KINDS = {
 }
 DEPENDENCY_OUTCOMES = {"present_compatible", "present_changed", "missing", "unresolved"}
 TARGET_COVERAGE_STATUSES = {"covered_by_vendor", "still_required", "changed_in_target", "needs_semantic_review"}
-def _valid_fingerprint(value: Any, *, optional: bool = False) -> bool:
+
+
+class ComponentBinding(TypedDict):
+    role: str
+    component_id: str
+    component_path: str
+    component_fingerprint: str
+    extension_uuid: str
+    active: bool
+    representation_schema: str
+    adapter_id: str
+    adapter_version: str
+
+
+class AnalyzerManifest(TypedDict):
+    schema_version: str
+    extension_analyzer_version: str
+    source_generation_id: str
+    source_comparison_epoch_fingerprint: str
+    routing_manifest_fingerprint: str
+    extension_adapter_versions: list[str]
+    component_bindings: list[ComponentBinding]
+    record_counts: dict[str, int]
+    data_files: dict[str, str]
+    output_fingerprint: str
+
+
+class AnalyzerResult(TypedDict):
+    adapter_versions: list[str]
+    component_bindings: list[ComponentBinding]
+    dependency_rows: list[Dependency]
+    detail_rows: list[Detail]
+    extension_analyzer_version: str
+    path_coverage: list[dict[str, str]]
+    physical_rows: list[dict[str, str]]
+    semantic_rows: list[dict[str, str]]
+
+
+class DiffPointer(TypedDict):
+    schema_version: str
+    generation_id: str
+    source_generation_id: str
+    files: dict[str, str]
+    row_counts: dict[str, int]
+
+
+class SourcePointer(TypedDict, total=False):
+    schema_version: str
+    generation_id: str
+    acquisition_profile_id: str
+    representation_schema: str
+    normalizer_version: str
+    routing_manifest_path: str
+    routing_manifest_fingerprint: str
+    components: list[ComponentRecord]
+    source_comparison_epoch_fingerprint: str
+
+
+@runtime_checkable
+class _StageRecompute(Protocol):
+    def recover_active_publication(self, repo: Path) -> object: ...
+
+
+def _recover_active_publication(repo: Path) -> None:
+    module = importlib.import_module(".stage_recompute", __package__)
+    if not isinstance(module, _StageRecompute):
+        raise RuntimeError("invalid stage recompute module")
+    _ = module.recover_active_publication(repo)
+
+
+def _evidence(value: object) -> DiffEvidence:
+    row = parse_json_object(canonical_json(value).decode("utf-8"))
+    return {
+        "role": _string(row["role"]),
+        "side": _string(row["side"]),
+        "path": _string(row["path"]),
+        "fingerprint": _string(row["fingerprint"]),
+    }
+
+
+def _detail(value: object) -> Detail:
+    row = parse_json_object(canonical_json(value).decode("utf-8"))
+    string_keys = DETAIL_KEYS - {"dependency_ids", "diagnostic_codes", "evidence"}
+    strings = {key: _string(row[key]) for key in string_keys}
+    return Detail(
+        **strings,
+        dependency_ids=_strings(row["dependency_ids"]),
+        diagnostic_codes=_strings(row["diagnostic_codes"]),
+        evidence=[_evidence(item) for item in _objects(row["evidence"])],
+    )
+
+
+def _dependency(value: object) -> Dependency:
+    row = parse_json_object(canonical_json(value).decode("utf-8"))
+    string_keys = DEPENDENCY_KEYS - {"evidence"}
+    strings = {key: _string(row[key]) for key in string_keys}
+    return Dependency(**strings, evidence=[_evidence(item) for item in _objects(row["evidence"])])
+
+
+def _binding(value: object) -> ComponentBinding:
+    row = parse_json_object(canonical_json(value).decode("utf-8"))
+    active = row["active"]
+    if not isinstance(active, bool):
+        raise ValueError("expected boolean")
+    return ComponentBinding(
+        **{key: _string(row[key]) for key in BINDING_KEYS - {"active"}},
+        active=active,
+    )
+
+
+def _analyzer_manifest(value: object) -> AnalyzerManifest:
+    row = parse_json_object(canonical_json(value).decode("utf-8"))
+    return {
+        "schema_version": _string(row["schema_version"]),
+        "extension_analyzer_version": _string(row["extension_analyzer_version"]),
+        "source_generation_id": _string(row["source_generation_id"]),
+        "source_comparison_epoch_fingerprint": _string(row["source_comparison_epoch_fingerprint"]),
+        "routing_manifest_fingerprint": _string(row["routing_manifest_fingerprint"]),
+        "extension_adapter_versions": _strings(row["extension_adapter_versions"]),
+        "component_bindings": [_binding(item) for item in _objects(row["component_bindings"])],
+        "record_counts": _integer_map(row["record_counts"]),
+        "data_files": _string_map(row["data_files"]),
+        "output_fingerprint": _string(row["output_fingerprint"]),
+    }
+
+
+def _routing_manifest(value: object) -> RoutingManifest:
+    row = parse_json_object(canonical_json(value).decode("utf-8"))
+    groups: list[RoutingGroup] = []
+    for value_group in _objects(row["groups"]):
+        members: list[RoutingMember] = [
+            {"role": _string(member["role"]), "component_id": _string(member["component_id"])}
+            for member in _objects(value_group["members"])
+        ]
+        groups.append({
+            "routing_group_id": _string(value_group["routing_group_id"]),
+            "kind": _string(value_group.get("kind", "")),
+            "members": members,
+            "absent_roles": _strings(value_group.get("absent_roles", [])),
+            "probe_contract_version": _string(value_group.get("probe_contract_version", "")),
+            "probe_fingerprints": [
+                {"component_id": _string(item["component_id"]), "probe_fingerprint": _string(item["probe_fingerprint"])}
+                for item in _objects(value_group.get("probe_fingerprints", []))
+            ],
+            "form_counts": _integer_map(value_group.get("form_counts", {})),
+            "routing_reason": _string(value_group.get("routing_reason", "")),
+            "exporter": _string(value_group.get("exporter", "")),
+            "representation_schema": _string(value_group["representation_schema"]),
+            "exporter_version": _string(value_group.get("exporter_version", "")),
+            "converter_version": _string(value_group.get("converter_version", "")),
+        })
+    return {
+        "schema_version": _string(row["schema_version"]),
+        "routing_contract_version": _string(row.get("routing_contract_version", "")),
+        "groups": groups,
+        "routing_manifest_fingerprint": _string(row["routing_manifest_fingerprint"]),
+    }
+
+
+def _analyzer_result(value: object) -> AnalyzerResult:
+    row = parse_json_object(canonical_json(value).decode("utf-8"))
+    return {
+        "adapter_versions": _strings(row["adapter_versions"]),
+        "component_bindings": [_binding(item) for item in _objects(row["component_bindings"])],
+        "dependency_rows": [_dependency(item) for item in _objects(row["dependency_rows"])],
+        "detail_rows": [_detail(item) for item in _objects(row["detail_rows"])],
+        "extension_analyzer_version": _string(row["extension_analyzer_version"]),
+        "path_coverage": [_string_map(item) for item in _objects(row["path_coverage"])],
+        "physical_rows": [_string_map(item) for item in _objects(row["physical_rows"])],
+        "semantic_rows": [_string_map(item) for item in _objects(row["semantic_rows"])],
+    }
+
+
+def _strings(value: object) -> list[str]:
+    normalized = parse_json(canonical_json(value).decode("utf-8"))
+    if not isinstance(normalized, list):
+        raise ValueError("expected string array")
+    if not all(isinstance(item, str) for item in normalized):
+        raise ValueError("expected string array")
+    return [item for item in normalized if isinstance(item, str)]
+
+
+def _objects(value: object) -> list[dict[str, JsonValue]]:
+    normalized = parse_json(canonical_json(value).decode("utf-8"))
+    if not isinstance(normalized, list) or not all(isinstance(item, dict) for item in normalized):
+        raise ValueError("expected object array")
+    return [item for item in normalized if isinstance(item, dict)]
+
+
+def _string(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("expected string")
+    return value
+
+
+def _integer(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("expected integer")
+    return value
+
+
+def _string_map(value: object) -> dict[str, str]:
+    normalized = parse_json(canonical_json(value).decode("utf-8"))
+    if not isinstance(normalized, dict) or not all(isinstance(item, str) for item in normalized.values()):
+        raise ValueError("expected string map")
+    return {key: item for key, item in normalized.items() if isinstance(item, str)}
+
+
+def _integer_map(value: object) -> dict[str, int]:
+    normalized = parse_json(canonical_json(value).decode("utf-8"))
+    if not isinstance(normalized, dict) or not all(isinstance(item, int) and not isinstance(item, bool) for item in normalized.values()):
+        raise ValueError("expected integer map")
+    return {key: item for key, item in normalized.items() if isinstance(item, int) and not isinstance(item, bool)}
+
+
+def _component(value: object) -> ComponentRecord:
+    row = parse_json_object(canonical_json(value).decode("utf-8"))
+    base: ComponentRecord = {
+        "component_id": _string(row["component_id"]),
+        "kind": _string(row["kind"]),
+        "path": _string(row["path"]),
+        "fingerprint": _string(row["fingerprint"]),
+    }
+    if "representation_schema" in row:
+        base = {
+            **base,
+            "representation_schema": _string(row["representation_schema"]),
+            "routing_group_id": _string(row["routing_group_id"]),
+            "bsl_file_count": _integer(row["bsl_file_count"]),
+        }
+    return base
+
+
+def source_pointer(value: dict[str, JsonValue]) -> SourcePointer:
+    result: SourcePointer = {}
+    for key in (
+        "schema_version", "generation_id", "acquisition_profile_id",
+        "representation_schema", "normalizer_version", "routing_manifest_path",
+        "routing_manifest_fingerprint", "source_comparison_epoch_fingerprint",
+    ):
+        if key in value:
+            result[key] = _string(value[key])
+    if "components" in value:
+        result["components"] = [_component(item) for item in _objects(value["components"])]
+    return result
+
+
+def diff_pointer(value: dict[str, JsonValue]) -> DiffPointer:
+    return {
+        "schema_version": _string(value["schema_version"]),
+        "generation_id": _string(value["generation_id"]),
+        "source_generation_id": _string(value["source_generation_id"]),
+        "files": _string_map(value["files"]),
+        "row_counts": _integer_map(value["row_counts"]),
+    }
+
+
+_source_pointer = source_pointer
+def _valid_fingerprint(value: object, *, optional: bool = False) -> bool:
     return bool(optional and value == "") or bool(re.fullmatch(r"sha256:[0-9a-f]{64}", str(value)))
 
 
@@ -76,7 +339,7 @@ def compare(before_root: Path, after_root: Path, metadata: dict[str, str]) -> li
         raise RuntimeError(f"Git comparison failed with exit {result.returncode}")
     fields = result.stdout.split(b"\0")
     if fields and fields[-1] == b"":
-        fields.pop()
+        _ = fields.pop()
     if len(fields) % 2:
         raise ValueError("invalid NUL-delimited Git output")
     seen: set[tuple[str, str]] = set()
@@ -112,26 +375,33 @@ def compare(before_root: Path, after_root: Path, metadata: dict[str, str]) -> li
     return sorted(rows, key=lambda row: (row["comparison_id"], row["path"], row["change_type"]))
 
 
-def _write_csv(path: Path, header: tuple[str, ...], rows: list[dict[str, Any]]) -> None:
+def _write_csv(path: Path, header: tuple[str, ...], rows: list[dict[str, str]]) -> None:
+    def field(value: str) -> str:
+        return f'"{value.replace(chr(34), chr(34) * 2)}"' if any(char in value for char in ',"\r\n') else value
+
     with path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=header, lineterminator="\n")
-        writer.writeheader(); writer.writerows(rows)
+        _ = stream.write(",".join(field(name) for name in header) + "\n")
+        for row in rows:
+            _ = stream.write(",".join(field(row[name]) for name in header) + "\n")
         stream.flush(); os.fsync(stream.fileno())
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+def _write_jsonl(path: Path, rows: Sequence[object]) -> None:
     with path.open("wb") as stream:
         for row in sorted(rows, key=canonical_json):
-            stream.write(canonical_json(row) + b"\n")
+            _ = stream.write(canonical_json(row) + b"\n")
         stream.flush(); os.fsync(stream.fileno())
 
 
-def _read_csv(path: Path, header: tuple[str, ...]) -> list[dict[str, str]]:
+def read_csv(path: Path, header: tuple[str, ...]) -> list[dict[str, str]]:
     with path.open(encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
         if tuple(reader.fieldnames or ()) != header:
             raise ValueError(f"invalid diff CSV schema: {path.name}")
-        rows = list(reader)
+        raw_rows = list(reader)
+        if any(value is None for row in raw_rows for value in row.values()):
+            raise ValueError(f"invalid diff CSV row: {path.name}")
+        rows = [{key: _string(value) for key, value in row.items()} for row in raw_rows]
     expected = path.read_bytes()
     with tempfile.TemporaryDirectory() as temporary:
         canonical = Path(temporary) / path.name
@@ -141,13 +411,13 @@ def _read_csv(path: Path, header: tuple[str, ...]) -> list[dict[str, str]]:
     return rows
 
 
-def _read_jsonl(path: Path, keys: set[str]) -> list[dict[str, Any]]:
-    rows = []
+def _read_jsonl(path: Path, keys: set[str]) -> list[dict[str, JsonValue]]:
+    rows: list[dict[str, JsonValue]] = []
     for line in path.read_bytes().splitlines(keepends=True):
         if not line.endswith(b"\n"):
             raise ValueError(f"non-canonical JSONL: {path.name}")
         try:
-            row = json.loads(line)
+            row = parse_json_object(line.decode())
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"invalid JSONL: {path.name}") from exc
         if set(row) != keys or canonical_json(row) + b"\n" != line:
@@ -162,15 +432,13 @@ def validate_active(
     repo: Path,
     *,
     require_tracked_clean_state: bool = False,
-    candidate: dict[str, Any] | None = None,
-    source_candidate: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    candidate: DiffPointer | None = None,
+    source_candidate: SourcePointer | None = None,
+) -> DiffPointer:
     if candidate is None:
-        from .stage_recompute import recover_active_publication
-
-        recover_active_publication(repo)
-    pointer = candidate or json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
-    source = source_candidate or json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+        _recover_active_publication(repo)
+    pointer = candidate or diff_pointer(parse_json_object((repo / "research/active-diff-generation.json").read_text(encoding="utf-8")))
+    source = source_candidate or source_pointer(parse_json_object((repo / "research/active-source-generation.json").read_text(encoding="utf-8")))
     generation = str(pointer.get("generation_id", "")); source_id = str(source.get("generation_id", ""))
     if pointer.get("source_generation_id") != source_id or not generation:
         raise ValueError("active diff generation is stale")
@@ -187,26 +455,25 @@ def validate_active(
         raise ValueError("active diff generation has a mixed or incomplete file set")
     actual_hashes = {name: sha256((root / name).read_bytes()) for name in VERSION_FILES[version]}
     for name, header in headers.items():
-        rows[name] = _read_csv(root / name, header)
+        rows[name] = read_csv(root / name, header)
         if pointer.get("row_counts", {}).get(name) != len(rows[name]): raise ValueError(f"diff row count mismatch: {name}")
     if actual_hashes != pointer.get("files"):
         raise ValueError("active diff file hash mismatch")
     if sha256(canonical_json({"files": actual_hashes, "schema_version": version, "source_generation_id": source_id})) != generation:
         raise ValueError("active diff generation ID mismatch")
-    details: list[dict[str, Any]] = []
+    details: list[Detail] = []
+    from .extension_analyzer import target_coverage as expected_target_coverage
     if version == "2":
         from .extension_analyzer import (
             ADAPTERS,
             ANALYZER_VERSION,
             dependency_id as expected_dependency_id,
-            intervention_key as expected_intervention_key,
-            target_coverage as expected_target_coverage,
         )
 
-        details = _read_jsonl(root / "extension-diff.jsonl", DETAIL_KEYS)
-        dependencies = _read_jsonl(root / "extension-dependencies.jsonl", DEPENDENCY_KEYS)
-        physical = _read_csv(root / "extension-physical-diff.csv", INVENTORY_HEADER)
-        path_coverage = _read_csv(root / "extension-path-coverage.csv", PATH_COVERAGE_HEADER)
+        details = [_detail(row) for row in _read_jsonl(root / "extension-diff.jsonl", DETAIL_KEYS)]
+        dependencies = [_dependency(row) for row in _read_jsonl(root / "extension-dependencies.jsonl", DEPENDENCY_KEYS)]
+        physical = read_csv(root / "extension-physical-diff.csv", INVENTORY_HEADER)
+        path_coverage = read_csv(root / "extension-path-coverage.csv", PATH_COVERAGE_HEADER)
         for name, values in (
             ("extension-diff.jsonl", details),
             ("extension-dependencies.jsonl", dependencies),
@@ -216,7 +483,7 @@ def validate_active(
             if pointer.get("row_counts", {}).get(name) != len(values):
                 raise ValueError(f"diff row count mismatch: {name}")
         manifest_path = root / "extension-analyzer-manifest.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = _analyzer_manifest(parse_json_object(manifest_path.read_text(encoding="utf-8")))
         if set(manifest) != MANIFEST_KEYS or manifest_path.read_bytes() != canonical_json(manifest) + b"\n":
             raise ValueError("invalid extension analyzer manifest")
         manifest_preimage = {key: value for key, value in manifest.items() if key != "output_fingerprint"}
@@ -254,7 +521,7 @@ def validate_active(
         }
         if {item["component_id"] for item in manifest["component_bindings"]} != expected_component_ids:
             raise ValueError("incomplete extension component bindings")
-        binding_by_role_uuid = {}
+        binding_by_role_uuid: dict[tuple[str, str], ComponentBinding] = {}
         for binding in manifest["component_bindings"]:
             component = source_components.get(binding["component_id"])
             adapter = ADAPTERS.get(binding["representation_schema"], "")
@@ -300,7 +567,17 @@ def validate_active(
             raise ValueError("invalid extension semantic detail ordering")
         source_root = repo / "sources/generations" / source_id
         for detail in details:
-            if detail["intervention_key"] != expected_intervention_key(detail):
+            expected_key = content_id("EIN-", {
+                "affected_base_identity": detail["affected_base_identity"],
+                "extension_analyzer_version": ANALYZER_VERSION,
+                "extension_object_identity": detail["extension_object_identity"],
+                "extension_uuid": detail["extension_uuid"],
+                "intervention_kind": detail["intervention_kind"],
+                "object_scope": detail["object_scope"],
+                "structural_sublocation": detail["structural_sublocation"],
+                "symbol_identity": detail["symbol_identity"],
+            })
+            if detail["intervention_key"] != expected_key:
                 raise ValueError("invalid extension intervention identity")
             for evidence in detail["evidence"]:
                 binding = binding_by_role_uuid.get((evidence["role"], detail["extension_uuid"]))
@@ -335,7 +612,6 @@ def validate_active(
             )
         ):
             raise ValueError("duplicate extension dependency identity")
-        dependency_ids = {row["dependency_id"] for row in dependencies}
         if any(set(row["dependency_ids"]) != {item["dependency_id"] for item in dependencies if item["stable_diff_id"] == row["stable_diff_id"]} for row in details) or any(row["stable_diff_id"] not in detail_ids for row in dependencies):
             raise ValueError("extension dependency ownership mismatch")
         configuration_by_role = {
@@ -370,7 +646,7 @@ def validate_active(
             raise ValueError("extension path coverage is incomplete")
         physical_by_id = {row["stable_diff_id"]: row for row in physical}
         for row in path_coverage:
-            owners = json.loads(row["semantic_diff_ids"])
+            owners = _strings(parse_json(row["semantic_diff_ids"]))
             raw = physical_by_id[row["raw_diff_id"]]
             if owners != sorted(set(owners)) or bool(owners) == bool(row["noise_reason"]):
                 raise ValueError("invalid extension path disposition")
@@ -392,11 +668,11 @@ def validate_active(
                 before_binding = binding_by_role_uuid.get((raw["before_role"], extension_uuid))
                 after_binding = binding_by_role_uuid.get((raw["after_role"], extension_uuid))
 
-                def component_manifest(binding: dict[str, Any] | None) -> dict[str, Any] | None:
+                def component_manifest(binding: ComponentBinding | None) -> dict[str, JsonValue] | None:
                     if binding is None:
                         return None
                     path = source_root / binding["component_path"] / "component-manifest.json"
-                    return json.loads(path.read_text(encoding="utf-8"))
+                    return parse_json_object(path.read_text(encoding="utf-8"))
 
                 before_manifest = component_manifest(before_binding)
                 after_manifest = component_manifest(after_binding)
@@ -413,16 +689,16 @@ def validate_active(
     seen: set[str] = set(); customer: set[str] = set()
     routed = version == "2"
     detail_by_id = {row["stable_diff_id"]: row for row in details}
-    manifest = json.loads((root / "extension-analyzer-manifest.json").read_text(encoding="utf-8")) if routed else {}
+    manifest = _analyzer_manifest(parse_json_object((root / "extension-analyzer-manifest.json").read_text(encoding="utf-8"))) if routed else None
     routed_ids = {
         (kind, before, after): content_id("CMP-", {
             "after_role": after,
             "before_role": before,
             "comparison_kind": kind,
-            "extension_adapter_versions": manifest["extension_adapter_versions"],
-            "extension_analyzer_version": manifest["extension_analyzer_version"],
+            "extension_adapter_versions": manifest["extension_adapter_versions"] if manifest else [],
+            "extension_analyzer_version": manifest["extension_analyzer_version"] if manifest else "",
             "schema_version": "2",
-            "source_comparison_epoch_fingerprint": source["source_comparison_epoch_fingerprint"],
+            "source_comparison_epoch_fingerprint": _string(source.get("source_comparison_epoch_fingerprint")),
         })
         for kind, before, after in COMPARISONS
     } if routed else {}
@@ -430,7 +706,7 @@ def validate_active(
         if row["source_generation"] != source_id or row["before_role"] != "vendor_baseline" or row["after_role"] not in {"target_cf", "next_vendor"}:
             raise ValueError("mixed or invalid diff roles")
         kind = "customer-customization" if row["after_role"] == "target_cf" else "target-release"
-        cmp_id = routed_ids[(kind, row["before_role"], row["after_role"])] if routed else comparison_id(kind, row["before_role"], row["after_role"], source["acquisition_profile_id"], source["representation_schema"], source["normalizer_version"])
+        cmp_id = routed_ids[(kind, row["before_role"], row["after_role"])] if routed else comparison_id(kind, row["before_role"], row["after_role"], _string(source.get("acquisition_profile_id")), _string(source.get("representation_schema")), _string(source.get("normalizer_version")))
         if row["object_kind"] == "extension_intervention":
             detail = detail_by_id.get(row["stable_diff_id"])
             expected = content_id("DIF-", {"change_type": row["change_type"], "comparison_id": cmp_id, "intervention_key": detail["intervention_key"] if detail else "", "schema_version": "2"})
@@ -472,28 +748,28 @@ def validate_active(
     return pointer
 
 
-def build(repo: Path, source_pointer: dict[str, Any], cancelled: callable | None = None, *, activate: bool = True) -> dict[str, Any]:
+def build(repo: Path, source_pointer: SourcePointer, cancelled: Callable[[], bool] | None = None, *, activate: bool = True) -> DiffPointer:
     if source_pointer.get("schema_version") == "2":
         from .sources import validate_active as validate_source
         if activate and validate_source(repo, deep=False) != source_pointer:
             raise RuntimeError("stale or invalid source generation")
     with repository_lock(repo):
-        current = __import__("json").loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
-        if activate and current != source_pointer:
+        current = parse_json_object((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+        if activate and canonical_json(current) != canonical_json(source_pointer):
             raise RuntimeError("stale source generation")
         if cancelled and cancelled():
             raise InterruptedError("diff build cancelled before comparison")
         return _build_locked(repo, source_pointer, cancelled=cancelled, activate=activate)
 
 
-def _build_locked(repo: Path, source_pointer: dict[str, Any], cancelled: callable | None = None, *, activate: bool = True) -> dict[str, Any]:
+def _build_locked(repo: Path, source_pointer: SourcePointer, cancelled: Callable[[], bool] | None = None, *, activate: bool = True) -> DiffPointer:
     if source_pointer.get("schema_version") == "2":
         return _build_routed(repo, source_pointer, cancelled=cancelled, activate=activate)
     raise ValueError("new diff builds require routed source schema version 2")
 
 
-def _publish_inventory(repo: Path, source_pointer: dict[str, Any], inventory: list[dict[str, str]]) -> dict[str, Any]:
-    source_id = source_pointer["generation_id"]
+def _publish_inventory(repo: Path, source_pointer: SourcePointer, inventory: list[dict[str, str]]) -> DiffPointer:
+    source_id = _string(source_pointer.get("generation_id"))
     routed = source_pointer.get("schema_version") == "2"
     id_preimages: dict[str, bytes] = {}
     for row in inventory:
@@ -517,12 +793,12 @@ def _publish_inventory(repo: Path, source_pointer: dict[str, Any], inventory: li
     current_comparisons = {row["comparison_id"] for row in inventory}
     if not current_comparisons:
         if routed:
-            epoch = source_pointer["source_comparison_epoch_fingerprint"]
+            epoch = _string(source_pointer.get("source_comparison_epoch_fingerprint"))
             current_comparisons = {content_id("CMP-", {"after_role": after, "before_role": before, "comparison_kind": kind, "schema_version": "2", "source_comparison_epoch_fingerprint": epoch}) for kind, before, after in COMPARISONS}
         else:
-            current_comparisons = {comparison_id(kind, before, after, source_pointer["acquisition_profile_id"], source_pointer["representation_schema"], source_pointer["normalizer_version"]) for kind, before, after in COMPARISONS}
+            current_comparisons = {comparison_id(kind, before, after, _string(source_pointer.get("acquisition_profile_id")), _string(source_pointer.get("representation_schema")), _string(source_pointer.get("normalizer_version"))) for kind, before, after in COMPARISONS}
     if pointer_path.is_file():
-        old_pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        old_pointer = parse_json_object(pointer_path.read_text(encoding="utf-8"))
         old_map = repo / "analysis/indexes/generations" / str(old_pointer.get("generation_id", "")) / "diff-id-map.csv"
         if old_map.is_file():
             with old_map.open(encoding="utf-8", newline="") as stream:
@@ -532,7 +808,7 @@ def _publish_inventory(repo: Path, source_pointer: dict[str, Any], inventory: li
     id_map.extend({**row, "active": "false"} for identifier, row in previous.items() if identifier not in active_ids)
     id_map.sort(key=lambda row: (row["comparison_id"], row["path"], row["change_type"], row["stable_diff_id"]))
     target_by_path = {row["path"]: row for row in inventory if row["after_role"] == "next_vendor"}
-    coverage = []
+    coverage: list[dict[str, str]] = []
     for row in inventory:
         if row["after_role"] != "target_cf":
             continue
@@ -575,15 +851,15 @@ def _publish_inventory(repo: Path, source_pointer: dict[str, Any], inventory: li
                 os.close(parent_fd)
         if any(sha256((destination / name).read_bytes()) != digest for name, digest in hashes.items()):
             raise RuntimeError("existing diff generation does not match its deterministic identity")
-        pointer = {"schema_version": "1", "generation_id": generation_id, "source_generation_id": source_id, "files": hashes, "row_counts": {"diff-inventory.csv": len(inventory), "diff-id-map.csv": len(id_map), "target-coverage.csv": len(coverage)}}
+        pointer: DiffPointer = {"schema_version": "1", "generation_id": generation_id, "source_generation_id": source_id, "files": hashes, "row_counts": {"diff-inventory.csv": len(inventory), "diff-id-map.csv": len(id_map), "target-coverage.csv": len(coverage)}}
         atomic_json(repo / "research/active-diff-generation.json", pointer)
         return pointer
 
 
-def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], inventory: list[dict[str, str]], analysis: dict[str, Any], *, activate: bool = True) -> dict[str, Any]:
+def _publish_routed_inventory(repo: Path, source_pointer: SourcePointer, inventory: list[dict[str, str]], analysis: AnalyzerResult, *, activate: bool = True) -> DiffPointer:
     from .extension_analyzer import target_coverage as semantic_target_coverage
 
-    source_id = source_pointer["generation_id"]
+    source_id = _string(source_pointer.get("generation_id"))
     inventory = sorted(inventory, key=lambda row: (row["comparison_id"], row["path"], row["change_type"], row["stable_diff_id"]))
     details = sorted(analysis["detail_rows"], key=canonical_json)
     dependencies = sorted(analysis["dependency_rows"], key=canonical_json)
@@ -606,14 +882,14 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
     if len(preimages) != len(inventory):
         raise ValueError("duplicate routed DIF identity")
     for row in inventory:
-        expected = content_id("DIF-", json.loads(preimages[row["stable_diff_id"]]))
+        expected = content_id("DIF-", parse_json_object(preimages[row["stable_diff_id"]].decode()))
         if expected != row["stable_diff_id"]:
             raise ValueError(f"invalid routed DIF identity: {row['stable_diff_id']}")
     pointer_path = repo / "research/active-diff-generation.json"
     previous: dict[str, dict[str, str]] = {}
     current_comparisons = {row["comparison_id"] for row in inventory}
     if pointer_path.is_file():
-        old_pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        old_pointer = parse_json_object(pointer_path.read_text(encoding="utf-8"))
         old_map = repo / "analysis/indexes/generations" / str(old_pointer.get("generation_id", "")) / "diff-id-map.csv"
         if old_map.is_file():
             with old_map.open(encoding="utf-8", newline="") as stream:
@@ -643,7 +919,7 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
     id_map.sort(key=lambda row: (row["comparison_id"], row["path"], row["change_type"], row["stable_diff_id"]))
     target_by_path = {row["path"]: row for row in inventory if row["after_role"] == "next_vendor" and row["object_kind"] != "extension_intervention"}
     target_by_key = {row["intervention_key"]: row for row in details if row["after_role"] == "next_vendor"}
-    coverage = []
+    coverage: list[dict[str, str]] = []
     for row in inventory:
         if row["after_role"] != "target_cf":
             continue
@@ -681,8 +957,8 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
             "schema_version": "2",
             "extension_analyzer_version": analysis["extension_analyzer_version"],
             "source_generation_id": source_id,
-            "source_comparison_epoch_fingerprint": source_pointer["source_comparison_epoch_fingerprint"],
-            "routing_manifest_fingerprint": source_pointer["routing_manifest_fingerprint"],
+            "source_comparison_epoch_fingerprint": _string(source_pointer.get("source_comparison_epoch_fingerprint")),
+            "routing_manifest_fingerprint": _string(source_pointer.get("routing_manifest_fingerprint")),
             "extension_adapter_versions": sorted(analysis["adapter_versions"]),
             "component_bindings": sorted(analysis["component_bindings"], key=canonical_json),
             "record_counts": {
@@ -692,7 +968,7 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
             "data_files": data_files,
         }
         manifest["output_fingerprint"] = "sha256:" + sha256(canonical_json(manifest))
-        (staging / "extension-analyzer-manifest.json").write_bytes(canonical_json(manifest) + b"\n")
+        _ = (staging / "extension-analyzer-manifest.json").write_bytes(canonical_json(manifest) + b"\n")
         for name, header in (
             ("diff-inventory.csv", INVENTORY_HEADER),
             ("diff-id-map.csv", ID_MAP_HEADER),
@@ -700,9 +976,9 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
             ("extension-physical-diff.csv", INVENTORY_HEADER),
             ("extension-path-coverage.csv", PATH_COVERAGE_HEADER),
         ):
-            _read_csv(staging / name, header)
-        _read_jsonl(staging / "extension-diff.jsonl", DETAIL_KEYS)
-        _read_jsonl(staging / "extension-dependencies.jsonl", DEPENDENCY_KEYS)
+            _ = read_csv(staging / name, header)
+        _ = _read_jsonl(staging / "extension-diff.jsonl", DETAIL_KEYS)
+        _ = _read_jsonl(staging / "extension-dependencies.jsonl", DEPENDENCY_KEYS)
         if set(manifest) != MANIFEST_KEYS or (staging / "extension-analyzer-manifest.json").read_bytes() != canonical_json(manifest) + b"\n":
             raise ValueError("invalid staged extension analyzer manifest")
         hashes = {name: sha256((staging / name).read_bytes()) for name in VERSION_FILES["2"]}
@@ -718,7 +994,7 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
                 os.close(parent_fd)
         if any(sha256((destination / name).read_bytes()) != digest for name, digest in hashes.items()):
             raise RuntimeError("existing diff generation does not match its deterministic identity")
-        pointer = {
+        pointer: DiffPointer = {
             "schema_version": "2", "generation_id": generation_id, "source_generation_id": source_id, "files": hashes,
             "row_counts": {
                 "diff-inventory.csv": len(inventory), "diff-id-map.csv": len(id_map), "target-coverage.csv": len(coverage),
@@ -726,10 +1002,10 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
                 "extension-physical-diff.csv": len(physical), "extension-path-coverage.csv": len(path_coverage),
             },
         }
-        current_source = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+        current_source = parse_json_object((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
         if activate and current_source != source_pointer:
             raise RuntimeError("stale source generation before diff publication")
-        validate_active(repo, candidate=pointer, source_candidate=source_pointer)
+        _ = validate_active(repo, candidate=pointer, source_candidate=source_pointer)
         if activate:
             atomic_json(pointer_path, pointer)
             canonical_pointer = repo / "research/active-generation.json"
@@ -743,18 +1019,18 @@ def _publish_routed_inventory(repo: Path, source_pointer: dict[str, Any], invent
         return pointer
 
 
-def _build_routed(repo: Path, source_pointer: dict[str, Any], cancelled: callable | None = None, *, activate: bool = True) -> dict[str, Any]:
+def _build_routed(repo: Path, source_pointer: SourcePointer, cancelled: Callable[[], bool] | None = None, *, activate: bool = True) -> DiffPointer:
     from .extension_analyzer import analyze_role_union, build_main_config_index, comparison_id_v2
 
-    source_id = source_pointer["generation_id"]
+    source_id = _string(source_pointer.get("generation_id"))
     source_root = repo / "sources/generations" / source_id
-    manifest = json.loads((source_root / source_pointer["routing_manifest_path"]).read_text(encoding="utf-8"))
-    epoch = source_pointer["source_comparison_epoch_fingerprint"]
-    components = {item["component_id"]: item for item in source_pointer["components"]}
-    inventory = []
-    raw_extensions = []
-    role_components: dict[str, dict[str, tuple[Path, str]]] = {role: {} for role in ("vendor_baseline", "target_cf", "next_vendor")}
-    main_config_indexes: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    manifest = _routing_manifest(parse_json_object((source_root / _string(source_pointer.get("routing_manifest_path"))).read_text(encoding="utf-8")))
+    epoch = _string(source_pointer.get("source_comparison_epoch_fingerprint"))
+    components = {item["component_id"]: item for item in source_pointer.get("components", [])}
+    inventory: list[dict[str, str]] = []
+    raw_extensions: list[dict[str, str]] = []
+    role_components: dict[str, dict[str, Path | tuple[Path, str]]] = {role: {} for role in ("vendor_baseline", "target_cf", "next_vendor")}
+    main_config_indexes: dict[str, dict[str, list[MainMatch]]] = {}
     for group in manifest["groups"]:
         if cancelled and cancelled():
             raise InterruptedError("diff build cancelled during component binding")
@@ -783,28 +1059,28 @@ def _build_routed(repo: Path, source_pointer: dict[str, Any], cancelled: callabl
                     "comparison_kind": kind,
                     "before_role": before,
                     "after_role": after,
-                    "acquisition_profile_id": source_pointer["acquisition_profile_id"],
+                    "acquisition_profile_id": _string(source_pointer.get("acquisition_profile_id")),
                     "representation_schema": group["representation_schema"],
-                    "normalizer_version": source_pointer["normalizer_version"],
+                    "normalizer_version": _string(source_pointer.get("normalizer_version")),
                     "source_generation": source_id,
                     "comparison_id": cmp_id,
                     "path_prefix": prefix,
                     "schema_version": "2",
-                    "include_component_manifest": group["routing_group_id"].startswith("extension:"),
+                    "include_component_manifest": "true" if group["routing_group_id"].startswith("extension:") else "",
                 })
                 if group["routing_group_id"].startswith("extension:"):
                     raw_extensions.extend(rows)
                 else:
                     inventory.extend(rows)
-    analysis = analyze_role_union(
+    analysis = _analyzer_result(analyze_role_union(
         role_components,
         epoch,
         source_generation_id=source_id,
         main_config_indexes=main_config_indexes,
         raw_rows=raw_extensions,
         cancelled=cancelled,
-    )
-    pointer_components = {item["component_id"]: item for item in source_pointer["components"]}
+    ))
+    pointer_components = {item["component_id"]: item for item in source_pointer.get("components", [])}
     for binding in analysis["component_bindings"]:
         component = pointer_components.get(binding["component_id"])
         if not component or component["path"] != binding["component_path"]:
@@ -816,3 +1092,6 @@ def _build_routed(repo: Path, source_pointer: dict[str, Any], cancelled: callabl
     if cancelled and cancelled():
         raise InterruptedError("diff build cancelled before publication")
     return _publish_routed_inventory(repo, source_pointer, inventory, analysis, activate=activate)
+
+
+_ = _publish_inventory

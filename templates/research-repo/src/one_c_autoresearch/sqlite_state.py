@@ -13,18 +13,34 @@
 
 from __future__ import annotations
 
-import json
-import os
 import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from types import TracebackType
+from typing import TYPE_CHECKING, Protocol, Self, TypeGuard, runtime_checkable
+from typing_extensions import override
 
-from .contracts import canonical_json, repository_lock, sha256
+if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
+    from langchain_core.runnables import RunnableConfig
+    from langchain_core.runnables.utils import ConfigurableFieldSpec
+    from langgraph.checkpoint.base import (
+        ChannelVersions,
+        Checkpoint,
+        CheckpointMetadata,
+        CheckpointTuple,
+    )
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    from .events import EventStore
+
+from .contracts import JsonValue, canonical_json, parse_json, parse_json_object, repository_lock, sha256
 from .user_state import state_root, workspace_id
 
 
@@ -43,6 +59,109 @@ INVOCATION_ERROR_CODES = {
     "environment_unavailable",
     "internal_error",
 }
+SqlValue = None | int | float | str
+SqlRow = tuple[SqlValue, ...]
+
+
+class _Cursor(Protocol):
+    rowcount: int
+
+    def execute(self, sql: str, parameters: object = ()) -> Self: ...
+    def executemany(self, sql: str, parameters: Iterable[object]) -> Self: ...
+    def executescript(self, sql_script: str) -> Self: ...
+    def fetchone(self) -> SqlRow | None: ...
+    def fetchall(self) -> list[SqlRow]: ...
+    def close(self) -> None: ...
+    def __iter__(self) -> Iterator[SqlRow]: ...
+
+
+@runtime_checkable
+class _Connection(Protocol):
+    def cursor(self) -> _Cursor: ...
+    def execute(self, sql: str, parameters: object = ()) -> _Cursor: ...
+    def commit(self) -> None: ...
+    def close(self) -> None: ...
+    def backup(self, target: sqlite3.Connection) -> None: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None: ...
+
+
+@runtime_checkable
+class _HasConfigSpecs(Protocol):
+    @property
+    def config_specs(self) -> object: ...
+
+
+@runtime_checkable
+class _HasNoArgPut(Protocol):
+    def put(self) -> object: ...
+
+
+def _connection(value: object) -> _Connection:
+    if not isinstance(value, _Connection):
+        raise TypeError("unexpected SQLite connection")
+    return value
+
+
+def _fetchone(cursor: _Cursor) -> SqlRow | None:
+    return cursor.fetchone()
+
+
+def _fetchall(cursor: _Cursor) -> list[SqlRow]:
+    return cursor.fetchall()
+
+
+def _text(value: SqlValue) -> str:
+    if not isinstance(value, str):
+        raise TypeError("unexpected SQLite text value")
+    return value
+
+
+def _integer(value: SqlValue) -> int:
+    if not isinstance(value, int):
+        raise TypeError("unexpected SQLite integer value")
+    return value
+
+
+def _number(value: JsonValue) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("expected a JSON number")
+    return value
+
+
+def _string(value: JsonValue) -> str:
+    if not isinstance(value, str):
+        raise TypeError("expected a JSON string")
+    return value
+
+
+def _strings(value: JsonValue) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise TypeError("expected a JSON string array")
+    return [item for item in value if isinstance(item, str)]
+
+
+def _is_runnable_config(value: object) -> TypeGuard[RunnableConfig]:
+    return isinstance(value, dict)
+
+
+def _config_specs(value: object) -> list[ConfigurableFieldSpec]:
+    from langchain_core.runnables.utils import ConfigurableFieldSpec
+
+    if not isinstance(value, _HasConfigSpecs):
+        raise TypeError("checkpoint saver has no config specs")
+    specs = value.config_specs
+    if not isinstance(specs, Sequence) or not all(
+        isinstance(spec, ConfigurableFieldSpec) for spec in specs
+    ):
+        raise TypeError("checkpoint saver returned invalid config specs")
+    return [spec for spec in specs if isinstance(spec, ConfigurableFieldSpec)]
+
+
+def _call_no_arg_put(value: object) -> object:
+    if not isinstance(value, _HasNoArgPut):
+        raise TypeError("checkpoint saver put is not callable")
+    return value.put()
 
 
 class SourceSearchBudgetError(RuntimeError):
@@ -54,36 +173,36 @@ class SourceSearchBudgetError(RuntimeError):
         requested: int | float,
     ):
         super().__init__("source_search.budget_exhausted")
-        self.code = "source_search.budget_exhausted"
-        self.limit = limit
-        self.limit_value = limit_value
-        self.consumed = consumed
-        self.requested = requested
+        self.code: str = "source_search.budget_exhausted"
+        self.limit: str = limit
+        self.limit_value: int | float = limit_value
+        self.consumed: int | float = consumed
+        self.requested: int | float = requested
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _decode_context_columns(row: dict[str, Any]) -> dict[str, Any]:
-    for key, empty in (
-        ("context_provenance", []),
-        ("context_diagnostics", {}),
-    ):
-        encoded = row.get(key)
-        if not encoded:
-            row[key] = empty
-            continue
-        try:
-            decoded = json.loads(str(encoded))
-        except json.JSONDecodeError:
-            decoded = empty
-        row[key] = decoded if isinstance(decoded, type(empty)) else empty
+def _decode_context_columns(row: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    encoded_provenance = row.get("context_provenance")
+    try:
+        provenance: JsonValue = parse_json(encoded_provenance) if isinstance(encoded_provenance, str) else []
+    except ValueError:
+        provenance = []
+    row["context_provenance"] = provenance if isinstance(provenance, list) else []
+
+    encoded_diagnostics = row.get("context_diagnostics")
+    try:
+        diagnostics: JsonValue = parse_json(encoded_diagnostics) if isinstance(encoded_diagnostics, str) else {}
+    except ValueError:
+        diagnostics = {}
+    row["context_diagnostics"] = diagnostics if isinstance(diagnostics, dict) else {}
     return row
 
 
 def _terminalize_rows(
-    cur,
+    cur: _Cursor,
     invocation_ids: list[str],
     status: str,
     now: str,
@@ -95,15 +214,15 @@ def _terminalize_rows(
     changed = 0
     for invocation_id in invocation_ids:
         row = cur.execute(
-            "SELECT run_id, phase_id, role_id, slot_id, work_unit_id, created_at "
+            "SELECT run_id, phase_id, role_id, slot_id, work_unit_id, created_at " +
             "FROM dispatcher_invocations WHERE invocation_id = ? AND status = 'running'",
             (invocation_id,),
         ).fetchone()
         if row is None:
             continue
-        cur.execute(
-            "UPDATE dispatcher_invocations SET status = ?, updated_at = ?, "
-            "finished_at = ?, error_code = ?, error_summary = ?, result_ref = ? "
+        _ = cur.execute(
+            "UPDATE dispatcher_invocations SET status = ?, updated_at = ?, " +
+            "finished_at = ?, error_code = ?, error_summary = ?, result_ref = ? " +
             "WHERE invocation_id = ? AND status = 'running'",
             (
                 status,
@@ -119,26 +238,26 @@ def _terminalize_rows(
             continue
         changed += 1
         if status in {"cancelled", "interrupted"}:
-            cur.execute(
-                "UPDATE source_search_invocations SET admission_state = 'closed', "
+            _ = cur.execute(
+                "UPDATE source_search_invocations SET admission_state = 'closed', " +
                 "updated_at = ? WHERE invocation_id = ? AND admission_state = 'open'",
                 (now, invocation_id),
             )
-            cur.execute(
-                "UPDATE source_search_calls SET status = ?, error_code = ?, "
-                "actual_results = 0, actual_returned_bytes = 0, actual_backend_seconds = 0, "
+            _ = cur.execute(
+                "UPDATE source_search_calls SET status = ?, error_code = ?, " +
+                "actual_results = 0, actual_returned_bytes = 0, actual_backend_seconds = 0, " +
                 "finished_at = ? WHERE invocation_id = ? AND status = 'reserved'",
                 (status, f"source_search.{status}", now, invocation_id),
             )
-        cur.execute(
-            "UPDATE dispatcher_phase_work SET status = ?, updated_at = ? "
+        _ = cur.execute(
+            "UPDATE dispatcher_phase_work SET status = ?, updated_at = ? " +
             "WHERE invocation_id = ? AND status = 'running'",
             (status, now, invocation_id),
         )
         try:
             duration = max(
                 0.0,
-                (datetime.fromisoformat(now) - datetime.fromisoformat(row[5])).total_seconds(),
+                (datetime.fromisoformat(now) - datetime.fromisoformat(_text(row[5]))).total_seconds(),
             )
         except (TypeError, ValueError):
             duration = 0.0
@@ -160,9 +279,9 @@ def _terminalize_rows(
             payload["error_summary"] = error_summary
         if result_ref:
             payload["result_ref"] = result_ref
-        cur.execute(
-            "INSERT OR IGNORE INTO dispatcher_invocation_outbox "
-            "(transition_key, invocation_id, run_id, event_type, payload, created_at) "
+        _ = cur.execute(
+            "INSERT OR IGNORE INTO dispatcher_invocation_outbox " +
+            "(transition_key, invocation_id, run_id, event_type, payload, created_at) " +
             "VALUES (?, ?, ?, 'invocation.finished', ?, ?)",
             (
                 payload["transition_key"],
@@ -188,7 +307,7 @@ def dispatcher_db_path(repo: Path, base: Path | None = None) -> Path:
     return path
 
 
-def _import_saver():
+def _import_saver() -> type[SqliteSaver]:
     """Импортирует ``SqliteSaver`` лениво, чтобы пакет оставался импортируемым
     без установленного extra ``workspace``.
     """
@@ -200,29 +319,28 @@ def _import_saver():
     return SqliteSaver
 
 
-def _apply_pragmas(saver) -> None:
+def _apply_pragmas(saver: SqliteSaver) -> None:
     """Применяет короткие безопасные PRAGMA к соединению библиотечного saver-а.
 
     ``journal_mode=WAL`` библиотека уже включает в ``setup()``; здесь добавляем
     только ``busy_timeout`` (по ``design.md`` §3) и подтверждаем ``synchrousnous=NORMAL``.
     """
 
-    conn = getattr(saver, "conn", None)
-    if conn is None:
-        return
+    raw_conn = saver.conn
+    conn = _connection(raw_conn)
     cur = conn.cursor()
     try:
-        cur.execute(f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT_MS)};")
-        cur.execute("PRAGMA synchronous = NORMAL;")
+        _ = cur.execute(f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT_MS)};")
+        _ = cur.execute("PRAGMA synchronous = NORMAL;")
         conn.commit()
     finally:
         cur.close()
 
 
-def _ensure_dispatcher_tables(conn) -> None:
+def _ensure_dispatcher_tables(conn: _Connection) -> None:
     cur = conn.cursor()
     try:
-        cur.executescript(
+        _ = cur.executescript(
             """
             CREATE TABLE IF NOT EXISTS dispatcher_revision (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -387,14 +505,14 @@ def _ensure_dispatcher_tables(conn) -> None:
         )
         columns = {row[1] for row in cur.execute("PRAGMA table_info(dispatcher_leases)")}
         if "lease_token" not in columns:
-            cur.execute("ALTER TABLE dispatcher_leases ADD COLUMN lease_token TEXT")
+            _ = cur.execute("ALTER TABLE dispatcher_leases ADD COLUMN lease_token TEXT")
         if "run_id" not in columns:
-            cur.execute("ALTER TABLE dispatcher_leases ADD COLUMN run_id TEXT NOT NULL DEFAULT ''")
+            _ = cur.execute("ALTER TABLE dispatcher_leases ADD COLUMN run_id TEXT NOT NULL DEFAULT ''")
         if "execution_snapshot_fingerprint" not in columns:
-            cur.execute("ALTER TABLE dispatcher_leases ADD COLUMN execution_snapshot_fingerprint TEXT NOT NULL DEFAULT ''")
+            _ = cur.execute("ALTER TABLE dispatcher_leases ADD COLUMN execution_snapshot_fingerprint TEXT NOT NULL DEFAULT ''")
         retry_columns = {row[1] for row in cur.execute("PRAGMA table_info(dispatcher_retry_runs)")}
         if "owner_token" not in retry_columns:
-            cur.execute("ALTER TABLE dispatcher_retry_runs ADD COLUMN owner_token TEXT NOT NULL DEFAULT ''")
+            _ = cur.execute("ALTER TABLE dispatcher_retry_runs ADD COLUMN owner_token TEXT NOT NULL DEFAULT ''")
         invocation_columns = {
             row[1] for row in cur.execute("PRAGMA table_info(dispatcher_invocations)")
         }
@@ -413,20 +531,20 @@ def _ensure_dispatcher_tables(conn) -> None:
         }
         for name, column_type in additions.items():
             if name not in invocation_columns:
-                cur.execute(
+                _ = cur.execute(
                     f"ALTER TABLE dispatcher_invocations ADD COLUMN {name} {column_type}"
                 )
         search_invocation_columns = {
             row[1] for row in cur.execute("PRAGMA table_info(source_search_invocations)")
         }
         if "expires_at" not in search_invocation_columns:
-            cur.execute(
-                "ALTER TABLE source_search_invocations ADD COLUMN expires_at TEXT NOT NULL "
+            _ = cur.execute(
+                "ALTER TABLE source_search_invocations ADD COLUMN expires_at TEXT NOT NULL " +
                 "DEFAULT '1970-01-01T00:00:00+00:00'"
             )
         for name in ("last_error_code", "last_error_details"):
             if name not in search_invocation_columns:
-                cur.execute(
+                _ = cur.execute(
                     f"ALTER TABLE source_search_invocations ADD COLUMN {name} TEXT"
                 )
         search_call_columns = {
@@ -439,18 +557,18 @@ def _ensure_dispatcher_tables(conn) -> None:
             "canonical_manifest_fingerprint", "derived_manifest_fingerprint",
         ):
             if name not in search_call_columns:
-                cur.execute(f"ALTER TABLE source_search_calls ADD COLUMN {name} TEXT")
+                _ = cur.execute(f"ALTER TABLE source_search_calls ADD COLUMN {name} TEXT")
         phase_columns = {
             row[1] for row in cur.execute("PRAGMA table_info(dispatcher_phase_work)")
         }
         for name in ("execution_kind", "source_result_ref", "context_diagnostics"):
             if name not in phase_columns:
-                cur.execute(
+                _ = cur.execute(
                     f"ALTER TABLE dispatcher_phase_work ADD COLUMN {name} TEXT"
                 )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS dispatcher_invocation_history "
-            "ON dispatcher_invocations "
+        _ = cur.execute(
+            "CREATE INDEX IF NOT EXISTS dispatcher_invocation_history " +
+            "ON dispatcher_invocations " +
             "(run_id, phase_id, role_id, slot_id, created_at DESC, invocation_id DESC)"
         )
         conn.commit()
@@ -458,7 +576,9 @@ def _ensure_dispatcher_tables(conn) -> None:
         cur.close()
 
 
-def _acquire_saver(repo: Path, base: Path | None = None):
+def _acquire_saver(
+    repo: Path, base: Path | None = None
+) -> tuple[SqliteSaver, AbstractContextManager[SqliteSaver]]:
     """Открывает saver и подготавливает таблицы диспетчера.
 
     Возвращает кортеж ``(saver, conn)``; вызывающий ответственен за закрытие
@@ -473,7 +593,7 @@ def _acquire_saver(repo: Path, base: Path | None = None):
         _apply_pragmas(saver)
         columns = {
             row[1]
-            for row in saver.conn.execute(
+            for row in _connection(saver.conn).execute(
                 "PRAGMA table_info(dispatcher_invocations)"
             )
         }
@@ -482,7 +602,7 @@ def _acquire_saver(repo: Path, base: Path | None = None):
             if not backup.exists():
                 destination = sqlite3.connect(backup)
                 try:
-                    saver.conn.backup(destination)
+                    _connection(saver.conn).backup(destination)
                 finally:
                     destination.close()
                 backup.chmod(0o600)
@@ -491,13 +611,13 @@ def _acquire_saver(repo: Path, base: Path | None = None):
             if not backup.exists():
                 destination = sqlite3.connect(backup)
                 try:
-                    saver.conn.backup(destination)
+                    _connection(saver.conn).backup(destination)
                 finally:
                     destination.close()
                 backup.chmod(0o600)
-        _ensure_dispatcher_tables(saver.conn)
+        _ensure_dispatcher_tables(_connection(saver.conn))
     except Exception:
-        saver_cm.__exit__(None, None, None)
+        _ = saver_cm.__exit__(None, None, None)
         raise
     return saver, saver_cm
 
@@ -522,12 +642,12 @@ class DispatcherStore:
     """
 
     def __init__(self, repo: Path, base: Path | None = None) -> None:
-        self.repo = repo.resolve()
-        self.base = base
-        self.path = dispatcher_db_path(self.repo, base)
-        self._lock = threading.RLock()
-        self._saver = None
-        self._saver_cm = None
+        self.repo: Path = repo.resolve()
+        self.base: Path | None = base
+        self.path: Path = dispatcher_db_path(self.repo, base)
+        self._lock: threading.RLock = threading.RLock()
+        self._saver: SqliteSaver | None = None
+        self._saver_cm: AbstractContextManager[SqliteSaver] | None = None
 
     # -- жизненный цикл соединения -------------------------------------
 
@@ -535,7 +655,12 @@ class DispatcherStore:
         self.open()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def open(self) -> None:
@@ -550,37 +675,38 @@ class DispatcherStore:
             if self._saver_cm is None:
                 return
             try:
-                self._saver_cm.__exit__(None, None, None)
+                _ = self._saver_cm.__exit__(None, None, None)
             finally:
                 self._saver = None
                 self._saver_cm = None
 
     @property
-    def saver(self):
+    def saver(self) -> SqliteSaver:
         if self._saver is None:
             self.open()
+        assert self._saver is not None
         return self._saver
 
     @property
-    def conn(self):
-        return self.saver.conn
+    def conn(self) -> _Connection:
+        return _connection(self.saver.conn)
 
     def owns_lease(self, job_id: str, lease_token: str, thread_id: str | None = None) -> bool:
         with self._lock:
             cur = self.conn.cursor()
             try:
                 sql = "SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?"
-                parameters: tuple[Any, ...] = (job_id, lease_token)
+                parameters: tuple[SqlValue, ...] = (job_id, lease_token)
                 if thread_id is not None:
                     sql += " AND thread_id = ?"
                     parameters += (thread_id,)
-                cur.execute(sql, parameters)
-                return cur.fetchone() is not None
+                _ = cur.execute(sql, parameters)
+                return _fetchone(cur) is not None
             finally:
                 cur.close()
 
     @contextmanager
-    def lease_guard(self, job_id: str, lease_token: str, thread_id: str | None = None) -> Iterator[None]:
+    def lease_guard(self, job_id: str, lease_token: str, thread_id: str | None = None) -> Generator[None, None, None]:
         """Исключает перехват аренды на время внешней записи или эффекта."""
 
         with repository_lock(self.repo), self._lock:
@@ -595,35 +721,69 @@ class DispatcherStore:
 
         store = self
         saver = self.saver
+        lease_thread_id = thread_id
 
-        class FencedSaver(BaseCheckpointSaver):
+        class FencedSaver(BaseCheckpointSaver[str]):
             def __init__(self):
                 super().__init__(serde=saver.serde)
 
             @property
-            def config_specs(self):
-                return saver.config_specs
+            @override
+            def config_specs(self) -> list[ConfigurableFieldSpec]:
+                return _config_specs(saver)
 
-            def get_tuple(self, *args, **kwargs):
-                return saver.get_tuple(*args, **kwargs)
+            @override
+            def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+                return saver.get_tuple(config)
 
-            def list(self, *args, **kwargs):
-                return saver.list(*args, **kwargs)
+            @override
+            def list(
+                self,
+                config: RunnableConfig | None,
+                *,
+                filter: dict[str, object] | None = None,
+                before: RunnableConfig | None = None,
+                limit: int | None = None,
+            ) -> Iterator[CheckpointTuple]:
+                return saver.list(config, filter=filter, before=before, limit=limit)
 
-            def get_next_version(self, *args, **kwargs):
-                return saver.get_next_version(*args, **kwargs)
+            @override
+            def get_next_version(self, current: str | None, channel: None) -> str:
+                return saver.get_next_version(current, channel)
 
-            def put(self, *args, **kwargs):
-                with store.lease_guard(job_id, lease_token, thread_id):
-                    return saver.put(*args, **kwargs)
+            @override
+            def put(
+                self,
+                config: RunnableConfig | None = None,
+                checkpoint: Checkpoint | None = None,
+                metadata: CheckpointMetadata | None = None,
+                new_versions: ChannelVersions | None = None,
+            ) -> RunnableConfig:
+                with store.lease_guard(job_id, lease_token, lease_thread_id):
+                    if config is None:
+                        value = _call_no_arg_put(saver)
+                        if not _is_runnable_config(value):
+                            raise TypeError("checkpoint saver returned an invalid config")
+                        return value
+                    if checkpoint is None or metadata is None or new_versions is None:
+                        raise TypeError("incomplete checkpoint write")
+                    return saver.put(config, checkpoint, metadata, new_versions)
 
-            def put_writes(self, *args, **kwargs):
-                with store.lease_guard(job_id, lease_token, thread_id):
-                    return saver.put_writes(*args, **kwargs)
+            @override
+            def put_writes(
+                self,
+                config: RunnableConfig,
+                writes: Sequence[tuple[str, object]],
+                task_id: str,
+                task_path: str = "",
+            ) -> None:
+                with store.lease_guard(job_id, lease_token, lease_thread_id):
+                    saver.put_writes(config, writes, task_id, task_path)
 
-            def delete_thread(self, *args, **kwargs):
-                with store.lease_guard(job_id, lease_token, thread_id):
-                    return saver.delete_thread(*args, **kwargs)
+            @override
+            def delete_thread(self, thread_id: str) -> None:
+                with store.lease_guard(job_id, lease_token, lease_thread_id):
+                    saver.delete_thread(thread_id)
 
         return FencedSaver()
 
@@ -635,16 +795,16 @@ class DispatcherStore:
         with self._lock, self.conn:  # короткая транзакция
             cur = self.conn.cursor()
             try:
-                cur.execute(
+                _ = cur.execute(
                     "UPDATE dispatcher_revision SET value = value + 1, updated_at = ? WHERE id = 1 RETURNING value",
                     (_now_iso(),),
                 )
-                row = cur.fetchone()
+                row = _fetchone(cur)
             finally:
                 cur.close()
         if row is None:
             raise RuntimeError("dispatcher revision row is missing")
-        return int(row[0])
+        return _integer(row[0])
 
     def bump_revision_if_lease(self, job_id: str, lease_token: str) -> int | None:
         """Увеличивает ревизию только для текущего владельца аренды."""
@@ -652,29 +812,29 @@ class DispatcherStore:
         with self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute(
-                    "UPDATE dispatcher_revision SET value = value + 1, updated_at = ? "
-                    "WHERE id = 1 AND EXISTS "
-                    "(SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?) "
+                _ = cur.execute(
+                    "UPDATE dispatcher_revision SET value = value + 1, updated_at = ? " +
+                    "WHERE id = 1 AND EXISTS " +
+                    "(SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?) " +
                     "RETURNING value",
                     (_now_iso(), job_id, lease_token),
                 )
-                row = cur.fetchone()
+                row = _fetchone(cur)
             finally:
                 cur.close()
-        return int(row[0]) if row is not None else None
+        return _integer(row[0]) if row is not None else None
 
     def revision(self) -> tuple[int, str]:
         with self._lock:
             cur = self.conn.cursor()
             try:
-                cur.execute("SELECT value, updated_at FROM dispatcher_revision WHERE id = 1")
-                row = cur.fetchone()
+                _ = cur.execute("SELECT value, updated_at FROM dispatcher_revision WHERE id = 1")
+                row = _fetchone(cur)
             finally:
                 cur.close()
         if row is None:
             return 0, ""
-        return int(row[0]), str(row[1])
+        return _integer(row[0]), str(row[1])
 
     # -- аренды --------------------------------------------------------
 
@@ -684,9 +844,9 @@ class DispatcherStore:
         thread_id: str,
         work_unit_id: str,
         owner: str,
-        process_identity: dict | None,
+        process_identity: Mapping[str, object] | None,
         state: str = "running",
-        summary: dict | None = None,
+        summary: Mapping[str, object] | None = None,
         *,
         run_id: str = "",
         execution_snapshot_fingerprint: str = "",
@@ -706,11 +866,11 @@ class DispatcherStore:
                 ).fetchone():
                     return None
                 if job_id != "stage-recompute":
-                    cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = 'stage-recompute'")
-                    if cur.fetchone() is not None:
+                    _ = cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = 'stage-recompute'")
+                    if _fetchone(cur) is not None:
                         return None
-                cur.execute("SELECT renewed_at, owner FROM dispatcher_leases WHERE job_id = ?", (job_id,))
-                existing = cur.fetchone()
+                _ = cur.execute("SELECT renewed_at, owner FROM dispatcher_leases WHERE job_id = ?", (job_id,))
+                existing = _fetchone(cur)
                 now = time.time()
                 if existing is not None:
                     renewed_iso = str(existing[0])
@@ -724,18 +884,18 @@ class DispatcherStore:
                     invocation_ids = [
                         str(row[0])
                         for row in cur.execute(
-                            "SELECT invocation_id FROM dispatcher_invocations "
+                            "SELECT invocation_id FROM dispatcher_invocations " +
                             "WHERE job_id = ? AND status = 'running'",
                             (job_id,),
                         )
                     ]
-                    _terminalize_rows(
+                    _ = _terminalize_rows(
                         cur, invocation_ids, "interrupted", renewed_at
                     )
-                    cur.execute("DELETE FROM dispatcher_leases WHERE job_id = ?", (job_id,))
-                cur.execute(
-                    "INSERT INTO dispatcher_leases "
-                    "(job_id, thread_id, work_unit_id, run_id, execution_snapshot_fingerprint, owner, process_identity, acquired_at, renewed_at, state, summary, lease_token) "
+                    _ = cur.execute("DELETE FROM dispatcher_leases WHERE job_id = ?", (job_id,))
+                _ = cur.execute(
+                    "INSERT INTO dispatcher_leases " +
+                    "(job_id, thread_id, work_unit_id, run_id, execution_snapshot_fingerprint, owner, process_identity, acquired_at, renewed_at, state, summary, lease_token) " +
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         job_id,
@@ -761,11 +921,11 @@ class DispatcherStore:
         migration_id: str,
         *,
         owner: str,
-        process_identity: dict | None,
+        process_identity: Mapping[str, object] | None,
         repository_fingerprint: str,
         workflow_fingerprint: str,
-        journal_seed: dict[str, Any],
-    ) -> dict[str, Any] | None:
+        journal_seed: dict[str, JsonValue],
+    ) -> dict[str, JsonValue] | None:
         """Атомарно заменяет допустимую старую аренду глобальным барьером миграции."""
 
         now = _now_iso()
@@ -775,7 +935,7 @@ class DispatcherStore:
             cur = self.conn.cursor()
             try:
                 prior = cur.execute(
-                    "SELECT migration_id, status, lease_token, thread_id, result "
+                    "SELECT migration_id, status, lease_token, thread_id, result " +
                     "FROM workflow_migration_runs WHERE migration_id = ?",
                     (migration_id,),
                 ).fetchone()
@@ -785,16 +945,16 @@ class DispatcherStore:
                         "status": prior[1],
                         "lease_token": prior[2],
                         "thread_id": prior[3],
-                        "result": json.loads(prior[4]) if prior[4] else None,
+                        "result": parse_json(_text(prior[4])) if prior[4] else None,
                     }
                 leases = cur.execute(
-                    "SELECT job_id, thread_id, work_unit_id, run_id, "
-                    "execution_snapshot_fingerprint, owner, process_identity, acquired_at, "
+                    "SELECT job_id, thread_id, work_unit_id, run_id, " +
+                    "execution_snapshot_fingerprint, owner, process_identity, acquired_at, " +
                     "renewed_at, state, summary, lease_token FROM dispatcher_leases ORDER BY job_id"
                 ).fetchall()
                 if any(row[0] != "discover-mrq" for row in leases) or len(leases) > 1:
                     return None
-                legacy = None
+                legacy: dict[str, JsonValue] | None = None
                 audit_ids: dict[str, list[str]] = {
                     "invocation_ids": [], "phase_work_ids": [], "approval_keys": [],
                 }
@@ -808,53 +968,53 @@ class DispatcherStore:
                         "acquired_at", "renewed_at", "state", "summary", "lease_token",
                     )
                     legacy = dict(zip(keys, row, strict=True))
-                    legacy["process_identity"] = json.loads(legacy["process_identity"]) if legacy["process_identity"] else None
-                    legacy["summary"] = json.loads(legacy["summary"]) if legacy["summary"] else {}
+                    legacy["process_identity"] = parse_json_object(_string(legacy["process_identity"])) if legacy["process_identity"] else None
+                    legacy["summary"] = parse_json_object(_string(legacy["summary"])) if legacy["summary"] else {}
                     run_id = str(legacy["run_id"])
                     audit_ids["invocation_ids"] = [
                         str(item[0]) for item in cur.execute(
-                            "SELECT invocation_id FROM dispatcher_invocations "
+                            "SELECT invocation_id FROM dispatcher_invocations " +
                             "WHERE job_id = 'discover-mrq' AND run_id = ?",
                             (run_id,),
                         )
                     ]
                     audit_ids["phase_work_ids"] = [
                         "|".join(map(str, item)) for item in cur.execute(
-                            "SELECT run_id, phase_id, role_id, work_unit_id "
+                            "SELECT run_id, phase_id, role_id, work_unit_id " +
                             "FROM dispatcher_phase_work WHERE job_id = 'discover-mrq' AND run_id = ?",
                             (run_id,),
                         )
                     ]
                     audit_ids["approval_keys"] = [
                         str(item[0]) for item in cur.execute(
-                            "SELECT key FROM dispatcher_proposals "
-                            "WHERE job_id = 'discover-mrq' AND thread_id = ? "
+                            "SELECT key FROM dispatcher_proposals " +
+                            "WHERE job_id = 'discover-mrq' AND thread_id = ? " +
                             "AND kind = 'approval' AND consumed_at IS NULL",
                             (str(legacy["thread_id"]),),
                         )
                     ]
-                    cur.execute(
-                        "UPDATE dispatcher_proposals SET consumed_at = ? "
-                        "WHERE job_id = 'discover-mrq' AND thread_id = ? "
+                    _ = cur.execute(
+                        "UPDATE dispatcher_proposals SET consumed_at = ? " +
+                        "WHERE job_id = 'discover-mrq' AND thread_id = ? " +
                         "AND kind = 'approval' AND consumed_at IS NULL",
                         (now, str(legacy["thread_id"])),
                     )
-                    _terminalize_rows(
+                    _ = _terminalize_rows(
                         cur, audit_ids["invocation_ids"], "interrupted", now,
                         error_code="interrupted",
                         error_summary="legacy workflow interrupted by version-4 migration",
                     )
-                    cur.execute(
-                        "UPDATE dispatcher_phase_work SET status = 'interrupted', updated_at = ? "
-                        "WHERE job_id = 'discover-mrq' AND run_id = ? "
+                    _ = cur.execute(
+                        "UPDATE dispatcher_phase_work SET status = 'interrupted', updated_at = ? " +
+                        "WHERE job_id = 'discover-mrq' AND run_id = ? " +
                         "AND status IN ('queued', 'running')",
                         (now, run_id),
                     )
-                    cur.execute("DELETE FROM dispatcher_leases WHERE job_id = 'discover-mrq'")
-                cur.execute(
-                    "INSERT INTO dispatcher_leases "
-                    "(job_id, thread_id, work_unit_id, run_id, execution_snapshot_fingerprint, "
-                    "owner, process_identity, acquired_at, renewed_at, state, summary, lease_token) "
+                    _ = cur.execute("DELETE FROM dispatcher_leases WHERE job_id = 'discover-mrq'")
+                _ = cur.execute(
+                    "INSERT INTO dispatcher_leases " +
+                    "(job_id, thread_id, work_unit_id, run_id, execution_snapshot_fingerprint, " +
+                    "owner, process_identity, acquired_at, renewed_at, state, summary, lease_token) " +
                     "VALUES ('workflow-migration', ?, ?, ?, '', ?, ?, ?, ?, 'running', ?, ?)",
                     (
                         thread_id, migration_id, migration_id, owner,
@@ -863,11 +1023,11 @@ class DispatcherStore:
                         canonical_json({"phase": "handoff_prepared"}).decode(), token,
                     ),
                 )
-                cur.execute(
-                    "INSERT INTO workflow_migration_runs "
-                    "(migration_id, status, lease_token, thread_id, repository_fingerprint, "
-                    "workflow_fingerprint, legacy_lease_preimage, legacy_audit_ids, journal_seed, "
-                    "result, created_at, updated_at) "
+                _ = cur.execute(
+                    "INSERT INTO workflow_migration_runs " +
+                    "(migration_id, status, lease_token, thread_id, repository_fingerprint, " +
+                    "workflow_fingerprint, legacy_lease_preimage, legacy_audit_ids, journal_seed, " +
+                    "result, created_at, updated_at) " +
                     "VALUES (?, 'handoff_prepared', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
                     (
                         migration_id, token, thread_id, repository_fingerprint,
@@ -887,14 +1047,14 @@ class DispatcherStore:
             "result": None,
         }
 
-    def workflow_migration(self, migration_id: str | None = None) -> dict[str, Any] | None:
+    def workflow_migration(self, migration_id: str | None = None) -> dict[str, JsonValue] | None:
         with self._lock:
             sql = (
                 "SELECT migration_id, status, lease_token, thread_id, repository_fingerprint, "
                 "workflow_fingerprint, legacy_lease_preimage, legacy_audit_ids, journal_seed, "
                 "result, created_at, updated_at FROM workflow_migration_runs"
             )
-            parameters: tuple[Any, ...] = ()
+            parameters: tuple[SqlValue, ...] = ()
             if migration_id is not None:
                 sql += " WHERE migration_id = ?"
                 parameters = (migration_id,)
@@ -907,9 +1067,12 @@ class DispatcherStore:
             "repository_fingerprint", "workflow_fingerprint", "legacy_lease_preimage",
             "legacy_audit_ids", "journal_seed", "result", "created_at", "updated_at",
         )
-        result = dict(zip(keys, row, strict=True))
+        result: dict[str, JsonValue] = dict(zip(keys, row, strict=True))
         for key in ("legacy_lease_preimage", "legacy_audit_ids", "journal_seed", "result"):
-            result[key] = json.loads(result[key]) if result[key] else None
+            encoded = result[key]
+            if encoded is not None and not isinstance(encoded, str):
+                raise TypeError(f"invalid encoded workflow migration field: {key}")
+            result[key] = parse_json_object(_text(encoded)) if encoded else None
         return result
 
     def update_workflow_migration(
@@ -917,7 +1080,7 @@ class DispatcherStore:
         migration_id: str,
         lease_token: str,
         status: str,
-        result: dict[str, Any] | None = None,
+        result: dict[str, JsonValue] | None = None,
         *,
         release: bool = False,
     ) -> bool:
@@ -925,9 +1088,9 @@ class DispatcherStore:
             cur = self.conn.cursor()
             try:
                 changed = cur.execute(
-                    "UPDATE workflow_migration_runs SET status = ?, result = ?, updated_at = ? "
-                    "WHERE migration_id = ? AND lease_token = ? AND EXISTS "
-                    "(SELECT 1 FROM dispatcher_leases WHERE job_id = 'workflow-migration' "
+                    "UPDATE workflow_migration_runs SET status = ?, result = ?, updated_at = ? " +
+                    "WHERE migration_id = ? AND lease_token = ? AND EXISTS " +
+                    "(SELECT 1 FROM dispatcher_leases WHERE job_id = 'workflow-migration' " +
                     "AND lease_token = ?)",
                     (
                         status,
@@ -936,8 +1099,8 @@ class DispatcherStore:
                     ),
                 ).rowcount
                 if changed and release:
-                    cur.execute(
-                        "DELETE FROM dispatcher_leases "
+                    _ = cur.execute(
+                        "DELETE FROM dispatcher_leases " +
                         "WHERE job_id = 'workflow-migration' AND lease_token = ?",
                         (lease_token,),
                     )
@@ -950,16 +1113,16 @@ class DispatcherStore:
         migration_id: str,
         lease_token: str,
         backup_path: Path,
-        result: dict[str, Any],
+        result: dict[str, JsonValue],
     ) -> bool:
         """Восстанавливает неарендные таблицы и оставляет старую работу прерванной."""
 
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
-            backup = sqlite3.connect(backup_path)
+            backup = _connection(sqlite3.connect(backup_path))
             try:
                 if not cur.execute(
-                    "SELECT 1 FROM dispatcher_leases "
+                    "SELECT 1 FROM dispatcher_leases " +
                     "WHERE job_id = 'workflow-migration' AND lease_token = ?",
                     (lease_token,),
                 ).fetchone():
@@ -967,8 +1130,8 @@ class DispatcherStore:
                 tables = [
                     str(row[0])
                     for row in backup.execute(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+                        "SELECT name FROM sqlite_master " +
+                        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' " +
                         "AND name NOT IN ('dispatcher_leases', 'workflow_migration_runs')"
                     )
                     if cur.execute(
@@ -979,45 +1142,45 @@ class DispatcherStore:
                 for table in tables:
                     quoted = '"' + table.replace('"', '""') + '"'
                     rows = backup.execute(f"SELECT * FROM {quoted}").fetchall()
-                    cur.execute(f"DELETE FROM main.{quoted}")
+                    _ = cur.execute(f"DELETE FROM main.{quoted}")
                     if rows:
                         placeholders = ",".join("?" for _ in rows[0])
-                        cur.executemany(
+                        _ = cur.executemany(
                             f"INSERT INTO main.{quoted} VALUES ({placeholders})", rows
                         )
                 invocation_ids = [
                     str(row[0])
                     for row in cur.execute(
-                        "SELECT invocation_id FROM dispatcher_invocations "
+                        "SELECT invocation_id FROM dispatcher_invocations " +
                         "WHERE job_id = 'discover-mrq' AND status = 'running'"
                     )
                 ]
-                _terminalize_rows(
+                _ = _terminalize_rows(
                     cur, invocation_ids, "interrupted", _now_iso(),
                     error_code="interrupted",
                     error_summary="legacy workflow remains interrupted after migration rollback",
                 )
-                cur.execute(
-                    "UPDATE dispatcher_phase_work SET status = 'interrupted', updated_at = ? "
+                _ = cur.execute(
+                    "UPDATE dispatcher_phase_work SET status = 'interrupted', updated_at = ? " +
                     "WHERE job_id = 'discover-mrq' AND status IN ('queued', 'running')",
                     (_now_iso(),),
                 )
-                cur.execute(
-                    "UPDATE dispatcher_proposals SET consumed_at = ? "
-                    "WHERE job_id = 'discover-mrq' AND kind = 'approval' "
+                _ = cur.execute(
+                    "UPDATE dispatcher_proposals SET consumed_at = ? " +
+                    "WHERE job_id = 'discover-mrq' AND kind = 'approval' " +
                     "AND consumed_at IS NULL",
                     (_now_iso(),),
                 )
-                cur.execute(
-                    "UPDATE workflow_migration_runs SET status = 'rolled_back', result = ?, "
+                _ = cur.execute(
+                    "UPDATE workflow_migration_runs SET status = 'rolled_back', result = ?, " +
                     "updated_at = ? WHERE migration_id = ? AND lease_token = ?",
                     (
                         canonical_json(result).decode(), _now_iso(),
                         migration_id, lease_token,
                     ),
                 )
-                cur.execute(
-                    "DELETE FROM dispatcher_leases "
+                _ = cur.execute(
+                    "DELETE FROM dispatcher_leases " +
                     "WHERE job_id = 'workflow-migration' AND lease_token = ?",
                     (lease_token,),
                 )
@@ -1026,15 +1189,15 @@ class DispatcherStore:
                 backup.close()
                 cur.close()
 
-    def renew_lease(self, job_id: str, lease_token: str, state: str | None = None, summary: dict | None = None) -> bool:
+    def renew_lease(self, job_id: str, lease_token: str, state: str | None = None, summary: Mapping[str, object] | None = None) -> bool:
         """Обновляет аренду, если она всё ещё принадлежит активному владельцу."""
 
         renewed_at = _now_iso()
         with self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute("SELECT renewed_at, summary FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?", (job_id, lease_token))
-                existing = cur.fetchone()
+                _ = cur.execute("SELECT renewed_at, summary FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?", (job_id, lease_token))
+                existing = _fetchone(cur)
                 if existing is None:
                     return False
                 now = time.time()
@@ -1045,19 +1208,19 @@ class DispatcherStore:
                 if (now - renewed_epoch) >= LEASE_EXPIRY_SECONDS:
                     return False
                 if state is None and summary is None:
-                    cur.execute("UPDATE dispatcher_leases SET renewed_at = ? WHERE job_id = ? AND lease_token = ?", (renewed_at, job_id, lease_token))
+                    _ = cur.execute("UPDATE dispatcher_leases SET renewed_at = ? WHERE job_id = ? AND lease_token = ?", (renewed_at, job_id, lease_token))
                 else:
                     assignments = ["renewed_at = ?"]
-                    params: list[Any] = [renewed_at]
+                    params: list[SqlValue] = [renewed_at]
                     if state is not None:
                         assignments.append("state = ?")
                         params.append(state)
                     if summary is not None:
                         assignments.append("summary = ?")
-                        prior_summary = json.loads(existing[1]) if existing[1] else {}
+                        prior_summary = parse_json_object(_text(existing[1])) if existing[1] else {}
                         params.append(canonical_json({**prior_summary, **summary}).decode("utf-8"))
                     params.extend((job_id, lease_token))
-                    cur.execute(f"UPDATE dispatcher_leases SET {', '.join(assignments)} WHERE job_id = ? AND lease_token = ?", tuple(params))
+                    _ = cur.execute(f"UPDATE dispatcher_leases SET {', '.join(assignments)} WHERE job_id = ? AND lease_token = ?", tuple(params))
                 if cur.rowcount != 1:
                     return False
             finally:
@@ -1070,7 +1233,7 @@ class DispatcherStore:
         thread_id: str,
         prior_token: str,
         owner: str,
-        process_identity: dict | None,
+        process_identity: Mapping[str, object] | None,
     ) -> str | None:
         """Однократно передаёт возобновляемую аренду новому владельцу."""
 
@@ -1080,9 +1243,9 @@ class DispatcherStore:
             with repository_lock(self.repo), self._lock, self.conn:
                 cur = self.conn.cursor()
                 try:
-                    cur.execute(
-                        "UPDATE dispatcher_leases SET lease_token = ?, owner = ?, process_identity = ?, "
-                        "renewed_at = ?, state = 'running' "
+                    _ = cur.execute(
+                        "UPDATE dispatcher_leases SET lease_token = ?, owner = ?, process_identity = ?, " +
+                        "renewed_at = ?, state = 'running' " +
                         "WHERE job_id = ? AND thread_id = ? AND lease_token = ? AND state = 'resumable'",
                         (
                             token,
@@ -1106,23 +1269,23 @@ class DispatcherStore:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute("DELETE FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?", (job_id, lease_token))
+                _ = cur.execute("DELETE FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?", (job_id, lease_token))
                 affected = cur.rowcount
             finally:
                 cur.close()
         return affected == 1
 
-    def lease(self, job_id: str) -> dict[str, Any] | None:
+    def lease(self, job_id: str) -> dict[str, JsonValue] | None:
         with self._lock:
             cur = self.conn.cursor()
             try:
-                cur.execute(
-                    "SELECT job_id, thread_id, work_unit_id, run_id, execution_snapshot_fingerprint, "
-                    "owner, process_identity, acquired_at, renewed_at, state, summary, lease_token "
+                _ = cur.execute(
+                    "SELECT job_id, thread_id, work_unit_id, run_id, execution_snapshot_fingerprint, " +
+                    "owner, process_identity, acquired_at, renewed_at, state, summary, lease_token " +
                     "FROM dispatcher_leases WHERE job_id = ?",
                     (job_id,),
                 )
-                row = cur.fetchone()
+                row = _fetchone(cur)
             finally:
                 cur.close()
         if row is None:
@@ -1135,24 +1298,24 @@ class DispatcherStore:
             "run_id": run_id,
             "execution_snapshot_fingerprint": snapshot_fingerprint,
             "owner": owner,
-            "process_identity": json.loads(identity) if identity else None,
+            "process_identity": parse_json_object(_text(identity)) if identity else None,
             "acquired_at": acquired,
             "renewed_at": renewed,
             "state": state,
-            "summary": json.loads(summary) if summary else {},
+            "summary": parse_json_object(_text(summary)) if summary else {},
             "lease_token": token,
         }
 
-    def leases(self) -> list[dict[str, Any]]:
+    def leases(self) -> list[dict[str, JsonValue]]:
         with self._lock:
             cur = self.conn.cursor()
             try:
-                cur.execute(
-                    "SELECT job_id, thread_id, work_unit_id, run_id, execution_snapshot_fingerprint, "
-                    "owner, process_identity, acquired_at, renewed_at, state, summary "
+                _ = cur.execute(
+                    "SELECT job_id, thread_id, work_unit_id, run_id, execution_snapshot_fingerprint, " +
+                    "owner, process_identity, acquired_at, renewed_at, state, summary " +
                     "FROM dispatcher_leases ORDER BY job_id"
                 )
-                rows = cur.fetchall()
+                rows = _fetchall(cur)
             finally:
                 cur.close()
         return [
@@ -1163,11 +1326,11 @@ class DispatcherStore:
                 "run_id": r[3],
                 "execution_snapshot_fingerprint": r[4],
                 "owner": r[5],
-                "process_identity": json.loads(r[6]) if r[6] else None,
+                "process_identity": parse_json(_text(r[6])) if r[6] else None,
                 "acquired_at": r[7],
                 "renewed_at": r[8],
                 "state": r[9],
-                "summary": json.loads(r[10]) if r[10] else {},
+                "summary": parse_json(_text(r[10])) if r[10] else {},
             }
             for r in rows
         ]
@@ -1179,20 +1342,23 @@ class DispatcherStore:
         idempotency_key: str,
         request_fingerprint: str,
         boundary: str,
-        plan: dict[str, Any],
+        plan: dict[str, JsonValue],
         predecessor_run_id: str | None = None,
-    ) -> tuple[dict[str, Any], bool]:
+    ) -> tuple[dict[str, JsonValue], bool]:
         """Атомарно сохраняет запрос и захватывает взаимно исключающую аренду."""
 
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute("SELECT run_id, request_fingerprint FROM stage_recompute_runs WHERE idempotency_key = ?", (idempotency_key,))
-                existing = cur.fetchone()
+                _ = cur.execute("SELECT run_id, request_fingerprint FROM stage_recompute_runs WHERE idempotency_key = ?", (idempotency_key,))
+                existing = _fetchone(cur)
                 if existing is not None:
                     if existing[1] != request_fingerprint:
                         raise RuntimeError("idempotency key is already bound to another stage recompute request")
-                    return self._stage_run_locked(cur, str(existing[0])), False
+                    existing_run = self._stage_run_locked(cur, str(existing[0]))
+                    if existing_run is None:
+                        raise RuntimeError("stage recompute run is missing")
+                    return existing_run, False
                 if predecessor_run_id is not None:
                     predecessor = self._stage_run_locked(cur, predecessor_run_id)
                     if (
@@ -1201,18 +1367,18 @@ class DispatcherStore:
                         or predecessor["status"] not in {"failed", "cancelled", "resumable"}
                     ):
                         raise RuntimeError("incompatible stage recompute predecessor")
-                cur.execute("SELECT job_id, thread_id, renewed_at FROM dispatcher_leases")
-                leases = cur.fetchall()
+                _ = cur.execute("SELECT job_id, thread_id, renewed_at FROM dispatcher_leases")
+                leases = _fetchall(cur)
                 mrq = [row for row in leases if row[0] != "stage-recompute"]
                 if mrq:
                     raise RuntimeError(f"dispatcher lease is busy: {mrq[0][0]}")
                 active_stage = next((row for row in leases if row[0] == "stage-recompute"), None)
                 if active_stage is not None and is_stale(str(active_stage[2])):
-                    cur.execute(
+                    _ = cur.execute(
                         "UPDATE stage_recompute_runs SET status = 'resumable', result = ?, updated_at = ? WHERE run_id = ? AND status = 'running'",
                         (canonical_json({"status": "resumable", "reason": "lease_expired"}).decode(), _now_iso(), active_stage[1]),
                     )
-                    cur.execute("DELETE FROM dispatcher_leases WHERE job_id = 'stage-recompute'")
+                    _ = cur.execute("DELETE FROM dispatcher_leases WHERE job_id = 'stage-recompute'")
                     leases = []
                 busy = [str(row[0]) for row in leases]
                 if busy:
@@ -1222,19 +1388,22 @@ class DispatcherStore:
                 now = _now_iso()
                 key_fingerprint = "sha256:" + sha256(idempotency_key.encode())
                 summary = {"run_id": run_id, "boundary": boundary, "plan_fingerprint": plan["plan_fingerprint"]}
-                cur.execute(
+                _ = cur.execute(
                     "INSERT INTO dispatcher_leases (job_id, thread_id, work_unit_id, owner, process_identity, acquired_at, renewed_at, state, summary, lease_token) VALUES (?, ?, ?, ?, NULL, ?, ?, 'running', ?, ?)",
                     ("stage-recompute", run_id, boundary, run_id, now, now, canonical_json(summary).decode(), token),
                 )
-                cur.execute(
+                _ = cur.execute(
                     "INSERT INTO stage_recompute_runs (run_id, idempotency_key, idempotency_key_fingerprint, request_fingerprint, lease_token, boundary, plan, status, result, predecessor_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', NULL, ?, ?, ?)",
                     (run_id, idempotency_key, key_fingerprint, request_fingerprint, token, boundary, canonical_json(plan).decode(), predecessor_run_id, now, now),
                 )
-                return self._stage_run_locked(cur, run_id), True
+                created_run = self._stage_run_locked(cur, run_id)
+                if created_run is None:
+                    raise RuntimeError("stage recompute run is missing")
+                return created_run, True
             finally:
                 cur.close()
 
-    def stage_run(self, run_id: str) -> dict[str, Any] | None:
+    def stage_run(self, run_id: str) -> dict[str, JsonValue] | None:
         with self._lock:
             cur = self.conn.cursor()
             try:
@@ -1242,22 +1411,22 @@ class DispatcherStore:
             finally:
                 cur.close()
 
-    def latest_stage_recompute(self) -> dict[str, Any] | None:
+    def latest_stage_recompute(self) -> dict[str, JsonValue] | None:
         with self._lock:
             cur = self.conn.cursor()
             try:
-                cur.execute("SELECT run_id FROM stage_recompute_runs ORDER BY created_at DESC, run_id DESC LIMIT 1")
-                row = cur.fetchone()
+                _ = cur.execute("SELECT run_id FROM stage_recompute_runs ORDER BY created_at DESC, run_id DESC LIMIT 1")
+                row = _fetchone(cur)
                 return self._stage_run_locked(cur, str(row[0])) if row else None
             finally:
                 cur.close()
 
-    def _stage_run_locked(self, cur, run_id: str) -> dict[str, Any] | None:
-        cur.execute(
+    def _stage_run_locked(self, cur: _Cursor, run_id: str) -> dict[str, JsonValue] | None:
+        _ = cur.execute(
             "SELECT run_id, idempotency_key_fingerprint, request_fingerprint, lease_token, boundary, plan, status, result, predecessor_run_id, created_at, updated_at FROM stage_recompute_runs WHERE run_id = ?",
             (run_id,),
         )
-        row = cur.fetchone()
+        row = _fetchone(cur)
         if row is None:
             return None
         return {
@@ -1266,9 +1435,9 @@ class DispatcherStore:
             "request_fingerprint": row[2],
             "lease_token": row[3],
             "boundary": row[4],
-            "plan": json.loads(row[5]),
+            "plan": parse_json(_text(row[5])),
             "status": row[6],
-            "result": json.loads(row[7]) if row[7] else None,
+            "result": parse_json(_text(row[7])) if row[7] else None,
             "predecessor_run_id": row[8],
             "created_at": row[9],
             "updated_at": row[10],
@@ -1278,32 +1447,32 @@ class DispatcherStore:
         with self._lock:
             cur = self.conn.cursor()
             try:
-                cur.execute(
+                _ = cur.execute(
                     "SELECT 1 FROM dispatcher_leases WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
                     (run_id, lease_token),
                 )
-                return cur.fetchone() is not None
+                return _fetchone(cur) is not None
             finally:
                 cur.close()
 
-    def renew_stage_lease(self, run_id: str, lease_token: str, summary: dict[str, Any] | None = None) -> bool:
+    def renew_stage_lease(self, run_id: str, lease_token: str, summary: dict[str, JsonValue] | None = None) -> bool:
         with self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute(
+                _ = cur.execute(
                     "SELECT renewed_at FROM dispatcher_leases WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
                     (run_id, lease_token),
                 )
-                row = cur.fetchone()
+                row = _fetchone(cur)
                 if row is None or is_stale(str(row[0])):
                     return False
                 if summary is None:
-                    cur.execute(
+                    _ = cur.execute(
                         "UPDATE dispatcher_leases SET renewed_at = ? WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
                         (_now_iso(), run_id, lease_token),
                     )
                 else:
-                    cur.execute(
+                    _ = cur.execute(
                         "UPDATE dispatcher_leases SET renewed_at = ?, summary = ? WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
                         (_now_iso(), canonical_json(summary).decode(), run_id, lease_token),
                     )
@@ -1311,24 +1480,24 @@ class DispatcherStore:
             finally:
                 cur.close()
 
-    def finish_stage_recompute(self, run_id: str, lease_token: str, status: str, result: dict[str, Any]) -> bool:
+    def finish_stage_recompute(self, run_id: str, lease_token: str, status: str, result: dict[str, JsonValue]) -> bool:
         """Записывает итог и освобождает аренду только для текущего токена."""
 
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute(
+                _ = cur.execute(
                     "SELECT 1 FROM dispatcher_leases WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
                     (run_id, lease_token),
                 )
-                if cur.fetchone() is None:
+                if _fetchone(cur) is None:
                     return False
                 now = _now_iso()
-                cur.execute(
+                _ = cur.execute(
                     "UPDATE stage_recompute_runs SET status = ?, result = ?, updated_at = ? WHERE run_id = ? AND lease_token = ?",
                     (status, canonical_json(result).decode(), now, run_id, lease_token),
                 )
-                cur.execute(
+                _ = cur.execute(
                     "DELETE FROM dispatcher_leases WHERE job_id = 'stage-recompute' AND thread_id = ? AND lease_token = ?",
                     (run_id, lease_token),
                 )
@@ -1345,13 +1514,13 @@ class DispatcherStore:
         with self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute("SELECT run_id FROM stage_recompute_cancellations WHERE idempotency_key = ?", (idempotency_key,))
-                existing = cur.fetchone()
+                _ = cur.execute("SELECT run_id FROM stage_recompute_cancellations WHERE idempotency_key = ?", (idempotency_key,))
+                existing = _fetchone(cur)
                 if existing is not None:
                     if existing[0] != run_id:
                         raise RuntimeError("idempotency key is already bound to another stage recompute cancellation")
                     return False
-                cur.execute(
+                _ = cur.execute(
                     "INSERT INTO stage_recompute_cancellations (idempotency_key, run_id, created_at) VALUES (?, ?, ?)",
                     (idempotency_key, run_id, _now_iso()),
                 )
@@ -1369,9 +1538,9 @@ class DispatcherStore:
         job_id: str,
         predecessor_run_id: str,
         policy_source: str,
-        execution_snapshot: dict[str, Any],
+        execution_snapshot: dict[str, JsonValue],
         execution_snapshot_fingerprint: str,
-    ) -> tuple[dict[str, Any], bool]:
+    ) -> tuple[dict[str, JsonValue], bool]:
         """Один раз связывает ключ повтора с запуском и полным снимком."""
 
         now = _now_iso()
@@ -1379,19 +1548,22 @@ class DispatcherStore:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute(
+                _ = cur.execute(
                     "SELECT run_id, request_fingerprint FROM dispatcher_retry_runs WHERE idempotency_key = ?",
                     (idempotency_key,),
                 )
-                existing = cur.fetchone()
+                existing = _fetchone(cur)
                 if existing is not None:
                     if str(existing[1]) != request_fingerprint:
                         raise RuntimeError("idempotency key is already bound to another dispatcher retry request")
-                    return self._retry_run_locked(cur, str(existing[0])), False
-                cur.execute(
-                    "INSERT INTO dispatcher_retry_runs "
-                    "(run_id, idempotency_key, request_fingerprint, job_id, predecessor_run_id, policy_source, "
-                    "execution_snapshot, execution_snapshot_fingerprint, owner_token, state, result, created_at, updated_at) "
+                    existing_run = self._retry_run_locked(cur, str(existing[0]))
+                    if existing_run is None:
+                        raise RuntimeError("dispatcher retry run is missing")
+                    return existing_run, False
+                _ = cur.execute(
+                    "INSERT INTO dispatcher_retry_runs " +
+                    "(run_id, idempotency_key, request_fingerprint, job_id, predecessor_run_id, policy_source, " +
+                    "execution_snapshot, execution_snapshot_fingerprint, owner_token, state, result, created_at, updated_at) " +
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', NULL, ?, ?)",
                     (
                         run_id,
@@ -1407,11 +1579,14 @@ class DispatcherStore:
                         now,
                     ),
                 )
-                return self._retry_run_locked(cur, run_id), True
+                created_run = self._retry_run_locked(cur, run_id)
+                if created_run is None:
+                    raise RuntimeError("dispatcher retry run is missing")
+                return created_run, True
             finally:
                 cur.close()
 
-    def retry_run(self, run_id: str) -> dict[str, Any] | None:
+    def retry_run(self, run_id: str) -> dict[str, JsonValue] | None:
         with self._lock:
             cur = self.conn.cursor()
             try:
@@ -1421,20 +1596,20 @@ class DispatcherStore:
 
     def abandon_retry(self, run_id: str, owner_token: str) -> None:
         with self._lock, self.conn:
-            self.conn.execute(
+            _ = self.conn.execute(
                 "DELETE FROM dispatcher_retry_runs WHERE run_id = ? AND owner_token = ? AND state = 'preparing'",
                 (run_id, owner_token),
             )
 
     @staticmethod
-    def _retry_run_locked(cur, run_id: str) -> dict[str, Any] | None:
-        cur.execute(
-            "SELECT run_id, request_fingerprint, job_id, predecessor_run_id, policy_source, execution_snapshot, "
-            "execution_snapshot_fingerprint, owner_token, state, result, created_at, updated_at "
+    def _retry_run_locked(cur: _Cursor, run_id: str) -> dict[str, JsonValue] | None:
+        _ = cur.execute(
+            "SELECT run_id, request_fingerprint, job_id, predecessor_run_id, policy_source, execution_snapshot, " +
+            "execution_snapshot_fingerprint, owner_token, state, result, created_at, updated_at " +
             "FROM dispatcher_retry_runs WHERE run_id = ?",
             (run_id,),
         )
-        row = cur.fetchone()
+        row = _fetchone(cur)
         if row is None:
             return None
         return {
@@ -1443,11 +1618,11 @@ class DispatcherStore:
             "job_id": row[2],
             "predecessor_run_id": row[3],
             "policy_source": row[4],
-            "execution_snapshot": json.loads(row[5]),
+            "execution_snapshot": parse_json(_text(row[5])),
             "execution_snapshot_fingerprint": row[6],
             "owner_token": row[7],
             "state": row[8],
-            "result": json.loads(row[9]) if row[9] else None,
+            "result": parse_json(_text(row[9])) if row[9] else None,
             "created_at": row[10],
             "updated_at": row[11],
         }
@@ -1457,15 +1632,15 @@ class DispatcherStore:
         run_id: str,
         owner_token: str,
         state: str,
-        result: dict[str, Any] | None = None,
+        result: dict[str, JsonValue] | None = None,
     ) -> bool:
         if state not in {"preparing", "started", "terminal"}:
             raise ValueError("invalid dispatcher retry state")
         with self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute(
-                    "UPDATE dispatcher_retry_runs SET state = ?, result = ?, updated_at = ? "
+                _ = cur.execute(
+                    "UPDATE dispatcher_retry_runs SET state = ?, result = ?, updated_at = ? " +
                     "WHERE run_id = ? AND owner_token = ?",
                     (
                         state,
@@ -1481,15 +1656,15 @@ class DispatcherStore:
 
     # -- предложения ---------------------------------------------------
 
-    def save_proposal(self, key: str, job_id: str, thread_id: str, kind: str, payload: dict, lease_token: str | None = None) -> bool:
+    def save_proposal(self, key: str, job_id: str, thread_id: str, kind: str, payload: Mapping[str, object], lease_token: str | None = None) -> bool:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
                 if lease_token is not None:
-                    cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND thread_id = ? AND lease_token = ?", (job_id, thread_id, lease_token))
-                    if cur.fetchone() is None:
+                    _ = cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND thread_id = ? AND lease_token = ?", (job_id, thread_id, lease_token))
+                    if _fetchone(cur) is None:
                         return False
-                cur.execute(
+                _ = cur.execute(
                     "INSERT OR REPLACE INTO dispatcher_proposals (key, job_id, thread_id, kind, payload, created_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, NULL)",
                     (key, job_id, thread_id, kind, canonical_json(payload).decode("utf-8"), _now_iso()),
                 )
@@ -1497,29 +1672,29 @@ class DispatcherStore:
                 cur.close()
         return True
 
-    def proposal(self, key: str) -> dict[str, Any] | None:
+    def proposal(self, key: str) -> dict[str, JsonValue] | None:
         with self._lock:
             cur = self.conn.cursor()
             try:
-                cur.execute("SELECT key, job_id, thread_id, kind, payload, created_at, consumed_at FROM dispatcher_proposals WHERE key = ?", (key,))
-                row = cur.fetchone()
+                _ = cur.execute("SELECT key, job_id, thread_id, kind, payload, created_at, consumed_at FROM dispatcher_proposals WHERE key = ?", (key,))
+                row = _fetchone(cur)
             finally:
                 cur.close()
         if row is None:
             return None
-        return {"key": row[0], "job_id": row[1], "thread_id": row[2], "kind": row[3], "payload": json.loads(row[4]), "created_at": row[5], "consumed_at": row[6]}
+        return {"key": row[0], "job_id": row[1], "thread_id": row[2], "kind": row[3], "payload": parse_json(_text(row[4])), "created_at": row[5], "consumed_at": row[6]}
 
-    def proposals(self) -> list[dict[str, Any]]:
+    def proposals(self) -> list[dict[str, JsonValue]]:
         """Возвращает ограниченные операционные предложения для проекции."""
 
         with self._lock:
             cur = self.conn.cursor()
             try:
-                cur.execute("SELECT key, job_id, thread_id, kind, payload, created_at, consumed_at FROM dispatcher_proposals ORDER BY created_at, key")
-                rows = cur.fetchall()
+                _ = cur.execute("SELECT key, job_id, thread_id, kind, payload, created_at, consumed_at FROM dispatcher_proposals ORDER BY created_at, key")
+                rows = _fetchall(cur)
             finally:
                 cur.close()
-        return [{"key": row[0], "job_id": row[1], "thread_id": row[2], "kind": row[3], "payload": json.loads(row[4]), "created_at": row[5], "consumed_at": row[6]} for row in rows]
+        return [{"key": row[0], "job_id": row[1], "thread_id": row[2], "kind": row[3], "payload": parse_json(_text(row[4])), "created_at": row[5], "consumed_at": row[6]} for row in rows]
 
     def copy_compatible_results(
         self,
@@ -1534,25 +1709,25 @@ class DispatcherStore:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND thread_id = ? AND lease_token = ?", (job_id, target_thread_id, lease_token))
-                if cur.fetchone() is None:
+                _ = cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND thread_id = ? AND lease_token = ?", (job_id, target_thread_id, lease_token))
+                if _fetchone(cur) is None:
                     return 0
-                cur.execute(
-                    "SELECT payload FROM dispatcher_proposals "
+                _ = cur.execute(
+                    "SELECT payload FROM dispatcher_proposals " +
                     "WHERE thread_id = ? AND kind = 'node-result' AND consumed_at IS NULL",
                     (source_thread_id,),
                 )
                 now = _now_iso()
-                for (encoded,) in cur.fetchall():
-                    payload = json.loads(encoded)
+                for (encoded,) in _fetchall(cur):
+                    payload = parse_json_object(_text(encoded))
                     name = payload.get("name")
                     envelope = payload.get("envelope")
                     if not isinstance(name, str) or not isinstance(envelope, dict):
                         continue
                     key = sha256(canonical_json({"thread_id": target_thread_id, "node_result": name}))
-                    cur.execute(
-                        "INSERT OR IGNORE INTO dispatcher_proposals "
-                        "(key, job_id, thread_id, kind, payload, created_at, consumed_at) "
+                    _ = cur.execute(
+                        "INSERT OR IGNORE INTO dispatcher_proposals " +
+                        "(key, job_id, thread_id, kind, payload, created_at, consumed_at) " +
                         "VALUES (?, ?, ?, 'node-result', ?, ?, NULL)",
                         (key, job_id, target_thread_id, canonical_json(payload).decode(), now),
                     )
@@ -1564,7 +1739,7 @@ class DispatcherStore:
     def configure_source_search(
         self,
         invocation_id: str,
-        policy: dict[str, Any],
+        policy: dict[str, JsonValue],
         capability_verifier: str,
         expires_at: str | None = None,
     ) -> None:
@@ -1579,13 +1754,13 @@ class DispatcherStore:
         now_value = datetime.now(timezone.utc)
         now = now_value.isoformat()
         expiry = expires_at or (
-            now_value + timedelta(seconds=int(policy["max_backend_seconds"]) + 300)
+            now_value + timedelta(seconds=int(_number(policy["max_backend_seconds"])) + 300)
         ).isoformat()
         if datetime.fromisoformat(expiry) <= now_value:
             raise ValueError("source-search capability expiry is invalid")
         with repository_lock(self.repo), self._lock, self.conn:
             prior = self.conn.execute(
-                "SELECT policy, capability_verifier, expires_at FROM source_search_invocations "
+                "SELECT policy, capability_verifier, expires_at FROM source_search_invocations " +
                 "WHERE invocation_id = ?",
                 (invocation_id,),
             ).fetchone()
@@ -1593,10 +1768,10 @@ class DispatcherStore:
                 if prior != (encoded, capability_verifier, expiry):
                     raise RuntimeError("source-search invocation is already bound")
                 return
-            self.conn.execute(
-                "INSERT INTO source_search_invocations "
-                "(invocation_id, policy_fingerprint, policy, capability_verifier, "
-                "admission_state, expires_at, created_at, updated_at) "
+            _ = self.conn.execute(
+                "INSERT INTO source_search_invocations " +
+                "(invocation_id, policy_fingerprint, policy, capability_verifier, " +
+                "admission_state, expires_at, created_at, updated_at) " +
                 "VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
                 (
                     invocation_id,
@@ -1612,7 +1787,7 @@ class DispatcherStore:
     def active_source_search_invocations(self) -> tuple[str, ...]:
         with self._lock:
             rows = self.conn.execute(
-                "SELECT invocation_id FROM source_search_invocations "
+                "SELECT invocation_id FROM source_search_invocations " +
                 "WHERE admission_state = 'open' ORDER BY invocation_id"
             ).fetchall()
         return tuple(str(row[0]) for row in rows)
@@ -1631,20 +1806,20 @@ class DispatcherStore:
         requested_results: int,
         requested_returned_bytes: int,
         requested_backend_seconds: float,
-    ) -> dict[str, Any]:
+    ) -> dict[str, JsonValue]:
+        from . import source_search
+
         if (
             not call_id
             or len(call_id) > 200
             or not query_hmac
-            or operation and operation not in __import__(
-                "one_c_autoresearch.source_search", fromlist=["V2_OPERATIONS"]
-            ).V2_OPERATIONS
+            or operation and operation not in source_search.V2_OPERATIONS
             or modality not in {"", "lexical", "hybrid", "workspace", "reference", "its"}
         ):
             raise ValueError("source_search.invalid_request")
         with repository_lock(self.repo), self._lock, self.conn:
             row = self.conn.execute(
-                "SELECT policy, capability_verifier, admission_state, expires_at "
+                "SELECT policy, capability_verifier, admission_state, expires_at " +
                 "FROM source_search_invocations WHERE invocation_id = ?",
                 (invocation_id,),
             ).fetchone()
@@ -1653,16 +1828,16 @@ class DispatcherStore:
             if row[2] != "open":
                 raise RuntimeError("source_search.invocation_terminal")
             if datetime.fromisoformat(str(row[3])) <= datetime.now(timezone.utc):
-                self.conn.execute(
-                    "UPDATE source_search_invocations SET admission_state = 'expired', "
+                _ = self.conn.execute(
+                    "UPDATE source_search_invocations SET admission_state = 'expired', " +
                     "updated_at = ? WHERE invocation_id = ?",
                     (_now_iso(), invocation_id),
                 )
                 raise RuntimeError("source_search.capability_expired")
-            policy = json.loads(row[0])
+            policy = parse_json_object(_text(row[0]))
             if capability not in {
-                __import__("one_c_autoresearch.source_search", fromlist=["OPERATIONS"]).OPERATIONS[operation]
-                for operation in policy["operations"]
+                source_search.OPERATIONS[allowed_operation]
+                for allowed_operation in _strings(policy["operations"])
             }:
                 raise ValueError("source_search.operation_forbidden")
             def exhausted(
@@ -1674,8 +1849,8 @@ class DispatcherStore:
                 error = SourceSearchBudgetError(
                     name, limit_value, consumed, requested,
                 )
-                self.conn.execute(
-                    "UPDATE source_search_invocations SET last_error_code = ?, "
+                _ = self.conn.execute(
+                    "UPDATE source_search_invocations SET last_error_code = ?, " +
                     "last_error_details = ?, updated_at = ? WHERE invocation_id = ?",
                     (
                         error.code,
@@ -1693,16 +1868,16 @@ class DispatcherStore:
                 return error
 
             per_call = (
-                ("max_query_bytes", policy["max_query_bytes"], query_bytes),
-                ("max_results_per_call", policy["max_results_per_call"], requested_results),
+                ("max_query_bytes", _number(policy["max_query_bytes"]), query_bytes),
+                ("max_results_per_call", _number(policy["max_results_per_call"]), requested_results),
                 (
                     "max_returned_bytes_per_call",
-                    policy["max_returned_bytes_per_call"],
+                    _number(policy["max_returned_bytes_per_call"]),
                     requested_returned_bytes,
                 ),
                 (
                     "per_call_deadline_seconds",
-                    policy["per_call_deadline_seconds"],
+                    _number(policy["per_call_deadline_seconds"]),
                     requested_backend_seconds,
                 ),
             )
@@ -1716,50 +1891,54 @@ class DispatcherStore:
             if duplicate is not None:
                 raise RuntimeError("source_search.replay")
             totals = self.conn.execute(
-                "SELECT COUNT(*), "
-                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN 1 ELSE 0 END), 0), "
-                "COALESCE(SUM(reserved_query_bytes), 0), "
-                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_results "
-                "ELSE COALESCE(actual_results, 0) END), 0), "
-                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_returned_bytes "
-                "ELSE COALESCE(actual_returned_bytes, 0) END), 0), "
-                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_backend_seconds "
-                "ELSE COALESCE(actual_backend_seconds, 0) END), 0), "
-                "COALESCE(MAX(ordinal), 0) "
+                "SELECT COUNT(*), " +
+                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN 1 ELSE 0 END), 0), " +
+                "COALESCE(SUM(reserved_query_bytes), 0), " +
+                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_results " +
+                "ELSE COALESCE(actual_results, 0) END), 0), " +
+                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_returned_bytes " +
+                "ELSE COALESCE(actual_returned_bytes, 0) END), 0), " +
+                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_backend_seconds " +
+                "ELSE COALESCE(actual_backend_seconds, 0) END), 0), " +
+                "COALESCE(MAX(ordinal), 0) " +
                 "FROM source_search_calls WHERE invocation_id = ?",
                 (invocation_id,),
             ).fetchone()
+            if totals is None:
+                raise RuntimeError("source-search totals are missing")
             checks = (
-                ("max_calls", policy["max_calls"], totals[0], 1),
-                ("max_concurrent_calls", policy["max_concurrent_calls"], totals[1], 1),
-                ("max_total_query_bytes", policy["max_total_query_bytes"], totals[2], query_bytes),
-                ("max_total_results", policy["max_total_results"], totals[3], requested_results),
+                ("max_calls", _number(policy["max_calls"]), _number(totals[0]), 1),
+                ("max_concurrent_calls", _number(policy["max_concurrent_calls"]), _number(totals[1]), 1),
+                ("max_total_query_bytes", _number(policy["max_total_query_bytes"]), _number(totals[2]), query_bytes),
+                ("max_total_results", _number(policy["max_total_results"]), _number(totals[3]), requested_results),
                 (
                     "max_total_returned_bytes",
-                    policy["max_total_returned_bytes"],
-                    totals[4],
+                    _number(policy["max_total_returned_bytes"]),
+                    _number(totals[4]),
                     requested_returned_bytes,
                 ),
             )
             for name, limit_value, consumed, requested in checks:
                 if consumed + requested > limit_value:
                     raise exhausted(name, limit_value, consumed, requested)
-            remaining_seconds = policy["max_backend_seconds"] - totals[5]
+            max_backend_seconds = _number(policy["max_backend_seconds"])
+            consumed_backend_seconds = _number(totals[5])
+            remaining_seconds = max_backend_seconds - consumed_backend_seconds
             if remaining_seconds <= 0:
                 raise exhausted(
                     "max_backend_seconds",
-                    policy["max_backend_seconds"],
-                    totals[5],
+                    max_backend_seconds,
+                    consumed_backend_seconds,
                     requested_backend_seconds,
                 )
             reserved_backend_seconds = min(requested_backend_seconds, remaining_seconds)
-            ordinal = int(totals[6]) + 1
+            ordinal = int(_number(totals[6])) + 1
             now = _now_iso()
-            self.conn.execute(
-                "INSERT INTO source_search_calls "
-                "(invocation_id, call_id, ordinal, query_hmac, capability, operation, modality, scope_fingerprint, "
-                "reserved_query_bytes, reserved_results, reserved_returned_bytes, "
-                "reserved_backend_seconds, status, created_at) "
+            _ = self.conn.execute(
+                "INSERT INTO source_search_calls " +
+                "(invocation_id, call_id, ordinal, query_hmac, capability, operation, modality, scope_fingerprint, " +
+                "reserved_query_bytes, reserved_results, reserved_returned_bytes, " +
+                "reserved_backend_seconds, status, created_at) " +
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?)",
                 (
                     invocation_id,
@@ -1769,7 +1948,7 @@ class DispatcherStore:
                     capability,
                     operation or None,
                     modality or None,
-                    policy["scope_fingerprint"],
+                    _string(policy["scope_fingerprint"]),
                     query_bytes,
                     requested_results,
                     requested_returned_bytes,
@@ -1780,7 +1959,7 @@ class DispatcherStore:
             return {
                 "ordinal": ordinal,
                 "deadline_seconds": reserved_backend_seconds,
-                "policy_fingerprint": policy["policy_fingerprint"],
+                "policy_fingerprint": _string(policy["policy_fingerprint"]),
             }
 
     def settle_source_search_call(
@@ -1811,15 +1990,15 @@ class DispatcherStore:
             raise ValueError("invalid source-search terminal status")
         with repository_lock(self.repo), self._lock, self.conn:
             row = self.conn.execute(
-                "SELECT reserved_results, reserved_returned_bytes, reserved_backend_seconds "
-                "FROM source_search_calls WHERE invocation_id = ? AND call_id = ? "
+                "SELECT reserved_results, reserved_returned_bytes, reserved_backend_seconds " +
+                "FROM source_search_calls WHERE invocation_id = ? AND call_id = ? " +
                 "AND status = 'reserved'",
                 (invocation_id, call_id),
             ).fetchone()
             if row is None:
                 return False
             call = self.conn.execute(
-                "SELECT operation, modality FROM source_search_calls "
+                "SELECT operation, modality FROM source_search_calls " +
                 "WHERE invocation_id = ? AND call_id = ?",
                 (invocation_id, call_id),
             ).fetchone()
@@ -1830,7 +2009,7 @@ class DispatcherStore:
             }
             if call and call[0] and (
                 set(counts) - allowed_classes
-                or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in counts.values())
+                or any(value < 0 for value in counts.values())
                 or sum(counts.values()) != result_count
             ):
                 raise ValueError("source_search.invalid_result_class_counts")
@@ -1853,20 +2032,20 @@ class DispatcherStore:
                 ):
                     raise ValueError("source_search.incomplete_v2_provenance")
             if (
-                result_count < 0 or result_count > row[0]
-                or returned_bytes < 0 or returned_bytes > row[1]
-                or backend_seconds < 0 or backend_seconds > row[2]
+                result_count < 0 or result_count > _number(row[0])
+                or returned_bytes < 0 or returned_bytes > _number(row[1])
+                or backend_seconds < 0 or backend_seconds > _number(row[2])
             ):
                 raise ValueError("source_search.settlement_exceeds_reservation")
             cur = self.conn.execute(
-                "UPDATE source_search_calls SET status = ?, route_fingerprint = ?, fallback_reason = ?, "
-                "adapter_id = ?, adapter_version = ?, capability_fingerprint = ?, "
-                "index_fingerprint = ?, result_manifest_fingerprint = ?, "
-                "surface_identity = ?, embedding_identity = ?, reference_identity = ?, "
-                "result_class_counts = ?, canonical_manifest_fingerprint = ?, "
-                "derived_manifest_fingerprint = ?, "
-                "actual_results = ?, actual_returned_bytes = ?, actual_backend_seconds = ?, "
-                "error_code = ?, finished_at = ? "
+                "UPDATE source_search_calls SET status = ?, route_fingerprint = ?, fallback_reason = ?, " +
+                "adapter_id = ?, adapter_version = ?, capability_fingerprint = ?, " +
+                "index_fingerprint = ?, result_manifest_fingerprint = ?, " +
+                "surface_identity = ?, embedding_identity = ?, reference_identity = ?, " +
+                "result_class_counts = ?, canonical_manifest_fingerprint = ?, " +
+                "derived_manifest_fingerprint = ?, " +
+                "actual_results = ?, actual_returned_bytes = ?, actual_backend_seconds = ?, " +
+                "error_code = ?, finished_at = ? " +
                 "WHERE invocation_id = ? AND call_id = ? AND status = 'reserved'",
                 (
                     status,
@@ -1899,14 +2078,14 @@ class DispatcherStore:
             raise ValueError("invalid source-search close status")
         now = _now_iso()
         with repository_lock(self.repo), self._lock, self.conn:
-            self.conn.execute(
-                "UPDATE source_search_invocations SET admission_state = 'closed', "
+            _ = self.conn.execute(
+                "UPDATE source_search_invocations SET admission_state = 'closed', " +
                 "updated_at = ? WHERE invocation_id = ? AND admission_state = 'open'",
                 (now, invocation_id),
             )
             cur = self.conn.execute(
-                "UPDATE source_search_calls SET status = ?, error_code = ?, "
-                "actual_results = 0, actual_returned_bytes = 0, actual_backend_seconds = 0, "
+                "UPDATE source_search_calls SET status = ?, error_code = ?, " +
+                "actual_results = 0, actual_returned_bytes = 0, actual_backend_seconds = 0, " +
                 "finished_at = ? WHERE invocation_id = ? AND status = 'reserved'",
                 (terminal_status, f"source_search.{terminal_status}", now, invocation_id),
             )
@@ -1915,7 +2094,7 @@ class DispatcherStore:
     def source_search_admission_open(self, invocation_id: str) -> bool:
         with self._lock:
             row = self.conn.execute(
-                "SELECT admission_state, expires_at FROM source_search_invocations "
+                "SELECT admission_state, expires_at FROM source_search_invocations " +
                 "WHERE invocation_id = ?",
                 (invocation_id,),
             ).fetchone()
@@ -1928,39 +2107,44 @@ class DispatcherStore:
     def complete_source_search(self, invocation_id: str) -> None:
         now = _now_iso()
         with repository_lock(self.repo), self._lock, self.conn:
-            reserved = self.conn.execute(
-                "SELECT COUNT(*) FROM source_search_calls "
+            reserved_row = self.conn.execute(
+                "SELECT COUNT(*) FROM source_search_calls " +
                 "WHERE invocation_id = ? AND status = 'reserved'",
                 (invocation_id,),
-            ).fetchone()[0]
+            ).fetchone()
+            if reserved_row is None:
+                raise RuntimeError("source-search reservation count is missing")
+            reserved = _integer(reserved_row[0])
             if reserved:
                 raise RuntimeError("source_search.calls_in_flight")
-            self.conn.execute(
-                "UPDATE source_search_invocations SET admission_state = 'completed', "
+            _ = self.conn.execute(
+                "UPDATE source_search_invocations SET admission_state = 'completed', " +
                 "updated_at = ? WHERE invocation_id = ? AND admission_state = 'open'",
                 (now, invocation_id),
             )
 
-    def source_search_ledger(self, invocation_id: str, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+    def source_search_ledger(self, invocation_id: str, offset: int = 0, limit: int = 100) -> dict[str, JsonValue]:
+        from . import source_search
+
         if offset < 0 or not 1 <= limit <= 200:
             raise ValueError("invalid source-search ledger page")
         with self._lock:
             invocation = self.conn.execute(
-                "SELECT policy_fingerprint, policy, admission_state, expires_at, "
-                "last_error_code, last_error_details "
+                "SELECT policy_fingerprint, policy, admission_state, expires_at, " +
+                "last_error_code, last_error_details " +
                 "FROM source_search_invocations WHERE invocation_id = ?",
                 (invocation_id,),
             ).fetchone()
             if invocation is None:
                 raise KeyError("source-search invocation not found")
             rows = self.conn.execute(
-                "SELECT ordinal, query_hmac, capability, operation, modality, scope_fingerprint, "
-                "route_fingerprint, fallback_reason, adapter_id, adapter_version, capability_fingerprint, "
-                "index_fingerprint, result_manifest_fingerprint, surface_identity, "
-                "embedding_identity, reference_identity, result_class_counts, "
-                "canonical_manifest_fingerprint, derived_manifest_fingerprint, "
-                "actual_results, actual_returned_bytes, actual_backend_seconds, status, "
-                "error_code, created_at, finished_at FROM source_search_calls "
+                "SELECT ordinal, query_hmac, capability, operation, modality, scope_fingerprint, " +
+                "route_fingerprint, fallback_reason, adapter_id, adapter_version, capability_fingerprint, " +
+                "index_fingerprint, result_manifest_fingerprint, surface_identity, " +
+                "embedding_identity, reference_identity, result_class_counts, " +
+                "canonical_manifest_fingerprint, derived_manifest_fingerprint, " +
+                "actual_results, actual_returned_bytes, actual_backend_seconds, status, " +
+                "error_code, created_at, finished_at FROM source_search_calls " +
                 "WHERE invocation_id = ? ORDER BY ordinal LIMIT ? OFFSET ?",
                 (invocation_id, limit + 1, offset),
             ).fetchall()
@@ -1976,28 +2160,30 @@ class DispatcherStore:
         )
         with self._lock:
             totals = self.conn.execute(
-                "SELECT COUNT(*), "
-                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN 1 ELSE 0 END), 0), "
-                "COALESCE(SUM(COALESCE(actual_results, 0)), 0), "
-                "COALESCE(SUM(COALESCE(actual_returned_bytes, 0)), 0), "
-                "COALESCE(SUM(COALESCE(actual_backend_seconds, 0)), 0) "
+                "SELECT COUNT(*), " +
+                "COALESCE(SUM(CASE WHEN status = 'reserved' THEN 1 ELSE 0 END), 0), " +
+                "COALESCE(SUM(COALESCE(actual_results, 0)), 0), " +
+                "COALESCE(SUM(COALESCE(actual_returned_bytes, 0)), 0), " +
+                "COALESCE(SUM(COALESCE(actual_backend_seconds, 0)), 0) " +
                 "FROM source_search_calls WHERE invocation_id = ?",
                 (invocation_id,),
             ).fetchone()
+            if totals is None:
+                raise RuntimeError("source-search totals are missing")
             all_rows = self.conn.execute(
-                "SELECT ordinal, query_hmac, capability, operation, modality, scope_fingerprint, "
-                "route_fingerprint, fallback_reason, adapter_id, adapter_version, capability_fingerprint, "
-                "index_fingerprint, result_manifest_fingerprint, surface_identity, "
-                "embedding_identity, reference_identity, result_class_counts, "
-                "canonical_manifest_fingerprint, derived_manifest_fingerprint, "
-                "actual_results, actual_returned_bytes, status, error_code "
+                "SELECT ordinal, query_hmac, capability, operation, modality, scope_fingerprint, " +
+                "route_fingerprint, fallback_reason, adapter_id, adapter_version, capability_fingerprint, " +
+                "index_fingerprint, result_manifest_fingerprint, surface_identity, " +
+                "embedding_identity, reference_identity, result_class_counts, " +
+                "canonical_manifest_fingerprint, derived_manifest_fingerprint, " +
+                "actual_results, actual_returned_bytes, status, error_code " +
                 "FROM source_search_calls WHERE invocation_id = ? ORDER BY ordinal",
                 (invocation_id,),
             ).fetchall()
-        items = [dict(zip(keys, row)) for row in rows[:limit]]
+        items: list[dict[str, JsonValue]] = [dict(zip(keys, row)) for row in rows[:limit]]
         for item in items:
-            item["result_class_counts"] = json.loads(item["result_class_counts"] or "{}")
-        policy = json.loads(invocation[1])
+            item["result_class_counts"] = parse_json_object(_string(item["result_class_counts"] or "{}"))
+        policy = parse_json_object(_text(invocation[1]))
         status_counts: dict[str, int] = {}
         routes: dict[tuple[str, str, str], int] = {}
         for row in all_rows:
@@ -2012,7 +2198,7 @@ class DispatcherStore:
                 item["surface_identity"]
                 and item["result_class_counts"]
                 and (
-                    not item["operation"].startswith("reference.")
+                    not _string(item["operation"]).startswith("reference.")
                     or item["reference_identity"]
                 )
                 and (
@@ -2031,8 +2217,8 @@ class DispatcherStore:
             "expires_at": invocation[3],
             "operations": policy["operations"],
             "scope": {
-                "component_count": len(policy.get("component_ids", [])),
-                "path_count": len(policy.get("logical_path_prefixes", [])),
+                "component_count": len(_strings(policy.get("component_ids", []))),
+                "path_count": len(_strings(policy.get("logical_path_prefixes", []))),
                 "fingerprint": policy["scope_fingerprint"],
             },
             "configured_limits": {
@@ -2045,10 +2231,11 @@ class DispatcherStore:
                     "max_returned_bytes_per_call", "max_total_returned_bytes",
                 )
             },
-            "capacity_reserve_bytes": __import__(
-                "one_c_autoresearch.source_search",
-                fromlist=["dynamic_reserve_bytes"],
-            ).dynamic_reserve_bytes(policy),
+            "capacity_reserve_bytes": (
+                _number(policy["max_total_query_bytes"])
+                + _number(policy["max_total_returned_bytes"])
+                + _number(policy["max_calls"]) * source_search.TOOL_FRAMING_BYTES_PER_CALL
+            ),
             "usage": {
                 "calls": totals[0],
                 "in_flight": totals[1],
@@ -2069,7 +2256,7 @@ class DispatcherStore:
             "last_error": (
                 {
                     "code": invocation[4],
-                    **json.loads(invocation[5]),
+                    **parse_json_object(_text(invocation[5])),
                     "recovery": "start_new_invocation",
                 }
                 if invocation[4] and invocation[5]
@@ -2098,31 +2285,31 @@ class DispatcherStore:
         context_manifest_fingerprint: str = "",
         context_envelope_fingerprint: str = "",
         prepared_input_fingerprint: str = "",
-        context_provenance: list[dict[str, Any]] | None = None,
-        context_diagnostics: dict[str, Any] | None = None,
+        context_provenance: list[dict[str, JsonValue]] | None = None,
+        context_diagnostics: dict[str, JsonValue] | None = None,
     ) -> dict[str, str] | None:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?", (job_id, lease_token))
-                if cur.fetchone() is None:
+                _ = cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?", (job_id, lease_token))
+                if _fetchone(cur) is None:
                     return None
-                cur.execute("SELECT slot_id FROM dispatcher_invocations WHERE job_id = ? AND run_id = ? AND phase_id = ? AND role_id = ? AND status = 'running'", (job_id, run_id, phase_id, role_id))
-                used = {str(row[0]) for row in cur.fetchall()}
+                _ = cur.execute("SELECT slot_id FROM dispatcher_invocations WHERE job_id = ? AND run_id = ? AND phase_id = ? AND role_id = ? AND status = 'running'", (job_id, run_id, phase_id, role_id))
+                used = {str(row[0]) for row in _fetchall(cur)}
                 ordinal = next((value for value in range(1, configured_slots + 1) if f"{phase_id}:{role_id}:{value}" not in used), None)
                 if ordinal is None:
                     return None
                 invocation_id = str(uuid.uuid4())
                 slot_id = f"{phase_id}:{role_id}:{ordinal}"
                 now = _now_iso()
-                cur.execute(
-                    "SELECT context_diagnostics FROM dispatcher_phase_work "
+                _ = cur.execute(
+                    "SELECT context_diagnostics FROM dispatcher_phase_work " +
                     "WHERE run_id = ? AND phase_id = ? AND role_id = ? AND work_unit_id = ?",
                     (run_id, phase_id, role_id, work_unit_id),
                 )
-                prior_row = cur.fetchone()
+                prior_row = _fetchone(cur)
                 prior_diagnostics = (
-                    json.loads(prior_row[0])
+                    parse_json_object(_text(prior_row[0]))
                     if prior_row and prior_row[0]
                     else {}
                 )
@@ -2130,14 +2317,14 @@ class DispatcherStore:
                     **prior_diagnostics,
                     **(context_diagnostics or {}),
                 }
-                cur.execute(
-                    "INSERT INTO dispatcher_invocations "
-                    "(invocation_id, job_id, run_id, phase_id, role_id, "
-                    "work_unit_id, slot_id, status, created_at, updated_at, "
-                    "execution_snapshot_fingerprint, profile_id, "
-                    "context_manifest_fingerprint, context_envelope_fingerprint, "
-                    "prepared_input_fingerprint, context_provenance, "
-                    "context_diagnostics) "
+                _ = cur.execute(
+                    "INSERT INTO dispatcher_invocations " +
+                    "(invocation_id, job_id, run_id, phase_id, role_id, " +
+                    "work_unit_id, slot_id, status, created_at, updated_at, " +
+                    "execution_snapshot_fingerprint, profile_id, " +
+                    "context_manifest_fingerprint, context_envelope_fingerprint, " +
+                    "prepared_input_fingerprint, context_provenance, " +
+                    "context_diagnostics) " +
                     "VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         invocation_id,
@@ -2158,10 +2345,10 @@ class DispatcherStore:
                         canonical_json(merged_diagnostics).decode(),
                     ),
                 )
-                cur.execute(
-                    "UPDATE dispatcher_phase_work SET status = 'running', "
-                    "execution_kind = 'provider', context_diagnostics = ?, "
-                    "invocation_id = ?, updated_at = ? "
+                _ = cur.execute(
+                    "UPDATE dispatcher_phase_work SET status = 'running', " +
+                    "execution_kind = 'provider', context_diagnostics = ?, " +
+                    "invocation_id = ?, updated_at = ? " +
                     "WHERE run_id = ? AND phase_id = ? AND role_id = ? AND work_unit_id = ?",
                     (
                         canonical_json(merged_diagnostics).decode(),
@@ -2184,9 +2371,9 @@ class DispatcherStore:
                     "invocation_status": "running",
                     "timestamp": now,
                 }
-                cur.execute(
-                    "INSERT OR IGNORE INTO dispatcher_invocation_outbox "
-                    "(transition_key, invocation_id, run_id, event_type, payload, created_at) "
+                _ = cur.execute(
+                    "INSERT OR IGNORE INTO dispatcher_invocation_outbox " +
+                    "(transition_key, invocation_id, run_id, event_type, payload, created_at) " +
                     "VALUES (?, ?, ?, 'invocation.started', ?, ?)",
                     (
                         payload["transition_key"],
@@ -2234,7 +2421,7 @@ class DispatcherStore:
             try:
                 now = _now_iso()
                 if lease_token is not None and not cur.execute(
-                    "SELECT 1 FROM dispatcher_invocations i JOIN dispatcher_leases l "
+                    "SELECT 1 FROM dispatcher_invocations i JOIN dispatcher_leases l " +
                     "ON l.job_id = i.job_id WHERE i.invocation_id = ? AND l.lease_token = ?",
                     (invocation_id, lease_token),
                 ).fetchone():
@@ -2254,20 +2441,20 @@ class DispatcherStore:
     def finish_invocation(self, invocation_id: str, status: str, lease_token: str) -> bool:
         return self.terminalize_invocation(invocation_id, status, lease_token)
 
-    def reconcile_invocation_outbox(self, event_store) -> int:
+    def reconcile_invocation_outbox(self, event_store: EventStore) -> int:
         delivered = 0
         with self._lock:
             rows = self.conn.execute(
-                "SELECT transition_key, event_type, run_id, payload "
-                "FROM dispatcher_invocation_outbox WHERE delivered_at IS NULL "
+                "SELECT transition_key, event_type, run_id, payload " +
+                "FROM dispatcher_invocation_outbox WHERE delivered_at IS NULL " +
                 "ORDER BY created_at, transition_key"
             ).fetchall()
         for transition_key, event_type, run_id, encoded in rows:
-            payload = json.loads(encoded)
-            event_store.emit(event_type, run_id, payload)
+            payload = parse_json_object(_text(encoded))
+            _ = event_store.emit(_text(event_type), _text(run_id), payload)
             with self._lock, self.conn:
                 changed = self.conn.execute(
-                    "UPDATE dispatcher_invocation_outbox SET delivered_at = ? "
+                    "UPDATE dispatcher_invocation_outbox SET delivered_at = ? " +
                     "WHERE transition_key = ? AND delivered_at IS NULL",
                     (_now_iso(), transition_key),
                 ).rowcount
@@ -2288,13 +2475,13 @@ class DispatcherStore:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?", (job_id, lease_token))
-                if cur.fetchone() is None:
+                _ = cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?", (job_id, lease_token))
+                if _fetchone(cur) is None:
                     return False
                 now = _now_iso()
-                cur.executemany(
-                    "INSERT OR IGNORE INTO dispatcher_phase_work "
-                    "(job_id, run_id, phase_id, role_id, work_unit_id, status, invocation_id, updated_at) "
+                _ = cur.executemany(
+                    "INSERT OR IGNORE INTO dispatcher_phase_work " +
+                    "(job_id, run_id, phase_id, role_id, work_unit_id, status, invocation_id, updated_at) " +
                     "VALUES (?, ?, ?, ?, ?, 'queued', NULL, ?)",
                     [(job_id, run_id, phase_id, role_id, item, now) for item in work_unit_ids],
                 )
@@ -2302,17 +2489,17 @@ class DispatcherStore:
             finally:
                 cur.close()
 
-    def phase_work(self, run_id: str) -> list[dict[str, Any]]:
+    def phase_work(self, run_id: str) -> list[dict[str, JsonValue]]:
         with self._lock:
             cur = self.conn.cursor()
             try:
-                cur.execute(
-                    "SELECT job_id, run_id, phase_id, role_id, work_unit_id, status, invocation_id, updated_at, "
-                    "execution_kind, source_result_ref, context_diagnostics "
+                _ = cur.execute(
+                    "SELECT job_id, run_id, phase_id, role_id, work_unit_id, status, invocation_id, updated_at, " +
+                    "execution_kind, source_result_ref, context_diagnostics " +
                     "FROM dispatcher_phase_work WHERE run_id = ? ORDER BY phase_id, role_id, work_unit_id",
                     (run_id,),
                 )
-                rows = cur.fetchall()
+                rows = _fetchall(cur)
             finally:
                 cur.close()
         keys = ("job_id", "run_id", "phase_id", "role_id", "work_unit_id", "status", "invocation_id", "updated_at", "execution_kind", "source_result_ref", "context_diagnostics")
@@ -2331,17 +2518,17 @@ class DispatcherStore:
         lease_token: str,
         *,
         source_result_ref: str = "",
-        context_diagnostics: dict[str, Any] | None = None,
+        context_diagnostics: dict[str, JsonValue] | None = None,
     ) -> bool:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute(
-                    "UPDATE dispatcher_phase_work SET status = 'completed', "
-                    "execution_kind = 'reused', source_result_ref = ?, "
-                    "context_diagnostics = ?, updated_at = ? "
-                    "WHERE run_id = ? AND phase_id = ? AND role_id = ? AND work_unit_id = ? "
-                    "AND status IN ('queued', 'completed') AND EXISTS "
+                _ = cur.execute(
+                    "UPDATE dispatcher_phase_work SET status = 'completed', " +
+                    "execution_kind = 'reused', source_result_ref = ?, " +
+                    "context_diagnostics = ?, updated_at = ? " +
+                    "WHERE run_id = ? AND phase_id = ? AND role_id = ? AND work_unit_id = ? " +
+                    "AND status IN ('queued', 'completed') AND EXISTS " +
                     "(SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?)",
                     (
                         source_result_ref or None,
@@ -2370,16 +2557,16 @@ class DispatcherStore:
         *,
         execution_kind: str,
         status: str,
-        context_diagnostics: dict[str, Any],
+        context_diagnostics: dict[str, JsonValue],
     ) -> bool:
         if execution_kind not in {"provider", "deterministic", "preflight_failed"}:
             raise ValueError("invalid phase execution kind")
         with repository_lock(self.repo), self._lock, self.conn:
             changed = self.conn.execute(
-                "UPDATE dispatcher_phase_work SET status = ?, execution_kind = ?, "
-                "context_diagnostics = ?, updated_at = ? "
-                "WHERE run_id = ? AND phase_id = ? AND role_id = ? "
-                "AND work_unit_id = ? AND EXISTS "
+                "UPDATE dispatcher_phase_work SET status = ?, execution_kind = ?, " +
+                "context_diagnostics = ?, updated_at = ? " +
+                "WHERE run_id = ? AND phase_id = ? AND role_id = ? " +
+                "AND work_unit_id = ? AND EXISTS " +
                 "(SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?)",
                 (
                     status,
@@ -2402,9 +2589,9 @@ class DispatcherStore:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute(
-                    "UPDATE dispatcher_phase_work SET status = 'cancelled', updated_at = ? "
-                    "WHERE job_id = ? AND run_id = ? AND status = 'queued' AND EXISTS "
+                _ = cur.execute(
+                    "UPDATE dispatcher_phase_work SET status = 'cancelled', updated_at = ? " +
+                    "WHERE job_id = ? AND run_id = ? AND status = 'queued' AND EXISTS " +
                     "(SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND lease_token = ?)",
                     (_now_iso(), job_id, run_id, job_id, lease_token),
                 )
@@ -2419,7 +2606,7 @@ class DispatcherStore:
             cur = self.conn.cursor()
             try:
                 if not cur.execute(
-                    "SELECT 1 FROM dispatcher_leases "
+                    "SELECT 1 FROM dispatcher_leases " +
                     "WHERE job_id = ? AND run_id = ? AND lease_token = ?",
                     (job_id, run_id, lease_token),
                 ).fetchone():
@@ -2427,7 +2614,7 @@ class DispatcherStore:
                 invocation_ids = [
                     str(row[0])
                     for row in cur.execute(
-                        "SELECT invocation_id FROM dispatcher_invocations "
+                        "SELECT invocation_id FROM dispatcher_invocations " +
                         "WHERE job_id = ? AND run_id = ? AND status = 'running'",
                         (job_id, run_id),
                     )
@@ -2444,17 +2631,17 @@ class DispatcherStore:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute(
+                _ = cur.execute(
                     "SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND run_id = ? AND lease_token = ?",
                     (job_id, run_id, lease_token),
                 )
-                if cur.fetchone() is None:
+                if _fetchone(cur) is None:
                     return 0
                 now = _now_iso()
                 invocation_ids = [
                     str(row[0])
                     for row in cur.execute(
-                        "SELECT invocation_id FROM dispatcher_invocations "
+                        "SELECT invocation_id FROM dispatcher_invocations " +
                         "WHERE job_id = ? AND run_id = ? AND status = 'running'",
                         (job_id, run_id),
                     )
@@ -2462,8 +2649,8 @@ class DispatcherStore:
                 invocation_count = _terminalize_rows(
                     cur, invocation_ids, "cancelled", now
                 )
-                cur.execute(
-                    "UPDATE dispatcher_phase_work SET status = 'cancelled', updated_at = ? "
+                _ = cur.execute(
+                    "UPDATE dispatcher_phase_work SET status = 'cancelled', updated_at = ? " +
                     "WHERE job_id = ? AND run_id = ? AND status IN ('running', 'queued')",
                     (now, job_id, run_id),
                 )
@@ -2475,17 +2662,17 @@ class DispatcherStore:
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute(
+                _ = cur.execute(
                     "SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND run_id = ? AND lease_token = ?",
                     (job_id, run_id, lease_token),
                 )
-                if cur.fetchone() is None:
+                if _fetchone(cur) is None:
                     return 0
                 now = _now_iso()
                 invocation_ids = [
                     str(row[0])
                     for row in cur.execute(
-                        "SELECT invocation_id FROM dispatcher_invocations "
+                        "SELECT invocation_id FROM dispatcher_invocations " +
                         "WHERE job_id = ? AND run_id = ? AND status = 'running'",
                         (job_id, run_id),
                     )
@@ -2500,12 +2687,12 @@ class DispatcherStore:
         with self._lock:
             cur = self.conn.cursor()
             try:
-                cur.execute(
-                    "SELECT run_id FROM dispatcher_phase_work WHERE job_id = ? "
+                _ = cur.execute(
+                    "SELECT run_id FROM dispatcher_phase_work WHERE job_id = ? " +
                     "ORDER BY updated_at DESC, run_id DESC LIMIT 1",
                     (job_id,),
                 )
-                row = cur.fetchone()
+                row = _fetchone(cur)
                 return str(row[0]) if row else ""
             finally:
                 cur.close()
@@ -2516,41 +2703,42 @@ class DispatcherStore:
         limit: int = 100,
         phase_id: str | None = None,
         role_id: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, JsonValue]]:
         with self._lock:
             cur = self.conn.cursor()
             try:
-                clauses, parameters = [], []
+                clauses: list[str] = []
+                parameters: list[SqlValue] = []
                 for column, value in (("run_id", run_id), ("phase_id", phase_id), ("role_id", role_id)):
                     if value is not None:
                         clauses.append(f"{column} = ?")
                         parameters.append(value)
                 where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-                cur.execute(
-                    "SELECT invocation_id, job_id, run_id, phase_id, role_id, work_unit_id, slot_id, status, created_at, updated_at, "
-                    "execution_snapshot_fingerprint, profile_id, context_manifest_fingerprint, "
-                    "context_envelope_fingerprint, prepared_input_fingerprint, "
-                    "context_provenance, context_diagnostics, "
-                    "finished_at, error_code, error_summary, result_ref "
+                _ = cur.execute(
+                    "SELECT invocation_id, job_id, run_id, phase_id, role_id, work_unit_id, slot_id, status, created_at, updated_at, " +
+                    "execution_snapshot_fingerprint, profile_id, context_manifest_fingerprint, " +
+                    "context_envelope_fingerprint, prepared_input_fingerprint, " +
+                    "context_provenance, context_diagnostics, " +
+                    "finished_at, error_code, error_summary, result_ref " +
                     f"FROM dispatcher_invocations{where} ORDER BY created_at DESC, invocation_id DESC LIMIT ?",
                     (*parameters, limit),
                 )
-                rows = cur.fetchall()
+                rows = _fetchall(cur)
             finally:
                 cur.close()
         keys = ("invocation_id", "job_id", "run_id", "phase_id", "role_id", "work_unit_id", "slot_id", "status", "created_at", "updated_at", "execution_snapshot_fingerprint", "profile_id", "context_manifest_fingerprint", "context_envelope_fingerprint", "prepared_input_fingerprint", "context_provenance", "context_diagnostics", "finished_at", "error_code", "error_summary", "result_ref")
         return [_decode_context_columns(dict(zip(keys, row, strict=True))) for row in rows]
 
-    def invocation(self, invocation_id: str) -> dict[str, Any] | None:
+    def invocation(self, invocation_id: str) -> dict[str, JsonValue] | None:
         with self._lock:
             row = self.conn.execute(
-                "SELECT invocation_id, job_id, run_id, phase_id, role_id, "
-                "work_unit_id, slot_id, status, created_at, updated_at, "
-                "execution_snapshot_fingerprint, profile_id, "
-                "context_manifest_fingerprint, context_envelope_fingerprint, "
-                "prepared_input_fingerprint, context_provenance, "
-                "context_diagnostics, finished_at, error_code, "
-                "error_summary, result_ref FROM dispatcher_invocations "
+                "SELECT invocation_id, job_id, run_id, phase_id, role_id, " +
+                "work_unit_id, slot_id, status, created_at, updated_at, " +
+                "execution_snapshot_fingerprint, profile_id, " +
+                "context_manifest_fingerprint, context_envelope_fingerprint, " +
+                "prepared_input_fingerprint, context_provenance, " +
+                "context_diagnostics, finished_at, error_code, " +
+                "error_summary, result_ref FROM dispatcher_invocations " +
                 "WHERE invocation_id = ?",
                 (invocation_id,),
             ).fetchone()
@@ -2575,8 +2763,8 @@ class DispatcherStore:
         slot_id: str,
         limit: int,
         before: tuple[str, str] | None = None,
-    ) -> list[dict[str, Any]]:
-        parameters: list[Any] = [run_id, phase_id, role_id, slot_id]
+    ) -> list[dict[str, JsonValue]]:
+        parameters: list[SqlValue] = [run_id, phase_id, role_id, slot_id]
         before_clause = ""
         if before is not None:
             before_clause = (
@@ -2585,13 +2773,13 @@ class DispatcherStore:
             parameters.extend((before[0], before[0], before[1]))
         with self._lock:
             rows = self.conn.execute(
-                "SELECT invocation_id, job_id, run_id, phase_id, role_id, "
-                "work_unit_id, slot_id, status, created_at, updated_at, "
-                "execution_snapshot_fingerprint, profile_id, "
-                "context_manifest_fingerprint, context_envelope_fingerprint, "
-                "prepared_input_fingerprint, context_provenance, "
-                "context_diagnostics, finished_at, error_code, "
-                "error_summary, result_ref FROM dispatcher_invocations "
+                "SELECT invocation_id, job_id, run_id, phase_id, role_id, " +
+                "work_unit_id, slot_id, status, created_at, updated_at, " +
+                "execution_snapshot_fingerprint, profile_id, " +
+                "context_manifest_fingerprint, context_envelope_fingerprint, " +
+                "prepared_input_fingerprint, context_provenance, " +
+                "context_diagnostics, finished_at, error_code, " +
+                "error_summary, result_ref FROM dispatcher_invocations " +
                 "WHERE run_id = ? AND phase_id = ? AND role_id = ? AND slot_id = ?"
                 + before_clause
                 + " ORDER BY created_at DESC, invocation_id DESC LIMIT ?",
@@ -2612,34 +2800,37 @@ class DispatcherStore:
         with self._lock:
             cur = self.conn.cursor()
             try:
-                cur.execute(
+                _ = cur.execute(
                     "SELECT COUNT(*) FROM dispatcher_invocations WHERE run_id = ? AND phase_id = ? AND role_id = ?",
                     (run_id, phase_id, role_id),
                 )
-                return int(cur.fetchone()[0])
+                row = _fetchone(cur)
+                if row is None:
+                    raise RuntimeError("invocation count is missing")
+                return _integer(row[0])
             finally:
                 cur.close()
 
     def slot_assignments(
         self, run_id: str, phase_id: str, role_id: str
-    ) -> dict[str, dict[str, dict[str, Any] | None]]:
+    ) -> dict[str, dict[str, dict[str, JsonValue] | None]]:
         """Returns current and latest invocation per slot in one bounded-result query."""
 
         with self._lock:
             rows = self.conn.execute(
-                "WITH ranked AS ("
-                "SELECT invocation_id, job_id, run_id, phase_id, role_id, "
-                "work_unit_id, slot_id, status, created_at, updated_at, "
-                "execution_snapshot_fingerprint, profile_id, "
-                "context_manifest_fingerprint, context_envelope_fingerprint, "
-                "prepared_input_fingerprint, context_provenance, "
-                "context_diagnostics, finished_at, error_code, "
-                "error_summary, result_ref, "
-                "ROW_NUMBER() OVER (PARTITION BY slot_id "
-                "ORDER BY created_at DESC, invocation_id DESC) AS row_number "
-                "FROM dispatcher_invocations "
-                "WHERE run_id = ? AND phase_id = ? AND role_id = ?"
-                ") SELECT * FROM ranked WHERE row_number = 1 OR status = 'running' "
+                "WITH ranked AS (" +
+                "SELECT invocation_id, job_id, run_id, phase_id, role_id, " +
+                "work_unit_id, slot_id, status, created_at, updated_at, " +
+                "execution_snapshot_fingerprint, profile_id, " +
+                "context_manifest_fingerprint, context_envelope_fingerprint, " +
+                "prepared_input_fingerprint, context_provenance, " +
+                "context_diagnostics, finished_at, error_code, " +
+                "error_summary, result_ref, " +
+                "ROW_NUMBER() OVER (PARTITION BY slot_id " +
+                "ORDER BY created_at DESC, invocation_id DESC) AS row_number " +
+                "FROM dispatcher_invocations " +
+                "WHERE run_id = ? AND phase_id = ? AND role_id = ?" +
+                ") SELECT * FROM ranked WHERE row_number = 1 OR status = 'running' " +
                 "ORDER BY slot_id, row_number",
                 (run_id, phase_id, role_id),
             ).fetchall()
@@ -2652,13 +2843,13 @@ class DispatcherStore:
             "context_diagnostics", "finished_at", "error_code",
             "error_summary", "result_ref",
         )
-        result: dict[str, dict[str, dict[str, Any] | None]] = {}
+        result: dict[str, dict[str, dict[str, JsonValue] | None]] = {}
         for row in rows:
             invocation = _decode_context_columns(
                 dict(zip(keys, row[: len(keys)], strict=True))
             )
             slot = result.setdefault(
-                invocation["slot_id"], {"current": None, "latest": None}
+                _string(invocation["slot_id"]), {"current": None, "latest": None}
             )
             if row[-1] == 1:
                 slot["latest"] = invocation
@@ -2671,14 +2862,14 @@ class DispatcherStore:
             cur = self.conn.cursor()
             try:
                 if lease_token is not None:
-                    cur.execute("SELECT job_id, thread_id FROM dispatcher_proposals WHERE key = ?", (key,))
-                    owner = cur.fetchone()
+                    _ = cur.execute("SELECT job_id, thread_id FROM dispatcher_proposals WHERE key = ?", (key,))
+                    owner = _fetchone(cur)
                     if owner is None:
                         return False
-                    cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND thread_id = ? AND lease_token = ?", (owner[0], owner[1], lease_token))
-                    if cur.fetchone() is None:
+                    _ = cur.execute("SELECT 1 FROM dispatcher_leases WHERE job_id = ? AND thread_id = ? AND lease_token = ?", (owner[0], owner[1], lease_token))
+                    if _fetchone(cur) is None:
                         return False
-                cur.execute("UPDATE dispatcher_proposals SET consumed_at = ? WHERE key = ? AND consumed_at IS NULL", (_now_iso(), key))
+                _ = cur.execute("UPDATE dispatcher_proposals SET consumed_at = ? WHERE key = ? AND consumed_at IS NULL", (_now_iso(), key))
                 affected = cur.rowcount
             finally:
                 cur.close()
@@ -2691,43 +2882,43 @@ class DispatcherStore:
         job_id: str,
         thread_id: str,
         lease_token: str,
-        payload: dict[str, Any],
-        summary: dict[str, Any],
+        payload: dict[str, JsonValue],
+        summary: dict[str, JsonValue],
     ) -> bool:
         """Атомарно сохраняет одобрение шума и делает поток возобновляемым."""
 
         with repository_lock(self.repo), self._lock, self.conn:
             cur = self.conn.cursor()
             try:
-                cur.execute(
-                    "SELECT summary FROM dispatcher_leases "
+                _ = cur.execute(
+                    "SELECT summary FROM dispatcher_leases " +
                     "WHERE job_id = ? AND thread_id = ? AND lease_token = ?",
                     (job_id, thread_id, lease_token),
                 )
-                lease = cur.fetchone()
-                cur.execute(
-                    "SELECT 1 FROM dispatcher_proposals "
-                    "WHERE key = ? AND job_id = ? AND thread_id = ? "
+                lease = _fetchone(cur)
+                _ = cur.execute(
+                    "SELECT 1 FROM dispatcher_proposals " +
+                    "WHERE key = ? AND job_id = ? AND thread_id = ? " +
                     "AND kind = 'approval' AND consumed_at IS NULL",
                     (proposal_key, job_id, thread_id),
                 )
-                if lease is None or cur.fetchone() is None:
+                if lease is None or _fetchone(cur) is None:
                     return False
                 now = _now_iso()
-                cur.execute(
-                    "INSERT OR REPLACE INTO dispatcher_proposals "
-                    "(key, job_id, thread_id, kind, payload, created_at, consumed_at) "
+                _ = cur.execute(
+                    "INSERT OR REPLACE INTO dispatcher_proposals " +
+                    "(key, job_id, thread_id, kind, payload, created_at, consumed_at) " +
                     "VALUES (?, ?, ?, 'noise-approval', ?, ?, NULL)",
                     (approval_key, job_id, thread_id, canonical_json(payload).decode(), now),
                 )
-                cur.execute(
-                    "UPDATE dispatcher_proposals SET consumed_at = ? "
+                _ = cur.execute(
+                    "UPDATE dispatcher_proposals SET consumed_at = ? " +
                     "WHERE key = ? AND consumed_at IS NULL",
                     (now, proposal_key),
                 )
-                merged = {**(json.loads(lease[0]) if lease[0] else {}), "phase": "noise_approved", **summary}
-                cur.execute(
-                    "UPDATE dispatcher_leases SET state = 'resumable', summary = ?, renewed_at = ? "
+                merged = {**(parse_json_object(_text(lease[0])) if lease[0] else {}), "phase": "noise_approved", **summary}
+                _ = cur.execute(
+                    "UPDATE dispatcher_leases SET state = 'resumable', summary = ?, renewed_at = ? " +
                     "WHERE job_id = ? AND thread_id = ? AND lease_token = ?",
                     (canonical_json(merged).decode(), now, job_id, thread_id, lease_token),
                 )
@@ -2756,7 +2947,7 @@ class DispatcherStore:
             with self.conn:
                 cur = self.conn.cursor()
                 try:
-                    cur.execute(
+                    _ = cur.execute(
                         "DELETE FROM dispatcher_proposals WHERE thread_id = ?"
                         + (" AND kind != 'node-result'" if preserve_results else ""),
                         (thread_id,),
@@ -2793,7 +2984,7 @@ def fresh_lease_seconds(renewed_at: str, *, now: float | None = None) -> float:
 
 
 @contextmanager
-def open_store(repo: Path, base: Path | None = None) -> Iterator[DispatcherStore]:
+def open_store(repo: Path, base: Path | None = None) -> Generator[DispatcherStore, None, None]:
     store = DispatcherStore(repo, base)
     store.open()
     try:

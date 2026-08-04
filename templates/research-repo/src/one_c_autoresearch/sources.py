@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
 import shutil
 import tempfile
@@ -10,11 +11,14 @@ import re
 import signal
 import time
 import unicodedata
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import IO, BinaryIO, NotRequired, Protocol, TypedDict, runtime_checkable
 
-from .contracts import ROLES, atomic_json, canonical_json, confined, external_id, file_manifest, normalize_relative, reject_secrets, repository_lock, require_tracked_clean as validate_tracked_clean, sha256
+from .contracts import JsonValue, ROLES, atomic_json, canonical_json, confined, external_id, file_manifest, json_object, normalize_relative, parse_json, parse_json_object, reject_secrets, repository_lock, require_tracked_clean as validate_tracked_clean, sha256
+
+from .source_routing import ComponentMember, ExtensionObservation, ExtensionScope, FormProbe, RoutingGroup, RoutingManifest
 
 
 EXPORTERS = ("ibcmd", "designer")
@@ -30,17 +34,466 @@ MAX_EXTENSION_LIST_BYTES = 1024 * 1024
 NOISE_NAMES = {"ConfigDumpInfo.xml", ".metadata", "build", "cache", "logs", "tmp"}
 _UNSET = object()
 UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+CancelCallback = Callable[[], bool]
+ProgressCallback = Callable[[dict[str, object]], None]
+class CommandRunner(Protocol):
+    def __call__(
+        self,
+        command: list[str],
+        *,
+        stdin: IO[str] | int | None = None,
+        stdout: int | None = None,
+        stderr: int | None = None,
+        text: bool = False,
+        check: bool = False,
+        timeout: float | None = None,
+        env: dict[str, str] | None = None,
+        input: str | None = None,
+    ) -> subprocess.CompletedProcess[str]: ...
 
 
-def current_profile_test(profile: dict[str, Any], profile_id: str) -> bool:
+def _default_run(
+    command: list[str],
+    *,
+    stdin: IO[str] | int | None = None,
+    stdout: int | None = None,
+    stderr: int | None = None,
+    text: bool = False,
+    check: bool = False,
+    timeout: float | None = None,
+    env: dict[str, str] | None = None,
+    input: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if text:
+        return subprocess.run(command, stdin=stdin, stdout=stdout, stderr=stderr, text=True, check=check, timeout=timeout, env=env, input=input)
+    result = subprocess.run(
+        command, stdin=stdin, stdout=stdout, stderr=stderr, text=False, check=check,
+        timeout=timeout, env=env, input=input.encode() if input is not None else None,
+    )
+    return subprocess.CompletedProcess(
+        command,
+        result.returncode,
+        result.stdout.decode(),
+        result.stderr.decode(),
+    )
+
+
+@runtime_checkable
+class _WorkflowModule(Protocol):
+    def state_fingerprint(self, repo: Path) -> str: ...
+
+
+@runtime_checkable
+class _StageRecomputeModule(Protocol):
+    def recover_active_publication(self, repo: Path) -> object: ...
+
+
+class ExtensionInfo(TypedDict):
+    uuid: str
+    name: str
+    version: str
+    active: bool
+
+
+class ConnectionProfile(TypedDict, total=False):
+    platform_path: str
+    kind: str
+    server: str
+    reference: str
+    path: str
+    dbms: str
+    db_server: str
+    db_name: str
+    db_user: str
+    db_password: str
+    infobase_user: str
+    infobase_password: str
+    tested: bool
+    profile_id: str
+    tested_fingerprint: str
+    extensions: list[ExtensionInfo]
+    client_connection: str
+    configuration: dict[str, str]
+    tool_versions: dict[str, str]
+
+
+class RoleBinding(TypedDict):
+    connection_profile: str
+    configuration_name: str
+    root_uuid: str
+    version: str
+
+
+class ExtensionDecision(TypedDict):
+    uuid: str
+    decision: str
+    rationale: str
+
+
+class InfobasesContract(TypedDict):
+    schema_version: str
+    acquisition_profile: str
+    roles: dict[str, RoleBinding]
+    extension_decisions: list[ExtensionDecision]
+
+
+class ArtifactDeclaration(TypedDict):
+    role: str
+    kind: str
+    semantic_key: str
+    filename: str
+    declared_size_bytes: int
+    sha256: NotRequired[str]
+    external_artifact_id: NotRequired[str]
+
+
+class ArtifactsContract(TypedDict):
+    schema_version: str
+    artifacts: list[ArtifactDeclaration]
+
+
+class SourceContract(TypedDict):
+    schema_version: str
+    acquisition_profile_id: str
+    roles: dict[str, RoleBinding]
+    artifacts: list[ArtifactDeclaration]
+    extension_decisions: NotRequired[list[ExtensionDecision]]
+
+
+class ComponentManifest(TypedDict):
+    schema_version: str
+    component_id: str
+    kind: str
+    routing_group_id: str
+    probe_contract_version: str
+    probe_fingerprint: str
+    form_counts: dict[str, int]
+    routing_reason: str
+    exporter: str
+    representation_schema: str
+    exporter_version: str
+    converter_version: str
+    payload_file_count: int
+    payload_fingerprint: str
+    uuid: NotRequired[str]
+    name: NotRequired[str]
+    version: NotRequired[str]
+    active: NotRequired[bool]
+
+
+class RoutingPreview(TypedDict):
+    schema_version: str
+    bindings: dict[str, str]
+    extension_scope: ExtensionScope
+    blockers: list[RoutingBlocker]
+    probe_results: list[FormProbe]
+    routing_manifest: RoutingManifest
+    required_tools: list[str]
+    routing_plan_fingerprint: str
+
+
+class RoutingBlocker(TypedDict):
+    code: str
+    uuid: str
+    roles: dict[str, ExtensionObservation]
+    action: str
+
+
+class ComponentBase(TypedDict):
+    component_id: str
+    kind: str
+    path: str
+    fingerprint: str
+
+
+class RoutedComponentRecord(ComponentBase):
+    representation_schema: str
+    routing_group_id: str
+    bsl_file_count: int
+
+
+ComponentRecord = ComponentBase | RoutedComponentRecord
+
+
+class SourcePointer(TypedDict, total=False):
+    schema_version: str
+    generation_id: str
+    acquisition_profile_id: str
+    representation_schema: str
+    normalizer_version: str
+    source_contract_fingerprint: str
+    source_contract_sha256: str
+    roles: dict[str, str]
+    routing_manifest_path: str
+    routing_manifest_fingerprint: str
+    components: list[ComponentRecord]
+    source_comparison_epoch_fingerprint: str
+
+
+def _toml_object(payload: object) -> dict[str, JsonValue]:
+    return parse_json_object(json.dumps(payload))
+
+
+def _string(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("expected string")
+    return value
+
+
+def _integer(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("expected integer")
+    return value
+
+
+def _boolean(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("expected boolean")
+    return value
+
+
+def _objects(value: object) -> list[dict[str, JsonValue]]:
+    normalized = parse_json(canonical_json(value).decode())
+    if not isinstance(normalized, list):
+        raise ValueError("expected object array")
+    return [json_object(item) for item in normalized]
+
+
+def _strings(value: object) -> list[str]:
+    normalized = parse_json(canonical_json(value).decode())
+    if not isinstance(normalized, list):
+        raise ValueError("expected string array")
+    return [_string(item) for item in normalized]
+
+
+def _string_map(value: object) -> dict[str, str]:
+    return {key: _string(item) for key, item in json_object(value).items()}
+
+
+def _integer_map(value: object) -> dict[str, int]:
+    return {key: _integer(item) for key, item in json_object(value).items()}
+
+
+def _role_binding(value: object) -> RoleBinding:
+    row = json_object(value)
+    return {
+        "connection_profile": _string(row.get("connection_profile")),
+        "configuration_name": _string(row.get("configuration_name")),
+        "root_uuid": _string(row.get("root_uuid")),
+        "version": _string(row.get("version")),
+    }
+
+
+def _extension_decision(value: object) -> ExtensionDecision:
+    row = json_object(value)
+    return {
+        "uuid": _string(row.get("uuid")),
+        "decision": _string(row.get("decision")),
+        "rationale": _string(row.get("rationale")),
+    }
+
+
+def _infobases_contract(value: dict[str, JsonValue]) -> InfobasesContract:
+    return {
+        "schema_version": _string(value.get("schema_version", "1")),
+        "acquisition_profile": _string(value.get("acquisition_profile", "")),
+        "roles": {name: _role_binding(binding) for name, binding in json_object(value.get("roles", {})).items()},
+        "extension_decisions": [_extension_decision(item) for item in _objects(value.get("extension_decisions", []))],
+    }
+
+
+def _artifact_declaration(value: object) -> ArtifactDeclaration:
+    row = json_object(value)
+    required = {"role", "kind", "semantic_key", "filename", "declared_size_bytes"}
+    if not required <= row.keys() or set(row) - required - {"sha256", "external_artifact_id"}:
+        raise ValueError("external artifact declared_size_bytes must be a positive integer")
+    declared_size = row["declared_size_bytes"]
+    if not isinstance(declared_size, int) or isinstance(declared_size, bool):
+        raise ValueError("external artifact declared_size_bytes must be a positive integer")
+    result = ArtifactDeclaration(
+        role=_string(row.get("role")),
+        kind=_string(row.get("kind")),
+        semantic_key=_string(row.get("semantic_key")),
+        filename=_string(row.get("filename")),
+        declared_size_bytes=declared_size,
+    )
+    if "sha256" in row:
+        result["sha256"] = _string(row["sha256"])
+    if "external_artifact_id" in row:
+        result["external_artifact_id"] = _string(row["external_artifact_id"])
+    return result
+
+
+def _artifacts_contract(value: dict[str, JsonValue]) -> ArtifactsContract:
+    return {
+        "schema_version": _string(value.get("schema_version", "1")),
+        "artifacts": [_artifact_declaration(item) for item in _objects(value.get("artifacts", []))],
+    }
+
+
+def _json_contract(value: object) -> dict[str, JsonValue]:
+    return parse_json_object(canonical_json(value).decode())
+
+
+def _json_connections(value: dict[str, ConnectionProfile]) -> dict[str, dict[str, JsonValue]]:
+    parsed = _json_contract(value)
+    if not all(isinstance(profile, dict) for profile in parsed.values()):
+        raise ValueError("connections must contain objects")
+    return {name: profile for name, profile in parsed.items() if isinstance(profile, dict)}
+
+
+def source_pointer(value: dict[str, JsonValue]) -> SourcePointer:
+    if not isinstance(value.get("schema_version"), str) or not isinstance(value.get("generation_id"), str):
+        raise ValueError("invalid active source pointer")
+    result: SourcePointer = {}
+    string_fields = (
+        "schema_version", "generation_id", "acquisition_profile_id", "representation_schema",
+        "normalizer_version", "source_contract_fingerprint", "source_contract_sha256",
+        "routing_manifest_path", "routing_manifest_fingerprint", "source_comparison_epoch_fingerprint",
+    )
+    for field in string_fields:
+        if field in value:
+            result[field] = _string(value[field])
+    if "roles" in value:
+        result["roles"] = _string_map(value["roles"])
+    if "components" in value:
+        result["components"] = [_component_record(item) for item in _objects(value["components"])]
+    return result
+
+
+def _component_record(value: object) -> ComponentRecord:
+    row = json_object(value)
+    base = ComponentBase(
+        component_id=_string(row.get("component_id")),
+        kind=_string(row.get("kind")),
+        path=_string(row.get("path")),
+        fingerprint=_string(row.get("fingerprint")),
+    )
+    if "representation_schema" not in row:
+        return base
+    return RoutedComponentRecord(
+        **base,
+        representation_schema=_string(row["representation_schema"]),
+        routing_group_id=_string(row.get("routing_group_id")),
+        bsl_file_count=_integer(row.get("bsl_file_count")),
+    )
+
+
+def _source_contract(value: dict[str, JsonValue]) -> SourceContract:
+    if not isinstance(value.get("roles"), dict) or not isinstance(value.get("artifacts"), list) or not isinstance(value.get("extension_decisions", []), list):
+        raise ValueError("invalid source contract")
+    result = SourceContract(
+        schema_version=_string(value.get("schema_version")),
+        acquisition_profile_id=_string(value.get("acquisition_profile_id")),
+        roles={name: _role_binding(binding) for name, binding in json_object(value["roles"]).items()},
+        artifacts=[_artifact_declaration(item) for item in _objects(value["artifacts"])],
+    )
+    if "extension_decisions" in value:
+        result["extension_decisions"] = [_extension_decision(item) for item in _objects(value["extension_decisions"])]
+    return result
+
+
+def _component_manifest(value: dict[str, JsonValue]) -> ComponentManifest:
+    if not isinstance(value.get("component_id"), str) or not isinstance(value.get("form_counts"), dict):
+        raise ValueError("invalid component manifest")
+    result = ComponentManifest(
+        schema_version=_string(value.get("schema_version")),
+        component_id=_string(value["component_id"]),
+        kind=_string(value.get("kind")),
+        routing_group_id=_string(value.get("routing_group_id")),
+        probe_contract_version=_string(value.get("probe_contract_version")),
+        probe_fingerprint=_string(value.get("probe_fingerprint")),
+        form_counts=_integer_map(value["form_counts"]),
+        routing_reason=_string(value.get("routing_reason")),
+        exporter=_string(value.get("exporter")),
+        representation_schema=_string(value.get("representation_schema")),
+        exporter_version=_string(value.get("exporter_version")),
+        converter_version=_string(value.get("converter_version")),
+        payload_file_count=_integer(value.get("payload_file_count")),
+        payload_fingerprint=_string(value.get("payload_fingerprint")),
+    )
+    for key in ("uuid", "name", "version"):
+        if key in value:
+            result[key] = _string(value[key])
+    if "active" in value:
+        result["active"] = _boolean(value["active"])
+    return result
+
+
+def _contract_without_artifact_ids(contract: SourceContract) -> SourceContract:
+    artifacts: list[ArtifactDeclaration] = []
+    for item in contract["artifacts"]:
+        clean = item.copy()
+        _ = clean.pop("external_artifact_id", None)
+        artifacts.append(clean)
+    return {**contract, "artifacts": artifacts}
+
+
+def _routing_manifest(value: dict[str, JsonValue]) -> RoutingManifest:
+    if not isinstance(value.get("groups"), list) or not isinstance(value.get("routing_manifest_fingerprint"), str):
+        raise ValueError("invalid active source routing manifest")
+    return {
+        "schema_version": _string(value.get("schema_version")),
+        "routing_contract_version": _string(value.get("routing_contract_version")),
+        "groups": [_routing_group(item) for item in _objects(value["groups"])],
+        "routing_manifest_fingerprint": _string(value["routing_manifest_fingerprint"]),
+    }
+
+
+def _routing_group(value: object) -> RoutingGroup:
+    row = json_object(value)
+    return {
+        "routing_group_id": _string(row.get("routing_group_id")),
+        "kind": _string(row.get("kind")),
+        "members": [
+            {"role": _string(item.get("role")), "component_id": _string(item.get("component_id"))}
+            for item in _objects(row.get("members"))
+        ],
+        "absent_roles": _strings(row.get("absent_roles")),
+        "probe_contract_version": _string(row.get("probe_contract_version")),
+        "probe_fingerprints": [
+            {"component_id": _string(item.get("component_id")), "probe_fingerprint": _string(item.get("probe_fingerprint"))}
+            for item in _objects(row.get("probe_fingerprints"))
+        ],
+        "form_counts": _integer_map(row.get("form_counts")),
+        "routing_reason": _string(row.get("routing_reason")),
+        "exporter": _string(row.get("exporter")),
+        "representation_schema": _string(row.get("representation_schema")),
+        "exporter_version": _string(row.get("exporter_version")),
+        "converter_version": _string(row.get("converter_version")),
+    }
+
+
+def _public_profiles(value: dict[str, ConnectionProfile]) -> dict[str, ConnectionProfile]:
+    result: dict[str, ConnectionProfile] = {}
+    for name, profile in value.items():
+        public = profile.copy()
+        _ = public.pop("db_password", None)
+        _ = public.pop("infobase_password", None)
+        result[name] = public
+    return result
+
+
+def _valid_tested_extension(value: object) -> bool:
+    try:
+        item = json_object(value)
+    except ValueError:
+        return False
+    return (
+        re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", str(item.get("uuid", "")).lower()) is not None
+        and bool(str(item.get("name", "")).strip())
+        and type(item.get("active")) is bool
+    )
+
+
+def current_profile_test(profile: Mapping[str, object], profile_id: str) -> bool:
     sealed = {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password", "tested_fingerprint"}}
     extensions = profile.get("extensions")
-    valid_extensions = isinstance(extensions, list) and all(
-        re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", str(item.get("uuid", "")).lower())
-        and str(item.get("name", "")).strip()
-        and isinstance(item.get("active"), bool)
-        for item in extensions
-    )
+    try:
+        normalized_extensions = parse_json(json.dumps(extensions))
+    except (TypeError, ValueError):
+        normalized_extensions = None
+    valid_extensions = isinstance(normalized_extensions, list) and all(_valid_tested_extension(item) for item in normalized_extensions)
     return bool(profile.get("tested")) and profile.get("profile_id") == profile_id and valid_extensions and profile.get("tested_fingerprint") == "sha256:" + sha256(canonical_json(sealed))
 
 
@@ -48,28 +501,27 @@ def _immutable_role_fingerprint(path: str) -> str:
     return "sha256:" + sha256(canonical_json(file_manifest(Path(path))))
 
 
-def load_contract(repo: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def load_contract(repo: Path) -> tuple[InfobasesContract, ArtifactsContract]:
     with (repo / "research/infobases.toml").open("rb") as stream:
-        infobases = tomllib.load(stream)
+        raw_infobases: object = tomllib.load(stream)
+        infobases = _infobases_contract(_toml_object(raw_infobases))
     with (repo / "research/external-artifacts.toml").open("rb") as stream:
-        artifacts = tomllib.load(stream)
-    reject_secrets(infobases, "research/infobases.toml")
-    reject_secrets(artifacts, "research/external-artifacts.toml")
+        raw_artifacts: object = tomllib.load(stream)
+        artifacts = _artifacts_contract(_toml_object(raw_artifacts))
+    reject_secrets(_json_contract(infobases), "research/infobases.toml")
+    reject_secrets(_json_contract(artifacts), "research/external-artifacts.toml")
     infobases["extension_decisions"] = normalize_extension_decisions(infobases.get("extension_decisions", []))
     return infobases, artifacts
 
 
-def extension_scope_status(repo: Path, connections: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def extension_scope_status(repo: Path, connections: dict[str, ConnectionProfile]) -> dict[str, object]:
     from .source_routing import extension_scope
     infobases, _artifacts = load_contract(repo)
     selected = {
         binding["connection_profile"]: connections.get(binding["connection_profile"], {"extensions": []})
         for binding in infobases["roles"].values()
     }
-    scope = extension_scope(
-        {"roles": infobases["roles"], "extension_decisions": infobases["extension_decisions"]},
-        selected,
-    )
+    scope = extension_scope(_json_contract({"roles": infobases["roles"], "extension_decisions": infobases["extension_decisions"]}), _json_connections(selected))
     blockers = [
         {
             "code": "extension_scope_required",
@@ -88,13 +540,14 @@ def extension_scope_status(repo: Path, connections: dict[str, dict[str, Any]]) -
     }
 
 
-def normalize_extension_decisions(raw: Any) -> list[dict[str, str]]:
-    if not isinstance(raw, list):
+def normalize_extension_decisions(raw: object) -> list[ExtensionDecision]:
+    normalized = parse_json(canonical_json(raw).decode())
+    if not isinstance(normalized, list):
         raise ValueError("extension_decisions must be an array of tables")
-    decisions: list[dict[str, str]] = []
+    decisions: list[ExtensionDecision] = []
     seen: set[str] = set()
-    for item in raw:
-        if not isinstance(item, dict) or set(item) != {"uuid", "decision", "rationale"}:
+    for item in _objects(normalized):
+        if set(item) != {"uuid", "decision", "rationale"}:
             raise ValueError("extension decision must contain exactly uuid, decision, and rationale")
         uuid = str(item["uuid"])
         decision = str(item["decision"])
@@ -114,7 +567,7 @@ def normalize_extension_decisions(raw: Any) -> list[dict[str, str]]:
     return sorted(decisions, key=lambda item: item["uuid"])
 
 
-def serialize_infobases(infobases: dict[str, Any]) -> bytes:
+def serialize_infobases(infobases: InfobasesContract) -> bytes:
     decisions = normalize_extension_decisions(infobases.get("extension_decisions", []))
     lines = [
         f'schema_version = {json.dumps(str(infobases.get("schema_version", "1")))}',
@@ -143,7 +596,7 @@ def serialize_infobases(infobases: dict[str, Any]) -> bytes:
     return "\n".join(lines).encode()
 
 
-def validate_role_contract(repo: Path, tested_profiles: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def validate_role_contract(repo: Path, tested_profiles: dict[str, ConnectionProfile]) -> SourceContract:
     infobases, artifacts = load_contract(repo)
     profile_id = infobases.get("acquisition_profile")
     if profile_id not in PROFILES:
@@ -152,7 +605,11 @@ def validate_role_contract(repo: Path, tested_profiles: dict[str, dict[str, Any]
     if tuple(roles) != ROLES:
         raise ValueError(f"exactly three ordered roles are required: {ROLES}")
     identities: set[str] = set(); roots: set[str] = set()
-    project = tomllib.loads((repo / "project.toml").read_text(encoding="utf-8"))["project"]
+    raw_project: object = tomllib.loads((repo / "project.toml").read_text(encoding="utf-8"))
+    project_document = _toml_object(raw_project)
+    project = project_document.get("project")
+    if not isinstance(project, dict):
+        raise ValueError("project.toml project table is missing")
     expected_versions = {"vendor_baseline": project.get("baseline_version"), "target_cf": project.get("target_version"), "next_vendor": project.get("next_vendor_version")}
     for role in ROLES:
         binding = roles[role]
@@ -166,6 +623,8 @@ def validate_role_contract(repo: Path, tested_profiles: dict[str, dict[str, Any]
         if not tested or not current_profile_test(tested, profile_id):
             raise ValueError(f"connection was not tested for current acquisition profile: {role}")
         extensions = tested.get("extensions")
+        if not isinstance(extensions, list):
+            raise ValueError(f"connection extension inventory is invalid: {role}")
         if len({str(item["uuid"]).lower() for item in extensions}) != len(extensions):
             raise ValueError(f"duplicate extension UUID in current enumeration: {role}")
         identity = normalize_connection_identity(tested)
@@ -177,13 +636,13 @@ def validate_role_contract(repo: Path, tested_profiles: dict[str, dict[str, Any]
     seen_binding: set[tuple[str, str, str]] = set(); seen_id: dict[str, tuple[str, str]] = {}
     for item in artifacts.get("artifacts", []):
         role, kind, key = item.get("role"), item.get("kind"), item.get("semantic_key")
-        if role not in ROLES or kind not in {"epf", "erf", "source-tree", "other"} or not isinstance(key, str) or not key or key != unicodedata.normalize("NFC", key):
+        if role not in ROLES or kind not in {"epf", "erf", "source-tree", "other"} or not key or key != unicodedata.normalize("NFC", key):
             raise ValueError("invalid external artifact declaration")
         filename = item.get("filename")
-        if not isinstance(filename, str) or normalize_relative(filename) != filename:
+        if normalize_relative(filename) != filename:
             raise ValueError("invalid external artifact filename")
         declared_size = item.get("declared_size_bytes")
-        if not isinstance(declared_size, int) or isinstance(declared_size, bool) or declared_size <= 0:
+        if isinstance(declared_size, bool) or declared_size <= 0:
             raise ValueError("external artifact declared_size_bytes must be a positive integer")
         expected_sha256 = item.get("sha256")
         if expected_sha256 is not None and not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", str(expected_sha256)):
@@ -207,7 +666,7 @@ def validate_role_contract(repo: Path, tested_profiles: dict[str, dict[str, Any]
     }
 
 
-def normalize_connection_identity(profile: dict[str, Any]) -> str:
+def normalize_connection_identity(profile: ConnectionProfile) -> str:
     kind = profile.get("kind")
     if kind == "server":
         server = str(profile.get("server", "")).strip().lower()
@@ -221,29 +680,45 @@ def normalize_connection_identity(profile: dict[str, Any]) -> str:
     raise ValueError(f"unsupported connection kind: {kind}")
 
 
-def _ibcmd_db_args(connection: dict[str, Any]) -> list[str]:
+def _ibcmd_db_args(connection: ConnectionProfile) -> list[str]:
     required = ("dbms", "db_server", "db_name", "db_user", "db_password")
     if any(key not in connection for key in required):
         raise ValueError("incomplete ibcmd DBMS connection profile")
-    return [f"--dbms={connection['dbms']}", f"--db-server={connection['db_server']}", f"--db-name={connection['db_name']}", f"--db-user={connection['db_user']}", f"--db-pwd={connection['db_password']}"]
+    values = [connection.get(key) for key in required]
+    if not all(isinstance(value, str) for value in values):
+        raise ValueError("incomplete ibcmd DBMS connection profile")
+    dbms, server, name, user, password = values
+    return [f"--dbms={dbms}", f"--db-server={server}", f"--db-name={name}", f"--db-user={user}", f"--db-pwd={password}"]
 
 
-def _run_command(run: callable, command: list[str], *, cancelled: callable | None = None, **kwargs):
+def run_command(
+    run: CommandRunner,
+    command: list[str],
+    *,
+    cancelled: CancelCallback | None = None,
+    stdin: IO[str] | int | None = None,
+    stdout: int | None = None,
+    stderr: int | None = None,
+    text: bool = False,
+    check: bool = False,
+    timeout: float | None = None,
+    env: dict[str, str] | None = None,
+    input: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     if cancelled and cancelled():
         raise InterruptedError("source acquisition cancelled")
-    if run is not subprocess.run or cancelled is None:
-        result = run(command, **kwargs)
+    if run is not _default_run and run is not subprocess.run or cancelled is None:
+        result = run(command, stdin=stdin, stdout=stdout, stderr=stderr, text=text, check=check, timeout=timeout, env=env, input=input)
         if cancelled and cancelled():
             raise InterruptedError("source acquisition cancelled")
         return result
-    timeout = kwargs.pop("timeout", None)
-    input_data = kwargs.pop("input", None)
-    kwargs.pop("check", None)
-    if input_data is not None:
-        kwargs.setdefault("stdin", subprocess.PIPE)
-    kwargs.setdefault("start_new_session", os.name == "posix")
     started = time.monotonic()
-    process = subprocess.Popen(command, **kwargs)
+    if input is not None:
+        stdin = subprocess.PIPE
+    process = subprocess.Popen(
+        command, stdin=stdin, stdout=stdout, stderr=stderr, text=True, env=env,
+        start_new_session=os.name == "posix",
+    )
 
     def stop(sig: signal.Signals) -> None:
         try:
@@ -254,29 +729,33 @@ def _run_command(run: callable, command: list[str], *, cancelled: callable | Non
     first_communicate = True
     while True:
         try:
-            stdout, stderr = process.communicate(input=input_data if first_communicate else None, timeout=0.2)
-            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            stdout_value, stderr_value = process.communicate(input=input if first_communicate else None, timeout=0.2)
+            return subprocess.CompletedProcess(command, process.returncode, stdout_value, stderr_value)
         except subprocess.TimeoutExpired:
             first_communicate = False
             if cancelled():
                 stop(signal.SIGTERM)
                 try:
-                    process.communicate(timeout=5)
+                    _ = process.communicate(timeout=5)
                 except subprocess.TimeoutExpired:
-                    stop(signal.SIGKILL); process.communicate()
+                    stop(signal.SIGKILL); _ = process.communicate()
                 raise InterruptedError("source acquisition cancelled")
             if timeout is not None and time.monotonic() - started >= timeout:
-                stop(signal.SIGKILL); process.communicate()
+                stop(signal.SIGKILL); _ = process.communicate()
                 raise subprocess.TimeoutExpired(command, timeout)
 
 
-def _toolchain_versions(profile_id: str, platform: Path, *, timeout_seconds: int, run: callable, cancelled: callable | None = None) -> dict[str, str]:
+# Kept for callers from releases before the helper became public.
+_run_command = run_command
+
+
+def _toolchain_versions(profile_id: str, platform: Path, *, timeout_seconds: float, run: CommandRunner, cancelled: CancelCallback | None = None) -> dict[str, str]:
     from .source_tools import classify_version
     if profile_id in PROFILES:
         exporter, representation = PROFILES[profile_id], None
     else:
         exporter, representation = LEGACY_PROFILES[profile_id]
-    ibcmd = _run_command(run, [str(platform / "ibcmd"), "--version"], cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
+    ibcmd = run_command(run, [str(platform / "ibcmd"), "--version"], cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
     status, platform_version, _reason = classify_version("ibcmd", platform / "ibcmd", ibcmd.returncode, ibcmd.stdout)
     if status != "ready":
         raise RuntimeError("ibcmd version preflight failed")
@@ -287,7 +766,7 @@ def _toolchain_versions(profile_id: str, platform: Path, *, timeout_seconds: int
         executable = shutil.which("v8unpack")
         if not executable:
             raise RuntimeError("v8unpack executable is unavailable")
-        result = _run_command(run, [executable, "-h"], cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
+        result = run_command(run, [executable, "-h"], cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
         status, version, _reason = classify_version("v8unpack", Path(executable), result.returncode, result.stdout)
         if status != "ready":
             raise RuntimeError(f"v8unpack {V8UNPACK_VERSION} is required")
@@ -302,7 +781,7 @@ def _toolchain_versions(profile_id: str, platform: Path, *, timeout_seconds: int
     return versions
 
 
-def preflight_connection(profile_id: str, platform: Path, connection: dict[str, Any], *, timeout_seconds: int = 120, run: callable = subprocess.run, cancelled: callable | None = None, identity_staging: Path | None = None) -> dict[str, Any]:
+def preflight_connection(profile_id: str, platform: Path, connection: ConnectionProfile, *, timeout_seconds: float = 120, run: CommandRunner = _default_run, cancelled: CancelCallback | None = None, identity_staging: Path | None = None) -> ConnectionProfile:
     if profile_id not in PROFILES:
         raise ValueError("unsupported acquisition profile")
     started = time.monotonic()
@@ -315,39 +794,39 @@ def preflight_connection(profile_id: str, platform: Path, connection: dict[str, 
     executable = platform / "ibcmd"
     toolchain_versions = _toolchain_versions(profile_id, platform, timeout_seconds=remaining(), run=run, cancelled=cancelled)
     with tempfile.TemporaryDirectory(prefix="ibcmd-preflight-") as data_dir, tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as credentials:
-        credentials.write(f"{connection.get('infobase_user', '')}\n{connection.get('infobase_password', '')}\n"); credentials.flush(); credentials.seek(0)
+        _ = credentials.write(f"{connection.get('infobase_user', '')}\n{connection.get('infobase_password', '')}\n"); credentials.flush(); _ = credentials.seek(0)
         command = [str(executable), "extension", "list", f"--data={data_dir}", *_ibcmd_db_args(connection)]
-        listed = _run_command(run, command, cancelled=cancelled, stdin=credentials, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=remaining(), env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
+        listed = run_command(run, command, cancelled=cancelled, stdin=credentials, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=remaining(), env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
     if listed.returncode:
         raise RuntimeError("infobase authentication or extension enumeration preflight failed")
     if len(listed.stdout.encode("utf-8")) > MAX_EXTENSION_LIST_BYTES:
         raise ValueError("extension discovery response-size bound exceeded")
     cleaned = listed.stdout.replace("Authentication in the infobase is required to perform the operation", "").replace("User:", "").replace("Password:", "")
-    extensions: list[dict[str, Any]] = []
+    extensions: list[ExtensionInfo] = []
     current: dict[str, str] = {}
     for line in (line.strip() for line in cleaned.splitlines() if line.strip()):
         if ":" not in line: raise RuntimeError("unsupported ibcmd extension list output")
         key, value = (part.strip() for part in line.split(":", 1)); value = value.strip('"')
         if key == "name" and current:
-            extensions.append({"name": current["name"], "version": current.get("version", ""), "active": current.get("active") == "yes"}); current = {}
+            extensions.append({"uuid": "", "name": current["name"], "version": current.get("version", ""), "active": current.get("active") == "yes"}); current = {}
         current[key] = value
     if current:
-        extensions.append({"name": current["name"], "version": current.get("version", ""), "active": current.get("active") == "yes"})
+        extensions.append({"uuid": "", "name": current["name"], "version": current.get("version", ""), "active": current.get("active") == "yes"})
     if len(extensions) > MAX_EXTENSION_COUNT:
         raise ValueError("extension discovery extension-count bound exceeded")
     context = tempfile.TemporaryDirectory(prefix="extension-identities-") if identity_staging is None else nullcontext(str(identity_staging))
     with context as temporary:
-        Path(temporary).mkdir(parents=True, exist_ok=True, mode=0o700)
+        _ = Path(temporary).mkdir(parents=True, exist_ok=True, mode=0o700)
         configuration_root = Path(temporary) / "configuration"
         command = adapter_plan(f"{exporter}+xml-hierarchical/v1", platform, connection, configuration_root, timeout_seconds=int(remaining()))[0]
-        exported = _run_command(run, command, cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=remaining(), env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
+        exported = run_command(run, command, cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=remaining(), env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
         if exported.returncode:
             raise RuntimeError("configuration identity export failed")
         configuration = configuration_identity(configuration_root)
         for index, extension in enumerate(extensions):
             output = Path(temporary) / str(index)
             command = adapter_plan(f"{exporter}+xml-hierarchical/v1", platform, connection, output, extension["name"], timeout_seconds=int(remaining()))[0]
-            exported = _run_command(run, command, cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=remaining(), env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
+            exported = run_command(run, command, cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=remaining(), env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
             if exported.returncode:
                 raise RuntimeError(f"extension identity export failed: {extension['name']}")
             identity = configuration_identity(output)
@@ -360,7 +839,9 @@ def preflight_connection(profile_id: str, platform: Path, connection: dict[str, 
                 os.replace(output, destination)
     if len({item["uuid"] for item in extensions}) != len(extensions):
         raise RuntimeError("extension enumeration produced duplicate UUIDs")
-    tested = {key: value for key, value in connection.items() if key not in {"db_password", "infobase_password", "tested", "extensions", "tested_fingerprint", "tool_version"}}
+    tested = connection.copy()
+    for key in ("db_password", "infobase_password", "tested", "extensions", "tested_fingerprint"):
+        _ = tested.pop(key, None)
     tested.update({"profile_id": profile_id, "tested": True, "configuration": configuration, "extensions": extensions, "tool_versions": toolchain_versions})
     tested["tested_fingerprint"] = "sha256:" + sha256(canonical_json(tested))
     return tested
@@ -380,17 +861,19 @@ def configuration_identity(root: Path) -> dict[str, str]:
     import xml.etree.ElementTree as ET
     element = ET.fromstring(raw)
     configuration = element if element.tag.rsplit("}", 1)[-1] == "Configuration" else next((item for item in element if item.tag.rsplit("}", 1)[-1] == "Configuration"), None)
-    identifier = str(configuration.attrib.get("uuid", "")).lower() if configuration is not None else ""
+    if configuration is None:
+        raise ValueError("exported configuration root UUID is missing or invalid")
+    identifier = str(configuration.attrib.get("uuid", "")).lower()
     if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", identifier):
         raise ValueError("exported configuration root UUID is missing or invalid")
-    properties = next((item for item in configuration if item.tag.rsplit("}", 1)[-1] == "Properties"), None) if configuration is not None else None
+    properties = next((item for item in configuration if item.tag.rsplit("}", 1)[-1] == "Properties"), None)
     values = {item.tag.rsplit("}", 1)[-1].lower(): (item.text or "").strip() for item in (properties if properties is not None else configuration)}
     if not values.get("name"):
         raise ValueError("exported configuration name is missing")
     return {"uuid": identifier, "name": values["name"], "version": values.get("version", "")}
 
 
-def adapter_plan(profile_id: str, platform: Path, connection: dict[str, str], output: Path, extension_name: str | None = None, *, representation: str | None = None, workspace: Path | None = None, project_name: str | None = None, timeout_seconds: int = 1800) -> list[list[str]]:
+def adapter_plan(profile_id: str, platform: Path, connection: ConnectionProfile, output: Path, extension_name: str | None = None, *, representation: str | None = None, workspace: Path | None = None, project_name: str | None = None, timeout_seconds: float = 1800) -> list[list[str]]:
     if profile_id in PROFILES:
         exporter = PROFILES[profile_id]
         if representation not in {"xml-hierarchical", "v8unpack"}:
@@ -407,11 +890,20 @@ def adapter_plan(profile_id: str, platform: Path, connection: dict[str, str], ou
         required = ("dbms", "db_server", "db_name", "db_user", "db_password", "infobase_user", "infobase_password")
         if any(key not in connection for key in required):
             raise ValueError("incomplete ibcmd connection profile")
-        commands = [[str(platform / "ibcmd"), "config", verb, *_ibcmd_db_args(connection), f"--user={connection['infobase_user']}", f"--password={connection['infobase_password']}", *(["--threads=1"] if verb == "export" else []), *extension, str(intermediate)]]
+        infobase_user, infobase_password = connection.get("infobase_user"), connection.get("infobase_password")
+        if not isinstance(infobase_user, str) or not isinstance(infobase_password, str):
+            raise ValueError("incomplete ibcmd connection profile")
+        commands = [[str(platform / "ibcmd"), "config", verb, *_ibcmd_db_args(connection), f"--user={infobase_user}", f"--password={infobase_password}", *(["--threads=1"] if verb == "export" else []), *extension, str(intermediate)]]
     else:
         intermediate = output.with_name(output.name + ".xml-staging") if representation == "edt-project" else output if representation != "v8unpack" else output.with_suffix(".cfe" if extension_name else ".cf")
         switch = "/DumpConfigToFiles" if representation != "v8unpack" else "/DumpCfg"
-        commands = [[str(platform / "1cv8"), "DESIGNER", connection["client_connection"], f"/N{connection['infobase_user']}", f"/P{connection['infobase_password']}", switch, str(intermediate)]]
+        client_connection = connection.get("client_connection")
+        infobase_user = connection.get("infobase_user")
+        infobase_password = connection.get("infobase_password")
+        if not all(isinstance(value, str) for value in (client_connection, infobase_user, infobase_password)):
+            raise ValueError("incomplete Designer connection profile")
+        assert isinstance(client_connection, str) and isinstance(infobase_user, str) and isinstance(infobase_password, str)
+        commands = [[str(platform / "1cv8"), "DESIGNER", client_connection, f"/N{infobase_user}", f"/P{infobase_password}", switch, str(intermediate)]]
         if representation != "v8unpack":
             commands[0] += ["-Format", "Hierarchical"]
         if extension_name:
@@ -449,7 +941,7 @@ def normalize_payload(root: Path) -> None:
         raw = path.read_bytes()
         normalized = volatile_period.sub(br"\g<1>2000-01-01\g<3>", raw)
         if normalized != raw:
-            path.write_bytes(normalized)
+            _ = path.write_bytes(normalized)
 
 
 def _reject_secret_content(root: Path) -> None:
@@ -484,7 +976,7 @@ def _extract_source_tree(source: Path, destination: Path) -> None:
                 else:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     with archive.open(item) as input_stream, target.open("xb") as output_stream:
-                        shutil.copyfileobj(input_stream, output_stream)
+                        _ = shutil.copyfileobj(input_stream, output_stream)
     elif tarfile.is_tarfile(source):
         with tarfile.open(source, "r:*") as archive:
             for item in sorted(archive.getmembers(), key=lambda value: value.name):
@@ -500,7 +992,7 @@ def _extract_source_tree(source: Path, destination: Path) -> None:
                     if input_stream is None:
                         raise ValueError("source-tree archive member is unreadable")
                     with input_stream, target.open("xb") as output_stream:
-                        shutil.copyfileobj(input_stream, output_stream)
+                        _ = shutil.copyfileobj(input_stream, output_stream)
                 else:
                     raise ValueError("source-tree archive contains a link or special file")
     else:
@@ -510,7 +1002,7 @@ def _extract_source_tree(source: Path, destination: Path) -> None:
     _reject_secret_content(destination)
 
 
-def stream_upload(stream: BinaryIO, drafts_root: Path, relative_name: str, declared_length: int, declared_sha256: str | None, expected_draft_fingerprint: str | None = None, cancelled: callable | None = None) -> dict[str, Any]:
+def stream_upload(stream: BinaryIO, drafts_root: Path, relative_name: str, declared_length: int, declared_sha256: str | None, expected_draft_fingerprint: str | None = None, cancelled: CancelCallback | None = None) -> dict[str, str | int]:
     relative = normalize_relative(relative_name)
     target = confined(drafts_root, relative)
     if shutil.disk_usage(drafts_root).free < declared_length + 1024**3:
@@ -532,8 +1024,8 @@ def stream_upload(stream: BinaryIO, drafts_root: Path, relative_name: str, decla
                 written += len(chunk)
                 if written > declared_length:
                     raise ValueError("upload exceeds declared length")
-                digest.update(chunk); output.write(chunk)
-            output.flush(); os.fsync(output.fileno())
+                digest.update(chunk); _ = output.write(chunk)
+            output.flush(); _ = os.fsync(output.fileno())
         actual = digest.hexdigest()
         if written != declared_length or declared_sha256 and actual != declared_sha256.lower():
             raise ValueError("external upload length or SHA-256 mismatch")
@@ -548,16 +1040,18 @@ def draft_fingerprint(root: Path) -> str:
     return "sha256:" + sha256(canonical_json(file_manifest(root)))
 
 
-def routing_bindings(repo: Path, connections: dict[str, dict[str, Any]], upload_drafts: Path | None) -> dict[str, str]:
+def routing_bindings(repo: Path, connections: dict[str, ConnectionProfile], upload_drafts: Path | None) -> dict[str, str]:
     from .source_routing import PROBE_CONTRACT_VERSION
-    from .workflow import state_fingerprint
+    workflow = importlib.import_module(".workflow", __package__)
+    if not isinstance(workflow, _WorkflowModule):
+        raise RuntimeError("workflow module has an incompatible runtime interface")
     safe_connections = {
         name: {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}}
         for name, profile in sorted(connections.items())
     }
     return {
         "workflow": "sha256:" + sha256((repo / "research/workflow.toml").read_bytes()),
-        "workflow_state": state_fingerprint(repo),
+        "workflow_state": workflow.state_fingerprint(repo),
         "infobases": "sha256:" + sha256((repo / "research/infobases.toml").read_bytes()),
         "external_artifacts": "sha256:" + sha256((repo / "research/external-artifacts.toml").read_bytes()),
         "connections": "sha256:" + sha256(canonical_json(safe_connections)),
@@ -566,20 +1060,22 @@ def routing_bindings(repo: Path, connections: dict[str, dict[str, Any]], upload_
     }
 
 
-def _execute_plan(commands: list[list[str]], *, run: callable, timeout_seconds: int, cancelled: callable | None, subject: str) -> None:
+def _execute_plan(commands: list[list[str]], *, run: CommandRunner, timeout_seconds: float, cancelled: CancelCallback | None, subject: str) -> None:
     for command in commands:
-        result = _run_command(run, command, cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
+        result = run_command(run, command, cancelled=cancelled, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=timeout_seconds, env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"})
         if result.returncode:
             raise RuntimeError(f"source_route_failed:{subject}")
 
 
-def _check_cancelled(cancelled: callable | None, phase: str) -> None:
+def _check_cancelled(cancelled: CancelCallback | None, phase: str) -> None:
     if cancelled and cancelled():
         raise InterruptedError(f"source acquisition cancelled during {phase}")
 
 
-def _verified_artifact_source(upload_drafts: Path | None, member: dict[str, Any]) -> Path:
-    artifact = member["artifact"]
+def _verified_artifact_source(upload_drafts: Path | None, member: ComponentMember) -> Path:
+    artifact = member.get("artifact")
+    if artifact is None:
+        raise ValueError(f"external artifact declaration is unavailable: {member.get('name', '')}")
     if not upload_drafts:
         raise ValueError(f"external artifact upload draft is unavailable: {member['name']}")
     filename = normalize_relative(str(artifact["filename"]))
@@ -597,21 +1093,21 @@ def _verified_artifact_source(upload_drafts: Path | None, member: dict[str, Any]
     return source
 
 
-def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, timeout_seconds: int = 1800, run: callable = subprocess.run, upload_drafts: Path | None = None, cancelled: callable | None = None, progress: callable | None = None, identity_staging: dict[str, Path] | None = None) -> dict[str, Any]:
+def build_routing_preview(repo: Path, platform: Path, connections: dict[str, ConnectionProfile], *, timeout_seconds: float = 1800, run: CommandRunner = _default_run, upload_drafts: Path | None = None, cancelled: CancelCallback | None = None, progress: ProgressCallback | None = None, identity_staging: dict[str, Path] | None = None) -> RoutingPreview:
     from .source_routing import analyze_forms, component_members, extension_scope, plan_groups
-    tested = {name: {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}} for name, profile in connections.items()}
+    tested = _public_profiles(connections)
     contract = validate_role_contract(repo, tested)
-    scope = extension_scope(contract, connections)
+    scope = extension_scope(_json_contract(contract), _json_connections(connections))
     bindings = routing_bindings(repo, connections, upload_drafts)
     if scope["unreviewed"]:
         manifest = plan_groups([], PROFILES[contract["acquisition_profile_id"]], {})
-        blockers = [{
+        blockers: list[RoutingBlocker] = [{
             "code": "extension_scope_required",
             "uuid": uuid,
             "roles": next(item["roles"] for item in scope["extensions"] if item["uuid"] == uuid),
             "action": "review_extension_scope",
         } for uuid in scope["unreviewed"]]
-        preimage = {
+        preview: RoutingPreview = {
             "schema_version": "1",
             "bindings": bindings,
             "extension_scope": scope,
@@ -619,10 +1115,12 @@ def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dic
             "probe_results": [],
             "routing_manifest": manifest,
             "required_tools": [],
+            "routing_plan_fingerprint": "",
         }
-        return {**preimage, "routing_plan_fingerprint": "sha256:" + sha256(canonical_json(preimage))}
+        preview["routing_plan_fingerprint"] = "sha256:" + sha256(canonical_json({key: value for key, value in preview.items() if key != "routing_plan_fingerprint"}))
+        return preview
     exporter = PROFILES[contract["acquisition_profile_id"]]
-    members = component_members(contract, connections)
+    members = component_members(_json_contract(contract), _json_connections(connections))
     with tempfile.TemporaryDirectory(prefix="source-routing-preview-") as temporary:
         root = Path(temporary)
         for index, member in enumerate(members):
@@ -635,9 +1133,18 @@ def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dic
             output.parent.mkdir(parents=True, exist_ok=True)
             if member["kind"] in {"configuration", "extension"}:
                 staged = identity_staging.get(member["role"]) if identity_staging else None
-                staged = staged / ("configuration" if member["kind"] == "configuration" else f"extensions/{member['extension']['uuid']}") if staged else None
+                extension = member.get("extension")
+                if member["kind"] == "extension" and extension is None:
+                    raise ValueError("extension routing member has no extension identity")
+                if staged:
+                    if member["kind"] == "configuration":
+                        relative = "configuration"
+                    else:
+                        assert extension is not None
+                        relative = f"extensions/{extension['uuid']}"
+                    staged = staged / relative
                 if staged and staged.is_dir():
-                    shutil.copytree(staged, output)
+                    _ = shutil.copytree(staged, output)
                 else:
                     connection = connections[contract["roles"][member["role"]]["connection_profile"]]
                     _execute_plan(
@@ -664,10 +1171,20 @@ def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dic
             _reject_secret_content(output)
             if member["kind"] in {"configuration", "extension"}:
                 identity = configuration_identity(output)
-                expected = contract["roles"][member["role"]] if member["kind"] == "configuration" else member["extension"]
-                expected_uuid = str(expected["root_uuid"] if member["kind"] == "configuration" else expected["uuid"]).lower()
-                expected_name = expected["configuration_name"] if member["kind"] == "configuration" else expected["name"]
-                if identity["uuid"] != expected_uuid or identity["name"] != expected_name or expected.get("version") and identity["version"] != expected["version"]:
+                extension = member.get("extension")
+                if member["kind"] == "extension" and extension is None:
+                    raise ValueError("extension routing member has no extension identity")
+                if member["kind"] == "configuration":
+                    expected_uuid = contract["roles"][member["role"]]["root_uuid"].lower()
+                    expected_name = contract["roles"][member["role"]]["configuration_name"]
+                    expected_version = contract["roles"][member["role"]]["version"]
+                else:
+                    assert extension is not None
+                    uuid_value, name_value, version_value = extension.get("uuid"), extension.get("name"), extension.get("version")
+                    if not isinstance(uuid_value, str) or not isinstance(name_value, str) or not isinstance(version_value, str):
+                        raise ValueError(f"source_probe_identity_mismatch:{member['routing_group_id']}")
+                    expected_uuid, expected_name, expected_version = uuid_value.lower(), name_value, version_value
+                if identity["uuid"] != expected_uuid or identity["name"] != expected_name or expected_version and identity["version"] != expected_version:
                     raise ValueError(f"source_probe_identity_mismatch:{member['routing_group_id']}")
             member["probe"] = analyze_forms(output, member["component_id"])
         if progress:
@@ -680,15 +1197,25 @@ def build_routing_preview(repo: Path, platform: Path, connections: dict[str, dic
             for group in manifest["groups"]:
                 if group["representation_schema"] == "v8unpack/v1":
                     group["converter_version"] = converter["converter"]
-            manifest.pop("routing_manifest_fingerprint")
+            _ = manifest.pop("routing_manifest_fingerprint", None)
             manifest["routing_manifest_fingerprint"] = "sha256:" + sha256(canonical_json(manifest))
-    probe_results = sorted((member["probe"] for member in members if member.get("probe")), key=lambda item: item["component_id"])
+    probe_results = sorted((member["probe"] for member in members if "probe" in member), key=lambda item: item["component_id"])
     required_tools = sorted({group["exporter"] for group in manifest["groups"] if group["exporter"] in {"ibcmd", "designer"}} | ({"v8unpack"} if any(group["representation_schema"] == "v8unpack/v1" for group in manifest["groups"]) else set()))
-    preimage = {"schema_version": "1", "bindings": bindings, "extension_scope": scope, "blockers": [], "probe_results": probe_results, "routing_manifest": manifest, "required_tools": required_tools}
-    return {**preimage, "routing_plan_fingerprint": "sha256:" + sha256(canonical_json(preimage))}
+    result: RoutingPreview = {
+        "schema_version": "1",
+        "bindings": bindings,
+        "extension_scope": scope,
+        "blockers": [],
+        "probe_results": probe_results,
+        "routing_manifest": manifest,
+        "required_tools": required_tools,
+        "routing_plan_fingerprint": "",
+    }
+    result["routing_plan_fingerprint"] = "sha256:" + sha256(canonical_json({key: value for key, value in result.items() if key != "routing_plan_fingerprint"}))
+    return result
 
 
-def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, routing_preview: dict[str, Any], normalizer_version: str = NORMALIZER_VERSION, timeout_seconds: int = 1800, run: callable = subprocess.run, upload_drafts: Path | None = None, cancelled: callable | None = None, progress: callable | None = None, activate: bool = True) -> dict[str, Any]:
+def acquire(repo: Path, platform: Path, connections: dict[str, ConnectionProfile], *, routing_preview: RoutingPreview, normalizer_version: str = NORMALIZER_VERSION, timeout_seconds: float = 1800, run: CommandRunner = _default_run, upload_drafts: Path | None = None, cancelled: CancelCallback | None = None, progress: ProgressCallback | None = None, activate: bool = True) -> SourcePointer:
     if shutil.disk_usage(repo).free < MINIMUM_FREE_BYTES:
         raise OSError("source acquisition requires at least 1 GiB free space")
     staging_parent = repo / "sources/.staging"; staging_parent.mkdir(parents=True, exist_ok=True)
@@ -701,10 +1228,10 @@ def acquire(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], 
         )
 
 
-def _acquire_verified(repo: Path, platform: Path, connections: dict[str, dict[str, Any]], *, routing_preview: dict[str, Any], normalizer_version: str, timeout_seconds: int, run: callable, upload_drafts: Path | None, cancelled: callable | None, progress: callable | None, activate: bool, identity_root: Path) -> dict[str, Any]:
+def _acquire_verified(repo: Path, platform: Path, connections: dict[str, ConnectionProfile], *, routing_preview: RoutingPreview, normalizer_version: str, timeout_seconds: float, run: CommandRunner, upload_drafts: Path | None, cancelled: CancelCallback | None, progress: ProgressCallback | None, activate: bool, identity_root: Path) -> SourcePointer:
     deadline = time.monotonic() + timeout_seconds
     remaining = lambda: deadline - time.monotonic()
-    tested = {name: {key: value for key, value in profile.items() if key not in {"db_password", "infobase_password"}} for name, profile in connections.items()}
+    tested = _public_profiles(connections)
     contract = validate_role_contract(repo, tested)
     if routing_preview.get("blockers"):
         raise RuntimeError("extension_scope_required")
@@ -716,9 +1243,9 @@ def _acquire_verified(repo: Path, platform: Path, connections: dict[str, dict[st
             raise TimeoutError("extension-discovery overall-time bound exhausted")
         profile_name = contract["roles"][role]["connection_profile"]
         fresh = preflight_connection(contract["acquisition_profile_id"], platform, connections[profile_name], timeout_seconds=min(available, 120), run=run, cancelled=cancelled, identity_staging=identity_root / role)
-        if canonical_json(fresh["extensions"]) != canonical_json(connections[profile_name].get("extensions", [])):
+        if canonical_json(fresh.get("extensions", [])) != canonical_json(connections[profile_name].get("extensions", [])):
             raise RuntimeError("extension_inventory_stale")
-    included = {item["uuid"] for item in contract["extension_decisions"] if item["decision"] == "include"}
+    included = {item["uuid"] for item in contract.get("extension_decisions", []) if item["decision"] == "include"}
     for role in ROLES:
         root = identity_root / role / "extensions"
         if root.is_dir():
@@ -735,11 +1262,12 @@ def _acquire_verified(repo: Path, platform: Path, connections: dict[str, dict[st
     if fresh_preview.get("blockers") or routing_preview.get("routing_plan_fingerprint") != fresh_preview["routing_plan_fingerprint"]:
         raise RuntimeError("extension_inventory_stale" if fresh_preview.get("extension_scope") != routing_preview.get("extension_scope") else "routing_preview_stale")
     from .source_routing import component_members, source_comparison_epoch
-    members = component_members(contract, connections)
+    members = component_members(_json_contract(contract), _json_connections(connections))
     groups = {item["routing_group_id"]: item for item in fresh_preview["routing_manifest"]["groups"]}
     probes = {item["component_id"]: item for item in fresh_preview["probe_results"]}
     pointer_path = repo / "research/active-source-generation.json"
-    expected_generation = json.loads(pointer_path.read_text(encoding="utf-8")).get("generation_id") if pointer_path.is_file() else None
+    generation_value = parse_json_object(pointer_path.read_text(encoding="utf-8")).get("generation_id") if pointer_path.is_file() else None
+    expected_generation = generation_value if isinstance(generation_value, str) else None
     staging_parent = repo / "sources/.staging"; staging_parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="acquire-", dir=staging_parent) as temporary:
         staging = Path(temporary)
@@ -747,6 +1275,7 @@ def _acquire_verified(repo: Path, platform: Path, connections: dict[str, dict[st
         for role in ROLES:
             (staging / role).mkdir()
         for index, member in enumerate(members, 1):
+            identity: dict[str, str] | None = None
             if progress:
                 progress({"phase": "export", "completed": index - 1, "total": len(members), "subject": member["component_id"]})
             _check_cancelled(cancelled, "export")
@@ -757,14 +1286,24 @@ def _acquire_verified(repo: Path, platform: Path, connections: dict[str, dict[st
             elif member["kind"] == "extension":
                 output = staging / role / "extensions" / member["routing_group_id"].split(":", 1)[1]
             else:
-                output = staging / role / "external" / member["name"]
+                name = member.get("name")
+                if name is None:
+                    raise ValueError("external routing member has no name")
+                output = staging / role / "external" / name
             output.parent.mkdir(parents=True, exist_ok=True)
             work_output = work_root / role / member["routing_group_id"].replace(":", "-")
             if member["kind"] in {"configuration", "extension"}:
                 representation = group["representation_schema"].removesuffix("/v1")
-                verified = identity_root / role / ("configuration" if member["kind"] == "configuration" else f"extensions/{member['extension']['uuid']}")
+                extension = member.get("extension")
+                if member["kind"] == "extension" and extension is None:
+                    raise ValueError("extension routing member has no extension identity")
+                if member["kind"] == "configuration":
+                    verified = identity_root / role / "configuration"
+                else:
+                    assert extension is not None
+                    verified = identity_root / role / f"extensions/{extension['uuid']}"
                 if representation == "xml-hierarchical" and verified.is_dir():
-                    shutil.copytree(verified, work_output)
+                    _ = shutil.copytree(verified, work_output)
                 else:
                     connection = connections[contract["roles"][role]["connection_profile"]]
                     _execute_plan(
@@ -777,7 +1316,7 @@ def _acquire_verified(repo: Path, platform: Path, connections: dict[str, dict[st
                 if not work_output.is_dir() or not any(path.is_file() for path in work_output.rglob("*")):
                     raise ValueError(f"source_export_empty:{member['routing_group_id']}")
                 reject_links_and_special_files(work_output)
-                shutil.copytree(work_output, output)
+                _ = shutil.copytree(work_output, output)
                 normalize_payload(output)
                 identity = configuration_identity(output)
                 if member["kind"] == "configuration":
@@ -785,7 +1324,7 @@ def _acquire_verified(repo: Path, platform: Path, connections: dict[str, dict[st
                     if (identity["uuid"], identity["name"], identity["version"]) != (str(expected["root_uuid"]).lower(), expected["configuration_name"], expected["version"]):
                         raise ValueError(f"source_identity_mismatch:{member['routing_group_id']}")
                 else:
-                    extension = member["extension"]
+                    assert extension is not None
                     if identity["uuid"] != str(extension["uuid"]).lower() or identity["name"] != extension["name"] or extension.get("version") and identity["version"] != extension["version"]:
                         raise ValueError(f"source_identity_mismatch:{member['routing_group_id']}")
             else:
@@ -807,20 +1346,24 @@ def _acquire_verified(repo: Path, platform: Path, connections: dict[str, dict[st
                 elif member["kind"] == "source-tree":
                     _extract_source_tree(source, output / "source")
                 else:
-                    shutil.copy2(source, output / normalize_relative(member["artifact"]["filename"]))
+                    artifact = member.get("artifact")
+                    filename = artifact.get("filename") if artifact is not None else None
+                    if not isinstance(filename, str):
+                        raise ValueError("external routing member has no artifact filename")
+                    _ = shutil.copy2(source, output / normalize_relative(filename))
                     _reject_secret_content(output)
             _check_cancelled(cancelled, "validation")
             clean_payload(output)
             payload = file_manifest(output)
-            probe = probes.get(member["component_id"], {})
-            metadata = {
+            probe = probes.get(member["component_id"])
+            metadata: dict[str, object] = {
                 "schema_version": "2",
                 "component_id": member["component_id"],
                 "kind": member["kind"],
                 "routing_group_id": member["routing_group_id"],
-                "probe_contract_version": probe.get("probe_contract_version", ""),
-                "probe_fingerprint": probe.get("probe_fingerprint", ""),
-                "form_counts": probe.get("form_counts", {"managed": 0, "ordinary": 0, "inconclusive": 0}),
+                "probe_contract_version": probe.get("probe_contract_version", "") if probe else "",
+                "probe_fingerprint": probe.get("probe_fingerprint", "") if probe else "",
+                "form_counts": probe.get("form_counts", {"managed": 0, "ordinary": 0, "inconclusive": 0}) if probe else {"managed": 0, "ordinary": 0, "inconclusive": 0},
                 "routing_reason": group["routing_reason"],
                 "exporter": group["exporter"],
                 "representation_schema": group["representation_schema"],
@@ -830,9 +1373,13 @@ def _acquire_verified(repo: Path, platform: Path, connections: dict[str, dict[st
                 "payload_fingerprint": "sha256:" + sha256(canonical_json(payload)),
             }
             if member["kind"] in {"configuration", "extension"}:
+                assert identity is not None
                 metadata.update({"uuid": identity["uuid"], "name": identity["name"], "version": identity["version"]})
             if member["kind"] == "extension":
-                metadata["active"] = bool(member["extension"]["active"])
+                extension = member.get("extension")
+                if extension is None:
+                    raise ValueError("extension routing member has no extension identity")
+                metadata["active"] = bool(extension["active"])
             atomic_json(output / "component-manifest.json", metadata)
             if progress:
                 progress({"phase": "export", "completed": index, "total": len(members), "subject": member["component_id"]})
@@ -855,7 +1402,7 @@ def _acquire_verified(repo: Path, platform: Path, connections: dict[str, dict[st
         return result
 
 
-def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], routing_manifest: dict[str, Any], normalizer_version: str, expected_generation: str | None, epoch_builder: callable, *, activate: bool = True, freshness_check: callable | None = None) -> dict[str, Any]:
+def publish_routed(repo: Path, staged_roles: Path, contract: SourceContract, routing_manifest: RoutingManifest, normalizer_version: str, expected_generation: str | None, epoch_builder: Callable[[dict[str, JsonValue], RoutingManifest], str], *, activate: bool = True, freshness_check: Callable[[], None] | None = None) -> SourcePointer:
     manifest_preimage = {key: value for key, value in routing_manifest.items() if key != "routing_manifest_fingerprint"}
     if routing_manifest.get("routing_manifest_fingerprint") != "sha256:" + sha256(canonical_json(manifest_preimage)):
         raise ValueError("routing manifest fingerprint mismatch")
@@ -863,10 +1410,11 @@ def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], rou
         if freshness_check:
             freshness_check()
         pointer_path = repo / "research/active-source-generation.json"
-        current = json.loads(pointer_path.read_text(encoding="utf-8")).get("generation_id") if pointer_path.is_file() else None
+        current = parse_json_object(pointer_path.read_text(encoding="utf-8")).get("generation_id") if pointer_path.is_file() else None
         if current != expected_generation:
             raise RuntimeError("stale active source generation")
-        role_manifests, role_fingerprints = {}, {}
+        role_manifests: dict[str, list[dict[str, str | int]]] = {}
+        role_fingerprints: dict[str, str] = {}
         for role in ROLES:
             role_root = confined(staged_roles, role)
             if not (role_root / "configuration").is_dir():
@@ -874,7 +1422,7 @@ def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], rou
             clean_payload(role_root)
             role_manifests[role] = file_manifest(role_root)
             role_fingerprints[role] = "sha256:" + sha256(canonical_json(role_manifests[role]))
-        safe_contract = json.loads(canonical_json(contract))
+        safe_contract = _json_contract(contract)
         reject_secrets(safe_contract, "source contract")
         contract_fingerprint = "sha256:" + sha256(canonical_json(safe_contract))
         routing_fingerprint = routing_manifest["routing_manifest_fingerprint"]
@@ -891,17 +1439,17 @@ def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], rou
             temporary = Path(tempfile.mkdtemp(prefix=f".{generation_id}.", dir=destination.parent))
             try:
                 for role in ROLES:
-                    shutil.copytree(staged_roles / role, temporary / role)
-                (temporary / "source-contract.json").write_bytes(canonical_json(safe_contract) + b"\n")
-                (temporary / "routing-manifest.json").write_bytes(canonical_json(routing_manifest) + b"\n")
+                    _ = shutil.copytree(staged_roles / role, temporary / role)
+                _ = (temporary / "source-contract.json").write_bytes(canonical_json(safe_contract) + b"\n")
+                _ = (temporary / "routing-manifest.json").write_bytes(canonical_json(routing_manifest) + b"\n")
                 for path in temporary.rglob("*"):
                     if path.is_file():
                         with path.open("rb") as stream:
-                            os.fsync(stream.fileno())
+                            _ = os.fsync(stream.fileno())
                 os.replace(temporary, destination)
                 parent_fd = os.open(destination.parent, os.O_RDONLY)
                 try:
-                    os.fsync(parent_fd)
+                    _ = os.fsync(parent_fd)
                 finally:
                     os.close(parent_fd)
             finally:
@@ -910,22 +1458,22 @@ def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], rou
             raise RuntimeError("existing routed source generation is inconsistent")
         if any(file_manifest(destination / role) != role_manifests[role] for role in ROLES):
             raise RuntimeError("existing routed source generation role payload is inconsistent")
-        components = []
+        components: list[ComponentRecord] = []
         for role in ROLES:
             for manifest_path in sorted((destination / role).rglob("component-manifest.json")):
-                component = json.loads(manifest_path.read_text(encoding="utf-8"))
+                component = parse_json_object(manifest_path.read_text(encoding="utf-8"))
                 path = manifest_path.parent
                 manifest = file_manifest(path)
                 components.append({
-                    "component_id": component["component_id"],
-                    "kind": component["kind"],
+                    "component_id": str(component["component_id"]),
+                    "kind": str(component["kind"]),
                     "path": path.relative_to(destination).as_posix(),
-                    "representation_schema": component["representation_schema"],
-                    "routing_group_id": component["routing_group_id"],
+                    "representation_schema": str(component["representation_schema"]),
+                    "routing_group_id": str(component["routing_group_id"]),
                     "fingerprint": "sha256:" + sha256(canonical_json(manifest)),
-                    "bsl_file_count": sum(item["path"].endswith(".bsl") for item in manifest),
+                    "bsl_file_count": sum(str(item["path"]).endswith(".bsl") for item in manifest),
                 })
-        pointer = {
+        pointer: SourcePointer = {
             "schema_version": "2",
             "generation_id": generation_id,
             "acquisition_profile_id": contract["acquisition_profile_id"],
@@ -936,24 +1484,24 @@ def publish_routed(repo: Path, staged_roles: Path, contract: dict[str, Any], rou
             "routing_manifest_fingerprint": routing_fingerprint,
             "components": components,
         }
-        pointer["source_comparison_epoch_fingerprint"] = epoch_builder(pointer, routing_manifest)
+        pointer["source_comparison_epoch_fingerprint"] = epoch_builder(parse_json_object(canonical_json(pointer).decode()), routing_manifest)
         if activate:
             atomic_json(pointer_path, pointer)
         return pointer
 
 
-def publish(repo: Path, staged_roles: Path, contract: dict[str, Any], normalizer_version: str = NORMALIZER_VERSION, expected_generation: str | None | object = _UNSET) -> dict[str, Any]:
+def publish(repo: Path, staged_roles: Path, contract: SourceContract, normalizer_version: str = NORMALIZER_VERSION, expected_generation: str | None | object = _UNSET) -> SourcePointer:
     profile_id = contract["acquisition_profile_id"]
     if profile_id not in LEGACY_PROFILES:
         raise ValueError("routed source publication requires a routing manifest")
     representation = LEGACY_PROFILES[profile_id][1]
     with repository_lock(repo):
         pointer_path = repo / "research/active-source-generation.json"
-        current_generation = json.loads(pointer_path.read_text(encoding="utf-8")).get("generation_id") if pointer_path.is_file() else None
+        current_generation = parse_json_object(pointer_path.read_text(encoding="utf-8")).get("generation_id") if pointer_path.is_file() else None
         if expected_generation is not _UNSET and current_generation != expected_generation:
             raise RuntimeError("stale active source generation")
         role_fingerprints: dict[str, str] = {}
-        role_manifests: dict[str, list[dict[str, Any]]] = {}
+        role_manifests: dict[str, list[dict[str, str | int]]] = {}
         for role in ROLES:
             root = confined(staged_roles, role)
             if not root.is_dir() or not (root / "configuration").is_dir():
@@ -964,7 +1512,7 @@ def publish(repo: Path, staged_roles: Path, contract: dict[str, Any], normalizer
                 raise ValueError(f"staged role is empty: {role}")
             role_manifests[role] = manifest
             role_fingerprints[role] = "sha256:" + sha256(canonical_json(manifest))
-        safe_contract = json.loads(canonical_json(contract))
+        safe_contract = _json_contract(contract)
         reject_secrets(safe_contract, "source contract")
         contract_hash = sha256(canonical_json(safe_contract))
         preimage = {"schema_version": "1", "acquisition_profile_version": "1", "normalizer_version": normalizer_version, "source_contract_sha256": contract_hash, "roles": role_fingerprints}
@@ -975,15 +1523,15 @@ def publish(repo: Path, staged_roles: Path, contract: dict[str, Any], normalizer
             temporary = Path(tempfile.mkdtemp(prefix=f".{generation_id}.", dir=destination.parent))
             try:
                 for role in ROLES:
-                    shutil.copytree(staged_roles / role, temporary / role)
-                (temporary / "source-contract.json").write_bytes(canonical_json(safe_contract) + b"\n")
+                    _ = shutil.copytree(staged_roles / role, temporary / role)
+                _ = (temporary / "source-contract.json").write_bytes(canonical_json(safe_contract) + b"\n")
                 for path in temporary.rglob("*"):
                     if path.is_file():
-                        with path.open("rb") as stream: os.fsync(stream.fileno())
+                        with path.open("rb") as stream: _ = os.fsync(stream.fileno())
                 os.replace(temporary, destination)
                 parent_fd = os.open(destination.parent, os.O_RDONLY)
                 try:
-                    os.fsync(parent_fd)
+                    _ = os.fsync(parent_fd)
                 finally:
                     os.close(parent_fd)
             finally:
@@ -991,7 +1539,7 @@ def publish(repo: Path, staged_roles: Path, contract: dict[str, Any], normalizer
         expected_contract = canonical_json(safe_contract) + b"\n"
         if (destination / "source-contract.json").read_bytes() != expected_contract or any(file_manifest(destination / role) != role_manifests[role] for role in ROLES):
             raise RuntimeError("existing source generation does not match its deterministic identity")
-        components = []
+        components: list[ComponentRecord] = []
         for role in ROLES:
             role_root = destination / role
             for kind, parent in (("configuration", role_root / "configuration"), ("extension", role_root / "extensions"), ("external", role_root / "external")):
@@ -999,7 +1547,7 @@ def publish(repo: Path, staged_roles: Path, contract: dict[str, Any], normalizer
                 for path in paths:
                     identity = "configuration" if kind == "configuration" else path.name
                     components.append({"component_id": f"{role}:{kind}:{identity}" if kind != "configuration" else f"{role}:configuration", "kind": kind, "path": path.relative_to(destination).as_posix(), "fingerprint": "sha256:" + sha256(canonical_json(file_manifest(path)))})
-        pointer = {"schema_version": "1", "generation_id": generation_id, "acquisition_profile_id": profile_id, "representation_schema": representation, "normalizer_version": normalizer_version, "source_contract_sha256": contract_hash, "roles": role_fingerprints, "components": components}
+        pointer: SourcePointer = {"schema_version": "1", "generation_id": generation_id, "acquisition_profile_id": profile_id, "representation_schema": representation, "normalizer_version": normalizer_version, "source_contract_sha256": contract_hash, "roles": role_fingerprints, "components": components}
         atomic_json(repo / "research/active-source-generation.json", pointer)
         return pointer
 
@@ -1009,17 +1557,17 @@ def validate_active(
     *,
     deep: bool = False,
     require_tracked_clean: bool = False,
-    candidate: dict[str, Any] | None = None,
+    candidate: SourcePointer | None = None,
     current: bool = True,
-) -> dict[str, Any]:
-    import subprocess
+) -> SourcePointer:
     if candidate is None and current:
-        from .stage_recompute import recover_active_publication
-
-        recover_active_publication(repo)
+        stage_recompute = importlib.import_module(".stage_recompute", __package__)
+        if not isinstance(stage_recompute, _StageRecomputeModule):
+            raise RuntimeError("stage recompute module has an incompatible runtime interface")
+        _ = stage_recompute.recover_active_publication(repo)
     deep = deep or require_tracked_clean
     pointer_path = repo / "research/active-source-generation.json"
-    pointer = candidate or json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer = candidate or source_pointer(parse_json_object(pointer_path.read_text(encoding="utf-8")))
     if pointer.get("schema_version") == "2":
         return _validate_active_routed(
             repo, pointer, deep=deep,
@@ -1035,9 +1583,10 @@ def validate_active(
     if require_tracked_clean and candidate is None:
         validate_tracked_clean(repo, [root, pointer_path])
     contract_path = root / "source-contract.json"
-    contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    reject_secrets(contract, "active source contract")
-    if sha256(canonical_json(contract)) != pointer.get("source_contract_sha256"):
+    contract_json = parse_json_object(contract_path.read_text(encoding="utf-8"))
+    reject_secrets(contract_json, "active source contract")
+    contract = _source_contract(contract_json)
+    if sha256(canonical_json(contract_json)) != pointer.get("source_contract_sha256"):
         raise ValueError("active source contract hash mismatch")
     actual: dict[str, str] = {}
     for role in ROLES:
@@ -1049,19 +1598,25 @@ def validate_active(
             raise ValueError(f"active source role fingerprint is missing: {role}")
     if deep and actual != pointer.get("roles"):
         raise ValueError("active source role fingerprint mismatch")
-    if not isinstance(pointer.get("components"), list) or any(not str(item.get("component_id", "")) or not confined(root, str(item.get("path", ""))).is_dir() for item in pointer["components"]):
+    components = pointer.get("components")
+    normalizer_version = pointer.get("normalizer_version")
+    contract_sha256 = pointer.get("source_contract_sha256")
+    role_fingerprints = pointer.get("roles")
+    if not isinstance(components, list) or not isinstance(normalizer_version, str) or not isinstance(contract_sha256, str) or not isinstance(role_fingerprints, dict):
         raise ValueError("active source component catalog is missing or stale")
-    if deep and any(item.get("fingerprint") != "sha256:" + sha256(canonical_json(file_manifest(confined(root, item["path"])))) for item in pointer["components"]):
+    if any(not str(item.get("component_id", "")) or not confined(root, str(item.get("path", ""))).is_dir() for item in components):
         raise ValueError("active source component catalog is missing or stale")
-    preimage = {"schema_version": "1", "acquisition_profile_version": "1", "normalizer_version": pointer["normalizer_version"], "source_contract_sha256": pointer["source_contract_sha256"], "roles": pointer["roles"]}
+    if deep and any(item.get("fingerprint") != "sha256:" + sha256(canonical_json(file_manifest(confined(root, item["path"])))) for item in components):
+        raise ValueError("active source component catalog is missing or stale")
+    preimage = {"schema_version": "1", "acquisition_profile_version": "1", "normalizer_version": normalizer_version, "source_contract_sha256": contract_sha256, "roles": role_fingerprints}
     if sha256(canonical_json(preimage)) != generation_id:
         raise ValueError("active source generation ID mismatch")
     if current:
         current_infobases, current_artifacts = load_contract(repo)
-        current_contract = {"schema_version": "1", "acquisition_profile_id": current_infobases.get("acquisition_profile"), "roles": current_infobases.get("roles", {}), "artifacts": current_artifacts.get("artifacts", [])}
+        current_contract: dict[str, object] = {"schema_version": "1", "acquisition_profile_id": current_infobases.get("acquisition_profile"), "roles": current_infobases.get("roles", {}), "artifacts": current_artifacts.get("artifacts", [])}
         if current_infobases["extension_decisions"]:
             current_contract["extension_decisions"] = current_infobases["extension_decisions"]
-        active_contract = {**contract, "artifacts": [{key: value for key, value in item.items() if key != "external_artifact_id"} for item in contract.get("artifacts", [])]}
+        active_contract = _contract_without_artifact_ids(contract)
         if canonical_json(current_contract) != canonical_json(active_contract):
             raise ValueError("tracked source declarations changed; reacquisition is required")
     return pointer
@@ -1069,12 +1624,12 @@ def validate_active(
 
 def _validate_active_routed(
     repo: Path,
-    pointer: dict[str, Any],
+    pointer: SourcePointer,
     *,
     deep: bool,
     require_tracked_clean: bool,
     current: bool,
-) -> dict[str, Any]:
+) -> SourcePointer:
     generation_id = str(pointer.get("generation_id", ""))
     if len(generation_id) != 64 or generation_id != Path(generation_id).name:
         raise ValueError("invalid active source generation ID")
@@ -1082,12 +1637,13 @@ def _validate_active_routed(
     pointer_path = repo / "research/active-source-generation.json"
     if require_tracked_clean:
         validate_tracked_clean(repo, [root, pointer_path])
-    contract = json.loads((root / "source-contract.json").read_text(encoding="utf-8"))
-    reject_secrets(contract, "active source contract")
-    contract_fingerprint = "sha256:" + sha256(canonical_json(contract))
+    contract_json = parse_json_object((root / "source-contract.json").read_text(encoding="utf-8"))
+    reject_secrets(contract_json, "active source contract")
+    contract = _source_contract(contract_json)
+    contract_fingerprint = "sha256:" + sha256(canonical_json(contract_json))
     if contract_fingerprint != pointer.get("source_contract_fingerprint"):
         raise ValueError("active source contract fingerprint mismatch")
-    manifest = json.loads((root / "routing-manifest.json").read_text(encoding="utf-8"))
+    manifest = _routing_manifest(parse_json_object((root / "routing-manifest.json").read_text(encoding="utf-8")))
     manifest_preimage = {key: value for key, value in manifest.items() if key != "routing_manifest_fingerprint"}
     manifest_fingerprint = "sha256:" + sha256(canonical_json(manifest_preimage))
     if manifest_fingerprint != manifest.get("routing_manifest_fingerprint") or manifest_fingerprint != pointer.get("routing_manifest_fingerprint"):
@@ -1110,8 +1666,8 @@ def _validate_active_routed(
             or set(group.get("form_counts", {})) != {"managed", "ordinary", "inconclusive"}
         ):
             raise ValueError("invalid source routing group contract")
-    actual_roles = {}
-    catalog = {}
+    actual_roles: dict[str, str] = {}
+    catalog: dict[str, ComponentManifest] = {}
     for role in ROLES:
         role_root = confined(root, role)
         if not role_root.is_dir():
@@ -1121,7 +1677,7 @@ def _validate_active_routed(
         raise ValueError("active source role fingerprint mismatch")
     for item in pointer.get("components", []):
         component_root = confined(root, str(item.get("path", "")))
-        component = json.loads((component_root / "component-manifest.json").read_text(encoding="utf-8"))
+        component = _component_manifest(parse_json_object((component_root / "component-manifest.json").read_text(encoding="utf-8")))
         payload_manifest = [entry for entry in file_manifest(component_root) if entry["path"] != "component-manifest.json"] if deep else []
         group = groups.get(component.get("routing_group_id"))
         component_keys = {"schema_version", "component_id", "kind", "routing_group_id", "probe_contract_version", "probe_fingerprint", "form_counts", "routing_reason", "exporter", "representation_schema", "exporter_version", "converter_version", "payload_file_count", "payload_fingerprint"}
@@ -1129,9 +1685,10 @@ def _validate_active_routed(
             component_keys |= {"uuid", "name", "version"}
         if component.get("kind") == "extension":
             component_keys.add("active")
-        counts_valid = set(component.get("form_counts", {})) == {"managed", "ordinary", "inconclusive"} and all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in component.get("form_counts", {}).values())
+        counts_valid = set(component["form_counts"]) == {"managed", "ordinary", "inconclusive"} and all(not isinstance(value, bool) and value >= 0 for value in component["form_counts"].values())
         probe_valid = component.get("probe_contract_version") in {"", "form-probe/v1"} and (component.get("probe_fingerprint") == "" or re.fullmatch(r"sha256:[0-9a-f]{64}", str(component.get("probe_fingerprint"))) is not None)
         form_route = component.get("routing_reason") in {"managed_only", "ordinary_form_present", "inconclusive_form_payload", "no_forms"}
+        bsl_file_count = item.get("bsl_file_count")
         if (
             set(component) != component_keys
             or component.get("schema_version") != "2"
@@ -1149,11 +1706,11 @@ def _validate_active_routed(
             or item.get("component_id") != component.get("component_id")
             or item.get("routing_group_id") != component.get("routing_group_id")
             or item.get("representation_schema") != component.get("representation_schema")
-            or item.get("bsl_file_count") is not None and (
-                not isinstance(item.get("bsl_file_count"), int)
-                or isinstance(item.get("bsl_file_count"), bool)
-                or item["bsl_file_count"] < 0
-                or deep and item["bsl_file_count"] != sum(entry["path"].endswith(".bsl") for entry in payload_manifest)
+            or bsl_file_count is not None and (
+                not isinstance(bsl_file_count, int)
+                or isinstance(bsl_file_count, bool)
+                or bsl_file_count < 0
+                or deep and bsl_file_count != sum(str(entry["path"]).endswith(".bsl") for entry in payload_manifest)
             )
             or not group
             or not any(member["component_id"] == component["component_id"] for member in group["members"])
@@ -1184,14 +1741,14 @@ def _validate_active_routed(
         raise ValueError("active source generation contains temporary or binary payload")
     preimage = {
         "source_contract_fingerprint": contract_fingerprint,
-        "normalizer_version": pointer["normalizer_version"],
-        "roles": pointer["roles"],
+            "normalizer_version": pointer.get("normalizer_version"),
+            "roles": pointer.get("roles"),
         "routing_manifest_fingerprint": manifest_fingerprint,
     }
     if sha256(canonical_json(preimage)) != generation_id:
         raise ValueError("active source generation ID mismatch")
     from .source_routing import source_comparison_epoch
-    if pointer.get("source_comparison_epoch_fingerprint") != source_comparison_epoch(pointer, manifest):
+    if pointer.get("source_comparison_epoch_fingerprint") != source_comparison_epoch(_json_contract(pointer), manifest):
         raise ValueError("active source comparison epoch mismatch")
     if current:
         current_infobases, current_artifacts = load_contract(repo)
@@ -1202,7 +1759,7 @@ def _validate_active_routed(
             "artifacts": current_artifacts.get("artifacts", []),
             "extension_decisions": current_infobases["extension_decisions"],
         }
-        active_contract = {**contract, "artifacts": [{key: value for key, value in item.items() if key != "external_artifact_id"} for item in contract.get("artifacts", [])]}
+        active_contract = _contract_without_artifact_ids(contract)
         if canonical_json(current_contract) != canonical_json(active_contract):
             raise ValueError("tracked source declarations changed; reacquisition is required")
     return pointer

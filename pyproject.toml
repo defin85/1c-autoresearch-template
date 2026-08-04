@@ -32,7 +32,6 @@ addopts = "-m 'not smoke' --import-mode=importlib"
 [tool.basedpyright]
 include = ["src/one_c_autoresearch"]
 pythonVersion = "3.11"
-baselineFile = ".basedpyright/baseline.json"
 
 [dependency-groups]
 dev = [

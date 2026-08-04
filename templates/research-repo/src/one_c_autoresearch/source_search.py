@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import json
 from hashlib import sha256 as hashlib_sha256
 from pathlib import Path
-from typing import Any, Callable
+from collections.abc import Callable, Iterator, Mapping
+from typing import TypedDict
 
 from . import indexes
-from .contracts import canonical_json, normalize_relative, sha256
+from .contracts import (
+    JsonValue, canonical_json, json_object, normalize_relative, parse_json_object, sha256,
+)
 
 
 POLICY_VERSION = "source-search-policy/v2"
@@ -74,12 +76,91 @@ ROLE_OPERATIONS = {
 TOOL_FRAMING_BYTES_PER_CALL = 512
 
 
-def normalize_operation(operation: Any) -> str:
+class SourceSearchPolicy(TypedDict):
+    schema_version: str
+    tool_schema_version: str
+    bridge_version: str
+    operations: list[str]
+    source_generation_id: str
+    component_ids: list[str]
+    logical_path_prefixes: list[str]
+    routing_fingerprint: str
+    max_calls: int
+    max_concurrent_calls: int
+    per_call_deadline_seconds: int
+    max_backend_seconds: int
+    max_query_bytes: int
+    max_total_query_bytes: int
+    max_results_per_call: int
+    max_total_results: int
+    max_returned_bytes_per_call: int
+    max_total_returned_bytes: int
+    scope_fingerprint: str
+    policy_fingerprint: str
+
+
+class ProfilePolicy(TypedDict):
+    operations: list[str]
+    max_calls: int
+    max_concurrent_calls: int
+    per_call_deadline_seconds: int
+    max_backend_seconds: int
+    max_query_bytes: int
+    max_total_query_bytes: int
+    max_results_per_call: int
+    max_total_results: int
+    max_returned_bytes_per_call: int
+    max_total_returned_bytes: int
+
+
+class DiffScope(TypedDict, total=False):
+    before_role: str
+    after_role: str
+
+
+class WorkUnit(TypedDict, total=False):
+    allowed_paths: list[str]
+    diff: DiffScope
+    kind: str
+
+
+class SearchProfile(TypedDict, total=False):
+    source_search: object
+
+
+class LedgerItem(TypedDict, total=False):
+    status: str
+    capability: str
+    route_fingerprint: str
+    fallback_reason: str | None
+    adapter_id: str
+    adapter_version: str
+    capability_fingerprint: str
+    index_fingerprint: str
+    result_manifest_fingerprint: str
+    query_hmac: str
+
+
+class SearchLedger(TypedDict):
+    items: list[LedgerItem]
+    ledger_complete: bool
+    reconciled: bool
+    policy_fingerprint: str
+    scope_fingerprint: str
+
+
+def _json_list(value: object) -> list[JsonValue]:
+    items = json_object({"items": value})["items"]
+    if not isinstance(items, list):
+        raise ValueError("expected a JSON array")
+    return items
+
+
+def normalize_operation(operation: object) -> str:
     value = str(operation)
     if value == "find_references":
         raise ValueError(
-            "source_search.find_references_unsupported: use symbol.info usage summary "
-            "or graph.callers"
+            "source_search.find_references_unsupported: use symbol.info usage summary or graph.callers"
         )
     value = V1_ALIASES.get(value, value)
     if value not in V2_OPERATIONS:
@@ -87,10 +168,11 @@ def normalize_operation(operation: Any) -> str:
     return value
 
 
-def validate_profile_policy(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != POLICY_FIELDS:
+def validate_profile_policy(value: object) -> ProfilePolicy:
+    mapping = json_object(value)
+    if set(mapping) != POLICY_FIELDS:
         raise ValueError("invalid source_search policy fields")
-    operations = value.get("operations")
+    operations = mapping.get("operations")
     if (
         not isinstance(operations, list)
         or not operations
@@ -100,12 +182,25 @@ def validate_profile_policy(value: Any) -> dict[str, Any]:
     normalized_operations = [normalize_operation(operation) for operation in operations]
     if len(normalized_operations) != len(set(normalized_operations)):
         raise ValueError("duplicate source_search operations after v1 migration")
-    normalized = {"operations": normalized_operations}
+    limits: dict[str, int] = {}
     for field, maximum in POLICY_LIMITS.items():
-        item = value.get(field)
+        item = mapping.get(field)
         if not isinstance(item, int) or isinstance(item, bool) or item <= 0 or item > maximum:
             raise ValueError(f"invalid source_search limit: {field}")
-        normalized[field] = item
+        limits[field] = item
+    normalized = ProfilePolicy(
+        operations=normalized_operations,
+        max_calls=limits["max_calls"],
+        max_concurrent_calls=limits["max_concurrent_calls"],
+        per_call_deadline_seconds=limits["per_call_deadline_seconds"],
+        max_backend_seconds=limits["max_backend_seconds"],
+        max_query_bytes=limits["max_query_bytes"],
+        max_total_query_bytes=limits["max_total_query_bytes"],
+        max_results_per_call=limits["max_results_per_call"],
+        max_total_results=limits["max_total_results"],
+        max_returned_bytes_per_call=limits["max_returned_bytes_per_call"],
+        max_total_returned_bytes=limits["max_total_returned_bytes"],
+    )
     if normalized["max_concurrent_calls"] > normalized["max_calls"]:
         raise ValueError("source_search concurrency exceeds call budget")
     if normalized["max_query_bytes"] > normalized["max_total_query_bytes"]:
@@ -117,11 +212,11 @@ def validate_profile_policy(value: Any) -> dict[str, Any]:
     return normalized
 
 
-def dynamic_reserve_bytes(policy: dict[str, Any]) -> int:
+def dynamic_reserve_bytes(policy: ProfilePolicy | SourceSearchPolicy) -> int:
     return (
-        int(policy["max_total_query_bytes"])
-        + int(policy["max_total_returned_bytes"])
-        + int(policy["max_calls"]) * TOOL_FRAMING_BYTES_PER_CALL
+        policy["max_total_query_bytes"]
+        + policy["max_total_returned_bytes"]
+        + policy["max_calls"] * TOOL_FRAMING_BYTES_PER_CALL
     )
 
 
@@ -138,10 +233,10 @@ def _logical_prefix(component_id: str) -> str:
 
 def resolve_policy(
     repo: Path,
-    profile: dict[str, Any],
+    profile: SearchProfile,
     role_id: str,
-    work_unit: dict[str, Any],
-) -> dict[str, Any] | None:
+    work_unit: WorkUnit,
+) -> SourceSearchPolicy | None:
     raw = profile.get("source_search")
     if raw is None:
         return None
@@ -158,7 +253,7 @@ def resolve_policy(
         for role in ("vendor_baseline", "target_cf", "next_vendor")
         if any(str(path).replace("\\", "/").startswith(f"{role}/") for path in paths)
     )
-    diff = work_unit.get("diff") if isinstance(work_unit.get("diff"), dict) else {}
+    diff = work_unit.get("diff", DiffScope())
     diff_roles = tuple(
         role
         for role in (str(diff.get("before_role", "")), str(diff.get("after_role", "")))
@@ -176,7 +271,7 @@ def resolve_policy(
     component_ids = indexes.required_component_ids(repo, [str(path) for path in paths], roles)
     if not component_ids:
         return None
-    logical_paths = []
+    logical_paths: list[str] = []
     for value in paths:
         normalized = normalize_relative(str(value))
         parts = normalized.split("/")
@@ -190,21 +285,35 @@ def resolve_policy(
             logical_paths.append(normalized)
     if not logical_paths:
         return None
-    pointer = __import__("json").loads(
+    pointer = parse_json_object(
         (repo / "research/active-source-generation.json").read_text(encoding="utf-8")
     )
     config = indexes.load_config(repo)
-    result = {
-        "schema_version": POLICY_VERSION,
-        "tool_schema_version": TOOL_SCHEMA_VERSION,
-        "bridge_version": BRIDGE_VERSION,
-        "operations": operations,
-        "source_generation_id": str(pointer["generation_id"]),
-        "component_ids": component_ids,
-        "logical_path_prefixes": sorted(set(logical_paths)),
-        "routing_fingerprint": "sha256:" + sha256(canonical_json(config["routes"])),
-        **{field: policy[field] for field in POLICY_LIMITS},
-    }
+    generation_id = pointer.get("generation_id")
+    if not isinstance(generation_id, str):
+        raise ValueError("invalid active source generation")
+    result = SourceSearchPolicy(
+        schema_version=POLICY_VERSION,
+        tool_schema_version=TOOL_SCHEMA_VERSION,
+        bridge_version=BRIDGE_VERSION,
+        operations=operations,
+        source_generation_id=generation_id,
+        component_ids=component_ids,
+        logical_path_prefixes=sorted(set(logical_paths)),
+        routing_fingerprint="sha256:" + sha256(canonical_json(config["routes"])),
+        max_calls=policy["max_calls"],
+        max_concurrent_calls=policy["max_concurrent_calls"],
+        per_call_deadline_seconds=policy["per_call_deadline_seconds"],
+        max_backend_seconds=policy["max_backend_seconds"],
+        max_query_bytes=policy["max_query_bytes"],
+        max_total_query_bytes=policy["max_total_query_bytes"],
+        max_results_per_call=policy["max_results_per_call"],
+        max_total_results=policy["max_total_results"],
+        max_returned_bytes_per_call=policy["max_returned_bytes_per_call"],
+        max_total_returned_bytes=policy["max_total_returned_bytes"],
+        scope_fingerprint="",
+        policy_fingerprint="",
+    )
     result["scope_fingerprint"] = "sha256:" + sha256(canonical_json({
         "source_generation_id": result["source_generation_id"],
         "component_ids": component_ids,
@@ -214,12 +323,12 @@ def resolve_policy(
     return result
 
 
-def query_hmac(key: bytes, key_version: str, query: dict[str, Any]) -> str:
+def query_hmac(key: bytes, key_version: str, query: dict[str, object]) -> str:
     import hmac
     return f"{key_version}:" + hmac.new(key, canonical_json(query), hashlib_sha256).hexdigest()
 
 
-def request_schema(tool_schema_version: str = TOOL_SCHEMA_VERSION) -> dict[str, Any]:
+def request_schema(tool_schema_version: str = TOOL_SCHEMA_VERSION) -> dict[str, JsonValue]:
     if tool_schema_version == "source-search-tool/v1":
         return {
             "type": "object",
@@ -248,7 +357,9 @@ def request_schema(tool_schema_version: str = TOOL_SCHEMA_VERSION) -> dict[str, 
         "type": "integer", "minimum": 1,
         "maximum": POLICY_LIMITS["max_results_per_call"],
     }
-    def variant(operation: str, required: tuple[str, ...], **properties: Any) -> dict[str, Any]:
+    def variant(
+        operation: str, required: tuple[str, ...], **properties: JsonValue
+    ) -> dict[str, JsonValue]:
         return {
             "type": "object",
             "additionalProperties": False,
@@ -391,12 +502,14 @@ def request_schema(tool_schema_version: str = TOOL_SCHEMA_VERSION) -> dict[str, 
     }
 
 
-def response_schema() -> dict[str, Any]:
+def response_schema() -> dict[str, JsonValue]:
     text = {"type": "string", "maxLength": 4096}
     path = {"type": "string", "minLength": 1, "maxLength": 4096}
     fingerprint = {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
 
-    def item(kind: str, required: tuple[str, ...], **properties: Any) -> dict[str, Any]:
+    def item(
+        kind: str, required: tuple[str, ...], **properties: JsonValue
+    ) -> dict[str, JsonValue]:
         return {
             "type": "object",
             "additionalProperties": False,
@@ -483,16 +596,32 @@ def response_schema() -> dict[str, Any]:
     }
 
 
-def _v2_request(request: dict[str, Any], operation: str, policy: dict[str, Any]) -> dict[str, Any]:
-    variant = next(
-        item for item in request_schema()["oneOf"]
-        if item["properties"]["operation"]["const"] == operation
-    )
-    if set(request) - set(variant["properties"]) or any(
-        field not in request for field in variant["required"]
+def _v2_request(
+    request: dict[str, object], operation: str, policy: SourceSearchPolicy
+) -> dict[str, JsonValue]:
+    request_values = json_object(request)
+    variants = request_schema().get("oneOf")
+    if not isinstance(variants, list):
+        raise RuntimeError("source_search.request_schema_invalid")
+    variant: dict[str, JsonValue] | None = None
+    for candidate in variants:
+        candidate_object = json_object(candidate)
+        properties = json_object(candidate_object.get("properties"))
+        operation_schema = json_object(properties.get("operation"))
+        if operation_schema.get("const") == operation:
+            variant = candidate_object
+            break
+    if variant is None:
+        raise ValueError("source_search.invalid_request")
+    properties = json_object(variant.get("properties"))
+    required = variant.get("required")
+    if not isinstance(required, list) or not all(isinstance(field, str) for field in required):
+        raise RuntimeError("source_search.request_schema_invalid")
+    if set(request_values) - set(properties) or any(
+        field not in request_values for field in required
     ):
         raise ValueError("source_search.invalid_request")
-    normalized = dict(request)
+    normalized = dict(request_values)
     requested = normalized.get("max_results", 1)
     if (
         not isinstance(requested, int) or isinstance(requested, bool)
@@ -523,15 +652,16 @@ def _v2_request(request: dict[str, Any], operation: str, policy: dict[str, Any])
             raise ValueError("source_search.invalid_request")
         if isinstance(value, int) and value <= 0:
             raise ValueError("source_search.invalid_request")
-        if isinstance(value, list) and (
-            len(value) > 100 or len(value) != len({str(item) for item in value})
-        ):
-            raise ValueError("source_search.invalid_request")
+        if isinstance(value, list):
+            validated = _json_list(value)
+            values = [str(item) for item in validated]
+            if len(values) > 100 or len(values) != len(set(values)):
+                raise ValueError("source_search.invalid_request")
     return normalized
 
 
 def _component_relative_request_path(
-    value: str, component_id: str, policy: dict[str, Any]
+    value: str, component_id: str, policy: SourceSearchPolicy
 ) -> str:
     normalized = normalize_relative(value)
     logical_root = _logical_prefix(component_id)
@@ -548,11 +678,11 @@ def _component_relative_request_path(
 
 def _canonical_v2_item(
     repo: Path,
-    policy: dict[str, Any],
+    policy: SourceSearchPolicy,
     component_id: str,
     operation: str,
-    raw: dict[str, Any],
-) -> list[dict[str, Any]]:
+    raw: Mapping[str, object],
+) -> list[dict[str, object]]:
     if raw.get("kind") != "canonical-hit":
         if raw.get("kind") == "native-text" and operation not in {
             "graph.overview", "graph.schema", "metadata.info",
@@ -563,7 +693,7 @@ def _canonical_v2_item(
                 "reason": "source_search.native_source_text_discarded",
                 "narrowing_hint": "use a structured BSL Analyzer response",
             }]
-        return [raw]
+        return [dict(raw)]
     relative = normalize_relative(str(raw.get("component_relative_path", "")))
     evidence = indexes.canonical_evidence(repo, component_id, relative)
     if not any(
@@ -592,7 +722,8 @@ def _canonical_v2_item(
         / component["path"] / relative
     )
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    line = max(1, min(int(raw.get("line", 1)), len(lines) or 1))
+    raw_line = raw.get("line", 1)
+    line = max(1, min(raw_line if isinstance(raw_line, int) else 1, len(lines) or 1))
     start = max(1, line - 10)
     excerpt = "\n".join(lines[start - 1:start + 19])
     return [hit, {
@@ -604,14 +735,64 @@ def _canonical_v2_item(
     }]
 
 
+def _raw_hit(value: object) -> indexes.RawHit:
+    raw = json_object(value)
+    hit = indexes.RawHit()
+    component_relative_path = raw.get("component_relative_path")
+    symbol = raw.get("symbol")
+    kind = raw.get("kind")
+    rank = raw.get("rank")
+    if isinstance(component_relative_path, str):
+        hit["component_relative_path"] = component_relative_path
+    if isinstance(symbol, str):
+        hit["symbol"] = symbol
+    if isinstance(kind, str):
+        hit["kind"] = kind
+    if isinstance(rank, str):
+        hit["rank"] = rank
+    line = raw.get("line")
+    if isinstance(line, int) and not isinstance(line, bool):
+        hit["line"] = line
+    return hit
+
+
+def _backend_state(value: object) -> indexes.BackendState:
+    raw = json_object(value)
+    state = indexes.BackendState()
+    adapter_id = raw.get("adapter_id")
+    component_id = raw.get("component_id")
+    status = raw.get("status")
+    adapter_version = raw.get("adapter_version")
+    capability_fingerprint = raw.get("capability_fingerprint")
+    index_fingerprint = raw.get("index_fingerprint")
+    if isinstance(adapter_id, str): state["adapter_id"] = adapter_id
+    if isinstance(component_id, str): state["component_id"] = component_id
+    if isinstance(status, str): state["status"] = status
+    if isinstance(adapter_version, str): state["adapter_version"] = adapter_version
+    if isinstance(capability_fingerprint, str): state["capability_fingerprint"] = capability_fingerprint
+    if isinstance(index_fingerprint, str): state["index_fingerprint"] = index_fingerprint
+    capabilities = raw.get("capabilities")
+    if isinstance(capabilities, list):
+        capability_values = [item for item in capabilities if isinstance(item, str)]
+        if len(capability_values) == len(capabilities):
+            state["capabilities"] = capability_values
+    last_validation = raw.get("last_validation")
+    if last_validation is None or isinstance(last_validation, str):
+        state["last_validation"] = last_validation
+    legacy_adopted = raw.get("legacy_adopted")
+    if isinstance(legacy_adopted, bool):
+        state["legacy_adopted"] = legacy_adopted
+    return state
+
+
 def execute_query(
     repo: Path,
-    policy: dict[str, Any],
-    request: dict[str, Any],
-    states: list[dict[str, Any]],
-    query_backend: Callable[[dict[str, Any], dict[str, Any]], list[dict[str, Any]]],
+    policy: SourceSearchPolicy,
+    request: dict[str, object],
+    states: list[indexes.BackendState],
+    query_backend: Callable[[indexes.BackendDecision, Mapping[str, object]], JsonValue],
     cancelled: Callable[[], bool] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     requested_operation = str(request["operation"])
     operation = normalize_operation(requested_operation)
     if operation not in {normalize_operation(item) for item in policy["operations"]}:
@@ -634,10 +815,17 @@ def execute_query(
             probe = indexes.probe_backend(repo, backend)
             surface = probe.get("surface_manifest", {})
             surface_identity = str(surface.get("surface_fingerprint", ""))
-            if not probe.get("available") or not surface_identity.startswith("sha256:"):
+            executable_fingerprint = probe.get("executable_fingerprint")
+            capability_fingerprint = probe.get("capability_fingerprint")
+            if (
+                not probe.get("available")
+                or not surface_identity.startswith("sha256:")
+                or not isinstance(executable_fingerprint, str)
+                or not isinstance(capability_fingerprint, str)
+            ):
                 raise RuntimeError("source_search.reference_surface_incompatible")
             _selected, reference_identity, _probe, reference_root = (
-                indexes._reference_index_target(repo, backend)
+                indexes.reference_index_target(repo, backend)
             )
             token = None
             acknowledged = False
@@ -649,24 +837,27 @@ def execute_query(
                 acknowledged = bool(
                     its_profile.get("disclosure_acknowledged")
                 )
+                service_identity = its_profile.get("service_identity")
+                secret_version = its_profile.get("secret_version")
+                if not isinstance(service_identity, str) or not isinstance(secret_version, str):
+                    raise RuntimeError("source_search.reference_profile_incomplete")
                 reference_identity = "sha256:" + sha256(canonical_json({
                     "schema_version": "its-reference-identity/v1",
-                    "executable_fingerprint": probe["executable_fingerprint"],
+                    "executable_fingerprint": executable_fingerprint,
                     "surface_identity": surface_identity,
-                    "service": its_profile["service_identity"],
-                    "secret_version": its_profile["secret_version"],
+                    "service": service_identity,
+                    "secret_version": secret_version,
                 }))
             if operation in {
                 "reference.find_docs", "reference.search_docs",
             }:
                 try:
                     reference_root = reference_search.current_reference_index(
-                        reference_root, probe["executable_fingerprint"]
+                        reference_root, executable_fingerprint
                     )
                 except (OSError, KeyError, ValueError):
                     raise RuntimeError(
-                        "source_search.reference_index_not_ready: "
-                        "run indexes.build"
+                        "source_search.reference_index_not_ready: run indexes.build"
                     )
             backend_result = reference_search.execute_reference(
                 Path(executable),
@@ -676,8 +867,13 @@ def execute_query(
                 disclosure_acknowledged=acknowledged,
                 cancelled=cancelled,
             )
-            items = backend_result["items"]
-            encoded = canonical_json(items)
+            raw_items = backend_result.get("items")
+            if not isinstance(raw_items, list):
+                raise ValueError("source_search.backend_result_invalid")
+            reference_items: list[dict[str, JsonValue]] = [
+                json_object(raw_items[index]) for index in range(len(raw_items))
+            ]
+            encoded = canonical_json(reference_items)
             route = {
                 "route_fingerprint": "sha256:" + sha256(canonical_json({
                     "operation": operation,
@@ -688,7 +884,7 @@ def execute_query(
                 "selected_backend_id": "bsl-analyzer",
                 "fallback_reason": None,
                 "adapter_version": indexes.BACKEND_CATALOG["bsl-analyzer"]["adapter_version"],
-                "capability_fingerprint": probe["capability_fingerprint"],
+                "capability_fingerprint": capability_fingerprint,
                 "index_fingerprint": reference_identity,
                 "surface_identity": surface_identity,
                 "reference_identity": reference_identity,
@@ -698,10 +894,10 @@ def execute_query(
                 "operation": operation,
                 "capability": V2_OPERATIONS[operation],
                 "route": route,
-                "items": items,
+                "items": reference_items,
                 "truncated": bool(backend_result.get("truncated")),
                 "narrowing_hint": backend_result.get("narrowing_hint"),
-                "result_count": len(items),
+                "result_count": len(reference_items),
                 "returned_bytes": len(encoded),
                 "result_manifest_fingerprint": "sha256:" + sha256(encoded),
             }
@@ -729,26 +925,29 @@ def execute_query(
         decision = indexes.select_backend(
             config, V2_OPERATIONS[operation], component, states,
         )
-        backend_result = query_backend(decision, normalized)
-        if (
-            not isinstance(backend_result, dict)
-            or not isinstance(backend_result.get("items"), list)
-            or len(backend_result["items"]) > normalized["max_results"]
-        ):
+        backend_result = json_object(query_backend(decision, normalized))
+        raw_items = backend_result.get("items")
+        max_results = normalized["max_results"]
+        if not isinstance(raw_items, list) or not isinstance(max_results, int) or len(raw_items) > max_results:
             raise ValueError("source_search.backend_result_invalid")
-        items: list[dict[str, Any]] = []
-        for raw in backend_result["items"]:
-            if not isinstance(raw, dict):
-                raise ValueError("source_search.backend_result_invalid")
+        items: list[dict[str, object]] = []
+        for index in range(len(raw_items)):
+            v2_raw: object = raw_items[index]
             items.extend(
                 _canonical_v2_item(
-                    repo, policy, component_id, operation, raw,
+                    repo, policy, component_id, operation, json_object(v2_raw),
                 )
             )
         encoded = canonical_json(items)
         if len(encoded) > policy["max_returned_bytes_per_call"]:
             raise ValueError("source_search.returned_bytes_exhausted")
-        result = {
+        state = decision["state"]
+        state_values: dict[str, object] = dict(state)
+        adapter_version = state.get("adapter_version")
+        index_fingerprint = state.get("index_fingerprint")
+        if not isinstance(adapter_version, str) or not isinstance(index_fingerprint, str):
+            raise ValueError("source_search.backend_state_invalid")
+        result: dict[str, object] = {
             "schema_version": "source-search-result/v2",
             "operation": operation,
             "capability": V2_OPERATIONS[operation],
@@ -757,14 +956,14 @@ def execute_query(
                 "preferred_backend_id": decision["preferred_backend_id"],
                 "selected_backend_id": decision["selected_backend_id"],
                 "fallback_reason": decision["fallback_reason"],
-                "adapter_version": decision["state"]["adapter_version"],
-                "capability_fingerprint": decision["state"].get(
+                "adapter_version": adapter_version,
+                "capability_fingerprint": state.get(
                     "capability_fingerprint", ""
                 ),
-                "index_fingerprint": decision["state"]["index_fingerprint"],
+                "index_fingerprint": index_fingerprint,
                 **(
-                    {"surface_identity": decision["state"]["surface_identity"]}
-                    if decision["state"].get("surface_identity") else {}
+                    {"surface_identity": state_values["surface_identity"]}
+                    if state_values.get("surface_identity") else {}
                 ),
                 **(
                     {"embedding_identity": backend_result["embedding_identity"]}
@@ -822,12 +1021,15 @@ def execute_query(
         "component_relative_path_prefix": component_relative_prefix,
         "max_results": requested,
     })
-    if not isinstance(raw_hits, list) or len(raw_hits) > requested:
+    if not isinstance(raw_hits, list):
         raise ValueError("source_search.backend_result_invalid")
-    canonical = []
+    validated_hits = _json_list(raw_hits)
+    if len(validated_hits) > requested:
+        raise ValueError("source_search.backend_result_invalid")
+    canonical: list[dict[str, object]] = []
     identities: dict[tuple[str, int | None, str], bytes] = {}
-    for raw in raw_hits:
-        hit = indexes.normalize_hit(raw, decision, component)
+    for raw in validated_hits:
+        hit = indexes.normalize_hit(_raw_hit(raw), decision, component)
         if component_relative_prefix and not (
             hit["component_relative_path"] == component_relative_prefix.rstrip("/")
             or hit["component_relative_path"].startswith(
@@ -842,11 +1044,20 @@ def execute_query(
             for allowed in policy["logical_path_prefixes"]
         ):
             raise ValueError("source_search.backend_result_out_of_scope")
-        item = {
-            **evidence,
-            **{key: hit[key] for key in ("line", "symbol", "kind") if key in hit},
-        }
-        identity = (item["path"], item.get("line"), item["kind"])
+        item: dict[str, object] = dict(evidence)
+        if "line" in hit: item["line"] = hit["line"]
+        if "symbol" in hit: item["symbol"] = hit["symbol"]
+        item["kind"] = hit["kind"]
+        item_path = item.get("path")
+        item_line = item.get("line")
+        item_kind = item.get("kind")
+        if (
+            not isinstance(item_path, str)
+            or not (item_line is None or isinstance(item_line, int))
+            or not isinstance(item_kind, str)
+        ):
+            raise ValueError("source_search.backend_result_invalid")
+        identity = (item_path, item_line, item_kind)
         encoded_item = canonical_json(item)
         if identity in identities and identities[identity] != encoded_item:
             raise ValueError("source_search.conflicting_hits")
@@ -865,9 +1076,9 @@ def execute_query(
             "preferred_backend_id": decision["preferred_backend_id"],
             "selected_backend_id": decision["selected_backend_id"],
             "fallback_reason": decision["fallback_reason"],
-            "adapter_version": decision["state"]["adapter_version"],
+            "adapter_version": decision["state"].get("adapter_version", ""),
             "capability_fingerprint": decision["state"].get("capability_fingerprint", ""),
-            "index_fingerprint": decision["state"]["index_fingerprint"],
+            "index_fingerprint": decision["state"].get("index_fingerprint", ""),
         },
         "items": canonical,
         "result_count": len(canonical),
@@ -878,12 +1089,22 @@ def execute_query(
 
 def revalidate_proposal_evidence(
     repo: Path,
-    policy: dict[str, Any],
-    payload: dict[str, Any],
+    policy: SourceSearchPolicy,
+    payload: object,
 ) -> list[dict[str, str]]:
+    def nested_objects(value: JsonValue) -> Iterator[dict[str, JsonValue]]:
+        if isinstance(value, Mapping):
+            row = dict(value)
+            yield row
+            for child in row.values():
+                yield from nested_objects(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from nested_objects(child)
+
     candidates = [
         row
-        for row in indexes._nested_dicts(payload)
+        for row in nested_objects(json_object(payload))
         if isinstance(row.get("path"), str)
         and isinstance(row.get("fingerprint"), str)
     ]
@@ -921,8 +1142,8 @@ def revalidate_proposal_evidence(
 
 def revalidate_reuse_environment(
     repo: Path,
-    policy: dict[str, Any],
-    ledger: dict[str, Any],
+    policy: SourceSearchPolicy,
+    ledger: SearchLedger,
 ) -> None:
     config = indexes.load_config(repo)
     current_routing = "sha256:" + sha256(canonical_json(config["routes"]))
@@ -933,16 +1154,17 @@ def revalidate_reuse_environment(
         for item in indexes.discover(repo)
         if item["component_id"] in policy["component_ids"]
     }
-    states = indexes.backend_statuses(repo)
+    states = [_backend_state(row) for row in indexes.backend_statuses(repo)]
     for item in ledger["items"]:
         if item.get("status") != "completed":
             continue
         compatible = False
         for component in components.values():
             try:
-                decision = indexes.select_backend(
-                    config, str(item["capability"]), component, states,
-                )
+                capability = item.get("capability")
+                if not isinstance(capability, str):
+                    raise RuntimeError("source_search.ledger_incomplete")
+                decision = indexes.select_backend(config, capability, component, states)
             except RuntimeError:
                 continue
             if (
@@ -958,11 +1180,11 @@ def revalidate_reuse_environment(
 
 
 def reuse_binding(
-    policy: dict[str, Any],
-    ledger: dict[str, Any],
+    policy: SourceSearchPolicy,
+    ledger: SearchLedger,
     evidence_manifest: list[dict[str, str]],
     hmac_key_version: str,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     if (
         not ledger.get("ledger_complete")
         or not ledger.get("reconciled")
@@ -990,7 +1212,7 @@ def reuse_binding(
         }).decode()
         for item in ledger["items"]
     })
-    binding = {
+    binding: dict[str, object] = {
         "schema_version": "source-search-reuse/v1",
         "policy_schema_version": policy["schema_version"],
         "policy_fingerprint": policy["policy_fingerprint"],
@@ -998,7 +1220,7 @@ def reuse_binding(
         "source_generation_id": policy["source_generation_id"],
         "routing_fingerprint": policy["routing_fingerprint"],
         "query_hmac_key_version": hmac_key_version,
-        "calls": [json.loads(item) for item in stable_calls],
+        "calls": [parse_json_object(item) for item in stable_calls],
         "canonical_evidence": evidence_manifest,
     }
     binding["binding_fingerprint"] = "sha256:" + sha256(canonical_json(binding))

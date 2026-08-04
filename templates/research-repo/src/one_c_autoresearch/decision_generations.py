@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import tempfile
 from copy import deepcopy
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
 
-from .contracts import atomic_json, canonical_json, repository_lock, sha256
+from .contracts import JsonValue, atomic_json, canonical_json, json_object, parse_json_object, repository_lock, sha256
 
 
 ROOT = Path("analysis/migration-requirements/decision-generations")
@@ -21,11 +20,29 @@ DECISION_FIELDS = {
 }
 
 
-def fingerprint(value: Any) -> str:
+def _object(value: JsonValue) -> dict[str, JsonValue]:
+    if not isinstance(value, dict):
+        raise ValueError("expected object")
+    return value
+
+
+def _rows(value: JsonValue) -> list[dict[str, JsonValue]]:
+    if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+        raise ValueError("expected row array")
+    return [row for row in value if isinstance(row, dict)]
+
+
+def _string(value: JsonValue) -> str:
+    if not isinstance(value, str):
+        raise ValueError("expected string")
+    return value
+
+
+def fingerprint(value: object) -> str:
     return "sha256:" + sha256(canonical_json(value))
 
 
-def consolidation_input_fingerprint(pointer: dict[str, Any]) -> str:
+def consolidation_input_fingerprint(pointer: dict[str, JsonValue]) -> str:
     if pointer.get("state") != "active":
         raise ValueError("decisions require active consolidation")
     return fingerprint({
@@ -38,15 +55,15 @@ def consolidation_input_fingerprint(pointer: dict[str, Any]) -> str:
     })
 
 
-def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+def _write_jsonl(path: Path, rows: Iterable[dict[str, JsonValue]]) -> None:
     with path.open("wb") as stream:
         for row in sorted(rows, key=canonical_json):
-            stream.write(canonical_json(row) + b"\n")
+            _ = stream.write(canonical_json(row) + b"\n")
         stream.flush()
         os.fsync(stream.fileno())
 
 
-def _validate_rows(rows: list[dict[str, Any]]) -> None:
+def _validate_rows(rows: list[dict[str, JsonValue]]) -> None:
     seen: set[str] = set()
     for row in rows:
         required = {
@@ -70,6 +87,7 @@ def _validate_rows(rows: list[dict[str, Any]]) -> None:
             or not isinstance(decision.get("acceptance_criteria"), list)
             or not isinstance(decision.get("open_questions"), list)
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(row["approval_fingerprint"]))
+            or not isinstance(row["provenance"], dict)
             or row["provenance"].get("kind") not in {"stage-5", "legacy-v1"}
         ):
             raise ValueError("invalid decision row")
@@ -78,11 +96,11 @@ def _validate_rows(rows: list[dict[str, Any]]) -> None:
 
 def validate_generation(
     repo: Path, generation_id: str, *, allowed_mrq_ids: set[str] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     root = repo / ROOT / generation_id
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest = parse_json_object((root / "manifest.json").read_text(encoding="utf-8"))
     payload = (root / FILES[0]).read_bytes()
-    rows = [json.loads(line) for line in payload.splitlines()]
+    rows = [parse_json_object(line.decode()) for line in payload.splitlines()]
     if payload != b"".join(canonical_json(row) + b"\n" for row in rows):
         raise ValueError("non-canonical decision generation")
     if rows != sorted(rows, key=canonical_json):
@@ -113,11 +131,11 @@ def validate_generation(
 
 def create_generation(
     repo: Path,
-    rows: list[dict[str, Any]],
+    rows: list[dict[str, JsonValue]],
     *,
     input_fingerprint: str,
     approval_fingerprint: str,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     """Пишет неизменяемое поколение; активную привязку меняет вызывающий CAS."""
 
     _validate_rows(rows)
@@ -151,16 +169,17 @@ def create_generation(
 
 def publish(
     repo: Path,
-    rows: list[dict[str, Any]],
-    approval: dict[str, Any],
+    rows: list[dict[str, JsonValue]],
+    approval: dict[str, JsonValue],
     *,
     expected_transaction_id: str,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     from .consolidation import load_active
 
     _validate_rows(rows)
     with repository_lock(repo):
-        pointer = load_active(repo)["pointer"]
+        active = json_object(load_active(repo))
+        pointer = json_object(active["pointer"])
         if pointer["transaction_id"] != expected_transaction_id:
             raise RuntimeError("stale consolidation transaction")
         input_fingerprint = consolidation_input_fingerprint(pointer)
@@ -186,10 +205,10 @@ def publish(
             raise ValueError("invalid or stale decision approval")
 
         if pointer.get("decision_input_fingerprint") == input_fingerprint:
-            existing = validate_generation(repo, pointer["decision_generation_id"])
-            existing_rows = {row["mrq_id"]: row for row in existing[FILES[0]]}
-            requested_rows = {row["mrq_id"]: row for row in rows}
-            if existing["manifest"]["decision_fingerprint"] == decision_fingerprint:
+            existing = validate_generation(repo, _string(pointer["decision_generation_id"]))
+            existing_rows = {_string(row["mrq_id"]): row for row in _rows(existing[FILES[0]])}
+            requested_rows = {_string(row["mrq_id"]): row for row in rows}
+            if _object(existing["manifest"])["decision_fingerprint"] == decision_fingerprint:
                 return {"pointer": pointer, "generation": existing, "idempotent": True}
             if any(requested_rows.get(mrq_id) != row for mrq_id, row in existing_rows.items()):
                 raise RuntimeError("published decisions are immutable")
@@ -200,47 +219,47 @@ def publish(
             input_fingerprint=input_fingerprint,
             approval_fingerprint=fingerprint(approval),
         )
-        generation_id = generation["manifest"]["generation_id"]
+        generation_id = _string(_object(generation["manifest"])["generation_id"])
 
         # Lazy import avoids making consolidation depend on stage-5 payload semantics.
         from .consolidation import replace_downstream_binding
         updated = replace_downstream_binding(
             repo, "decision", generation_id, input_fingerprint,
             expected_transaction_id=expected_transaction_id,
-            expected_generation_id=pointer.get("decision_generation_id"),
+            expected_generation_id=_string(pointer["decision_generation_id"]) if pointer.get("decision_generation_id") is not None else None,
             already_locked=True,
         )
         return {"pointer": updated, "generation": generation, "idempotent": False}
 
 
 def extract_legacy(
-    legacy: dict[str, list[dict[str, Any]]],
-    current: dict[str, list[dict[str, Any]]],
+    legacy: dict[str, list[dict[str, JsonValue]]],
+    current: dict[str, list[dict[str, JsonValue]]],
     retained_or_revalidated: set[str],
     *,
     source_generation_id: str,
     diff_generation_id: str,
-) -> dict[str, list[dict[str, Any]]]:
-    current_ids = {row["mrq_id"] for row in current["mrq.jsonl"]}
+) -> dict[str, list[dict[str, JsonValue]]]:
+    current_ids = {_string(row["mrq_id"]) for row in current["mrq.jsonl"]}
     old_closure: dict[str, set[str]] = {}
     for relation in legacy["dispositions.jsonl"]:
         if relation.get("primary") and relation.get("mrq_id"):
-            old_closure.setdefault(relation["mrq_id"], set()).add(relation["stable_diff_id"])
+            old_closure.setdefault(_string(relation["mrq_id"]), set()).add(_string(relation["stable_diff_id"]))
     new_closure: dict[str, set[str]] = {}
     for relation in current["dispositions.jsonl"]:
         if relation.get("primary"):
-            new_closure.setdefault(relation["mrq_id"], set()).add(relation["stable_diff_id"])
+            new_closure.setdefault(_string(relation["mrq_id"]), set()).add(_string(relation["stable_diff_id"]))
 
     approvals = legacy["approvals.jsonl"]
-    carried: list[dict[str, Any]] = []
-    stale: list[dict[str, Any]] = []
+    carried: list[dict[str, JsonValue]] = []
+    stale: list[dict[str, JsonValue]] = []
     for item in legacy["mrq.jsonl"]:
-        decision = item.get("migration_decision", {})
+        decision = _object(item.get("migration_decision", {}))
         if not decision.get("decision"):
             continue
         candidate = deepcopy(item)
         candidate["state"] = "ready_for_review"
-        candidate["migration_decision"]["agreement_status"] = "pending_review"
+        _object(candidate["migration_decision"])["agreement_status"] = "pending_review"
         approval_hash = sha256(canonical_json(candidate))
         approval = next((
             row for row in approvals
@@ -250,8 +269,8 @@ def extract_legacy(
             and row.get("source_generation_id") == source_generation_id
             and row.get("diff_generation_id") == diff_generation_id
         ), None)
-        reasons = []
-        mrq_id = item.get("mrq_id")
+        reasons: list[JsonValue] = []
+        mrq_id = _string(item["mrq_id"])
         if mrq_id not in current_ids or mrq_id not in retained_or_revalidated:
             reasons.append("identity_not_retained_or_revalidated")
         if old_closure.get(mrq_id, set()) != new_closure.get(mrq_id, set()):

@@ -1,15 +1,101 @@
 from __future__ import annotations
 
 import csv
+import importlib
 import json
 import re
 import tomllib
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, runtime_checkable
 
-from .contracts import MRQ_STATES, ROLES, canonical_json, reject_secrets, sha256
+from .contracts import JsonValue, ROLES, canonical_json, json_array, json_object, parse_json_object, reject_secrets, sha256
 from . import __version__
+
+if TYPE_CHECKING:
+    from .sqlite_state import DispatcherStore
+
+
+@runtime_checkable
+class _StageRecomputeModule(Protocol):
+    def active_pointers(self, repo: Path, *, recover: bool = True) -> dict[str, object | None]: ...
+    def recover_active_publication(self, repo: Path) -> object: ...
+
+
+def _stage_recompute() -> _StageRecomputeModule:
+    module = importlib.import_module(".stage_recompute", __package__)
+    if not isinstance(module, _StageRecomputeModule):
+        raise RuntimeError("invalid stage recompute module")
+    return module
+
+
+class AgentRole(TypedDict):
+    role_id: str
+    agent_profile: str
+    count: int
+    instruction_supplement: str
+
+
+class AgentPhase(TypedDict):
+    phase_id: str
+    mode: str
+    max_concurrency: int
+    roles: list[AgentRole]
+
+
+class WorkflowStep(TypedDict):
+    id: str
+    operation: str
+    operation_version: str
+    timeout_seconds: NotRequired[int]
+    max_retries: NotRequired[int]
+    agent_phases: NotRequired[list[AgentPhase]]
+
+
+class WorkflowJob(TypedDict):
+    id: str
+    needs: list[str]
+    steps: list[WorkflowStep]
+
+
+class WorkflowGate(TypedDict):
+    id: str
+    validator: str
+
+
+class WorkflowManifest(TypedDict):
+    schema_version: str
+    tool_version: str
+    gates: list[WorkflowGate]
+    jobs: list[WorkflowJob]
+
+
+class StepConfiguration(TypedDict):
+    job_id: str
+    step: WorkflowStep
+    catalog: dict[str, object]
+
+
+class BlockerValue(TypedDict):
+    code: str
+    message: str
+    action: str
+
+
+class GateValue(TypedDict):
+    id: str
+    state: str
+    blockers: list[BlockerValue]
+
+
+class WorkflowSnapshot(TypedDict):
+    schema_version: str
+    tool_version: str
+    operation_versions: dict[str, str]
+    workflow_fingerprint: str
+    manifest_fingerprint: str
+    state: str
+    gates: list[GateValue]
 
 
 GATES = (
@@ -59,7 +145,7 @@ AGENT_PHASE_CATALOG = {
         {"phase_id": "research-target", "modes": ("sequential", "parallel-pool"), "roles": ("researcher",)},
     ),
 }
-_CATALOG = {
+_CATALOG: dict[str, dict[str, JsonValue]] = {
     "project.validate": {"executor": "application", "effect": "read", "paths": ["project.toml", "research/"], "artifacts": ["workflow-snapshot"], "validator": "doctor", "retryable": [], "approval_required": False},
     "sources.acquire": {"executor": "application", "effect": "write", "paths": ["sources/generations/", "research/active-source-generation.json"], "artifacts": ["source-generation"], "validator": "sources.validate", "retryable": [], "approval_required": True},
     "diff.build": {"executor": "application", "effect": "write", "paths": ["analysis/indexes/generations/", "research/active-diff-generation.json"], "artifacts": ["diff-generation"], "validator": "diff.validate", "retryable": ["transient_io"], "approval_required": False},
@@ -71,13 +157,13 @@ _CATALOG = {
     "projections.build": {"executor": "application", "effect": "write", "paths": ["outputs/"], "artifacts": ["projections"], "validator": "projections.validate", "retryable": ["transient_io"], "approval_required": False},
     "workflow.verify": {"executor": "application", "effect": "read", "paths": ["."], "artifacts": ["workflow-snapshot"], "validator": "doctor.strict", "retryable": [], "approval_required": False},
 }
-OPERATION_CATALOG = {
-    operation: {
+OPERATION_CATALOG: dict[str, dict[str, JsonValue]] = {
+    operation: json_object({
         "version": "1",
         "parameters": sorted(PARAMETERS[operation]),
         **entry,
         **({"fixed_inputs": {"mode": "ensure", "selector": "all"}, "run_inputs": {"mode": ["ensure", "validate", "rebuild"], "selector": "all|component_ids|backend_ids"}} if operation == "indexes.build" else {}),
-    }
+    })
     for operation, entry in _CATALOG.items()
 }
 for _operation, _phases in AGENT_PHASE_CATALOG.items():
@@ -99,36 +185,67 @@ RESEARCH_OWNED_PROJECT_KEYS = {
 }
 
 
-def _valid_agent_profile(value: Any) -> bool:
+def _object(value: object) -> dict[str, JsonValue]:
+    return json_object(value)
+
+
+def _objects(value: object) -> list[dict[str, JsonValue]]:
+    normalized = json_array(value)
+    return [json_object(item) for item in normalized]
+
+
+def _integer(value: JsonValue) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("expected integer")
+    return value
+
+
+def _strings(value: object) -> list[str]:
+    normalized = json_array(value)
+    if not all(isinstance(item, str) for item in normalized):
+        raise ValueError("expected string array")
+    return [item for item in normalized if isinstance(item, str)]
+
+
+def _valid_agent_profile(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value) is not None
 
 
-def _safe_positive_int(value: Any) -> bool:
+def _safe_positive_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 2**53 - 1
 
 
-def validate_agent_phases(operation: str, phases: Any) -> list[dict[str, Any]]:
+def validate_agent_phases(operation: str, phases: object) -> list[AgentPhase]:
     catalog = AGENT_PHASE_CATALOG.get(operation)
     if catalog is None:
         raise ValueError(f"{operation} does not declare agent phases")
-    if not isinstance(phases, list) or len(phases) != len(catalog):
+    raw_phases = _objects(phases)
+    if len(raw_phases) != len(catalog):
         raise ValueError(f"{operation} requires its fixed agent phase catalog")
-    for index, (phase, declared) in enumerate(zip(phases, catalog, strict=True)):
-        if not isinstance(phase, dict) or set(phase) != {"phase_id", "mode", "max_concurrency", "roles"}:
+    normalized: list[AgentPhase] = []
+    for index, (raw_phase, declared) in enumerate(zip(raw_phases, catalog, strict=True)):
+        raw_roles = _objects(raw_phase.get("roles"))
+        phase = AgentPhase(
+            phase_id=str(raw_phase.get("phase_id", "")),
+            mode=str(raw_phase.get("mode", "")),
+            max_concurrency=_integer(raw_phase.get("max_concurrency")),
+            roles=[AgentRole(role_id=str(role.get("role_id", "")), agent_profile=str(role.get("agent_profile", "")), count=_integer(role.get("count")), instruction_supplement=str(role.get("instruction_supplement", ""))) for role in raw_roles],
+        )
+        if set(raw_phase) != {"phase_id", "mode", "max_concurrency", "roles"}:
             raise ValueError(f"agent phase[{index}] fields differ")
         if phase["phase_id"] != declared["phase_id"] or phase["mode"] not in declared["modes"]:
             raise ValueError(f"agent phase[{index}] identity, order, or mode differs")
         if not _safe_positive_int(phase["max_concurrency"]):
             raise ValueError(f"agent phase[{index}] max_concurrency is not a safe integer")
         roles = phase["roles"]
-        if not isinstance(roles, list) or tuple(role.get("role_id") for role in roles if isinstance(role, dict)) != declared["roles"]:
+        if tuple(role["role_id"] for role in roles) != declared["roles"]:
             raise ValueError(f"agent phase[{index}] roles differ")
-        for role_index, role in enumerate(roles):
-            if set(role) != {"role_id", "agent_profile", "count", "instruction_supplement"}:
+        for role_index, (role, raw_role) in enumerate(zip(roles, raw_roles, strict=True)):
+            if set(raw_role) != {"role_id", "agent_profile", "count", "instruction_supplement"}:
                 raise ValueError(f"agent phase[{index}].role[{role_index}] fields differ")
             if not _valid_agent_profile(role["agent_profile"]) or not _safe_positive_int(role["count"]):
                 raise ValueError(f"agent phase[{index}].role[{role_index}] profile or count is invalid")
-            if not isinstance(role["instruction_supplement"], str) or len(role["instruction_supplement"]) > 4000:
+            if len(role["instruction_supplement"]) > 4000:
                 raise ValueError(f"agent phase[{index}].role[{role_index}] instruction supplement is invalid")
         counts = {role["role_id"]: role["count"] for role in roles}
         if phase["mode"] == "sequential" and (list(counts.values()) != [1] or phase["max_concurrency"] != 1):
@@ -138,8 +255,9 @@ def validate_agent_phases(operation: str, phases: Any) -> list[dict[str, Any]]:
             raise ValueError("agent phase max_concurrency exceeds worker count")
         if phase["mode"] == "coordinated-pool" and counts.get("coordinator") != 1:
             raise ValueError("coordinated phase requires one coordinator")
-        reject_secrets(phase, f"agent phase {phase['phase_id']}")
-    return phases
+        reject_secrets(json_object(phase), f"agent phase {phase['phase_id']}")
+        normalized.append(phase)
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -156,29 +274,68 @@ class Gate:
     blockers: tuple[Blocker, ...]
 
 
-def read_toml(path: Path) -> dict[str, Any]:
+def read_toml(path: Path) -> dict[str, JsonValue]:
     with path.open("rb") as stream:
-        value = tomllib.load(stream)
+        value = json_object(tomllib.load(stream))
     reject_secrets(value, str(path))
     return value
+
+
+def _workflow_manifest(value: object) -> WorkflowManifest:
+    root = _object(value)
+    if set(root) != {"schema_version", "tool_version", "gates", "jobs"}:
+        raise ValueError("workflow top-level fields differ")
+    gates = [WorkflowGate(id=str(item.get("id", "")), validator=str(item.get("validator", ""))) for item in _objects(root.get("gates"))]
+    jobs: list[WorkflowJob] = []
+    for item in _objects(root.get("jobs")):
+        if set(item) != {"id", "needs", "steps"}:
+            raise ValueError("fixed jobs: fields differ")
+        steps: list[WorkflowStep] = []
+        for raw in _objects(item.get("steps")):
+            operation = str(raw.get("operation", ""))
+            allowed = PARAMETERS.get(operation, set())
+            unknown = set(raw) - {"id", "operation", "operation_version"} - allowed
+            if unknown:
+                expected = OPERATION_CATALOG.get(operation, {}).get("version", "")
+                raise ValueError(f"unsupported workflow step fields: {sorted(unknown)}; {operation} requires operation version {expected}")
+            step = WorkflowStep(
+                id=str(raw.get("id", "")),
+                operation=operation,
+                operation_version=str(raw.get("operation_version", "")),
+            )
+            timeout = raw.get("timeout_seconds")
+            retries = raw.get("max_retries")
+            if isinstance(timeout, int) and not isinstance(timeout, bool):
+                step["timeout_seconds"] = timeout
+            if isinstance(retries, int) and not isinstance(retries, bool):
+                step["max_retries"] = retries
+            if "agent_phases" in raw:
+                step["agent_phases"] = validate_agent_phases(step["operation"], raw["agent_phases"])
+            steps.append(step)
+        jobs.append(WorkflowJob(id=str(item.get("id", "")), needs=_strings(item.get("needs")), steps=steps))
+    return WorkflowManifest(
+        schema_version=str(root.get("schema_version", "")),
+        tool_version=str(root.get("tool_version", "")),
+        gates=gates,
+        jobs=jobs,
+    )
 
 
 def workflow_fingerprint(repo: Path) -> str:
     return "sha256:" + sha256((repo / "research/workflow.toml").read_bytes())
 
 
-def validate_project_contract(repo: Path) -> dict[str, Any]:
+def validate_project_contract(repo: Path) -> dict[str, JsonValue]:
     project = read_toml(repo / "project.toml")
     unknown = sorted(set(project) - PROJECT_SECTIONS)
     if unknown:
         raise ValueError(f"unknown project.toml section [{unknown[0]}]; allowed sections are [project], [mcp], [web], [policy]")
-    for section, values in project.items():
-        if not isinstance(values, dict):
-            raise ValueError(f"project.toml section [{section}] must be a table")
+    for section, section_value in project.items():
+        values = _object(section_value)
         for key, owner in RESEARCH_OWNED_PROJECT_KEYS.items():
             if key in values:
                 raise ValueError(f"project.toml [{section}].{key} is owned by {owner}")
-    values = project.get("project", {})
+    values = _object(project.get("project", {}))
     missing = [key for key in ("id", "product", "baseline_version", "target_version", "next_vendor_version") if not str(values.get(key, "")).strip()]
     if missing:
         raise ValueError(f"empty project fields: {', '.join(missing)}")
@@ -190,7 +347,8 @@ def state_fingerprint(repo: Path) -> str:
     return "sha256:" + sha256(canonical_json({name: sha256((repo / name).read_bytes()) if (repo / name).is_file() else None for name in paths}))
 
 
-def validate_workflow_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+def validate_workflow_manifest(value: object) -> WorkflowManifest:
+    manifest = _workflow_manifest(value)
     errors: list[str] = []
     if set(manifest) != {"schema_version", "tool_version", "gates", "jobs"}:
         errors.append(f"workflow top-level fields differ: {sorted(set(manifest) ^ {'schema_version', 'tool_version', 'gates', 'jobs'})}")
@@ -204,11 +362,11 @@ def validate_workflow_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     actual_gates = tuple((item.get("id"), item.get("validator")) for item in manifest.get("gates", []))
     if actual_gates != GATES:
         errors.append(f"fixed eight-gate contract changed: {actual_gates!r}")
-    actual_jobs = []
+    actual_jobs: list[tuple[str, tuple[str, ...], tuple[tuple[str, str, str], ...]]] = []
     for job_index, job in enumerate(manifest.get("jobs", [])):
         if set(job) != {"id", "needs", "steps"}:
             errors.append(f"fixed jobs: job[{job_index}] fields differ: {sorted(set(job) ^ {'id', 'needs', 'steps'})}")
-        steps = []
+        steps: list[tuple[str, str, str]] = []
         for step_index, step in enumerate(job.get("steps", [])):
             operation = step.get("operation")
             allowed = PARAMETERS.get(operation)
@@ -222,18 +380,19 @@ def validate_workflow_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             if step.get("operation_version") != OPERATION_CATALOG[operation]["version"]:
                 errors.append(f"job[{job_index}].step[{step_index}] {operation} requires operation version {OPERATION_CATALOG[operation]['version']}")
             timeout = step.get("timeout_seconds", 1800)
-            if not isinstance(timeout, int) or not 30 <= timeout <= 86400:
+            if not 30 <= timeout <= 86400:
                 errors.append(f"job[{job_index}].step[{step_index}] invalid timeout for {operation}")
             retries = step.get("max_retries", 0)
             if retries not in ({0, 1} if operation in {"diff.build", "projections.build"} else {0}):
                 errors.append(f"job[{job_index}].step[{step_index}] invalid retry count for {operation}")
             if operation in AGENT_PHASE_CATALOG:
                 try:
-                    validate_agent_phases(operation, step.get("agent_phases"))
+                    _ = validate_agent_phases(operation, step.get("agent_phases"))
                 except ValueError as exc:
                     errors.append(f"job[{job_index}].step[{step_index}] {exc}")
             try:
-                reject_secrets(step, f"workflow step {step.get('id')}")
+                step_identifier = step.get("id")
+                reject_secrets(json_object(step), f"workflow step {step_identifier}")
             except ValueError as exc:
                 errors.append(str(exc))
             steps.append((step.get("id"), operation, step.get("operation_version")))
@@ -245,27 +404,86 @@ def validate_workflow_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     return manifest
 
 
-def validate_workflow(repo: Path) -> dict[str, Any]:
-    return validate_workflow_manifest(read_toml(repo / "research/workflow.toml"))
+def validate_workflow(repo: Path) -> WorkflowManifest:
+    return validate_workflow_manifest(_workflow_manifest(read_toml(repo / "research/workflow.toml")))
 
 
-def step_configurations(repo: Path) -> list[dict[str, Any]]:
+def step_configurations(repo: Path) -> list[StepConfiguration]:
     manifest = validate_workflow(repo)
-    result = []
+    result: list[StepConfiguration] = []
     for job in manifest["jobs"]:
         for step in job["steps"]:
             operation = step["operation"]
-            result.append({"job_id": job["id"], "step": step, "catalog": OPERATION_CATALOG[operation]})
+            result.append({"job_id": job["id"], "step": step, "catalog": dict(OPERATION_CATALOG[operation])})
     return result
+
+
+def read_diff_inventory(repo: Path) -> list[dict[str, str]]:
+    pointer = _pointer(repo, "active-diff-generation.json")
+    generation_id: object = pointer.get("generation_id", "")
+    path = repo / "analysis/indexes/generations" / str(generation_id) / "diff-inventory.csv"
+    if not path.is_file():
+        return []
+    with path.open(encoding="utf-8", newline="") as stream:
+        return [
+            row for row in csv.DictReader(stream)
+            if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"
+        ]
+
+
+def decision_mrqs(repo: Path) -> list[dict[str, JsonValue]]:
+    if not (repo / "research/active-consolidation-generation.json").is_file():
+        from .mrq import active
+
+        return [json_object(row) for row in active(repo)["mrq.jsonl"]]
+    from .consolidation import load_active
+
+    raw_state: object = load_active(repo)
+    state = _object(raw_state)
+    pointer = _object(state["pointer"])
+    mrq = _object(state["mrq"])
+    mrq_rows = _objects(mrq["mrq.jsonl"])
+    decisions: dict[str, dict[str, JsonValue]] = {}
+    decision_generation_id = pointer.get("decision_generation_id")
+    if isinstance(decision_generation_id, str):
+        from .decision_generations import validate_generation
+
+        generation = validate_generation(
+            repo,
+            decision_generation_id,
+            allowed_mrq_ids={str(row["mrq_id"]) for row in mrq_rows},
+        )
+        decisions = {
+            str(row["mrq_id"]): _object(row["decision"])
+            for row in _objects(generation["decisions.jsonl"])
+        }
+    evidence: dict[str, list[dict[str, JsonValue]]] = {}
+    for row in _objects(mrq["evidence.jsonl"]):
+        evidence.setdefault(str(row["mrq_id"]), []).append({
+            "stable_diff_id": row["stable_diff_id"],
+            **_object(row.get("payload", {})),
+        })
+    return [
+        {
+            **row,
+            "migration_decision": decisions.get(str(row["mrq_id"]), {}),
+            "source_customization": {
+                "business_meaning": row.get("business_meaning", ""),
+                "scope": row.get("scope", ""),
+                "evidence": evidence.get(str(row["mrq_id"]), []),
+            },
+        }
+        for row in mrq_rows
+    ]
 
 
 def preview_step_patch(
     repo: Path,
     step_id: str,
-    parameters: dict[str, Any],
+    parameters: dict[str, object],
     expected_manifest_fingerprint: str,
     state_base: Path | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     if expected_manifest_fingerprint != workflow_fingerprint(repo):
         raise RuntimeError("stale workflow manifest fingerprint")
     current = next((item for item in step_configurations(repo) if item["step"]["id"] == step_id), None)
@@ -282,10 +500,11 @@ def preview_step_patch(
     retries = candidate.get("max_retries", 0)
     if retries not in ({0, 1} if operation in {"diff.build", "projections.build"} else {0}):
         raise ValueError(f"invalid retry count for {operation}")
+    agent_phases: list[AgentPhase] = []
     if operation in AGENT_PHASE_CATALOG:
-        validate_agent_phases(operation, candidate.get("agent_phases"))
-    reject_secrets(candidate, f"workflow step {step_id}")
-    result = {"step_id": step_id, "operation": operation, "before": current["step"], "after": candidate, "catalog": current["catalog"], "manifest_fingerprint": expected_manifest_fingerprint}
+        agent_phases = validate_agent_phases(operation, candidate.get("agent_phases"))
+    reject_secrets(json_object(candidate), f"workflow step {step_id}")
+    result: dict[str, object] = {"step_id": step_id, "operation": operation, "before": current["step"], "after": candidate, "catalog": current["catalog"], "manifest_fingerprint": expected_manifest_fingerprint}
     if operation in AGENT_PHASE_CATALOG:
         try:
             from .user_state import load_agent_profiles
@@ -301,12 +520,11 @@ def preview_step_patch(
             discover_ready = discover_remaining = 0
         try:
             from .mrq_batches import load_active
-            from .pipeline_graphs import _decision_mrqs
             mrq_rows = [
                 row
-                for row in _decision_mrqs(repo)
+                for row in decision_mrqs(repo)
                 if row.get("state") != "superseded"
-                and not row.get("migration_decision", {}).get("decision")
+                and not _object(row.get("migration_decision", {})).get("decision")
             ]
             batches = load_active(repo)
             first_pending = mrq_rows[0]["mrq_id"] if mrq_rows else ""
@@ -354,21 +572,21 @@ def preview_step_patch(
                 "sandbox": "read-only",
                 "allowed_paths": "subject paths select context; they do not narrow filesystem read access",
             }
-            for phase in candidate["agent_phases"]
+            for phase in agent_phases
         ]
     return result
 
 
-def _pointer(repo: Path, name: str) -> dict[str, Any]:
+def _pointer(repo: Path, name: str) -> dict[str, JsonValue]:
     try:
-        return json.loads((repo / "research" / name).read_text(encoding="utf-8"))
+        return parse_json_object((repo / "research" / name).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid pointer research/{name}") from exc
 
 
 def _project_blockers(repo: Path) -> list[Blocker]:
     try:
-        validate_project_contract(repo)
+        _ = validate_project_contract(repo)
         return []
     except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
         return [Blocker("project.invalid", str(exc), "project.configure")]
@@ -377,7 +595,7 @@ def _project_blockers(repo: Path) -> list[Blocker]:
 def _source_blockers(repo: Path, *, deep: bool = True) -> list[Blocker]:
     from .sources import validate_active
     try:
-        validate_active(repo, deep=deep)
+        _ = validate_active(repo, deep=deep)
         return []
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         return [Blocker("sources.invalid", str(exc), "sources.acquire")]
@@ -386,34 +604,42 @@ def _source_blockers(repo: Path, *, deep: bool = True) -> list[Blocker]:
 def _diff_blockers(repo: Path) -> list[Blocker]:
     from .diffs import validate_active
     try:
-        validate_active(repo); return []
+        _ = validate_active(repo); return []
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         return [Blocker("diff.invalid", str(exc), "diff.build")]
 
 
-def _active_rows(repo: Path) -> tuple[list[dict[str, str]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    from .stage_recompute import active_pointers
-    pointers = active_pointers(repo)
-    diff_pointer = pointers["diff"]
+def _active_rows(repo: Path) -> tuple[list[dict[str, str]], list[dict[str, JsonValue]], list[dict[str, JsonValue]], list[dict[str, JsonValue]]]:
+    pointers = _stage_recompute().active_pointers(repo)
+    diff_pointer = _object(pointers["diff"])
     diff_root = repo / "analysis/indexes/generations" / str(diff_pointer.get("generation_id"))
     with (diff_root / "diff-inventory.csv").open(encoding="utf-8", newline="") as stream:
         diffs = [row for row in csv.DictReader(stream) if row.get("comparison_id", "").startswith("CMP-")]
     from .consolidation import load_active as load_consolidation
-    state = load_consolidation(repo)
-    if state["pointer"]["state"] != "active":
+    raw_state: object = load_consolidation(repo)
+    state = _object(raw_state)
+    pointer = _object(state["pointer"])
+    mrq = _object(state["mrq"])
+    if pointer["state"] != "active":
         return diffs, [], [], []
-    dispositions = state["mrq"]["dispositions.jsonl"]
-    decisions = []
-    if state["pointer"].get("decision_generation_id"):
+    dispositions = mrq["dispositions.jsonl"]
+    decisions: object = []
+    if pointer.get("decision_generation_id"):
         from .decision_generations import validate_generation as validate_decisions
-        decisions = validate_decisions(repo, state["pointer"]["decision_generation_id"])["decisions.jsonl"]
-    return diffs, state["mrq"]["mrq.jsonl"], dispositions, decisions
+        raw_decisions: object = validate_decisions(repo, str(pointer["decision_generation_id"]))
+        decisions = _object(raw_decisions)["decisions.jsonl"]
+    return (
+        diffs,
+        _objects(mrq["mrq.jsonl"]),
+        _objects(dispositions),
+        _objects(decisions),
+    )
 
 
-def _jsonl(path: Path) -> list[dict[str, Any]]:
+def _jsonl(path: Path) -> list[dict[str, JsonValue]]:
     if not path.is_file():
         return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [parse_json_object(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def _csv(path: Path) -> list[dict[str, str]]:
@@ -423,7 +649,7 @@ def _csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(stream))
 
 
-def semantic_diff_context(repo: Path, stable_diff_id: str, fact: dict[str, Any] | None = None) -> dict[str, Any]:
+def semantic_diff_context(repo: Path, stable_diff_id: str, fact: dict[str, JsonValue] | None = None) -> dict[str, JsonValue]:
     pointer = _pointer(repo, "active-diff-generation.json")
     root = repo / "analysis/indexes/generations" / str(pointer.get("generation_id"))
     if fact is None:
@@ -436,22 +662,23 @@ def semantic_diff_context(repo: Path, stable_diff_id: str, fact: dict[str, Any] 
                 if any(row.get("stable_diff_id") == stable_diff_id for row in csv.DictReader(stream)):
                     raise ValueError(f"raw extension audit DIF is not a workflow work unit: {stable_diff_id}")
         raise ValueError(f"unknown active DIF: {stable_diff_id}")
-    context: dict[str, Any] = {"diff": fact, "allowed_paths": [fact["path"]]}
+    context: dict[str, JsonValue] = {"diff": fact, "allowed_paths": [fact["path"]]}
     if pointer.get("schema_version") != "2" or fact.get("object_kind") != "extension_intervention":
         return context
     details = next((row for row in _jsonl(root / "extension-diff.jsonl") if row.get("stable_diff_id") == stable_diff_id), None)
     if details is None:
         raise ValueError(f"semantic extension DIF details are missing: {stable_diff_id}")
     dependencies = [row for row in _jsonl(root / "extension-dependencies.jsonl") if row.get("stable_diff_id") == stable_diff_id]
+    evidence = _objects(details["evidence"])
     with (root / "target-coverage.csv").open(encoding="utf-8", newline="") as stream:
         coverage = next((row for row in csv.DictReader(stream) if row.get("customer_diff_id") == stable_diff_id), None)
     context.update({
         "extension": details,
         "dependencies": dependencies,
         "target_coverage": coverage,
-        "allowed_paths": sorted({f"{item['role']}/extensions/{details['extension_uuid']}/{item['path']}" for item in details["evidence"]}),
+        "allowed_paths": sorted({f"{item['role']}/extensions/{details['extension_uuid']}/{item['path']}" for item in evidence}),
         "compatibility_summary": {
-            "dependency_outcomes": sorted({item["outcome"] for item in dependencies}),
+            "dependency_outcomes": sorted({str(item["outcome"]) for item in dependencies}),
             "diagnostic_codes": details["diagnostic_codes"],
             "target_coverage_status": coverage.get("coverage_status", "") if coverage else "",
         },
@@ -459,12 +686,10 @@ def semantic_diff_context(repo: Path, stable_diff_id: str, fact: dict[str, Any] 
     return context
 
 
-def status(repo: Path, *, deep: bool = True) -> dict[str, Any]:
+def status(repo: Path, *, deep: bool = True) -> WorkflowSnapshot:
     repo = repo.resolve()
-    from .stage_recompute import recover_active_publication
-
-    recover_active_publication(repo)
-    validate_workflow(repo)
+    _ = _stage_recompute().recover_active_publication(repo)
+    _ = validate_workflow(repo)
     checks = [_project_blockers(repo), _source_blockers(repo, deep=deep), _diff_blockers(repo)]
     if not any(checks):
         from .dif_classifications import coverage as classification_coverage
@@ -481,8 +706,9 @@ def status(repo: Path, *, deep: bool = True) -> dict[str, Any]:
     if not any(checks):
         try:
             from .consolidation import load_active as load_consolidation
-            consolidation = load_consolidation(repo)
-            consolidated = consolidation["pointer"]["state"] == "active"
+            raw_consolidation: object = load_consolidation(repo)
+            consolidation = _object(raw_consolidation)
+            consolidated = _object(consolidation["pointer"])["state"] == "active"
         except (OSError, ValueError, KeyError, json.JSONDecodeError):
             consolidated = False
         checks.append(
@@ -492,24 +718,27 @@ def status(repo: Path, *, deep: bool = True) -> dict[str, Any]:
         )
     if not any(checks):
         from .consolidation import load_active as load_consolidation
-        consolidated = load_consolidation(repo)
-        mrq_ids = {row["mrq_id"] for row in consolidated["mrq"]["mrq.jsonl"]}
-        evidenced = {row["mrq_id"] for row in consolidated["mrq"]["evidence.jsonl"]}
+        raw_consolidated: object = load_consolidation(repo)
+        consolidated = _object(raw_consolidated)
+        pointer = _object(consolidated["pointer"])
+        mrq = _object(consolidated["mrq"])
+        mrq_rows = _objects(mrq["mrq.jsonl"])
+        mrq_ids = {str(row["mrq_id"]) for row in mrq_rows}
+        evidenced = {str(row["mrq_id"]) for row in _objects(mrq["evidence.jsonl"])}
         checks.append([] if evidenced == mrq_ids else [Blocker("mrq.source_evidence", "active MRQ source evidence is incomplete", "mrq.consolidate")])
-        pointer = consolidated["pointer"]
         decisions_complete = False
         try:
             from .decision_generations import consolidation_input_fingerprint, validate_generation as validate_decisions
-            generation = validate_decisions(repo, pointer["decision_generation_id"])
+            generation = validate_decisions(repo, str(pointer["decision_generation_id"]))
             decisions_complete = (
                 pointer["decision_input_fingerprint"] == consolidation_input_fingerprint(pointer)
-                and {row["mrq_id"] for row in generation["decisions.jsonl"]}
-                == {row["mrq_id"] for row in consolidated["mrq"]["mrq.jsonl"]}
+                and {str(row["mrq_id"]) for row in _objects(generation["decisions.jsonl"])} == mrq_ids
             )
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             decisions_complete = False
         checks.append([] if decisions_complete else [Blocker("mrq.approvals", "active MRQ decisions are incomplete or unapproved", "mrq.decide-next")])
-        checks.append(_publication_blockers(repo, pointer.get("mrq_generation_id"), deep=deep))
+        generation_id = pointer.get("mrq_generation_id")
+        checks.append(_publication_blockers(repo, generation_id if isinstance(generation_id, str) else None, deep=deep))
     while len(checks) < len(GATES):
         checks.append([Blocker("predecessor.blocked", "a predecessor gate is incomplete", "")])
     gates: list[Gate] = []
@@ -519,7 +748,25 @@ def status(repo: Path, *, deep: bool = True) -> dict[str, Any]:
         state = "complete" if not effective else ("ready" if predecessor_complete and effective[0].action else "blocked")
         gates.append(Gate(gate_id, state, tuple(effective)))
         predecessor_complete &= state == "complete"
-    return {"schema_version": "1", "tool_version": __version__, "operation_versions": {operation: item["version"] for operation, item in OPERATION_CATALOG.items()}, "workflow_fingerprint": state_fingerprint(repo), "manifest_fingerprint": workflow_fingerprint(repo), "state": "complete" if all(g.state == "complete" for g in gates) else "ready" if any(g.state == "ready" for g in gates) else "blocked", "gates": [asdict(g) for g in gates]}
+    return {
+        "schema_version": "1",
+        "tool_version": __version__,
+        "operation_versions": {operation: str(item["version"]) for operation, item in OPERATION_CATALOG.items()},
+        "workflow_fingerprint": state_fingerprint(repo),
+        "manifest_fingerprint": workflow_fingerprint(repo),
+        "state": "complete" if all(g.state == "complete" for g in gates) else "ready" if any(g.state == "ready" for g in gates) else "blocked",
+        "gates": [
+            {
+                "id": gate.id,
+                "state": gate.state,
+                "blockers": [
+                    {"code": blocker.code, "message": blocker.message, "action": blocker.action}
+                    for blocker in gate.blockers
+                ],
+            }
+            for gate in gates
+        ],
+    }
 
 
 def _projection_blockers(repo: Path, generation: str | None) -> list[Blocker]:
@@ -529,18 +776,20 @@ def _projection_blockers(repo: Path, generation: str | None) -> list[Blocker]:
     if not manifest.is_file():
         return [Blocker("projection.missing", "projections are absent", "projections.build")]
     try:
-        value = json.loads(manifest.read_text(encoding="utf-8"))
+        value = parse_json_object(manifest.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         value = {}
     from .consolidation import load_active
     return [] if value == projection_value(load_active(repo)) else [Blocker("projection.stale", "projections are stale or independently edited", "projections.build")]
 
 
-def projection_value(state: dict[str, Any]) -> dict[str, Any]:
-    if "pointer" in state and state["pointer"].get("schema_version") == "2":
-        pointer = state["pointer"]
-        mrqs = state["mrq"]["mrq.jsonl"]
-        dispositions = state["mrq"]["dispositions.jsonl"]
+def projection_value(raw_state: object) -> dict[str, JsonValue]:
+    state = _object(raw_state)
+    pointer = _object(state["pointer"])
+    if pointer.get("schema_version") == "2":
+        mrq = _object(state["mrq"])
+        mrqs = _objects(mrq["mrq.jsonl"])
+        dispositions = _objects(mrq["dispositions.jsonl"])
         return {
             "schema_version": "3",
             "consolidation_transaction_id": pointer["transaction_id"],
@@ -556,9 +805,9 @@ def projection_value(state: dict[str, Any]) -> dict[str, Any]:
                 "specifications": [],
             },
         }
-    generation = state["pointer"].get("canonical_generation_id")
-    mrqs = state["mrq.jsonl"]
-    dispositions = state["dispositions.jsonl"]
+    generation = pointer.get("canonical_generation_id")
+    mrqs = _objects(state["mrq.jsonl"])
+    dispositions = _objects(state["dispositions.jsonl"])
     return {
         "schema_version": "1",
         "canonical_generation_id": generation,
@@ -582,34 +831,35 @@ def _publication_blockers(repo: Path, generation: str | None, *, deep: bool = Tr
     from .consolidation import load_active as active_consolidation
     from .contracts import require_tracked_clean
     try:
-        consolidation = active_consolidation(repo)
-        if consolidation["pointer"].get("batch_generation_id"):
+        raw_consolidation: object = active_consolidation(repo)
+        consolidation = _object(raw_consolidation)
+        if _object(consolidation["pointer"]).get("batch_generation_id"):
             from .mrq_batches import load_active
-            load_active(repo)
-        validate_active(repo, deep=True, require_tracked_clean=True)
-        validate_active_diffs(repo, require_tracked_clean_state=True)
+            _ = load_active(repo)
+        _ = validate_active(repo, deep=True, require_tracked_clean=True)
+        _ = validate_active_diffs(repo, require_tracked_clean_state=True)
         require_tracked_clean(repo, [repo / "outputs/projections.json"])
     except (ValueError, OSError, KeyError, json.JSONDecodeError) as exc:
         return [Blocker("publication.strict", str(exc), "workflow.verify")]
     return []
 
 
-def next_work(repo: Path) -> dict[str, Any] | None:
+def next_work(repo: Path) -> dict[str, JsonValue] | None:
     snapshot = status(repo)
     for gate in snapshot["gates"]:
         if gate["state"] == "ready":
             blocker = gate["blockers"][0]
-            result: dict[str, Any] = {"gate_id": gate["id"], "action": blocker["action"], "blocker": blocker, "workflow_fingerprint": snapshot["workflow_fingerprint"]}
+            result: dict[str, JsonValue] = {"gate_id": gate["id"], "action": blocker["action"], "blocker": json_object(blocker), "workflow_fingerprint": snapshot["workflow_fingerprint"]}
             if blocker["action"] == "mrq.discover-next":
                 diffs, mrqs, dispositions, _approvals = _active_rows(repo)
-                owned = {item["stable_diff_id"] for item in dispositions if item.get("primary")}
+                owned = {str(item["stable_diff_id"]) for item in dispositions if item.get("primary")}
                 pending = sorted((item for item in diffs if item.get("before_role") == "vendor_baseline" and item.get("after_role") == "target_cf" and item["stable_diff_id"] not in owned), key=lambda item: item["stable_diff_id"])
                 if pending:
                     target_pointer = _pointer(repo, "active-diff-generation.json")
                     if pending[0].get("object_kind") == "extension_intervention":
-                        context = semantic_diff_context(repo, pending[0]["stable_diff_id"], pending[0])
+                        context = semantic_diff_context(repo, pending[0]["stable_diff_id"], json_object(pending[0]))
                     else:
-                        coverage_path = repo / "analysis/indexes/generations" / target_pointer["generation_id"] / "target-coverage.csv"
+                        coverage_path = repo / "analysis/indexes/generations" / str(target_pointer["generation_id"]) / "target-coverage.csv"
                         with coverage_path.open(encoding="utf-8", newline="") as stream:
                             coverage = next((item for item in csv.DictReader(stream) if item["customer_diff_id"] == pending[0]["stable_diff_id"]), None)
                         context = {"diff": pending[0], "target_coverage": coverage, "allowed_paths": [pending[0]["path"]]}
@@ -617,7 +867,7 @@ def next_work(repo: Path) -> dict[str, Any] | None:
             elif blocker["action"] == "mrq.decide-next":
                 try:
                     from .mrq_batches import load_active
-                    load_active(repo)
+                    _ = load_active(repo)
                 except (OSError, ValueError, KeyError, json.JSONDecodeError):
                     from .mrq_batches import source_mrq_payload, stable_windows
                     generation_id, fingerprint, records = source_mrq_payload(repo)
@@ -638,19 +888,22 @@ def next_work(repo: Path) -> dict[str, Any] | None:
                             "window_count": len(stable_windows(records)),
                         },
                     }
-                _diffs, mrqs, dispositions, _approvals = _active_rows(repo)
-                pending = sorted((item for item in mrqs if item.get("state") != "superseded" and item.get("state") != "approved"), key=lambda item: item["mrq_id"])
+                diffs, mrqs, dispositions, _approvals = _active_rows(repo)
+                pending = sorted((item for item in mrqs if item.get("state") != "superseded" and item.get("state") != "approved"), key=lambda item: str(item["mrq_id"]))
                 if pending:
                     item = pending[0]
-                    owned = {relation["stable_diff_id"] for relation in dispositions if relation.get("mrq_id") == item["mrq_id"] and relation.get("primary")}
-                    paths = sorted({evidence["path"] for evidence in item.get("source_customization", {}).get("evidence", []) if evidence.get("stable_diff_id") in owned})
-                    semantic = [semantic_diff_context(repo, identifier) for identifier in sorted(owned) if next((row for row in diffs if row["stable_diff_id"] == identifier), {}).get("object_kind") == "extension_intervention"]
-                    result["work_unit"] = {"id": item["mrq_id"], "kind": "migration-decision" if not item.get("migration_decision", {}).get("decision") else "approval", "mrq": item, "semantic_extension_context": semantic, "source_generation_id": item["source_generation_id"], "diff_generation_id": item["diff_generation_id"], "allowed_paths": sorted(set(paths) | {path for context in semantic for path in context["allowed_paths"]})}
+                    owned = {str(relation["stable_diff_id"]) for relation in dispositions if relation.get("mrq_id") == item["mrq_id"] and relation.get("primary")}
+                    customization = _object(item.get("source_customization", {}))
+                    migration_decision = _object(item.get("migration_decision", {}))
+                    paths = sorted(str(evidence["path"]) for evidence in _objects(customization.get("evidence", [])) if str(evidence.get("stable_diff_id", "")) in owned)
+                    extension_ids = {row["stable_diff_id"] for row in diffs if row.get("object_kind") == "extension_intervention"}
+                    semantic = [semantic_diff_context(repo, identifier) for identifier in sorted(owned) if identifier in extension_ids]
+                    result["work_unit"] = {"id": item["mrq_id"], "kind": "migration-decision" if not migration_decision.get("decision") else "approval", "mrq": item, "semantic_extension_context": semantic, "source_generation_id": item["source_generation_id"], "diff_generation_id": item["diff_generation_id"], "allowed_paths": sorted(set(paths) | {path for context in semantic for path in _strings(_object(context)["allowed_paths"])})}
             return result
     return None
 
 
-def attach_dispatcher(snapshot: dict[str, Any], repo: Path, base: Path | None = None) -> dict[str, Any]:
+def attach_dispatcher(snapshot: WorkflowSnapshot, repo: Path, base: Path | None = None) -> dict[str, object]:
     """Присоединяет к снимку необязательную операционную секцию ``dispatcher``.
 
     Секция собирается из канонического снимка и пользовательского состояния
@@ -663,12 +916,12 @@ def attach_dispatcher(snapshot: dict[str, Any], repo: Path, base: Path | None = 
     try:
         from .sqlite_state import DispatcherStore
     except ImportError:
-        return snapshot
+        return dict(snapshot)
     try:
         store = DispatcherStore(repo, base)
         store.open()
         try:
-            projection = _dispatcher_projection(snapshot, repo, store)
+            projection: dict[str, object] = _dispatcher_projection(snapshot, repo, store)
         finally:
             store.close()
     except Exception:
@@ -677,7 +930,7 @@ def attach_dispatcher(snapshot: dict[str, Any], repo: Path, base: Path | None = 
     return {**snapshot, "dispatcher": projection}
 
 
-def _zone_state(gate: dict[str, Any] | None) -> str:
+def _zone_state(gate: GateValue | None) -> str:
     return {"complete": "complete", "ready": "waiting"}.get(
         str((gate or {}).get("state", "")),
         "unknown",
@@ -687,21 +940,21 @@ def _zone_state(gate: dict[str, Any] | None) -> str:
 def _prepare_zones(
     repo: Path,
     state_base: Path | None,
-    gates: dict[str, dict[str, Any]],
+    gates: dict[str, GateValue],
     runs_root: Path,
     workflow_fingerprint: str,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, JsonValue]]:
     from .sources import current_profile_test, load_contract
     from .user_state import load_connections, state_root
 
     infobases, _artifacts = load_contract(repo)
     connections = load_connections(repo, state_base)
     profile_id = str(infobases.get("acquisition_profile", ""))
-    zones = []
+    zones: list[dict[str, JsonValue]] = []
     for role in ROLES:
-        profile = connections.get(
-            str(infobases.get("roles", {}).get(role, {}).get("connection_profile", "")),
-        )
+        roles = _object(infobases.get("roles", {}))
+        role_definition = _object(roles.get(role, {}))
+        profile = connections.get(str(role_definition.get("connection_profile", "")))
         state = (
             "complete"
             if profile and current_profile_test(profile, profile_id)
@@ -734,7 +987,7 @@ def _prepare_zones(
             index_state = "error"
         elif any(item["status"] == "building" for item in index_rows):
             index_state = "active"
-        elif gates.get("diffs-built", {}).get("state") == "complete":
+        elif (diffs_gate := gates.get("diffs-built")) is not None and diffs_gate["state"] == "complete":
             index_state = "waiting"
         else:
             index_state = "unknown"
@@ -757,8 +1010,8 @@ def _latest_operation_zone(
         reverse=True,
     ):
         try:
-            run = json.loads(path.read_text(encoding="utf-8"))
-            execution = run["execution_snapshot"]
+            run = parse_json_object(path.read_text(encoding="utf-8"))
+            execution = _object(run["execution_snapshot"])
             if (
                 execution.get("operation") != operation
                 or (
@@ -770,7 +1023,9 @@ def _latest_operation_zone(
             ):
                 continue
             status = str(run.get("status", ""))
-            if status == "running" and process_identity_alive(run.get("process_identity")):
+            identity_value = run.get("process_identity")
+            identity = _object(identity_value) if identity_value is not None else None
+            if status == "running" and process_identity_alive(identity):
                 state = "active"
             elif status == "completed":
                 state = "complete"
@@ -778,14 +1033,15 @@ def _latest_operation_zone(
                 state = "error"
             else:
                 continue
-            updated_at = str((run.get("events") or [{}])[-1].get("timestamp", ""))
+            events = _objects(run.get("events", []))
+            updated_at = str(events[-1].get("timestamp", "")) if events else ""
             return {"state": state, **({"updated_at": updated_at} if updated_at else {})}
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
     return None
 
 
-def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> dict[str, Any]:
+def _dispatcher_projection(snapshot: WorkflowSnapshot, repo: Path, store: DispatcherStore) -> dict[str, object]:
     """Собирает операционную проекцию пяти контуров.
 
     Структура стабильна и предназначена для React Flow-схемы; координаты узлов
@@ -803,7 +1059,7 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
     except (OSError, ValueError, KeyError):
         safe_profiles = {}
     codex_probe = probe_codex_environment()
-    phases: list[dict[str, Any]] = []
+    phases: list[dict[str, object]] = []
     transient_meaning_ids: set[str] = set()
     for configured in step_configurations(repo):
         active_run_id = str(
@@ -817,7 +1073,7 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
             run = EventStore(store.path.parent.parent, store.path.parent.name).run_snapshot(active_run_id)
             execution_snapshot = (run or {}).get("execution_snapshot")
         phase_definitions = execution_snapshot.get("agent_phases", []) if isinstance(execution_snapshot, dict) else configured["step"].get("agent_phases", [])
-        profile_definitions = execution_snapshot.get("profiles", {}) if isinstance(execution_snapshot, dict) else safe_profiles
+        profile_definitions = _object(execution_snapshot.get("profiles", {})) if isinstance(execution_snapshot, dict) else safe_profiles
         snapshot_environment_available = False
         if isinstance(execution_snapshot, dict):
             try:
@@ -826,25 +1082,27 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
                 snapshot_environment_available = True
             except (OSError, RuntimeError, ValueError):
                 pass
-        for phase_index, phase in enumerate(phase_definitions):
-            roles = []
-            for role in phase["roles"]:
+        for phase_index, phase in enumerate(_objects(phase_definitions)):
+            roles: list[dict[str, object]] = []
+            for role in _objects(phase["roles"]):
+                phase_id = str(phase["phase_id"])
+                role_id = str(role["role_id"])
                 rows = store.invocations(
                     active_run_id,
                     limit=16,
-                    phase_id=phase["phase_id"],
-                    role_id=role["role_id"],
+                    phase_id=phase_id,
+                    role_id=role_id,
                 ) if active_run_id else []
                 invocation_total = store.invocation_count(
                     active_run_id,
-                    phase["phase_id"],
-                    role["role_id"],
+                    phase_id,
+                    role_id,
                 ) if active_run_id else 0
-                units = [item for item in work_rows if item["phase_id"] == phase["phase_id"] and item["role_id"] == role["role_id"]]
-                if phase["phase_id"] == "form-mrq" and role["role_id"] == "grouper":
+                units = [item for item in work_rows if item["phase_id"] == phase_id and item["role_id"] == role_id]
+                if phase_id == "form-mrq" and role_id == "grouper":
                     transient_meaning_ids.update(str(item["work_unit_id"]) for item in units)
                 counts = {state: sum(item["status"] == state for item in units) for state in ("running", "queued", "completed", "failed", "cancelled", "interrupted")}
-                profile = profile_definitions.get(role["agent_profile"], {})
+                profile = _object(profile_definitions.get(str(role["agent_profile"]), {}))
                 environment_status = (
                     "available"
                     if snapshot_environment_available
@@ -857,14 +1115,14 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
                 )
                 assignments = (
                     store.slot_assignments(
-                        active_run_id, phase["phase_id"], role["role_id"]
+                        active_run_id, phase_id, role_id
                     )
                     if active_run_id
                     else {}
                 )
-                slots = []
-                for ordinal in range(1, role["count"] + 1):
-                    slot_id = f"{phase['phase_id']}:{role['role_id']}:{ordinal}"
+                slots: list[dict[str, object]] = []
+                for ordinal in range(1, _integer(role["count"]) + 1):
+                    slot_id = f"{phase_id}:{role_id}:{ordinal}"
                     assignment = assignments.get(
                         slot_id, {"current": None, "latest": None}
                     )
@@ -894,7 +1152,7 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
                         "latest_invocation_id": latest["invocation_id"] if latest else None,
                     })
                 roles.append({
-                    "role_id": role["role_id"],
+                    "role_id": role_id,
                     "agent_profile": role["agent_profile"],
                     "model": profile.get("model", ""),
                     "reasoning_effort": profile.get("reasoning_effort", ""),
@@ -908,12 +1166,12 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
                     "invocations": rows,
                     "slots": slots,
                 })
-            phases.append({"job_id": configured["job_id"], "phase_id": phase["phase_id"], "mode": phase["mode"], "max_concurrency": phase["max_concurrency"], "roles": roles})
+            phases.append({"job_id": configured["job_id"], "phase_id": str(phase["phase_id"]), "mode": str(phase["mode"]), "max_concurrency": _integer(phase["max_concurrency"]), "roles": roles})
     # контуры выводятся из канонического снимка
     gates = {gate["id"]: gate for gate in snapshot.get("gates", [])}
     classify_aggregates = _classify_aggregates(repo)
-    active_jobs = {lease["job_id"] for lease in leases if lease["state"] == "running"}
-    circuits = [
+    active_jobs = {str(lease["job_id"]) for lease in leases if lease["state"] == "running"}
+    circuits: list[dict[str, object]] = [
         {"id": "prepare-diffs", "state": _circuit_state(gates.get("sources-acquired"), gates.get("diffs-built")), "aggregates": _prepare_aggregates(repo), "zones": _prepare_zones(repo, store.base, gates, store.path.parent / "runs", str(snapshot.get("workflow_fingerprint", "")))},
         {"id": "analyze-dif", "state": _agent_circuit_state("analyze-dif", active_jobs, gates.get("all-dif-classified")), "leases": [lease for lease in leases if lease["job_id"] == "analyze-dif"], "aggregates": _analyze_aggregates(repo, store)},
         {"id": "form-mrq", "state": _agent_circuit_state("consolidate-mrq", active_jobs, gates.get("mrq-consolidated"), gates.get("source-evidence-complete")), "leases": [lease for lease in leases if lease["job_id"] == "consolidate-mrq"], "aggregates": _form_mrq_aggregates(repo, store), "publication": {"id": "publication", "state": _zone_state(gates.get("source-evidence-complete"))}},
@@ -921,7 +1179,7 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
         {"id": "decide-target", "state": _agent_circuit_state("decide-mrq", active_jobs, gates.get("decisions-approved")), "leases": [lease for lease in leases if lease["job_id"] == "decide-mrq"], "aggregates": _decide_aggregates(repo)},
     ]
     from datetime import datetime, timezone
-    retry_candidates = []
+    retry_candidates: list[dict[str, object]] = []
     runs_root = store.path.parent / "runs"
     for path in sorted(
         runs_root.glob("*.json") if runs_root.is_dir() else [],
@@ -929,14 +1187,15 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
         reverse=True,
     ):
         try:
-            run = json.loads(path.read_text(encoding="utf-8"))
-            execution = run["execution_snapshot"]
+            run = parse_json_object(path.read_text(encoding="utf-8"))
+            execution = _object(run["execution_snapshot"])
             if (
                 run.get("execution_snapshot_fingerprint")
                 != "sha256:" + sha256(canonical_json(execution))
             ):
                 continue
-            operation = execution.get("operation")
+            operation_value = execution.get("operation")
+            operation = operation_value if isinstance(operation_value, str) else ""
             job_id = {
                 "dif.classify-next": "analyze-dif",
                 "mrq.consolidate": "consolidate-mrq",
@@ -946,7 +1205,8 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
             from .events import RETRYABLE_RUN_STATUSES
             if not job_id or run.get("status") not in RETRYABLE_RUN_STATUSES:
                 continue
-            bindings = execution.get("subject_bindings", {})
+            bindings = _object(execution.get("subject_bindings", {}))
+            work_unit = _object(execution.get("work_unit", {}))
             retry_candidates.append(
                 {
                     "run_id": run["run_id"],
@@ -959,7 +1219,7 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
                         "source_generation_id": str(bindings.get("source_generation_id", "")),
                         "diff_generation_id": str(bindings.get("diff_generation_id", "")),
                         "canonical_generation_id": str(bindings.get("canonical_generation_id", "")),
-                        "work_unit_id": str(execution.get("work_unit", {}).get("id", "")),
+                        "work_unit_id": str(work_unit.get("id", "")),
                     },
                 }
             )
@@ -986,9 +1246,9 @@ def _dispatcher_projection(snapshot: dict[str, Any], repo: Path, store: Any) -> 
 
 def _dispatcher_items(
     repo: Path,
-    store: Any,
+    store: DispatcherStore,
     transient_meaning_ids: set[str] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, JsonValue]:
     """Компактные карточки для экрана без второго предметного хранилища."""
 
     try:
@@ -1013,31 +1273,34 @@ def _dispatcher_items(
             row["stable_diff_id"]: row["classification"]
             for row in classification_rows
         }
-        active_mrqs = sorted((row for row in mrqs if row.get("state") != "superseded"), key=lambda row: row["mrq_id"])
+        active_mrqs = sorted((row for row in mrqs if row.get("state") != "superseded"), key=lambda row: str(row["mrq_id"]))
         pointer = _pointer(repo, "active-diff-generation.json")
         diff_root = repo / "analysis/indexes/generations" / str(pointer.get("generation_id"))
         extension_rows = _jsonl(diff_root / "extension-diff.jsonl") if pointer.get("schema_version") == "2" else []
         dependency_rows = _jsonl(diff_root / "extension-dependencies.jsonl") if pointer.get("schema_version") == "2" else []
         coverage_rows = _csv(diff_root / "target-coverage.csv")
         extension_by_id = {row["stable_diff_id"]: row for row in extension_rows}
-        dependencies_by_id: dict[str, list[dict[str, Any]]] = {}
+        dependencies_by_id: dict[str, list[dict[str, JsonValue]]] = {}
         for dependency in dependency_rows:
-            dependencies_by_id.setdefault(dependency["stable_diff_id"], []).append(dependency)
+            dependencies_by_id.setdefault(str(dependency["stable_diff_id"]), []).append(dependency)
         coverage_by_id = {row["customer_diff_id"]: row for row in coverage_rows}
-        card = lambda row, state: _dif_card(
-            row,
-            state,
-            extension_by_id.get(row["stable_diff_id"]),
-            coverage_by_id.get(row["stable_diff_id"]),
-            dependencies_by_id.get(row["stable_diff_id"], []),
-        )
+        def card(row: dict[str, str], state: str):
+            identifier = row["stable_diff_id"]
+            return _dif_card(
+                json_object(row),
+                state,
+                extension_by_id.get(identifier),
+                json_object(coverage_by_id[identifier]) if identifier in coverage_by_id else None,
+                dependencies_by_id.get(identifier, []),
+            )
         from .mrq_batches import load_active
         from .consolidation import load_active as load_consolidation
-        consolidation = load_consolidation(repo)
-        consolidation_pointer = consolidation["pointer"]
+        raw_consolidation: object = load_consolidation(repo)
+        consolidation = _object(raw_consolidation)
+        consolidation_pointer = _object(consolidation["pointer"])
         batches = load_active(repo) if consolidation_pointer.get("batch_generation_id") else []
         previously_owned = {
-            row["stable_diff_id"] for row in dispositions if row.get("primary")
+            str(row["stable_diff_id"]) for row in dispositions if row.get("primary")
         }
         pending_difs = [
             row for row in customer
@@ -1052,24 +1315,25 @@ def _dispatcher_items(
         ]
         noise_difs = [row for row in customer if classifications.get(row["stable_diff_id"]) == "noise_candidate" or transient.get(row["stable_diff_id"]) == "noise"]
         proposals = [row for row in operational if row.get("kind") == "approval" and row.get("consumed_at") is None]
-        decision_rows: list[dict[str, Any]] = []
-        if consolidation_pointer.get("decision_generation_id"):
+        decision_rows: list[dict[str, JsonValue]] = []
+        decision_generation_id = consolidation_pointer.get("decision_generation_id")
+        if isinstance(decision_generation_id, str):
             from .decision_generations import validate_generation as validate_decisions
-            decision_rows = validate_decisions(
+            decision_rows = _objects(validate_decisions(
                 repo,
-                consolidation_pointer["decision_generation_id"],
-                allowed_mrq_ids={row["mrq_id"] for row in active_mrqs},
-            )["decisions.jsonl"]
-        decision_by_mrq = {row["mrq_id"]: row["decision"] for row in decision_rows}
+                decision_generation_id,
+                allowed_mrq_ids={str(row["mrq_id"]) for row in active_mrqs},
+            )["decisions.jsonl"])
+        decision_by_mrq = {str(row["mrq_id"]): row["decision"] for row in decision_rows}
         pending_mrqs = [
             row for row in active_mrqs
-            if row["mrq_id"] not in decision_by_mrq
+            if str(row["mrq_id"]) not in decision_by_mrq
         ]
         decisions = [
-            {**row, "migration_decision": decision_by_mrq[row["mrq_id"]]}
-            for row in active_mrqs if row["mrq_id"] in decision_by_mrq
+            {**row, "migration_decision": decision_by_mrq[str(row["mrq_id"])]}
+            for row in active_mrqs if str(row["mrq_id"]) in decision_by_mrq
         ]
-        plan: dict[str, Any] = {}
+        plan: dict[str, JsonValue] = {}
         proposal = next((
             row for row in reversed(operational)
             if row.get("job_id") == "consolidate-mrq"
@@ -1077,48 +1341,45 @@ def _dispatcher_items(
             and row.get("consumed_at") is None
         ), None)
         if proposal:
-            relative = proposal.get("payload", {}).get("plan_path")
-            path = store.path.parent / relative if relative else None
+            payload = _object(proposal.get("payload", {}))
+            relative = payload.get("plan_path")
+            path = store.path.parent / relative if isinstance(relative, str) and relative else None
             if path and path.is_file():
-                plan = json.loads(path.read_text(encoding="utf-8"))
-        elif consolidation_pointer.get("plan_fingerprint"):
+                plan = parse_json_object(path.read_text(encoding="utf-8"))
+        elif isinstance(consolidation_pointer.get("plan_fingerprint"), str) and consolidation_pointer["plan_fingerprint"]:
+            plan_fingerprint = str(consolidation_pointer["plan_fingerprint"])
             path = (
                 store.path.parent
                 / "consolidation-plans"
-                / f"{consolidation_pointer['plan_fingerprint'].removeprefix('sha256:')}.json"
+                / f"{plan_fingerprint.removeprefix('sha256:')}.json"
             )
             if path.is_file():
-                plan = json.loads(path.read_text(encoding="utf-8"))
-        outcomes = plan.get("outcomes", {})
-        def outcome_cards() -> list[dict[str, Any]]:
+                plan = parse_json_object(path.read_text(encoding="utf-8"))
+        outcomes = _object(plan.get("outcomes", {}))
+        def outcome_cards() -> list[dict[str, JsonValue]]:
             lineage = [
-                row for row in plan.get("lineage", [])
+                row for row in _objects(plan.get("lineage", []))
                 if row.get("domain") == "mrq"
             ]
-            return [
-                {
-                    "id": f"mrq:{kind}:{identifier}",
-                    "title": identifier,
-                    "state": kind,
-                    "evidence_count": len([
+            cards: list[dict[str, JsonValue]] = []
+            for kind in ("retained", "new", "merged", "split", "superseded", "revalidated"):
+                for identifier in _strings(outcomes.get(kind, [])):
+                    related = [
                         row for row in lineage
-                        if identifier in row.get("source_ids", [])
-                        or identifier in row.get("target_ids", [])
-                    ]),
-                    "source_ids": next((
-                        row.get("source_ids", []) for row in lineage
-                        if identifier in row.get("source_ids", [])
-                        or identifier in row.get("target_ids", [])
-                    ), [identifier] if kind in {"retained", "revalidated"} else []),
-                    "target_ids": next((
-                        row.get("target_ids", []) for row in lineage
-                        if identifier in row.get("source_ids", [])
-                        or identifier in row.get("target_ids", [])
-                    ), [identifier] if kind in {"retained", "revalidated", "new"} else []),
-                }
-                for kind in ("retained", "new", "merged", "split", "superseded", "revalidated")
-                for identifier in outcomes.get(kind, [])
-            ]
+                        if identifier in _strings(row.get("source_ids", []))
+                        or identifier in _strings(row.get("target_ids", []))
+                    ]
+                    source_ids = _strings(related[0].get("source_ids", [])) if related else ([identifier] if kind in {"retained", "revalidated"} else [])
+                    target_ids = _strings(related[0].get("target_ids", [])) if related else ([identifier] if kind in {"retained", "revalidated", "new"} else [])
+                    cards.append({
+                        "id": f"mrq:{kind}:{identifier}",
+                        "title": identifier,
+                        "state": kind,
+                        "evidence_count": len(related),
+                        "source_ids": source_ids,
+                        "target_ids": target_ids,
+                    })
+            return cards
         mrq_outcomes = outcome_cards()
         return {
             "dif_queue": [card(row, "queued") for row in pending_difs[:32]],
@@ -1158,75 +1419,76 @@ def _dispatcher_items(
 
 
 def _dif_card(
-    row: dict[str, Any],
+    row: dict[str, JsonValue],
     state: str,
-    extension: dict[str, Any] | None = None,
-    target: dict[str, Any] | None = None,
-    dependencies: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    card = {"id": row.get("stable_diff_id", ""), "path": row.get("path", ""), "kind": row.get("object_kind", ""), "state": state}
+    extension: dict[str, JsonValue] | None = None,
+    target: dict[str, JsonValue] | None = None,
+    dependencies: list[dict[str, JsonValue]] | None = None,
+) -> dict[str, JsonValue]:
+    card: dict[str, JsonValue] = {"id": row.get("stable_diff_id", ""), "path": row.get("path", ""), "kind": row.get("object_kind", ""), "state": state}
     if extension:
         card.update({key: extension.get(key, "") for key in ("extension_uuid", "intervention_kind", "object_scope", "affected_base_identity")})
         role = extension.get("before_role") if row.get("change_type") == "deleted" else extension.get("after_role")
         card["component_id"] = f"{role}:extension:{extension.get('extension_uuid', '')}"
-        card["evidence_count"] = len(extension.get("evidence", []))
+        card["evidence_count"] = len(_objects(extension.get("evidence", [])))
         values = dependencies or []
         card["dependency_count"] = len(values)
         card["compatibility_summary"] = {
             outcome: sum(item.get("outcome") == outcome for item in values)
             for outcome in ("present_compatible", "present_changed", "missing", "unresolved")
         }
-        card["target_coverage"] = (target or {}).get("coverage_status", "")
+        card["target_coverage"] = target.get("coverage_status", "") if target else ""
         card["blocker_codes"] = sorted(
-            set(extension.get("diagnostic_codes", []))
-            | {item["diagnostic_code"] for item in values if item.get("diagnostic_code")}
+            set(_strings(extension.get("diagnostic_codes", [])))
+            | {str(item["diagnostic_code"]) for item in values if item.get("diagnostic_code")}
         )
     return card
 
 
-def _proposal_card(row: dict[str, Any]) -> dict[str, Any]:
-    payload = row.get("payload", {})
+def _proposal_card(row: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    payload = _object(row.get("payload", {}))
+    decision_proposal = _object(payload.get("decision_proposal", {}))
     return {
         "id": row.get("key", ""),
         "job_id": row.get("job_id", ""),
         "kind": row.get("kind", ""),
         "approval_stage": payload.get("approval_stage", ""),
         "semantic_key": payload.get("semantic_key", ""),
-        "dif_ids": sorted(payload.get("stable_diff_ids", [])),
-        "evidence_count": len(payload.get("evidence", [])),
-        "noise_count": len(payload.get("noise_proposals", payload.get("approved_noise_ids", []))),
-        "mrq_id": (payload.get("decision_proposal") or {}).get("mrq_id", ""),
+        "dif_ids": sorted(_strings(payload.get("stable_diff_ids", []))),
+        "evidence_count": len(_objects(payload.get("evidence", []))),
+        "noise_count": len(json_array(payload.get("noise_proposals", payload.get("approved_noise_ids", [])))),
+        "mrq_id": decision_proposal.get("mrq_id", ""),
         "created_at": row.get("created_at", ""),
     }
 
 
-def _mrq_card(row: dict[str, Any], dispositions: list[dict[str, Any]]) -> dict[str, Any]:
+def _mrq_card(row: dict[str, JsonValue], dispositions: list[dict[str, JsonValue]]) -> dict[str, JsonValue]:
     mrq_id = row.get("mrq_id", "")
-    diff_ids = sorted(item.get("stable_diff_id", "") for item in dispositions if item.get("mrq_id") == mrq_id and item.get("primary"))
-    source = row.get("source_customization", {})
+    diff_ids = sorted(str(item.get("stable_diff_id", "")) for item in dispositions if item.get("mrq_id") == mrq_id and item.get("primary"))
+    source = _object(row.get("source_customization", {}))
     return {
         "id": mrq_id,
         "title": row.get("title", ""),
         "semantic_key": row.get("semantic_key", ""),
         "state": row.get("state", ""),
         "dif_ids": diff_ids,
-        "evidence_count": len(source.get("evidence", [])),
+        "evidence_count": len(_objects(source.get("evidence", []))),
     }
 
 
-def _decision_card(row: dict[str, Any]) -> dict[str, Any]:
-    decision = row.get("migration_decision", {})
+def _decision_card(row: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    decision = _object(row.get("migration_decision", {}))
     return {
         "id": row.get("mrq_id", ""),
         "title": row.get("title", ""),
         "decision": decision.get("decision", ""),
         "target_solution": decision.get("target_solution", ""),
-        "evidence_count": len(decision.get("target_evidence", [])),
+        "evidence_count": len(_objects(decision.get("target_evidence", []))),
         "gap": decision.get("decision") == "adapt",
     }
 
 
-def _circuit_state(*gates: dict[str, Any]) -> str:
+def _circuit_state(*gates: GateValue | None) -> str:
     if not gates:
         return "unknown"
     states = [gate.get("state", "blocked") for gate in gates if gate]
@@ -1239,11 +1501,11 @@ def _circuit_state(*gates: dict[str, Any]) -> str:
     return "blocked"
 
 
-def _agent_circuit_state(job_id: str, active_jobs: set[str], *gates: dict[str, Any]) -> str:
+def _agent_circuit_state(job_id: str, active_jobs: set[str], *gates: GateValue | None) -> str:
     return "active" if job_id in active_jobs else _circuit_state(*gates)
 
 
-def _prepare_aggregates(repo: Path) -> dict[str, Any]:
+def _prepare_aggregates(repo: Path) -> dict[str, JsonValue]:
     import csv
     pointer_path = repo / "research/active-diff-generation.json"
     if not pointer_path.is_file():
@@ -1267,11 +1529,10 @@ def _prepare_aggregates(repo: Path) -> dict[str, Any]:
         return {"diff_count": 0, "target_coverage_count": 0, "semantic_extension_diff_count": 0}
 
 
-def _analyze_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]:
+def _analyze_aggregates(repo: Path, store: DispatcherStore | None = None) -> dict[str, JsonValue]:
     try:
-        from .pipeline_graphs import _read_diff_inventory
         from .dif_classifications import coverage
-        customer = _read_diff_inventory(repo)
+        customer = read_diff_inventory(repo)
         counts = coverage(repo)
         semantic = sum(row.get("object_kind") == "extension_intervention" for row in customer)
         pointer = _pointer(repo, "active-diff-generation.json")
@@ -1283,7 +1544,7 @@ def _analyze_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]:
         if store and lease:
             try:
                 from .dif_classifications import load_active
-                published = {row["stable_diff_id"] for row in load_active(repo)["rows"]}
+                published: set[str] = {row["stable_diff_id"] for row in load_active(repo)["rows"]}
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 published = set()
             completed = len(set(_transient_analyze_results(
@@ -1308,32 +1569,37 @@ def _analyze_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]:
 
 
 def _transient_analyze_results(
-    operational: list[dict[str, Any]],
+    operational: list[dict[str, JsonValue]],
     thread_id: str | None = None,
 ) -> dict[str, str]:
     rows = [
         row for row in operational
         if row.get("job_id") == "analyze-dif"
         and row.get("kind") == "node-result"
-        and str(row.get("payload", {}).get("name", "")).startswith("analyze-dif:")
+        and str(_object(row.get("payload", {})).get("name", "")).startswith("analyze-dif:")
     ]
     selected_thread = thread_id or (rows[-1].get("thread_id") if rows else None)
-    return {
-        str(result["stable_diff_id"]): str(result["kind"])
-        for row in rows
-        if row.get("thread_id") == selected_thread
-        for result in [row.get("payload", {}).get("envelope", {}).get("result", {})]
-        if result.get("kind") in {"meaning", "noise"} and result.get("stable_diff_id")
-    }
+    results: dict[str, str] = {}
+    for row in rows:
+        if row.get("thread_id") != selected_thread:
+            continue
+        payload = _object(row.get("payload", {}))
+        envelope = _object(payload.get("envelope", {}))
+        result = _object(envelope.get("result", {}))
+        if result.get("kind") in {"meaning", "noise"} and result.get("stable_diff_id"):
+            results[str(result["stable_diff_id"])] = str(result["kind"])
+    return results
 
 
-def _form_mrq_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]:
+def _form_mrq_aggregates(repo: Path, store: DispatcherStore | None = None) -> dict[str, JsonValue]:
     try:
         from .consolidation import load_active
-        state = load_active(repo)
-        pointer = state["pointer"]
-        result = {
-            "active_mrq_count": len(state["mrq"].get("mrq.jsonl", [])),
+        raw_state: object = load_active(repo)
+        state = _object(raw_state)
+        pointer = _object(state["pointer"])
+        mrq = _object(state["mrq"])
+        result: dict[str, JsonValue] = {
+            "active_mrq_count": len(_objects(mrq.get("mrq.jsonl", []))),
             "plan_fingerprint": pointer.get("plan_fingerprint"),
             "publication_state": pointer["state"],
             "published": int(pointer["state"] == "active"),
@@ -1348,22 +1614,27 @@ def _form_mrq_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]
                 configured = next(item for item in step_configurations(repo) if item["step"]["id"] == "consolidate-mrq")
                 coordinator_name = next(
                     role["agent_profile"]
-                    for phase in configured["step"]["agent_phases"]
+                    for phase in configured["step"].get("agent_phases", [])
                     for role in phase["roles"]
                     if role["role_id"] == "coordinator"
                 )
                 profile = profiles[coordinator_name]
                 snapshot = input_snapshot(repo)
+                input_context_tokens = profile.get("input_context_tokens")
+                if not isinstance(input_context_tokens, int) or isinstance(input_context_tokens, bool):
+                    raise ValueError("agent profile input_context_tokens must be an integer")
                 manifest = partition_manifest(
                     normalized_records(snapshot),
-                    profile.get("input_context_tokens"),
+                    input_context_tokens,
                     estimator_version=str(profile.get("context_estimator_version", "utf8-v1")),
                 )
+                partitions = manifest["partitions"]
+                pairs = manifest["pairs"]
                 result.update({
                     "input_context_tokens": manifest["input_context_tokens"],
                     "context_estimator_version": manifest["estimator_version"],
-                    "partition_count": len(manifest["partitions"]),
-                    "pair_count": len(manifest["pairs"]),
+                    "partition_count": len(partitions),
+                    "pair_count": len(pairs),
                     "planned_invocation_count": manifest["planned_invocation_count"],
                     "plan_status": "ready",
                 })
@@ -1375,7 +1646,7 @@ def _form_mrq_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]
                 })
             lease = store.lease("consolidate-mrq")
             if lease:
-                result.update(lease.get("summary", {}))
+                result.update(_object(lease.get("summary", {})))
             proposal = next((
                 row for row in reversed(store.proposals())
                 if row.get("job_id") == "consolidate-mrq"
@@ -1383,39 +1654,43 @@ def _form_mrq_aggregates(repo: Path, store: Any | None = None) -> dict[str, Any]
                 and row.get("consumed_at") is None
             ), None)
             if proposal:
-                result.update(proposal["payload"].get("aggregates", {}))
+                payload = _object(proposal["payload"])
+                result.update(_object(payload.get("aggregates", {})))
                 result["approval_pending"] = 1
-                relative = proposal["payload"].get("plan_path")
-                plan_path = store.path.parent / relative if relative else None
+                relative = payload.get("plan_path")
+                plan_path = store.path.parent / relative if isinstance(relative, str) and relative else None
                 if plan_path and plan_path.is_file():
-                    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-                    manifest = plan["partition_manifest"]
+                    plan = parse_json_object(plan_path.read_text(encoding="utf-8"))
+                    manifest = _object(plan["partition_manifest"])
                     result.update({
                         "input_context_tokens": manifest["input_context_tokens"],
                         "context_estimator_version": manifest["estimator_version"],
-                        "partition_count": len(manifest["partitions"]),
-                        "pair_count": len(manifest["pairs"]),
+                        "partition_count": len(json_array(manifest["partitions"])),
+                        "pair_count": len(json_array(manifest["pairs"])),
                         "planned_invocation_count": manifest["planned_invocation_count"],
                     })
-            elif pointer.get("plan_fingerprint"):
+            elif isinstance(pointer.get("plan_fingerprint"), str):
+                plan_fingerprint = str(pointer["plan_fingerprint"])
                 plan_path = (
                     store.path.parent
                     / "consolidation-plans"
-                    / f"{pointer['plan_fingerprint'].removeprefix('sha256:')}.json"
+                    / f"{plan_fingerprint.removeprefix('sha256:')}.json"
                 )
                 if plan_path.is_file():
-                    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                    plan = parse_json_object(plan_path.read_text(encoding="utf-8"))
+                    carryover = _object(plan.get("decision_carryover", {}))
                     result["legacy_decisions_stale"] = len(
-                        plan.get("decision_carryover", {}).get("stale", [])
+                        json_array(carryover.get("stale", []))
                     )
         return result
     except Exception:
         return {"active_mrq_count": 0, "publication_state": "unpublished"}
 
 
-def _classify_aggregates(repo: Path) -> dict[str, Any]:
-    records: list[dict[str, Any]] = []
-    windows: list[list[dict[str, Any]]] = []
+def _classify_aggregates(repo: Path) -> dict[str, JsonValue]:
+    from .mrq_batches import MRQRecord
+    records: list[MRQRecord] = []
+    windows: list[list[MRQRecord]] = []
     try:
         from .mrq_batches import load_active, source_mrq_payload, stable_windows
         _generation_id, _fingerprint, records = source_mrq_payload(repo)
@@ -1439,23 +1714,27 @@ def _classify_aggregates(repo: Path) -> dict[str, Any]:
         }
 
 
-def _decide_aggregates(repo: Path) -> dict[str, Any]:
+def _decide_aggregates(repo: Path) -> dict[str, JsonValue]:
     try:
         from .consolidation import load_active
-        state = load_active(repo)
-        pointer = state["pointer"]
-        rows: list[dict[str, Any]] = []
-        if pointer.get("decision_generation_id"):
+        raw_state: object = load_active(repo)
+        state = _object(raw_state)
+        pointer = _object(state["pointer"])
+        mrq = _object(state["mrq"])
+        mrq_rows = _objects(mrq["mrq.jsonl"])
+        rows: list[dict[str, JsonValue]] = []
+        decision_generation_id = pointer.get("decision_generation_id")
+        if isinstance(decision_generation_id, str):
             from .decision_generations import validate_generation
-            rows = validate_generation(
+            rows = _objects(validate_generation(
                 repo,
-                pointer["decision_generation_id"],
-                allowed_mrq_ids={row["mrq_id"] for row in state["mrq"]["mrq.jsonl"]},
-            )["decisions.jsonl"]
+                decision_generation_id,
+                allowed_mrq_ids={str(row["mrq_id"]) for row in mrq_rows},
+            )["decisions.jsonl"])
         return {
             "decision_count": len(rows),
-            "adapt_count": sum(row["decision"]["decision"] == "adapt" for row in rows),
-            "pending_count": len(state["mrq"]["mrq.jsonl"]) - len(rows),
+            "adapt_count": sum(_object(row["decision"])["decision"] == "adapt" for row in rows),
+            "pending_count": len(mrq_rows) - len(rows),
         }
     except Exception:
         return {"decision_count": 0, "adapt_count": 0, "pending_count": 0}

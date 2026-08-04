@@ -1,25 +1,87 @@
 from __future__ import annotations
 
-import json
 import os
+import importlib
 import tempfile
+from collections.abc import Iterable
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Protocol, TypedDict, runtime_checkable
 
-from .contracts import atomic_json, canonical_json, content_id, repository_lock, sha256
-from .dif_classifications import load_active as load_classifications
-
-
+from .contracts import JsonValue, atomic_json, canonical_json, content_id, json_object, parse_json, parse_json_object, repository_lock, sha256
 POINTER = "research/active-consolidation-generation.json"
 MRQ_FILES = ("mrq.jsonl", "dispositions.jsonl", "evidence.jsonl", "lineage.jsonl")
+JsonObject = dict[str, JsonValue]
 
 
-def fingerprint(value: Any) -> str:
+def _value(value: object) -> JsonValue:
+    return parse_json(canonical_json(value).decode("utf-8"))
+
+
+def _object(value: object) -> JsonObject:
+    return json_object(_value(value))
+
+
+def _objects(value: object) -> list[JsonObject]:
+    normalized = _value(value)
+    if not isinstance(normalized, list) or not all(isinstance(item, dict) for item in normalized):
+        raise ValueError("expected object array")
+    return [item for item in normalized if isinstance(item, dict)]
+
+
+def _strings(value: object) -> list[str]:
+    normalized = _value(value)
+    if not isinstance(normalized, list) or not all(isinstance(item, str) for item in normalized):
+        raise ValueError("expected string array")
+    return [item for item in normalized if isinstance(item, str)]
+
+
+def _integers(value: object) -> list[int]:
+    normalized = _value(value)
+    if not isinstance(normalized, list) or not all(isinstance(item, int) and not isinstance(item, bool) for item in normalized):
+        raise ValueError("expected integer array")
+    return [item for item in normalized if isinstance(item, int) and not isinstance(item, bool)]
+
+
+def _string(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("expected string")
+    return value
+
+
+def _integer(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("expected integer")
+    return value
+
+
+class PartitionManifest(TypedDict):
+    schema_version: str
+    estimator_version: str
+    input_context_tokens: int
+    partitions: list[JsonObject]
+    pairs: list[dict[str, int]]
+    planned_invocation_count: int
+
+
+@runtime_checkable
+class _DecisionGenerations(Protocol):
+    def consolidation_input_fingerprint(self, pointer: object) -> str: ...
+    def validate_generation(self, repo: Path, generation_id: str, *, allowed_mrq_ids: set[str]) -> object: ...
+
+
+def _decision_generations() -> _DecisionGenerations:
+    module = importlib.import_module(".decision_generations", __package__)
+    if not isinstance(module, _DecisionGenerations):
+        raise RuntimeError("invalid decision generations module")
+    return module
+
+
+def fingerprint(value: object) -> str:
     return "sha256:" + sha256(canonical_json(value))
 
 
-def sentinel() -> dict[str, Any]:
+def sentinel() -> JsonObject:
     return {
         "schema_version": "2",
         "state": "unpublished",
@@ -37,10 +99,10 @@ def sentinel() -> dict[str, Any]:
     }
 
 
-def _jsonl(path: Path) -> list[dict[str, Any]]:
+def _jsonl(path: Path) -> list[JsonObject]:
     if not path.is_file():
         raise ValueError(f"missing generation file: {path.name}")
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows = [parse_json_object(line) for line in path.read_text(encoding="utf-8").splitlines()]
     if path.read_bytes() != b"".join(canonical_json(row) + b"\n" for row in rows):
         raise ValueError(f"non-canonical generation file: {path.name}")
     if rows != sorted(rows, key=canonical_json):
@@ -48,15 +110,15 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+def _write_jsonl(path: Path, rows: Iterable[JsonObject]) -> None:
     with path.open("wb") as stream:
         for row in sorted(rows, key=canonical_json):
-            stream.write(canonical_json(row) + b"\n")
+            _ = stream.write(canonical_json(row) + b"\n")
         stream.flush()
         os.fsync(stream.fileno())
 
 
-def _validate_pointer(pointer: dict[str, Any]) -> None:
+def validate_pointer(pointer: JsonObject) -> None:
     if set(pointer) != set(sentinel()) or pointer["schema_version"] != "2" or pointer["state"] not in {"unpublished", "active"}:
         raise ValueError("invalid consolidation pointer")
     active = pointer["state"] == "active"
@@ -78,13 +140,13 @@ def _validate_pointer(pointer: dict[str, Any]) -> None:
 def validate_generation(
     repo: Path,
     generation_id: str,
-    expected_bindings: dict[str, Any],
-) -> dict[str, Any]:
+    expected_bindings: JsonObject,
+) -> JsonObject:
     root = repo / "analysis/migration-requirements/generations" / generation_id
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest = parse_json_object((root / "manifest.json").read_text(encoding="utf-8"))
     rows = {name: _jsonl(root / name) for name in MRQ_FILES}
     hashes = {name: sha256((root / name).read_bytes()) for name in MRQ_FILES}
-    bindings = manifest.get("input_bindings", {})
+    bindings = _object(manifest.get("input_bindings", {}))
     if any(bindings.get(key) != value for key, value in expected_bindings.items()):
         raise ValueError("stale MRQ generation bindings")
     preimage = {
@@ -96,12 +158,12 @@ def validate_generation(
     }
     if manifest != {**preimage, "generation_id": generation_id} or generation_id != sha256(canonical_json(preimage)):
         raise ValueError("invalid MRQ generation manifest")
-    mrq_ids = {row["mrq_id"] for row in rows["mrq.jsonl"]}
-    legacy_ids = set(bindings.get("legacy_identity_ids", []))
+    mrq_ids = {_string(row["mrq_id"]) for row in rows["mrq.jsonl"]}
+    legacy_ids = set(_strings(bindings.get("legacy_identity_ids", [])))
     if len(mrq_ids) != len(rows["mrq.jsonl"]) or any(
         row.get("schema_version") != "3"
         or (
-            row["mrq_id"] != content_id("MRQ-", {"schema_version": "3", "semantic_key": row["semantic_key"]})
+            row["mrq_id"] != content_id("MRQ-", {"schema_version": "3", "semantic_key": _string(row["semantic_key"])})
             and row["mrq_id"] not in legacy_ids
         )
         for row in rows["mrq.jsonl"]
@@ -112,10 +174,12 @@ def validate_generation(
     primary = [row["stable_diff_id"] for row in rows["dispositions.jsonl"] if row.get("primary")]
     if len(primary) != len(set(primary)):
         raise ValueError("duplicate primary DIF disposition")
-    prior_ids = set(bindings.get("prior_ids", []))
+    prior_ids = set(_strings(bindings.get("prior_ids", [])))
     edges: dict[str, set[str]] = {}
     for row in rows["lineage.jsonl"]:
-        kind, sources, targets = row.get("kind"), row.get("source_ids", []), row.get("target_ids", [])
+        kind = row.get("kind")
+        sources = _strings(row.get("source_ids", []))
+        targets = _strings(row.get("target_ids", []))
         if kind not in {"merge", "split", "supersede"} or not set(sources) <= prior_ids or not set(targets) <= mrq_ids:
             raise ValueError("invalid MRQ lineage")
         if kind == "merge" and (len(sources) < 2 or len(targets) != 1):
@@ -127,7 +191,7 @@ def validate_generation(
         for source in sources:
             edges.setdefault(source, set()).update(targets)
     for start in edges:
-        pending = [(start, frozenset())]
+        pending: list[tuple[str, frozenset[str]]] = [(start, frozenset())]
         while pending:
             current, ancestors = pending.pop()
             if current in ancestors:
@@ -136,7 +200,7 @@ def validate_generation(
     return {"manifest": manifest, **rows}
 
 
-def _publish_generation(repo: Path, rows: dict[str, list[dict[str, Any]]], input_bindings: dict[str, Any]) -> str:
+def _publish_generation(repo: Path, rows: dict[str, list[JsonObject]], input_bindings: JsonObject) -> str:
     if set(rows) != set(MRQ_FILES):
         raise ValueError("incomplete MRQ generation")
     parent = repo / "analysis/migration-requirements"
@@ -159,20 +223,22 @@ def _publish_generation(repo: Path, rows: dict[str, list[dict[str, Any]]], input
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
             os.replace(root, destination)
-    validate_generation(repo, generation_id, input_bindings)
+    _ = validate_generation(repo, generation_id, input_bindings)
     return generation_id
 
 
-def load_active(repo: Path, *, allow_legacy: bool = False) -> dict[str, Any]:
+def load_active(repo: Path, *, allow_legacy: bool = False) -> JsonObject:
+    from .dif_classifications import load_active as load_classifications
+
     del allow_legacy
     path = repo / POINTER
-    pointer = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else sentinel()
-    _validate_pointer(pointer)
+    pointer = parse_json_object(path.read_text(encoding="utf-8")) if path.is_file() else sentinel()
+    validate_pointer(pointer)
     if pointer["state"] != "active":
         return {"pointer": pointer, "mrq": {}}
     classifications = load_classifications(repo)
-    source = json.loads((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
-    diff = json.loads((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
+    source = parse_json_object((repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
+    diff = parse_json_object((repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
     bindings = {
         "source_fingerprint": fingerprint(source),
         "diff_fingerprint": fingerprint(diff),
@@ -180,21 +246,23 @@ def load_active(repo: Path, *, allow_legacy: bool = False) -> dict[str, Any]:
     }
     if any(pointer[key] != value for key, value in bindings.items()):
         raise ValueError("active consolidation bindings are stale")
-    mrq = validate_generation(repo, pointer["mrq_generation_id"], bindings)
+    mrq = validate_generation(repo, _string(pointer["mrq_generation_id"]), _object(bindings))
     if pointer.get("decision_generation_id"):
-        from .decision_generations import consolidation_input_fingerprint, validate_generation as validate_decisions
-        validate_decisions(repo, pointer["decision_generation_id"], allowed_mrq_ids={row["mrq_id"] for row in mrq["mrq.jsonl"]})
-        if pointer["decision_input_fingerprint"] != consolidation_input_fingerprint(pointer):
+        decisions = _decision_generations()
+        _ = decisions.validate_generation(repo, _string(pointer["decision_generation_id"]), allowed_mrq_ids={_string(row["mrq_id"]) for row in _objects(mrq["mrq.jsonl"])})
+        if pointer["decision_input_fingerprint"] != decisions.consolidation_input_fingerprint(pointer):
             raise ValueError("stale decision generation binding")
     return {"pointer": pointer, "mrq": mrq}
 
 
-def input_snapshot(repo: Path) -> dict[str, Any]:
+def input_snapshot(repo: Path) -> JsonObject:
+    from .dif_classifications import load_active as load_classifications
+
     classification = load_classifications(repo)
     current = load_active(repo)
     pointer = classification["pointer"]
     from .component_groups import derive
-    return {
+    return _object({
         "source_generation_id": pointer["source_generation_id"],
         "diff_generation_id": pointer["diff_generation_id"],
         "source_fingerprint": pointer["source_fingerprint"],
@@ -204,70 +272,75 @@ def input_snapshot(repo: Path) -> dict[str, Any]:
         "prior_consolidation": current["pointer"],
         "mrq": current["mrq"],
         "component_groups": derive(repo),
-    }
+    })
 
 
-def normalized_records(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+def normalized_records(snapshot: JsonObject) -> list[JsonObject]:
+    component_groups = _objects(snapshot.get("component_groups", []))
+    classifications = _objects(snapshot["classifications"])
+    mrq = _object(snapshot.get("mrq", {}))
+    dispositions = _objects(mrq.get("dispositions.jsonl", []))
     membership = {
-        identifier: {
+        identifier: _object({
             "component_kind": group["component_kind"],
             "component_key": group["component_key"],
             "component_direction": group["direction"],
-        }
-        for group in snapshot.get("component_groups", [])
-        for identifier in group["stable_diff_ids"]
+        })
+        for group in component_groups
+        for identifier in _strings(group["stable_diff_ids"])
     }
-    return [
-        *[{"record_id": row["stable_diff_id"], "record_type": "dif", **row, **membership.get(row["stable_diff_id"], {})} for row in snapshot["classifications"]],
-        *[{
+    records: list[JsonObject] = [
+        _object({"record_id": row["stable_diff_id"], "record_type": "dif", **row, **membership.get(_string(row["stable_diff_id"]), {})}) for row in classifications
+    ]
+    records.extend(_object({
             "record_id": f"component:{group['component_kind']}:{group['component_key']}",
             "record_type": "component_summary",
             "component_kind": group["component_kind"],
             "component_key": group["component_key"],
             "component_direction": group["direction"],
-            "member_count": len(group["stable_diff_ids"]),
+            "member_count": len(_strings(group["stable_diff_ids"])),
             "member_fingerprint": fingerprint(group["stable_diff_ids"]),
-            "page_count": len(group["stable_diff_ids"]),
-        } for group in snapshot.get("component_groups", [])],
-        *[
-            {
+            "page_count": len(_strings(group["stable_diff_ids"])),
+        }) for group in component_groups)
+    records.extend(
+            _object({
                 "record_id": f"component-page:{group['component_kind']}:{group['component_key']}:{index}",
                 "record_type": "component_page",
                 "component_kind": group["component_kind"],
                 "component_key": group["component_key"],
                 "component_direction": group["direction"],
                 "page_index": index,
-                "page_count": len(group["stable_diff_ids"]),
+                "page_count": len(_strings(group["stable_diff_ids"])),
                 "stable_diff_ids": [identifier],
-                "evidence": group["evidence"].get(identifier, []),
-                "target_coverage": group["target_coverage"].get(identifier),
-            }
-            for group in snapshot.get("component_groups", [])
-            for index, identifier in enumerate(group["stable_diff_ids"])
-        ],
-        *[
-            {
+                "evidence": _object(group["evidence"]).get(identifier, []),
+                "target_coverage": _object(group["target_coverage"]).get(identifier),
+            })
+            for group in component_groups
+            for index, identifier in enumerate(_strings(group["stable_diff_ids"]))
+        )
+    records.extend(
+            _object({
                 "record_id": row["mrq_id"],
                 "record_type": "mrq",
                 "mrq_id": row["mrq_id"],
                 "semantic_key": row["semantic_key"],
                 "stable_diff_ids": sorted(
-                    item["stable_diff_id"]
-                    for item in snapshot.get("mrq", {}).get("dispositions.jsonl", [])
+                    _string(item["stable_diff_id"])
+                    for item in dispositions
                     if item.get("mrq_id") == row["mrq_id"] and item.get("primary")
                 ),
-            }
-            for row in snapshot.get("mrq", {}).get("mrq.jsonl", [])
-        ],
-    ]
+            })
+            for row in _objects(mrq.get("mrq.jsonl", []))
+        )
+    return records
 
 
-def partition_manifest(records: list[dict[str, Any]], input_context_tokens: int, *, estimator_version: str = "utf8-v1") -> dict[str, Any]:
+def partition_manifest(records: list[JsonObject], input_context_tokens: object, *, estimator_version: str = "utf8-v1") -> PartitionManifest:
     if not isinstance(input_context_tokens, int) or input_context_tokens <= 4096:
         raise ValueError("consolidation.context_capacity")
     half = ((input_context_tokens - 4096) * 2) // 2
-    partitions: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
+    partitions: list[list[JsonObject]] = []
+    current: list[JsonObject] = []
     size = 0
     for record in sorted(records, key=canonical_json):
         record_size = len(canonical_json(record))
@@ -300,78 +373,92 @@ def partition_manifest(records: list[dict[str, Any]], input_context_tokens: int,
     }
 
 
-def ensure_context_payload(payload: Any, input_context_tokens: int) -> None:
+def ensure_context_payload(payload: object, input_context_tokens: object) -> None:
     if not isinstance(input_context_tokens, int) or input_context_tokens <= 4096 or len(canonical_json(payload)) > (input_context_tokens - 4096) * 2:
         raise ValueError("consolidation.context_capacity")
 
 
-def validate_plan(plan: dict[str, Any]) -> None:
+def validate_plan(plan: JsonObject) -> None:
     required = {
         "schema_version", "bindings", "mrq", "approved_noise", "outcomes",
         "lineage", "coverage_bitmap", "partition_manifest", "decision_carryover",
     }
     if set(plan) != required or plan["schema_version"] != "2":
         raise ValueError("invalid consolidation plan")
-    classifications = {row["stable_diff_id"] for row in plan["bindings"]["classifications"]}
-    primary = [row["stable_diff_id"] for row in plan["mrq"]["dispositions.jsonl"] if row.get("primary")]
-    noise = [row["stable_diff_id"] for row in plan["approved_noise"]]
+    bindings = _object(plan["bindings"])
+    mrq = _object(plan["mrq"])
+    outcomes = _object(plan["outcomes"])
+    partition = _object(plan["partition_manifest"])
+    classifications = {_string(row["stable_diff_id"]) for row in _objects(bindings["classifications"])}
+    primary = [_string(row["stable_diff_id"]) for row in _objects(mrq["dispositions.jsonl"]) if row.get("primary")]
+    noise = [_string(row["stable_diff_id"]) for row in _objects(plan["approved_noise"])]
     if set(primary) & set(noise) or set(primary) | set(noise) != classifications or len(primary) != len(set(primary)):
         raise ValueError("consolidation plan has incomplete or overlapping DIF coverage")
-    mrq_ids = {row["mrq_id"] for row in plan["mrq"]["mrq.jsonl"]}
-    if any(row.get("mrq_id") not in mrq_ids for name in ("dispositions.jsonl", "evidence.jsonl") for row in plan["mrq"][name]):
+    mrq_ids = {_string(row["mrq_id"]) for row in _objects(mrq["mrq.jsonl"])}
+    if any(row.get("mrq_id") not in mrq_ids for name in ("dispositions.jsonl", "evidence.jsonl") for row in _objects(mrq[name])):
         raise ValueError("consolidation plan has dangling MRQ references")
-    if {tuple(row) for row in plan["coverage_bitmap"]} != {
-        (row["left"], row["right"]) for row in plan["partition_manifest"]["pairs"]
-    }:
+    raw_coverage = _value(plan["coverage_bitmap"])
+    if not isinstance(raw_coverage, list):
         raise ValueError("consolidation comparison bitmap is incomplete")
-    buckets = plan["outcomes"]
+    coverage = {tuple(_integers(row)) for row in raw_coverage}
+    pairs = {
+        (_integer(row["left"]), _integer(row["right"])) for row in _objects(partition["pairs"])
+    }
+    if coverage != pairs:
+        raise ValueError("consolidation comparison bitmap is incomplete")
     seen: set[str] = set()
     for name in ("retained", "new", "merged", "split", "superseded", "revalidated"):
-        values = set(buckets.get(name, []))
+        values = set(_strings(outcomes.get(name, [])))
         if seen & values:
             raise ValueError("overlapping MRQ outcomes")
         seen |= values
-    prior_ids = set(plan["bindings"]["prior_mrq_ids"])
-    source_outcomes = set().union(*(set(buckets[name]) for name in ("retained", "revalidated", "merged", "split", "superseded")))
-    targets = {target for row in plan["lineage"] for target in row.get("target_ids", [])}
-    current_ids = {row["mrq_id"] for row in plan["mrq"]["mrq.jsonl"]}
-    if source_outcomes != prior_ids or set(buckets["retained"]) | set(buckets["revalidated"]) | set(buckets["new"]) | targets != current_ids:
+    prior_ids = set(_strings(bindings["prior_mrq_ids"]))
+    source_outcomes: set[str] = set()
+    for name in ("retained", "revalidated", "merged", "split", "superseded"):
+        source_outcomes.update(_strings(outcomes[name]))
+    targets = {target for row in _objects(plan["lineage"]) for target in _strings(row.get("target_ids", []))}
+    current_ids = {_string(row["mrq_id"]) for row in _objects(mrq["mrq.jsonl"])}
+    if source_outcomes != prior_ids or set(_strings(outcomes["retained"])) | set(_strings(outcomes["revalidated"])) | set(_strings(outcomes["new"])) | targets != current_ids:
         raise ValueError("non-exhaustive MRQ outcomes")
 
 
 def plan_from_groups(
-    snapshot: dict[str, Any],
-    groups: list[dict[str, Any]],
-    approved_noise: list[dict[str, Any]],
-    partition: dict[str, Any],
-) -> dict[str, Any]:
-    classified = {row["stable_diff_id"]: row for row in snapshot["classifications"]}
+    snapshot: JsonObject,
+    groups: list[JsonObject],
+    approved_noise: list[JsonObject],
+    partition: JsonObject,
+) -> JsonObject:
+    classifications = _objects(snapshot["classifications"])
+    prior_mrq = _object(snapshot.get("mrq", {}))
+    component_groups = _objects(snapshot.get("component_groups", []))
+    partition_pairs = _objects(partition["pairs"])
+    classified = {_string(row["stable_diff_id"]): row for row in classifications}
     meaning = {key for key, row in classified.items() if row["classification"] == "meaning"}
     noise = {key for key, row in classified.items() if row["classification"] == "noise_candidate"}
     if {str(row.get("stable_diff_id", "")) for row in approved_noise} != noise:
         raise ValueError("every noise candidate requires explicit consolidation approval")
-    prior = snapshot.get("mrq", {}).get("mrq.jsonl", [])
-    prior_by_semantic = {row.get("semantic_key"): row for row in prior}
-    old_ids = {row["mrq_id"] for row in prior}
-    mrqs: list[dict[str, Any]] = []
-    dispositions: list[dict[str, Any]] = []
-    evidence_rows: list[dict[str, Any]] = []
-    lineage: list[dict[str, Any]] = []
+    prior = _objects(prior_mrq.get("mrq.jsonl", []))
+    prior_by_semantic = {_string(row["semantic_key"]): row for row in prior}
+    old_ids = {_string(row["mrq_id"]) for row in prior}
+    mrqs: list[JsonObject] = []
+    dispositions: list[JsonObject] = []
+    evidence_rows: list[JsonObject] = []
+    lineage: list[JsonObject] = []
     assigned: set[str] = set()
     merged_sources: set[str] = set()
     merge_targets: set[str] = set()
     split_targets: dict[str, list[str]] = {}
     component_membership = {
         identifier: f"{group['component_kind']}:{group['component_key']}"
-        for group in snapshot.get("component_groups", [])
-        for identifier in group["stable_diff_ids"]
+        for group in component_groups
+        for identifier in _strings(group["stable_diff_ids"])
     }
     for group in sorted(groups, key=lambda row: str(row.get("semantic_key", ""))):
         semantic_key = str(group.get("semantic_key", "")).strip()
-        members = sorted(set(group.get("stable_diff_ids", [])))
+        members = sorted(set(_strings(group.get("stable_diff_ids", []))))
         if not semantic_key or not members or any(member not in meaning or member in assigned for member in members):
             raise ValueError("invalid or overlapping consolidation group")
-        supporting = sorted(set(group.get("supporting_diff_ids", [])) - set(members))
+        supporting = sorted(set(_strings(group.get("supporting_diff_ids", []))) - set(members))
         if any(identifier not in classified for identifier in supporting):
             raise ValueError("unknown supporting DIF")
         component_keys = sorted({
@@ -380,14 +467,13 @@ def plan_from_groups(
             if identifier in component_membership
         })
         if len(component_keys) > 1:
-            evidence = group.get("evidence", [])
+            evidence = _objects(group.get("evidence", []))
             if (
                 group.get("component_keys") != component_keys
                 or not str(group.get("rationale", "")).strip()
                 or not evidence
                 or any(
-                    not isinstance(item, dict)
-                    or not str(item.get("path", "")).strip()
+                    not str(item.get("path", "")).strip()
                     or not str(item.get("fingerprint", "")).startswith("sha256:")
                     for item in evidence
                 )
@@ -409,7 +495,7 @@ def plan_from_groups(
         )
         for member in members:
             dispositions.append({"schema_version": "3", "mrq_id": mrq_id, "stable_diff_id": member, "primary": True})
-            for index, evidence in enumerate(classified[member]["evidence"]):
+            for index, evidence in enumerate(_objects(classified[member]["evidence"])):
                 evidence_rows.append({
                     "schema_version": "3",
                     "evidence_id": content_id("EVD-", {"mrq": mrq_id, "dif": member, "index": index, "evidence": evidence}),
@@ -419,7 +505,7 @@ def plan_from_groups(
                 })
         for member in supporting:
             dispositions.append({"schema_version": "3", "mrq_id": mrq_id, "stable_diff_id": member, "primary": False})
-            for index, evidence in enumerate(classified[member]["evidence"]):
+            for index, evidence in enumerate(_objects(classified[member]["evidence"])):
                 evidence_rows.append({
                     "schema_version": "3",
                     "evidence_id": content_id("EVD-", {"mrq": mrq_id, "dif": member, "index": index, "evidence": evidence}),
@@ -427,7 +513,7 @@ def plan_from_groups(
                     "stable_diff_id": member,
                     "payload": evidence,
                 })
-        sources = sorted(set(group.get("source_mrq_ids", [])))
+        sources = sorted(set(_strings(group.get("source_mrq_ids", []))))
         if sources:
             if len(sources) < 2:
                 raise ValueError("MRQ merge requires at least two sources")
@@ -440,14 +526,14 @@ def plan_from_groups(
         assigned.update(members)
     if assigned != meaning:
         raise ValueError("consolidation groups do not cover every meaning DIF")
-    new_ids = {row["mrq_id"] for row in mrqs}
+    new_ids = {_string(row["mrq_id"]) for row in mrqs}
     for source, targets in split_targets.items():
         if source not in old_ids or len(set(targets)) < 2:
             raise ValueError("MRQ split requires one active source and at least two targets")
         lineage.append({"domain": "mrq", "kind": "split", "source_ids": [source], "target_ids": sorted(set(targets))})
     superseded = (old_ids - new_ids) - merged_sources - set(split_targets)
     lineage.extend({"domain": "mrq", "kind": "supersede", "source_ids": [identifier], "target_ids": []} for identifier in sorted(superseded))
-    plan = {
+    plan: object = {
         "schema_version": "2",
         "bindings": {
             "source_fingerprint": snapshot["source_fingerprint"],
@@ -485,26 +571,29 @@ def plan_from_groups(
         },
         "lineage": lineage,
         "decision_carryover": {"carried": [], "stale": []},
-        "coverage_bitmap": [[row["left"], row["right"]] for row in partition["pairs"]],
+        "coverage_bitmap": [[row["left"], row["right"]] for row in partition_pairs],
         "partition_manifest": partition,
     }
-    validate_plan(plan)
-    return plan
+    normalized_plan = _object(plan)
+    validate_plan(normalized_plan)
+    return normalized_plan
 
 
-def store_plan(root: Path, plan: dict[str, Any]) -> tuple[str, Path]:
+def store_plan(root: Path, plan: JsonObject) -> tuple[str, Path]:
     validate_plan(plan)
     plan_fingerprint = fingerprint(plan)
     path = root / "consolidation-plans" / f"{plan_fingerprint.removeprefix('sha256:')}.json"
-    if path.is_file() and fingerprint(json.loads(path.read_text(encoding="utf-8"))) != plan_fingerprint:
+    if path.is_file() and fingerprint(parse_json_object(path.read_text(encoding="utf-8"))) != plan_fingerprint:
         raise ValueError("consolidation.plan_storage")
     atomic_json(path, plan)
     return plan_fingerprint, path
 
 
-def approve_plan(repo: Path, plan: dict[str, Any], expected_pointer: dict[str, Any], approval: dict[str, Any]) -> dict[str, Any]:
+def approve_plan(repo: Path, plan: JsonObject, expected_pointer: JsonObject, approval: JsonObject) -> JsonObject:
     validate_plan(plan)
     plan_fingerprint = fingerprint(plan)
+    plan_bindings = _object(plan["bindings"])
+    plan_mrq = _object(plan["mrq"])
     fields = {
         "schema_version", "kind", "actor", "rationale", "evidence",
         "source_fingerprint", "diff_fingerprint", "classification_fingerprint",
@@ -517,36 +606,37 @@ def approve_plan(repo: Path, plan: dict[str, Any], expected_pointer: dict[str, A
         or not str(approval["actor"]).strip()
         or not str(approval["rationale"]).strip()
         or approval["plan_fingerprint"] != plan_fingerprint
-        or any(approval[key] != plan["bindings"][key] for key in (
+        or any(approval[key] != plan_bindings[key] for key in (
             "source_fingerprint", "diff_fingerprint", "classification_fingerprint", "prior_mrq_fingerprint"
         ))
     ):
         raise ValueError("invalid or stale consolidation approval")
     with repository_lock(repo):
         path = repo / POINTER
-        current = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else sentinel()
-        _validate_pointer(current)
+        current = parse_json_object(path.read_text(encoding="utf-8")) if path.is_file() else sentinel()
+        validate_pointer(current)
         if current.get("plan_fingerprint") == plan_fingerprint:
             return current
         if current != expected_pointer:
             raise RuntimeError("stale consolidation inputs")
         snapshot = input_snapshot(repo)
-        if any(plan["bindings"][key] != snapshot[key] for key in ("source_fingerprint", "diff_fingerprint", "classification_fingerprint")):
+        if any(plan_bindings[key] != snapshot[key] for key in ("source_fingerprint", "diff_fingerprint", "classification_fingerprint")):
             raise RuntimeError("stale consolidation inputs")
-        if plan["bindings"]["prior_mrq_fingerprint"] != fingerprint(snapshot.get("mrq", {})):
+        if plan_bindings["prior_mrq_fingerprint"] != fingerprint(snapshot.get("mrq", {})):
             raise RuntimeError("stale consolidation graph inputs")
         bindings = {
             key: snapshot[key]
             for key in ("source_fingerprint", "diff_fingerprint", "classification_fingerprint")
         }
-        generation_id = _publish_generation(repo, plan["mrq"], {
+        generation_rows = {name: _objects(plan_mrq[name]) for name in MRQ_FILES}
+        generation_id = _publish_generation(repo, generation_rows, _object({
             **bindings,
             "prior_generation_id": current.get("mrq_generation_id"),
-            "prior_ids": plan["bindings"]["prior_mrq_ids"],
+            "prior_ids": plan_bindings["prior_mrq_ids"],
             "legacy_identity_ids": [],
-        })
+        }))
         changed = generation_id != current.get("mrq_generation_id")
-        pointer = {
+        pointer = _object({
             **sentinel(),
             "state": "active",
             "mrq_generation_id": generation_id,
@@ -558,7 +648,7 @@ def approve_plan(repo: Path, plan: dict[str, Any], expected_pointer: dict[str, A
             "batch_input_fingerprint": None if changed else current.get("batch_input_fingerprint"),
             "decision_generation_id": None if changed else current.get("decision_generation_id"),
             "decision_input_fingerprint": None if changed else current.get("decision_input_fingerprint"),
-        }
+        })
         atomic_json(path, pointer)
         return pointer
 
@@ -572,17 +662,17 @@ def replace_downstream_binding(
     expected_transaction_id: str,
     expected_generation_id: str | None = None,
     already_locked: bool = False,
-) -> dict[str, Any]:
+) -> JsonObject:
     if kind not in {"batch", "decision"}:
         raise ValueError("unknown downstream binding")
     with (nullcontext() if already_locked else repository_lock(repo)):
-        current = load_active(repo)["pointer"]
+        current = _object(load_active(repo)["pointer"])
         if current["transaction_id"] != expected_transaction_id or current.get(f"{kind}_generation_id") != expected_generation_id:
             raise RuntimeError(f"stale {kind} generation")
-        updated = {
+        updated = _object({
             **current,
             f"{kind}_generation_id": generation_id,
             f"{kind}_input_fingerprint": input_fingerprint,
-        }
+        })
         atomic_json(repo / POINTER, updated)
         return updated

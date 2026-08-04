@@ -22,7 +22,6 @@ ACTIVE_DOCS = {
 TYPE_CHECK_CONFIG = {
     "include": ["src/one_c_autoresearch"],
     "pythonVersion": "3.11",
-    "baselineFile": ".basedpyright/baseline.json",
 }
 
 
@@ -88,6 +87,8 @@ def check(root: Path) -> list[str]:
         project = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
         if project.get("tool", {}).get("basedpyright") != TYPE_CHECK_CONFIG:
             errors.append(f"BasedPyright policy mismatch: {project_root.relative_to(root) or '.'}")
+        if (project_root / ".basedpyright" / "baseline.json").exists():
+            errors.append(f"BasedPyright baseline is forbidden: {project_root.relative_to(root) or '.'}")
         if project.get("dependency-groups", {}).get("dev") != ["basedpyright==1.39.9"]:
             errors.append(f"BasedPyright version mismatch: {project_root.relative_to(root) or '.'}")
         for path in (project_root / ROOT_RUNTIME).rglob("*.py"):

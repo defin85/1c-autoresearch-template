@@ -1,19 +1,143 @@
 from __future__ import annotations
 
 import json
+import importlib
 import tomllib
-from copy import deepcopy
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
-from typing import Any
+from collections.abc import Callable, Iterable
+from typing import Protocol, TypedDict, final, runtime_checkable
 
 from . import diffs, indexes, mrq, sources, workflow
-from .contracts import atomic_bytes, atomic_json, canonical_json, confined, reject_secrets, repository_lock, sha256
+from .contracts import ROLES, JsonValue, atomic_bytes, atomic_json, canonical_json, json_object, parse_json, parse_json_object, reject_secrets, repository_lock, sha256
 
 
+JsonObject = dict[str, JsonValue]
+Handler = Callable[[JsonObject], JsonObject]
+
+
+class Staged(TypedDict, total=False):
+    source: sources.SourcePointer
+    diff: diffs.DiffPointer
+
+
+@runtime_checkable
+class _StageRecompute(Protocol):
+    def active_pointers(self, repo: Path, *, recover: bool = True) -> dict[str, JsonObject | None]: ...
+
+
+@runtime_checkable
+class _SourceAcquirer(Protocol):
+    def acquire(self, repo: Path, platform: Path, connections: dict[str, sources.ConnectionProfile], *, routing_preview: JsonObject, timeout_seconds: int, upload_drafts: Path | None, cancelled: sources.CancelCallback | None, progress: sources.ProgressCallback | None, activate: bool) -> sources.SourcePointer: ...
+
+
+def _active_pointers(repo: Path) -> dict[str, JsonObject | None]:
+    module = importlib.import_module(".stage_recompute", __package__)
+    if not isinstance(module, _StageRecompute):
+        raise RuntimeError("invalid stage recompute module")
+    return module.active_pointers(repo)
+
+
+def _objects(value: JsonValue) -> list[JsonObject]:
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError("expected object array")
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _strings(value: JsonValue) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("expected string array")
+    return [item for item in value if isinstance(item, str)]
+
+
+def _string(value: JsonValue) -> str:
+    if not isinstance(value, str):
+        raise ValueError("expected string")
+    return value
+
+
+def _integer(value: JsonValue) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("expected integer")
+    return value
+
+
+def _json(value: object) -> JsonObject:
+    return json_object(value)
+
+
+def _value(value: object) -> JsonValue:
+    return parse_json(canonical_json(value).decode("utf-8"))
+
+
+def _index_candidate(value: JsonValue) -> indexes.ConfigCandidate:
+    source = json_object(value)
+    result: indexes.ConfigCandidate = {}
+    for key in ("schema_version", "machine_contract_version"):
+        if key in source:
+            result[key] = _string(source[key])
+    if "backends" in source:
+        backends: list[indexes.BackendRow] = []
+        for row in _objects(source["backends"]):
+            backends.append({"adapter_id": _string(row.get("adapter_id")), "engine_version": _string(row.get("engine_version"))})
+        result["backends"] = backends
+    if "routes" in source:
+        result["routes"] = {name: _strings(route) for name, route in json_object(source["routes"]).items()}
+    if "service_profiles" in source:
+        result["service_profiles"] = {name: _string(profile) for name, profile in json_object(source["service_profiles"]).items()}
+    return result
+
+
+def _backend_state(value: JsonObject) -> indexes.BackendState:
+    result: indexes.BackendState = {}
+    if "adapter_id" in value: result["adapter_id"] = _string(value["adapter_id"])
+    if "component_id" in value: result["component_id"] = _string(value["component_id"])
+    if "status" in value: result["status"] = _string(value["status"])
+    if "modality" in value: result["modality"] = _string(value["modality"])
+    if "adapter_version" in value: result["adapter_version"] = _string(value["adapter_version"])
+    if "capability_fingerprint" in value: result["capability_fingerprint"] = _string(value["capability_fingerprint"])
+    if "index_fingerprint" in value: result["index_fingerprint"] = _string(value["index_fingerprint"])
+    if "target_fingerprint" in value: result["target_fingerprint"] = _string(value["target_fingerprint"])
+    if "contract_version" in value: result["contract_version"] = _string(value["contract_version"])
+    if "index_key" in value: result["index_key"] = _string(value["index_key"])
+    if "instance_path" in value: result["instance_path"] = _string(value["instance_path"])
+    if "index_dir" in value: result["index_dir"] = _string(value["index_dir"])
+    if "embedding_identity" in value: result["embedding_identity"] = _string(value["embedding_identity"])
+    if "reference_identity" in value: result["reference_identity"] = _string(value["reference_identity"])
+    if "validated_at" in value: result["validated_at"] = _string(value["validated_at"])
+    if "capabilities" in value:
+        result["capabilities"] = _strings(value["capabilities"])
+    if "legacy_adopted" in value:
+        legacy = value["legacy_adopted"]
+        if not isinstance(legacy, bool):
+            raise ValueError("expected boolean")
+        result["legacy_adopted"] = legacy
+    if "last_validation" in value: result["last_validation"] = None if value["last_validation"] is None else _string(value["last_validation"])
+    if "readiness_reason" in value: result["readiness_reason"] = None if value["readiness_reason"] is None else _string(value["readiness_reason"])
+    if "recovery_action" in value: result["recovery_action"] = None if value["recovery_action"] is None else _string(value["recovery_action"])
+    return result
+
+
+def _diff_source_pointer(value: sources.SourcePointer) -> diffs.SourcePointer:
+    result: diffs.SourcePointer = {}
+    for key in (
+        "schema_version", "generation_id", "acquisition_profile_id",
+        "representation_schema", "normalizer_version", "routing_manifest_path",
+        "routing_manifest_fingerprint", "source_comparison_epoch_fingerprint",
+    ):
+        if key in value:
+            result[key] = _string(value.get(key))
+    if "components" in value:
+        result["components"] = value["components"]
+    return result
+
+
+@final
 class ApplicationService:
-    def __init__(self, repo: Path, rlm_executable: str | None = None, connections: dict[str, dict[str, Any]] | None = None, upload_drafts: Path | None = None, routing_previews: Path | None = None, progress: callable | None = None, agent_profiles: dict[str, dict[str, Any]] | None = None):
+    progress: sources.ProgressCallback | None = None
+
+    def __init__(self, repo: Path, rlm_executable: str | None = None, connections: dict[str, sources.ConnectionProfile] | None = None, upload_drafts: Path | None = None, routing_previews: Path | None = None, progress: sources.ProgressCallback | None = None, agent_profiles: dict[str, JsonObject] | None = None):
         self.repo = repo.resolve()
         self.rlm_executable = rlm_executable or indexes.discover_executable(self.repo)
         self.connections = connections
@@ -21,36 +145,46 @@ class ApplicationService:
         self.routing_previews = routing_previews
         self.agent_profiles = agent_profiles
         self.progress = progress
-        workflow.validate_workflow(self.repo)
+        self._expected_fingerprint = ""
+        self._cancelled: sources.CancelCallback | None = None
+        self._staged: Staged | None = None
+        self._fence: Callable[[], None] | None = None
+        _ = workflow.validate_workflow(self.repo)
 
     def _required_index_capabilities(self) -> tuple[str, ...]:
         if self.agent_profiles is None:
             return tuple(indexes.CAPABILITIES)
         from .source_search import OPERATIONS
-        assigned = {
-            role["agent_profile"]
-            for row in workflow.step_configurations(self.repo)
-            for phase in row["step"].get("agent_phases", [])
-            for role in phase["roles"]
-        }
+        assigned: set[str] = set()
+        configurations: Iterable[object] = workflow.step_configurations(self.repo)
+        for row_value in configurations:
+            row = json_object(_value(row_value))
+            step = json_object(row.get("step"))
+            for phase in _objects(step.get("agent_phases", [])):
+                for role in _objects(phase.get("roles", [])):
+                    assigned.add(_string(role.get("agent_profile")))
+        operations: set[str] = set()
+        for name in assigned:
+            profile = self.agent_profiles.get(name, {})
+            source_search = json_object(profile.get("source_search", {}))
+            operations.update(_strings(source_search.get("operations", [])))
         return tuple(sorted({
             OPERATIONS[operation]
-            for name in assigned
-            for operation in (
-                self.agent_profiles.get(name, {}).get("source_search") or {}
-            ).get("operations", [])
+            for operation in operations
             if operation in OPERATIONS
         }))
 
-    def snapshot(self, *, deep: bool = True) -> dict[str, Any]:
-        snapshot = workflow.status(self.repo, deep=deep)
+    def snapshot(self, *, deep: bool = True) -> JsonObject:
+        snapshot = _json(_value(workflow.status(self.repo, deep=deep)))
         if not self.connections:
             return snapshot
         scope = sources.extension_scope_status(self.repo, self.connections)
-        snapshot["extension_scope_blockers"] = scope["blockers"]
-        if scope["ready"] or snapshot["gates"][0]["state"] != "complete":
+        blockers = _objects(_value(scope["blockers"]))
+        snapshot["extension_scope_blockers"] = blockers
+        gates = _objects(snapshot["gates"])
+        if scope["ready"] or gates[0]["state"] != "complete":
             return snapshot
-        snapshot["gates"][1] = {
+        gates[1] = {
             "id": "sources-acquired",
             "state": "ready",
             "blockers": [
@@ -58,16 +192,17 @@ class ApplicationService:
                     **blocker,
                     "message": f"extension {blocker['uuid']} requires an explicit include or exclude decision",
                 }
-                for blocker in scope["blockers"]
+                for blocker in blockers
             ],
         }
-        for gate in snapshot["gates"][2:]:
+        for gate in gates[2:]:
             gate["state"] = "blocked"
             gate["blockers"] = [{
                 "code": "predecessor.blocked",
                 "message": "a predecessor gate is incomplete",
                 "action": "",
             }]
+        snapshot["gates"] = gates
         snapshot["state"] = "ready"
         return snapshot
 
@@ -78,21 +213,21 @@ class ApplicationService:
         limit: int = 100,
         expected_generation: str = "",
         item_id: str = "",
-    ) -> dict[str, Any]:
+    ) -> JsonObject:
         allowed = {"diff-inventory", "target-coverage", "mrq", "extension-diff", "extension-dependencies", "extension-path-coverage", "extension-physical-diff"}
         if name not in allowed or offset < 0 or not 1 <= limit <= 500:
             raise ValueError("invalid registry page")
         generation_id = ""
         if name == "mrq":
             from .consolidation import load_active
-            state = load_active(self.repo)
-            generation_id = str(state["pointer"].get("mrq_generation_id", ""))
+            state: JsonObject = load_active(self.repo)
+            generation_id = str(json_object(state["pointer"]).get("mrq_generation_id", ""))
             if expected_generation and expected_generation != generation_id:
                 raise RuntimeError("stale MRQ generation")
-            mrqs = state["mrq"].get("mrq.jsonl", [])
+            mrqs = _objects(json_object(state["mrq"]).get("mrq.jsonl", []))
             rows = mrqs if item_id else mrqs[offset : offset + limit + 1]
         else:
-            pointer = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
+            pointer = parse_json_object((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
             generation_id = str(pointer.get("generation_id", ""))
             if expected_generation and expected_generation != generation_id:
                 raise RuntimeError("stale diff generation")
@@ -106,7 +241,7 @@ class ApplicationService:
                 elif suffix == ".jsonl":
                     with path.open(encoding="utf-8") as stream:
                         rows = [
-                            json.loads(line)
+                            parse_json_object(line)
                             for line in (
                                 (line for line in stream if line.strip())
                                 if item_id
@@ -117,7 +252,7 @@ class ApplicationService:
                     import csv
                     with path.open(encoding="utf-8", newline="") as stream:
                         reader = csv.DictReader(stream)
-                        rows = list(reader if item_id else islice(reader, offset, offset + limit + 1))
+                        rows = [_json(row) for row in (reader if item_id else islice(reader, offset, offset + limit + 1))]
         if item_id:
             identifier_fields = {
                 "diff-inventory": ("stable_diff_id",),
@@ -136,38 +271,36 @@ class ApplicationService:
             "has_more": len(rows) > limit,
         }
 
-    def next(self) -> dict[str, Any] | None:
+    def next(self) -> JsonObject | None:
         snapshot = self.snapshot()
-        if snapshot.get("extension_scope_blockers"):
-            blocker = snapshot["extension_scope_blockers"][0]
+        scope_blockers = _objects(snapshot.get("extension_scope_blockers", []))
+        if scope_blockers:
+            blocker = scope_blockers[0]
             return {
                 "gate_id": "sources-acquired",
                 "action": blocker["action"],
                 "blocker": blocker,
                 "workflow_fingerprint": snapshot["workflow_fingerprint"],
             }
-        canonical = workflow.next_work(self.repo)
+        canonical: JsonObject | None = workflow.next_work(self.repo)
         if canonical and canonical["action"] in {"mrq.discover-next", "mrq.decide-next"}:
             components = indexes.discover(self.repo)
             if components:
-                statuses = indexes.backend_statuses(self.repo)
+                statuses = [_backend_state(row) for row in indexes.backend_statuses(self.repo)]
                 config = indexes.load_config(self.repo)
                 profiles = getattr(self, "agent_profiles", None)
                 if profiles is not None:
                     required = set(self._required_index_capabilities())
-                    config = {
-                        **config,
-                        "routes": {
-                            capability: route
-                            for capability, route in config["routes"].items()
-                            if capability in required
-                        },
+                    config["routes"] = {
+                        capability: route
+                        for capability, route in config["routes"].items()
+                        if capability in required
                     }
                 coverage = indexes.route_coverage(config, components, statuses)
                 if coverage["blockers"]:
                     pending = coverage["blockers"]
                     work_unit = {
-                        **(canonical.get("work_unit") or {}),
+                        **json_object(canonical.get("work_unit", {})),
                         "component_ids": sorted({item["component_id"] for item in pending}),
                         "backend_ids": sorted({
                             adapter_id
@@ -189,45 +322,46 @@ class ApplicationService:
                     }
         return canonical
 
-    def index_statuses(self) -> list[dict[str, Any]]:
-        return indexes.backend_statuses(self.repo)
+    def index_statuses(self) -> list[JsonObject]:
+        return [_json(row) for row in indexes.backend_statuses(self.repo)]
 
-    def workflow_configuration(self) -> dict[str, Any]:
-        manifest = workflow.validate_workflow(self.repo)
-        return {"manifest_fingerprint": workflow.workflow_fingerprint(self.repo), "jobs": [{"id": job["id"], "needs": job["needs"]} for job in manifest["jobs"]], "steps": workflow.step_configurations(self.repo)}
+    def workflow_configuration(self) -> JsonObject:
+        manifest = _json(_value(workflow.validate_workflow(self.repo)))
+        jobs = _objects(manifest["jobs"])
+        configurations: Iterable[object] = workflow.step_configurations(self.repo)
+        return {"manifest_fingerprint": workflow.workflow_fingerprint(self.repo), "jobs": [{"id": job["id"], "needs": _value(job["needs"])} for job in jobs], "steps": [_json(_value(item)) for item in configurations]}
 
-    def preview_step_patch(self, payload: dict[str, Any], state_base: Path | None = None) -> dict[str, Any]:
+    def preview_step_patch(self, payload: JsonObject, state_base: Path | None = None) -> JsonObject:
         if set(payload) != {"step_id", "parameters", "expected_manifest_fingerprint"}:
             raise ValueError("invalid workflow step patch")
-        return workflow.preview_step_patch(self.repo, payload["step_id"], payload["parameters"], payload["expected_manifest_fingerprint"], state_base)
+        parameters: dict[str, object] = dict(json_object(payload["parameters"]))
+        return _json(_value(workflow.preview_step_patch(self.repo, _string(payload["step_id"]), parameters, _string(payload["expected_manifest_fingerprint"]), state_base)))
 
-    def preview_index_configuration(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def preview_index_configuration(self, payload: JsonObject) -> JsonObject:
         if set(payload) != {"configuration", "expected_file_fingerprint"}:
             raise ValueError("invalid indexing configuration preview")
-        if payload["configuration"].get("schema_version") == "3":
-            return indexes.preview_schema3_migration(
+        configuration = _index_candidate(payload["configuration"])
+        if configuration.get("schema_version") == "3":
+            return _json(indexes.preview_schema3_migration(
                 self.repo,
-                payload["configuration"],
+                configuration,
                 str(payload["expected_file_fingerprint"]),
                 self._schema3_profile_operations(),
-            )
-        return indexes.preview_config(
+            ))
+        return _json(indexes.preview_config(
             self.repo,
-            payload["configuration"],
+            configuration,
             str(payload["expected_file_fingerprint"]),
             self._required_index_capabilities(),
-        )
+        ))
 
     def _schema3_profile_operations(self) -> dict[str, list[str]]:
         from .source_search import V2_OPERATIONS, normalize_operation
-        operations = sorted({
-            normalize_operation(operation)
-            for profile in (self.agent_profiles or {}).values()
-            for operation in (profile.get("source_search") or {}).get(
-                "operations", []
-            )
-            if normalize_operation(operation) in V2_OPERATIONS
-        })
+        configured: set[str] = set()
+        for profile in (self.agent_profiles or {}).values():
+            source_search = json_object(profile.get("source_search", {}))
+            configured.update(_strings(source_search.get("operations", [])))
+        operations = sorted({normalize_operation(operation) for operation in configured if normalize_operation(operation) in V2_OPERATIONS})
         if not operations:
             operations = sorted(V2_OPERATIONS)
         return {
@@ -241,7 +375,7 @@ class ApplicationService:
             ] or ["code.search_hybrid"],
         }
 
-    def apply(self, operation: str, payload: dict[str, Any], expected_fingerprint: str, cancelled: callable | None = None, *, staged: dict[str, dict[str, Any]] | None = None, fence: callable | None = None) -> dict[str, Any]:
+    def apply(self, operation: str, payload: JsonObject, expected_fingerprint: str, cancelled: sources.CancelCallback | None = None, *, staged: Staged | None = None, fence: Callable[[], None] | None = None) -> JsonObject:
         from .workflow_migration import guard_mutation
         guard_mutation(self.repo)
         reject_secrets(payload, "operation payload")
@@ -263,7 +397,7 @@ class ApplicationService:
         self._cancelled = cancelled
         self._staged = staged
         self._fence = fence
-        handlers = {
+        handlers: dict[str, Handler] = {
             "project.configure": self._configure,
             "sources.configure": lambda value: self._locked(self._configure_sources, value),
             "sources.acquire": self._acquire_sources,
@@ -281,23 +415,23 @@ class ApplicationService:
             raise ValueError(f"unsupported typed operation: {operation}") from exc
         return handler(payload)
 
-    def _verify_workflow(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _verify_workflow(self, payload: JsonObject) -> JsonObject:
         if payload:
             raise ValueError("workflow.verify takes no parameters")
         from .doctor import check
         result = check(self.repo, strict=True)
         if not result["ok"]:
             raise RuntimeError(json.dumps({"code": "workflow.verify.failed", "blockers": result["failures"]}, ensure_ascii=False, sort_keys=True))
-        return result
+        return _json(result)
 
-    def _locked(self, handler, payload: dict[str, Any]) -> dict[str, Any]:
+    def _locked(self, handler: Handler, payload: JsonObject) -> JsonObject:
         with repository_lock(self.repo):
             if workflow.state_fingerprint(self.repo) != self._expected_fingerprint:
                 raise RuntimeError("stale workflow fingerprint")
             result = handler(payload)
             return {**result, "workflow_fingerprint": workflow.state_fingerprint(self.repo)}
 
-    def _configure(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _configure(self, payload: JsonObject) -> JsonObject:
         allowed = {"product", "baseline_version", "target_version", "next_vendor_version", "description"}
         if set(payload) - allowed or any(not str(payload.get(key, "")).strip() for key in ("product", "baseline_version", "target_version", "next_vendor_version")):
             raise ValueError("invalid project configuration patch")
@@ -313,7 +447,7 @@ class ApplicationService:
             atomic_bytes(path, text.encode())
         return {"operation": "project.configure", "project_fingerprint": "sha256:" + sha256(path.read_bytes())}
 
-    def _acquire_sources(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _acquire_sources(self, payload: JsonObject) -> JsonObject:
         if set(payload) - {"timeout_seconds", "source_routing_preview_id", "routing_plan_fingerprint"}:
             raise ValueError("invalid source acquisition payload")
         if not self.connections:
@@ -328,25 +462,35 @@ class ApplicationService:
         preview_path = self.routing_previews / f"{preview_id}.json"
         if not preview_path.is_file():
             raise RuntimeError("routing_preview_stale")
-        preview = json.loads(preview_path.read_text(encoding="utf-8"))
+        preview = parse_json_object(preview_path.read_text(encoding="utf-8"))
         from .user_state import workspace_id
         if preview.get("project_id") != workspace_id(self.repo) or preview.get("status") != "ready" or preview.get("routing_plan_fingerprint") != payload.get("routing_plan_fingerprint"):
             raise RuntimeError("routing_preview_stale")
         if datetime.fromisoformat(str(preview.get("expires_at", ""))) <= datetime.now(timezone.utc):
             raise RuntimeError("routing_preview_stale")
-        result = sources.acquire(self.repo, platform, self.connections, routing_preview=preview, timeout_seconds=int(payload.get("timeout_seconds", 1800)), upload_drafts=self.upload_drafts, cancelled=self._cancelled, progress=getattr(self, "progress", None), activate=self._staged is None)
+        if not isinstance(sources, _SourceAcquirer):
+            raise RuntimeError("invalid source acquisition module")
+        result = sources.acquire(self.repo, platform, self.connections, routing_preview=preview, timeout_seconds=_integer(payload.get("timeout_seconds", 1800)), upload_drafts=self.upload_drafts, cancelled=self._cancelled, progress=self.progress, activate=self._staged is None)
         if self._staged is not None:
             self._staged["source"] = result
-        return result
+        return _json(result)
 
-    def _configure_sources(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _configure_sources(self, payload: JsonObject) -> JsonObject:
         external_keys = {"external_artifact_preview_id", "selected_entries", "expected_declaration_fingerprint", "expected_draft_fingerprint", "confirm"}
         if set(payload) == external_keys:
             if payload["confirm"] is not True or self.upload_drafts is None:
                 raise ValueError("invalid external artifact source setup patch")
             from .external_folder import PreviewStore
+            from .external_folder import Selection
             store = PreviewStore(self.repo, self.upload_drafts.parent / "external-folder-previews", self.upload_drafts)
-            return {"operation": "sources.configure", "comparison_epoch_changed": False, **store.confirm(payload["external_artifact_preview_id"], payload["selected_entries"], workflow_fingerprint=self._expected_fingerprint, expected_declaration_fingerprint=payload["expected_declaration_fingerprint"], expected_draft_fingerprint=payload["expected_draft_fingerprint"])}
+            selection: list[Selection] = []
+            for row in _objects(payload["selected_entries"]):
+                item: Selection = {}
+                if "entry_id" in row: item["entry_id"] = _string(row["entry_id"])
+                if "role" in row: item["role"] = _string(row["role"])
+                if "semantic_key" in row: item["semantic_key"] = _string(row["semantic_key"])
+                selection.append(item)
+            return _json({"operation": "sources.configure", "comparison_epoch_changed": False, **store.confirm(_string(payload["external_artifact_preview_id"]), selection, workflow_fingerprint=self._expected_fingerprint, expected_declaration_fingerprint=_string(payload["expected_declaration_fingerprint"]), expected_draft_fingerprint=_string(payload["expected_draft_fingerprint"]))})
         extension_keys = {"extension_decisions", "expected_manifest_fingerprint", "confirm_new_epoch"}
         if set(payload) == extension_keys:
             path = self.repo / "research/infobases.toml"
@@ -362,9 +506,9 @@ class ApplicationService:
                 "comparison_epoch_changed": candidate != path.read_bytes(),
             }
             if payload["confirm_new_epoch"] is not True:
-                return {**result, "preview": True}
+                return _json({**result, "preview": True})
             atomic_bytes(path, candidate)
-            return {**result, "preview": False}
+            return _json({**result, "preview": False})
         if set(payload) != {"acquisition_profile", "connection_profiles", "expected_manifest_fingerprint", "confirm_new_epoch"} or payload["acquisition_profile"] not in sources.PROFILES:
             raise ValueError("invalid source setup patch")
         path = self.repo / "research/infobases.toml"
@@ -372,264 +516,117 @@ class ApplicationService:
             raise RuntimeError("stale source setup fingerprint")
         if not payload["confirm_new_epoch"]:
             raise ValueError("source profile changes require explicit comparison-epoch confirmation")
-        bindings, _artifacts = sources.load_contract(self.repo); roles = bindings.get("roles", {}); profiles = payload["connection_profiles"]
+        bindings, _artifacts = sources.load_contract(self.repo); roles = bindings["roles"]; profiles = {name: _string(value) for name, value in json_object(payload["connection_profiles"]).items()}
         import re
-        if tuple(roles) != sources.ROLES or set(profiles) != set(sources.ROLES) or any(not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value) is None for value in profiles.values()):
+        if tuple(roles) != ROLES or set(profiles) != set(ROLES) or any(re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value) is None for value in profiles.values()):
             raise ValueError("exactly three safe connection-profile bindings are required")
-        bindings["acquisition_profile"] = payload["acquisition_profile"]
-        for role in sources.ROLES:
+        bindings["acquisition_profile"] = _string(payload["acquisition_profile"])
+        for role in ROLES:
             roles[role]["connection_profile"] = profiles[role]
         atomic_bytes(path, sources.serialize_infobases(bindings))
         return {"operation": "sources.configure", "manifest_fingerprint": "sha256:" + sha256(path.read_bytes()), "comparison_epoch_changed": True}
 
-    def _ensure_indexes(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _ensure_indexes(self, payload: JsonObject) -> JsonObject:
         if set(payload) - {"component_ids", "backend_ids", "mode", "confirmed"}:
             raise ValueError("invalid index operation payload")
         mode = payload.get("mode", "ensure")
         if mode not in {"ensure", "rebuild", "validate"}:
             raise ValueError("invalid index operation mode")
         if mode == "validate":
-            return {
+            return _json({
                 "operation": "indexes.validate",
                 "components": indexes.validate_configured(
                     self.repo,
-                    component_ids=payload.get("component_ids"),
-                    backend_ids=payload.get("backend_ids"),
+                    component_ids=_strings(payload["component_ids"]) if "component_ids" in payload else None,
+                    backend_ids=_strings(payload["backend_ids"]) if "backend_ids" in payload else None,
                 ),
-            }
+            })
         rows = indexes.ensure_configured(
             self.repo,
-            component_ids=payload.get("component_ids"),
-            backend_ids=payload.get("backend_ids"),
+            component_ids=_strings(payload["component_ids"]) if "component_ids" in payload else None,
+            backend_ids=_strings(payload["backend_ids"]) if "backend_ids" in payload else None,
             rebuild=mode == "rebuild",
             confirmed=bool(payload.get("confirmed")),
             cancelled=self._cancelled,
         )
-        return {"operation": "indexes.build", "components": rows}
+        return _json({"operation": "indexes.build", "components": rows})
 
-    def _configure_indexes(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _configure_indexes(self, payload: JsonObject) -> JsonObject:
         if set(payload) != {
             "configuration",
             "expected_file_fingerprint",
             "expected_plan_fingerprint",
         }:
             raise ValueError("invalid indexing configuration apply")
-        if payload["configuration"].get("schema_version") == "3":
-            return indexes.apply_schema3_migration(
+        configuration = _index_candidate(payload["configuration"])
+        if configuration.get("schema_version") == "3":
+            return _json(indexes.apply_schema3_migration(
                 self.repo,
-                payload["configuration"],
-                str(payload["expected_file_fingerprint"]),
-                str(payload["expected_plan_fingerprint"]),
+                configuration,
+                _string(payload["expected_file_fingerprint"]),
+                _string(payload["expected_plan_fingerprint"]),
                 self._schema3_profile_operations(),
-            )
-        return indexes.apply_config(
+            ))
+        return _json(indexes.apply_config(
             self.repo,
-            payload["configuration"],
-            str(payload["expected_file_fingerprint"]),
-            str(payload["expected_plan_fingerprint"]),
+            configuration,
+            _string(payload["expected_file_fingerprint"]),
+            _string(payload["expected_plan_fingerprint"]),
             self._required_index_capabilities(),
-        )
+        ))
 
-    def _build_diffs(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _build_diffs(self, payload: JsonObject) -> JsonObject:
         if payload:
             raise ValueError("diff.build takes no parameters")
-        from .stage_recompute import active_pointers
-        pointers = active_pointers(self.repo) if self._staged is None else {}
-        pointer = self._staged.get("source") if self._staged and self._staged.get("source") else pointers["source"]
-        if self._staged is None and sources.validate_active(self.repo, deep=True) != pointer:
-            raise RuntimeError("active source generation changed during validation")
-        prior_pointer = pointers["mrq"] if self._staged is None else active_pointers(self.repo)["mrq"]
-        result = diffs.build(self.repo, pointer, cancelled=self._cancelled, activate=self._staged is None)
+        pointers = _active_pointers(self.repo) if self._staged is None else {}
+        if self._staged is not None and "source" in self._staged:
+            pointer = self._staged["source"]
+        else:
+            pointer = sources.validate_active(self.repo, deep=True)
+            if _json(pointer) != pointers["source"]:
+                raise RuntimeError("active source generation changed during validation")
+        prior_pointer = pointers["mrq"] if self._staged is None else _active_pointers(self.repo)["mrq"]
+        diff_source = _diff_source_pointer(pointer)
+        result = diffs.build(self.repo, diff_source, cancelled=self._cancelled, activate=self._staged is None)
         if self._staged is not None:
             self._staged["diff"] = result
-            return result
-        prior_generation = prior_pointer.get("canonical_generation_id")
-        analyzer = json.loads((self.repo / "analysis/indexes/generations" / result["generation_id"] / "extension-analyzer-manifest.json").read_text(encoding="utf-8"))
-        new_epoch = mrq.comparison_epoch_fingerprint(pointer, analyzer)
+            return _json(result)
+        prior = {} if prior_pointer is None else prior_pointer
+        prior_generation_value = prior.get("canonical_generation_id")
+        prior_generation = prior_generation_value if isinstance(prior_generation_value, str) else None
+        analyzer = parse_json_object((self.repo / "analysis/indexes/generations" / result["generation_id"] / "extension-analyzer-manifest.json").read_text(encoding="utf-8"))
+        epoch = _json(pointer)
+        new_epoch = mrq.comparison_epoch_fingerprint(epoch, analyzer)
+        prior_manifest: JsonObject = {}
         if prior_generation:
-            prior_manifest = json.loads((self.repo / "research/generations" / prior_generation / "manifest.json").read_text(encoding="utf-8"))
+            prior_manifest = parse_json_object((self.repo / "research/generations" / prior_generation / "manifest.json").read_text(encoding="utf-8"))
         if not prior_generation or prior_manifest.get("comparison_epoch_fingerprint") != new_epoch:
-            mrq.publish(self.repo, {name: [] for name in mrq.FILES}, pointer["generation_id"], result["generation_id"], pointer, prior_generation)
-        return result
+            empty: mrq.ArtifactRows = {"mrq.jsonl": [], "dispositions.jsonl": [], "evidence.jsonl": [], "lineage.jsonl": [], "approvals.jsonl": []}
+            _ = mrq.publish(self.repo, empty, _string(diff_source.get("generation_id")), result["generation_id"], epoch, prior_generation)
+        return _json(result)
 
-    def _mrq_revalidate_unchanged(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if set(payload) != {"actor", "rationale", "timestamp"}:
-            raise ValueError("invalid unchanged MRQ revalidation")
-        from .stage_recompute import active_pointers
-        pointers = active_pointers(self.repo)
-        source = self._staged.get("source") if self._staged and self._staged.get("source") else pointers["source"]
-        diff = self._staged.get("diff") if self._staged and self._staged.get("diff") else pointers["diff"]
-        result = mrq.revalidate_unchanged(self.repo, source, diff, payload["actor"], payload["rationale"], payload["timestamp"], activate=self._staged is None)
-        if self._staged is not None:
-            self._staged["mrq"] = {
-                key: result[key]
-                for key in ("schema_version", "canonical_generation_id", "source_generation_id", "diff_generation_id")
-            }
-        return result
-
-    def _mrq_rows(self) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
-        state = mrq.active(self.repo)
-        return state["pointer"], {name: deepcopy(state[name]) for name in mrq.FILES}
-
-    def _publish_mrq(self, pointer: dict[str, Any], rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
-        source = json.loads((self.repo / "research/active-source-generation.json").read_text(encoding="utf-8"))
-        diff = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))
-        return mrq.publish(
-            self.repo,
-            rows,
-            source["generation_id"],
-            diff["generation_id"],
-            source,
-            pointer.get("canonical_generation_id"),
-            fence=getattr(self, "_fence", None),
-        )
-
-    def _mrq_propose(self, payload: dict[str, Any]) -> dict[str, Any]:
-        required = {"semantic_key", "title", "stable_diff_ids", "supporting_diff_ids", "evidence", "business_meaning", "scope", "confidence", "rationale"}
-        if set(payload) != required:
-            raise ValueError("invalid MRQ proposal")
-        pointer, rows = self._mrq_rows()
-        source = json.loads((self.repo / "research/active-source-generation.json").read_text(encoding="utf-8"))["generation_id"]
-        diff = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))["generation_id"]
-        identifier = mrq.propose(rows, payload["semantic_key"], payload["title"], source, diff, payload["stable_diff_ids"], payload["supporting_diff_ids"], payload["evidence"], payload["business_meaning"], payload["scope"], payload["confidence"], payload["rationale"])
-        result = self._publish_mrq(pointer, rows); result["mrq_id"] = identifier
-        return result
-
-    def _mrq_publish_source_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Атомарная внутренняя граница применения ``mrq.discover-next``.
-
-        Принимает одобренный локальным пользователем пакет групп и публикует
-        ровно одно каноническое MRQ-поколение, либо ничего. Это не девятая
-        операция workflow-каталога, а детерминированная атомарная граница:
-        повторная проверка под существующей репозиторной блокировкой
-        гарантирует полное непересекающееся покрытие и свободное владение.
-        """
-
-        required = {"approved_noise", "group_proposals"}
-        if set(payload) != required:
-            raise ValueError("invalid MRQ source batch payload")
-        noise_entries = payload["approved_noise"]
-        group_proposals = payload["group_proposals"]
-        if (
-            not isinstance(noise_entries, list)
-            or not isinstance(group_proposals, list)
-            or not (noise_entries or group_proposals)
-        ):
-            raise ValueError("MRQ source batch requires at least one reviewed item")
-        for proposal in group_proposals:
-            required_fields = {"semantic_key", "title", "stable_diff_ids", "supporting_diff_ids", "evidence", "business_meaning", "scope", "confidence", "rationale"}
-            if set(proposal) != required_fields:
-                raise ValueError("invalid MRQ batch group proposal")
-        for entry in noise_entries:
-            required_noise = {"stable_diff_id", "actor", "rationale", "evidence", "timestamp"}
-            if set(entry) != required_noise:
-                raise ValueError("invalid MRQ batch approved noise entry")
-        pointer, rows = self._mrq_rows()
-        source = json.loads((self.repo / "research/active-source-generation.json").read_text(encoding="utf-8"))["generation_id"]
-        diff = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))["generation_id"]
-        # повторная проверка свободного владения до эффекта: ни один DIF пакета
-        # не должен уже иметь первичную диспозицию в текущем поколении
-        active_ids = {item["mrq_id"] for item in rows["mrq.jsonl"] if item.get("state") != "superseded"}
-        already_owned = {item["stable_diff_id"] for item in rows["dispositions.jsonl"] if item.get("primary") and (not item.get("mrq_id") or item.get("mrq_id") in active_ids)}
-        for proposal in group_proposals:
-            clash = already_owned.intersection(proposal["stable_diff_ids"])
-            if clash:
-                raise ValueError(f"customer DIF already has a primary disposition: {sorted(clash)[0]}")
-        # пересечение внутри пакета: один DIF не может быть primary в двух группах
-        seen_primary: set[str] = set()
-        for proposal in group_proposals:
-            clash = seen_primary.intersection(proposal["stable_diff_ids"])
-            if clash:
-                raise ValueError(f"batch group proposals overlap on primary DIF: {sorted(clash)[0]}")
-            seen_primary.update(proposal["stable_diff_ids"])
-        # шум диспозиций тоже не должен пересекаться с primary DIF пакета
-        for entry in noise_entries:
-            if entry["stable_diff_id"] in seen_primary:
-                raise ValueError(f"approved noise conflicts with primary DIF: {entry['stable_diff_id']}")
-        import csv
-        inventory_path = self.repo / "analysis/indexes/generations" / diff / "diff-inventory.csv"
-        with inventory_path.open(encoding="utf-8", newline="") as stream:
-            customer_ids = {
-                row["stable_diff_id"]
-                for row in csv.DictReader(stream)
-                if row.get("before_role") == "vendor_baseline" and row.get("after_role") == "target_cf"
-            }
-        noise_ids = {entry["stable_diff_id"] for entry in noise_entries}
-        covered = already_owned | seen_primary | noise_ids
-        if covered != customer_ids:
-            missing = sorted(customer_ids - covered)
-            extra = sorted(covered - customer_ids)
-            detail = missing[0] if missing else extra[0]
-            raise ValueError(f"MRQ source batch does not form complete customer DIF coverage: {detail}")
-        published_mrq_ids: list[str] = []
-        for proposal in group_proposals:
-            identifier = mrq.propose(rows, proposal["semantic_key"], proposal["title"], source, diff, proposal["stable_diff_ids"], proposal["supporting_diff_ids"], proposal["evidence"], proposal["business_meaning"], proposal["scope"], proposal["confidence"], proposal["rationale"])
-            published_mrq_ids.append(identifier)
-        for entry in noise_entries:
-            mrq.approve_noise(rows, entry["stable_diff_id"], entry["actor"], entry["rationale"], entry["evidence"], source, diff, entry["timestamp"], pointer.get("canonical_generation_id"))
-        result = self._publish_mrq(pointer, rows)
-        result["mrq_ids"] = published_mrq_ids
-        result["operation"] = "mrq.publish-source-batch"
-        return result
-
-    def _mrq_decide(self, payload: dict[str, Any]) -> dict[str, Any]:
-        required = {"mrq_id", "decision", "target_evidence", "target_coverage", "residual_gap", "target_solution", "rationale", "acceptance_criteria", "risk", "open_questions"}
-        if set(payload) != required:
-            raise ValueError("invalid MRQ decision")
-        pointer, rows = self._mrq_rows()
-        mrq.decide(rows, payload["mrq_id"], payload["decision"], payload["target_evidence"], payload["target_coverage"], payload["residual_gap"], payload["target_solution"], payload["rationale"], payload["acceptance_criteria"], payload["risk"], payload["open_questions"])
-        return self._publish_mrq(pointer, rows)
-
-    def _mrq_review(self, payload: dict[str, Any]) -> dict[str, Any]:
-        required = {"mrq_id", "event", "actor", "rationale", "evidence", "timestamp"}
-        if set(payload) != required:
-            raise ValueError("invalid MRQ review")
-        pointer, rows = self._mrq_rows()
-        source = json.loads((self.repo / "research/active-source-generation.json").read_text(encoding="utf-8"))["generation_id"]
-        diff = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))["generation_id"]
-        mrq.review(rows, payload["mrq_id"], payload["event"], payload["actor"], payload["rationale"], payload["evidence"], source, diff, payload["timestamp"], pointer.get("canonical_generation_id"))
-        return self._publish_mrq(pointer, rows)
-
-    def _mrq_approve_noise(self, payload: dict[str, Any]) -> dict[str, Any]:
-        required = {"stable_diff_id", "actor", "rationale", "evidence", "timestamp"}
-        if set(payload) != required:
-            raise ValueError("invalid approved-noise review")
-        pointer, rows = self._mrq_rows()
-        source = json.loads((self.repo / "research/active-source-generation.json").read_text(encoding="utf-8"))["generation_id"]
-        diff = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))["generation_id"]
-        mrq.approve_noise(rows, payload["stable_diff_id"], payload["actor"], payload["rationale"], payload["evidence"], source, diff, payload["timestamp"], pointer.get("canonical_generation_id"))
-        return self._publish_mrq(pointer, rows)
-
-    def _mrq_restructure(self, payload: dict[str, Any]) -> dict[str, Any]:
-        required = {"kind", "source_ids", "target_proposals", "rationale", "evidence", "actor"}
-        if set(payload) != required:
-            raise ValueError("invalid MRQ restructuring payload")
-        pointer, rows = self._mrq_rows()
-        source = json.loads((self.repo / "research/active-source-generation.json").read_text(encoding="utf-8"))["generation_id"]
-        diff = json.loads((self.repo / "research/active-diff-generation.json").read_text(encoding="utf-8"))["generation_id"]
-        targets = mrq.restructure(rows, payload["kind"], payload["source_ids"], payload["target_proposals"], payload["rationale"], payload["evidence"], payload["actor"], source, diff)
-        result = self._publish_mrq(pointer, rows); result["target_ids"] = targets
-        return result
-
-    def _build_projections(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _build_projections(self, payload: JsonObject) -> JsonObject:
         if payload:
             raise ValueError("projections.build takes no parameters")
         from .consolidation import load_active
-        state = load_active(self.repo)
-        if state["pointer"].get("state") != "active":
+        state = _json(load_active(self.repo))
+        pointer = json_object(state["pointer"])
+        if pointer.get("state") != "active":
             raise ValueError("canonical consolidation generation is absent")
-        projections = workflow.projection_value(state)
+        projections = _json(workflow.projection_value(state))
         atomic_json(self.repo / "outputs/projections.json", projections)
         return projections
 
-    def _patch_step(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _patch_step(self, payload: JsonObject) -> JsonObject:
         if set(payload) != {"step_id", "parameters", "expected_manifest_fingerprint"}:
             raise ValueError("invalid workflow step patch")
         path = self.repo / "research/workflow.toml"
         # TOML has no stdlib writer; serialize only the already validated fixed step.
         text = path.read_text(encoding="utf-8")
-        preview = workflow.preview_step_patch(self.repo, payload["step_id"], payload["parameters"], payload["expected_manifest_fingerprint"])
-        marker_at = text.find(f'{{ id = {json.dumps(payload["step_id"])}, operation =')
+        step_id = _string(payload["step_id"])
+        parameters: dict[str, object] = dict(json_object(payload["parameters"]))
+        preview = _json(workflow.preview_step_patch(self.repo, step_id, parameters, _string(payload["expected_manifest_fingerprint"])))
+        marker_at = text.find(f'{{ id = {json.dumps(step_id)}, operation =')
         if marker_at < 0:
             raise ValueError("workflow step not found")
         start = marker_at
@@ -645,11 +642,11 @@ class ApplicationService:
                     break
         if start < 0 or end < 0:
             raise ValueError("workflow step is malformed")
-        operation = preview["operation"]
-        if set(payload["parameters"]) - workflow.PARAMETERS.get(operation, set()):
+        operation = _string(preview["operation"])
+        if set(parameters) - workflow.PARAMETERS.get(operation, set()):
             raise ValueError("unsupported workflow step parameter")
 
-        def toml_value(value: Any) -> str:
+        def toml_value(value: JsonValue) -> str:
             if isinstance(value, str):
                 return json.dumps(value, ensure_ascii=False)
             if isinstance(value, bool):
@@ -662,8 +659,8 @@ class ApplicationService:
                 return "{ " + ", ".join(f"{key} = {toml_value(item)}" for key, item in value.items()) + " }"
             raise ValueError("unsupported workflow step value")
 
-        updated = "{ " + ", ".join(f"{key} = {toml_value(value)}" for key, value in preview["after"].items()) + " }"
+        updated = "{ " + ", ".join(f"{key} = {toml_value(value)}" for key, value in json_object(preview["after"]).items()) + " }"
         candidate = text[:start] + updated + text[end:]
-        workflow.validate_workflow_manifest(tomllib.loads(candidate))
+        _ = workflow.validate_workflow_manifest(tomllib.loads(candidate))
         atomic_bytes(path, candidate.encode())
         return {"workflow_fingerprint": workflow.workflow_fingerprint(self.repo)}
