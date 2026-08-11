@@ -10,7 +10,12 @@ UUID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
 
 def test_backend_state_omits_null_optional_identities() -> None:
-    assert backend_state({"status": "missing", "embedding_identity": None, "reference_identity": None}) == {"status": "missing"}
+    assert backend_state({
+        "status": "missing",
+        "target_fingerprint": None,
+        "embedding_identity": None,
+        "reference_identity": None,
+    }) == {"status": "missing"}
 
 
 def _status() -> dict:

@@ -126,7 +126,7 @@ test("shows accessible source tool installations and current use", async () => {
               status: "ready",
               purpose: "source_indexer",
               required: true,
-              route_capabilities: ["text-search", "symbol-definition"],
+              route_capabilities: ["code-search-lexical", "symbol-info"],
               instances: [
                 {
                   version: "1.30.0",
@@ -174,7 +174,7 @@ test("shows accessible source tool installations and current use", async () => {
   ).toBeInTheDocument();
   expect(screen.getByText("требуется текущим маршрутом")).toBeInTheDocument();
   expect(screen.getByText("не используется текущим способом получения")).toBeInTheDocument();
-  expect(screen.getByText(/требуется маршрутами: text-search, symbol-definition/)).toBeInTheDocument();
+  expect(screen.getByText(/требуется маршрутами: code-search-lexical, symbol-info/)).toBeInTheDocument();
   expect(screen.getByText("не выбран в маршрутах")).toBeInTheDocument();
 });
 
@@ -215,7 +215,7 @@ test("blocks only indexing when a routed indexer is unavailable", async () => {
           status: "unavailable",
           purpose: "source_indexer",
           required: true,
-          route_capabilities: ["text-search"],
+          route_capabilities: ["code-search-lexical"],
           instances: [],
         }],
       }),
@@ -426,7 +426,7 @@ test("index validation is an explicit progress-visible action", async () => {
             configuration: {
               schema_version: "2",
               backends: [{ adapter_id: "rlm-tools-bsl", engine_version: "1.30.0" }],
-              routes: { "text-search": ["rlm-tools-bsl"] },
+              routes: { "code-search-lexical": ["rlm-tools-bsl"] },
             },
             configuration_fingerprint: "sha256:config",
           }
@@ -478,7 +478,7 @@ test("index workspace shows loading instead of a false empty configuration", asy
       configuration: {
         schema_version: "2",
         backends: [{ adapter_id: "rlm-tools-bsl", engine_version: "1.30.1+v8unpack.1" }],
-        routes: { "text-search": ["rlm-tools-bsl"] },
+        routes: { "code-search-lexical": ["rlm-tools-bsl"] },
       },
       backend_tools: [{
         tool_id: "bsl-analyzer",
@@ -516,63 +516,6 @@ test("index cleanup preview explains removable copies without raw JSON", async (
   expect(screen.queryByText(/sha256:plan/)).not.toBeInTheDocument();
 });
 
-test("schema 3 rollback requires a reviewed preview and confirmation", async () => {
-  const fetchMock = vi.fn().mockImplementation((url: string) =>
-    Promise.resolve({
-      ok: true,
-      json: async () => url.endsWith("/indexes")
-        ? {
-            items: [],
-            configuration: {
-              schema_version: "3",
-              backends: [{ adapter_id: "bsl-analyzer", engine_version: "1.0" }],
-              routes: {
-                "code-search-lexical": ["bsl-analyzer"],
-                "code-search-hybrid": ["bsl-analyzer"],
-              },
-              service_profiles: {
-                lexical: "lexical-default",
-                hybrid: "embedding-default",
-              },
-            },
-            configuration_fingerprint: "sha256:config",
-            reference_readiness: {
-              status: "not_ready",
-              recovery_action: "ensure_index",
-            },
-          }
-        : url.endsWith("/search-services")
-          ? { profiles: [], state_fingerprint: "sha256:services" }
-          : url.endsWith("/rollback-preview")
-            ? {
-                plan_fingerprint: "sha256:plan",
-                v2_inflight_ids: ["inv-1"],
-                admission_closure_required: true,
-                readiness_check_required: true,
-              }
-            : {},
-    }),
-  );
-  vi.stubGlobal("fetch", fetchMock);
-  vi.spyOn(window, "confirm").mockReturnValue(true);
-  render(<Indexes
-    project={{ id: "p", name: "p", root: "/repo" }}
-    snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
-  />);
-  expect(await screen.findByText(/Справочный индекс.*not_ready/)).toBeInTheDocument();
-  fireEvent.click(await screen.findByRole("button", { name: /Настройка адаптеров/ }));
-  fireEvent.click(screen.getByRole("button", { name: "Просмотреть откат к схеме 2" }));
-  expect(await screen.findByText(/"admission_closure_required": true/)).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Применить проверенный откат" }));
-  await waitFor(() => {
-    const apply = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/indexes/rollback"));
-    expect(JSON.parse(String(apply?.[1]?.body))).toMatchObject({
-      plan_fingerprint: "sha256:plan",
-      inflight_handling: "cancelled",
-      confirmed: true,
-    });
-  });
-});
 
 test("index workspace shows mixed backend readiness and reviewed route impact", async () => {
   const items = [
@@ -588,8 +531,8 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
       last_validation: "2026-07-29T00:00:00Z",
       index_fingerprint: "sha256:bsl",
       contract_version: "1.1",
-      capabilities: ["text-search"],
-      route_priorities: { "text-search": 0 },
+      capabilities: ["code-search-lexical"],
+      route_priorities: { "code-search-lexical": 0 },
     },
     {
       component_id: "target_cf:configuration",
@@ -614,7 +557,7 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
       json: async () => url.endsWith("/configuration-preview")
         ? {
             plan_fingerprint: "sha256:plan",
-            degraded_routes: ["text-search"],
+            degraded_routes: ["code-search-lexical"],
             rebuild_backends: [],
           }
         : url.endsWith("/indexes")
@@ -627,7 +570,7 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
                   { adapter_id: "rlm-tools-bsl", engine_version: "1.30.0" },
                 ],
                 routes: {
-                  "text-search": ["rlm-tools-bsl", "bsl-analyzer"],
+                  "code-search-lexical": ["rlm-tools-bsl", "bsl-analyzer"],
                 },
               },
               configuration_fingerprint: "sha256:config",
@@ -636,7 +579,7 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
                 blockers: [],
                 degraded: [{
                   component_id: "target_cf:configuration",
-                  capability: "text-search",
+                  capability: "code-search-lexical",
                   selected_backend_id: "bsl-analyzer",
                   fallback_reason: "backend_unavailable",
                 }],
@@ -654,7 +597,7 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
   expect(screen.getByText(/rlm-tools-bsl 1.30.0/)).toBeInTheDocument();
   expect(screen.getAllByText(/backend.executable_unavailable/)).toHaveLength(2);
   expect(screen.getByText(/fix_backend_installation/)).toBeInTheDocument();
-  expect(screen.getByText(/Деградированные маршруты/)).toBeInTheDocument();
+  expect(screen.getByText(/Часть запросов использует резервный движок/)).toBeInTheDocument();
   expect(screen.getByText(/\/state\/one-c-autoresearch\/indexes-v2\/repository/)).toBeInTheDocument();
   fireEvent.click(screen.getByText("Настройка адаптеров и маршрутов"));
   expect(screen.getAllByLabelText("Версия движка", { selector: "input" })[0]).toHaveValue("0.2.63");
@@ -664,7 +607,7 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
   fireEvent.click(screen.getByRole("button", { name: "Проверить изменения" }));
   expect(await screen.findByText("Настройки корректны и готовы к применению")).toBeInTheDocument();
   expect(screen.getByText("Перестроение индексов не требуется.")).toBeInTheDocument();
-  expect(screen.getByText("Изменятся маршруты: Поиск по тексту.")).toBeInTheDocument();
+  expect(screen.getByText("Изменятся маршруты: Лексический поиск по коду.")).toBeInTheDocument();
   expect(screen.queryByText(/degraded_routes/)).not.toBeInTheDocument();
   expect(screen.getByRole("button", {
     name: "Применить проверенный план",

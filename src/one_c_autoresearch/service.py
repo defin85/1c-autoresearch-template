@@ -78,18 +78,16 @@ def _index_candidate(value: JsonValue) -> indexes.ConfigCandidate:
 
 def backend_state(value: JsonObject) -> indexes.BackendState:
     result: indexes.BackendState = {}
-    if "adapter_id" in value: result["adapter_id"] = _string(value["adapter_id"])
-    if "component_id" in value: result["component_id"] = _string(value["component_id"])
-    if "status" in value: result["status"] = _string(value["status"])
-    if "modality" in value: result["modality"] = _string(value["modality"])
-    if "adapter_version" in value: result["adapter_version"] = _string(value["adapter_version"])
-    if "capability_fingerprint" in value: result["capability_fingerprint"] = _string(value["capability_fingerprint"])
-    if "index_fingerprint" in value: result["index_fingerprint"] = _string(value["index_fingerprint"])
-    if "target_fingerprint" in value: result["target_fingerprint"] = _string(value["target_fingerprint"])
-    if "contract_version" in value: result["contract_version"] = _string(value["contract_version"])
-    if "index_key" in value: result["index_key"] = _string(value["index_key"])
-    if "instance_path" in value: result["instance_path"] = _string(value["instance_path"])
-    if "index_dir" in value: result["index_dir"] = _string(value["index_dir"])
+    for key in (
+        "adapter_id", "component_id", "status", "modality", "adapter_version",
+        "capability_fingerprint", "index_fingerprint", "target_fingerprint",
+        "contract_version", "index_key", "instance_path", "index_dir",
+    ):
+        item = value.get(key)
+        if isinstance(item, str):
+            result[key] = item
+        elif item is not None:
+            raise ValueError("expected string")
     if value.get("embedding_identity") is not None: result["embedding_identity"] = _string(value["embedding_identity"])
     if value.get("reference_identity") is not None: result["reference_identity"] = _string(value["reference_identity"])
     if "validated_at" in value: result["validated_at"] = _string(value["validated_at"])
@@ -140,8 +138,8 @@ class ApplicationService:
 
     def _required_index_capabilities(self) -> tuple[str, ...]:
         if self.agent_profiles is None:
-            return tuple(indexes.CAPABILITIES)
-        from .source_search import OPERATIONS
+            return tuple(indexes.COMPLETE_SEARCH_CAPABILITIES)
+        from .source_search import V2_OPERATIONS
         assigned: set[str] = set()
         configurations: Iterable[object] = workflow.step_configurations(self.repo)
         for row_value in configurations:
@@ -156,9 +154,9 @@ class ApplicationService:
             source_search = json_object(profile.get("source_search", {}))
             operations.update(_strings(source_search.get("operations", [])))
         return tuple(sorted({
-            OPERATIONS[operation]
+            V2_OPERATIONS[operation]
             for operation in operations
-            if operation in OPERATIONS
+            if operation in V2_OPERATIONS
         }))
 
     def snapshot(self, *, deep: bool = True) -> JsonObject:
@@ -328,39 +326,12 @@ class ApplicationService:
         if set(payload) != {"configuration", "expected_file_fingerprint"}:
             raise ValueError("invalid indexing configuration preview")
         configuration = _index_candidate(payload["configuration"])
-        if configuration.get("schema_version") == "3":
-            return _json(indexes.preview_schema3_migration(
-                self.repo,
-                configuration,
-                str(payload["expected_file_fingerprint"]),
-                self._schema3_profile_operations(),
-            ))
         return _json(indexes.preview_config(
             self.repo,
             configuration,
             str(payload["expected_file_fingerprint"]),
             self._required_index_capabilities(),
         ))
-
-    def _schema3_profile_operations(self) -> dict[str, list[str]]:
-        from .source_search import V2_OPERATIONS, normalize_operation
-        configured: set[str] = set()
-        for profile in (self.agent_profiles or {}).values():
-            source_search = json_object(profile.get("source_search", {}))
-            configured.update(_strings(source_search.get("operations", [])))
-        operations = sorted({normalize_operation(operation) for operation in configured if normalize_operation(operation) in V2_OPERATIONS})
-        if not operations:
-            operations = sorted(V2_OPERATIONS)
-        return {
-            "lexical": [
-                operation for operation in operations
-                if operation != "code.search_hybrid"
-            ],
-            "hybrid": [
-                operation for operation in operations
-                if operation == "code.search_hybrid"
-            ] or ["code.search_hybrid"],
-        }
 
     def apply(self, operation: str, payload: JsonObject, expected_fingerprint: str, cancelled: sources.CancelCallback | None = None, *, staged: Staged | None = None, fence: Callable[[], None] | None = None) -> JsonObject:
         from .workflow_migration import guard_mutation
@@ -545,14 +516,6 @@ class ApplicationService:
         }:
             raise ValueError("invalid indexing configuration apply")
         configuration = _index_candidate(payload["configuration"])
-        if configuration.get("schema_version") == "3":
-            return _json(indexes.apply_schema3_migration(
-                self.repo,
-                configuration,
-                _string(payload["expected_file_fingerprint"]),
-                _string(payload["expected_plan_fingerprint"]),
-                self._schema3_profile_operations(),
-            ))
         return _json(indexes.apply_config(
             self.repo,
             configuration,

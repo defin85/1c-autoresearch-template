@@ -4,31 +4,19 @@ Source indexes are disposable user-scope state. They help workers navigate the
 active immutable source generation, but only files re-read from the canonical
 generation can become evidence.
 
-## Configuration and migration
+## Configuration
 
-`research/indexing.toml` schema version 1 remains readable and keeps the
-existing exact-version `rlm-tools-bsl` index usable when its repository,
-component, generation, representation, and content identities still match.
-Reading version 1 never rewrites the file.
+`research/indexing.toml` accepts only schema version 3 with machine contract
+1.3, the complete closed route set, and stable lexical and hybrid service
+profile bindings. Missing versions, older formats, unknown fields, aliases,
+and incomplete routes fail with `indexing.schema3_required` and never rewrite
+the file.
 
-Use the index workspace to edit the typed version 2 value. Preview shows the
-normalized file and impact fingerprint. Apply requires the unchanged file and
-plan fingerprints, replaces only `research/indexing.toml`, and starts no build.
-Use **Ensure indexes** after apply. Route order is authoritative; a ready later
-member is a degraded fallback, not a blocker.
-
-To downgrade, preview exactly `{"schema_version": "1"}`. Downgrade is allowed
-only for one `rlm-tools-bsl` backend when every route contains exactly that
-backend. Any BSL Analyzer backend, missing route, or different route order
-blocks the downgrade without changing the file.
-
-Schema version 3 enables the closed `source-search-tool/v2` surface. Its
-reviewed migration pins machine contract 1.3, explicit lexical and hybrid
-routes, and stable service-profile IDs. Migration stores an owner-only schema
-2 backup, marks semantic targets stale, invalidates v2 reuse, and starts no
-build. Rollback first closes v2 admission, drains or cancels in-flight work,
-proves the prior runtime can read the backup, and then either retains or
-explicitly purges disposable v2 state.
+Use the index workspace in this order: prove BSL Analyzer readiness, configure
+and safely probe the embedding profile, review and enable semantic search, then
+select **Create missing indexes**. Applying configuration or a service profile
+never starts a build. Route order is authoritative; a ready later member is a
+degraded fallback, not a blocker.
 
 ## Build, validation, and disk ownership
 
@@ -109,7 +97,7 @@ attributable; remove them only after the corresponding operational ledgers no
 longer need retention. Keys and their pointer must never enter repository
 artifacts or logs.
 
-## Cancellation, rollback, and recovery
+## Cancellation and recovery
 
 Cancellation closes admission, terminalizes reserved calls, kills bounded
 adapter process groups, discards late output, and never replays a search.
@@ -117,12 +105,12 @@ After an unclean restart, reconcile the dispatcher before resuming; incomplete
 calls are terminal operational records and must be requested again by a new
 worker invocation.
 
-Rollback the runtime independently from canonical research data:
+Roll back an application release independently from canonical research data:
 
 1. stop active dispatcher and index actions;
-2. restore a previously reviewed `research/indexing.toml`, or use the exact
-   version 1 downgrade when representable;
-3. retain compatible old promoted indexes, or delete disposable operational
+2. restore the matching application release and its reviewed schema-3
+   configuration; in-product configuration downgrade is not supported;
+3. retain compatible promoted indexes, or delete disposable operational
    index state;
 4. validate readiness, then ensure only missing routes;
 5. start a new invocation so policy, scope, route, key version, and capacity

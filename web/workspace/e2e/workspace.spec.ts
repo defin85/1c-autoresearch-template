@@ -29,6 +29,21 @@ const NEW_REQUIRED_LINKS = [
   ['publication', 'batch-input'], ['batch-input', 'classifier-1'], ['classifier-1', 'batch-validation'], ['batch-validation', 'batch-output'],
   ['batch-output', 'mrq-queue'], ['mrq-queue', 'researcher-1'], ['researcher-1', 'target-db'], ['target-db', 'results'],
 ] as const;
+const INDEX_CAPABILITIES = [
+  'code-search-lexical', 'code-search-hybrid', 'symbol-info', 'symbol-info-positional',
+  'graph-overview', 'graph-schema', 'graph-resolve', 'graph-node', 'graph-source',
+  'graph-neighbors', 'graph-callers', 'graph-callees', 'metadata-info', 'metadata-tree',
+  'metadata-object', 'metadata-form', 'diagnostics-catalog', 'diagnostics-schema',
+  'diagnostics-file', 'diagnostics-workspace', 'reference-docs-find',
+  'reference-docs-search', 'reference-syntax-help', 'reference-its-help',
+] as const;
+const schema3IndexConfiguration = (backends: Array<{ adapter_id: string; engine_version: string }>) => ({
+  schema_version: '3',
+  machine_contract_version: '1.3',
+  backends,
+  routes: Object.fromEntries(INDEX_CAPABILITIES.map((capability) => [capability, backends.map(({ adapter_id }) => adapter_id)])),
+  service_profiles: { lexical: 'source-search-lexical/v2', hybrid: 'source-search-hybrid/v2' },
+});
 
 async function openFixture(
   page: Page,
@@ -131,13 +146,13 @@ async function openFixture(
           },
           source_search: invocationId ? {
             available: true,
-            operations: ['search_text'],
+            operations: ['code.search_lexical'],
             scope: { component_count: 1, path_count: 2, fingerprint: 'sha256:scope' },
             configured_limits: { max_calls: 4, max_concurrent_calls: 1 },
             capacity_reserve_bytes: 4096,
             usage: { calls: 2, in_flight: 0, results: 3, returned_bytes: 512, backend_seconds: 1.5 },
             status_counts: { completed: 2 },
-            route_summaries: [{ capability: 'text-search', selected_backend_id: 'rlm-tools-bsl', fallback_reason: 'index_not_ready', calls: 2 }],
+            route_summaries: [{ capability: 'code-search-lexical', selected_backend_id: 'rlm-tools-bsl', fallback_reason: 'index_not_ready', calls: 2 }],
             last_error: { code: 'source_search.budget_exhausted', limit: 'max_calls', limit_value: 4, consumed: 4, requested: 1, recovery: 'start_new_invocation' },
             ledger_complete: true,
             reconciled: true,
@@ -186,11 +201,9 @@ async function openFixture(
     contentType: 'application/json',
     body: JSON.stringify(indexSetup || {
       items: [],
-      configuration: {
-        schema_version: '2',
-        backends: [{ adapter_id: 'rlm-tools-bsl', engine_version: '1.30.0' }],
-        routes: { 'text-search': ['rlm-tools-bsl'] },
-      },
+      configuration: schema3IndexConfiguration([
+        { adapter_id: 'rlm-tools-bsl', engine_version: '1.30.0' },
+      ]),
       configuration_fingerprint: 'sha256:index-config',
     }),
   }));
@@ -208,7 +221,7 @@ async function openFixture(
     contentType: 'application/json',
     body: JSON.stringify({
       plan_fingerprint: 'sha256:index-plan',
-      degraded_routes: ['text-search'],
+      degraded_routes: ['code-search-lexical'],
       rebuild_backends: [],
     }),
   }));
@@ -531,8 +544,8 @@ test('index workspace exposes mixed backends, safe failure and reviewed validati
         last_validation: '2026-07-29T00:00:00Z',
         index_fingerprint: 'sha256:bsl',
         contract_version: '1.1',
-        capabilities: ['text-search'],
-        route_priorities: { 'text-search': 0 },
+        capabilities: ['code-search-lexical'],
+        route_priorities: { 'code-search-lexical': 0 },
       },
       {
         component_id: 'target_cf:configuration',
@@ -549,19 +562,16 @@ test('index workspace exposes mixed backends, safe failure and reviewed validati
         failure_summary: 'approved launcher is unavailable',
       },
     ],
-    configuration: {
-      schema_version: '2',
-      backends: [
+    configuration: schema3IndexConfiguration([
         { adapter_id: 'bsl-analyzer', engine_version: '0.2.63' },
         { adapter_id: 'rlm-tools-bsl', engine_version: '1.30.0' },
-      ],
-      routes: { 'text-search': ['bsl-analyzer', 'rlm-tools-bsl'] },
-    },
+      ]),
     configuration_fingerprint: 'sha256:index-config',
   });
   await page.getByRole('navigation', { name: 'Этапы диспетчера' })
     .getByRole('button', { name: 'Подготовка различий' }).click();
   await page.getByRole('button', { name: 'Проверить индексы' }).click();
+  await page.getByRole('button', { name: /Диагностика по объектам/ }).click();
   await expect(page.getByText(/bsl-analyzer 0.2.63/)).toBeVisible();
   await expect(page.getByText(/rlm-tools-bsl 1.30.0/)).toBeVisible();
   await expect(page.getByText(/backend.executable_unavailable/)).toBeVisible();

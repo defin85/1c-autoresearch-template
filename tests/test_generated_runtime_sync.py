@@ -20,6 +20,7 @@ def reference(tmp_path: Path, monkeypatch) -> Path:
         "README.md": "# Example Research\n",
         "docs/operator/dispatcher-inspector-rollback.md": "rollback\n",
         "research/workflow.toml": 'schema_version = "1"\n',
+        "research/indexing.toml": 'schema_version = "3"\n',
         "src/one_c_autoresearch/service.py": "VALUE = 1\n",
         "src/one_c_autoresearch/cli.py": "COMMAND = 'status'\n",
         "tests/test_runner.py": "from pathlib import Path\nREPO = Path(__file__).resolve().parents[1]\n",
@@ -29,7 +30,7 @@ def reference(tmp_path: Path, monkeypatch) -> Path:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-    monkeypatch.setattr(MODULE, "FILES", ("README.md", "docs/operator/dispatcher-inspector-rollback.md", "research/workflow.toml", "tests/test_runner.py"))
+    monkeypatch.setattr(MODULE, "FILES", ("README.md", "docs/operator/dispatcher-inspector-rollback.md", "research/workflow.toml", "research/indexing.toml", "tests/test_runner.py"))
     monkeypatch.setattr(MODULE, "TREES", ("src/one_c_autoresearch", "web/workspace"))
     monkeypatch.setattr(MODULE, "VISUAL_ASSETS", ())
     return root
@@ -82,6 +83,28 @@ def test_apply_prunes_stale_files_and_second_preview_is_noop(reference: Path, tm
     apply(reference, destination, plan)
     assert not stale.exists()
     assert preview(reference, destination)["changes"] == []
+
+
+def test_existing_project_sync_preserves_configuration_and_customer_data(reference: Path, tmp_path: Path) -> None:
+    destination = tmp_path / "generated"
+    apply(reference, destination, preview(reference, destination))
+    indexing = destination / "research/indexing.toml"
+    source = destination / "sources/generations/customer/source.txt"
+    output = destination / "outputs/report.md"
+    indexing.write_text('schema_version = "2"\n', encoding="utf-8")
+    source.parent.mkdir(parents=True)
+    source.write_text("customer source\n", encoding="utf-8")
+    output.write_text("customer output\n", encoding="utf-8")
+    (reference / "src/one_c_autoresearch/service.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    plan = preview(reference, destination)
+    assert not any(item["path"] in {"research/indexing.toml", "sources/generations/customer/source.txt", "outputs/report.md"} for item in plan["changes"])
+    apply(reference, destination, plan)
+
+    assert indexing.read_text(encoding="utf-8") == 'schema_version = "2"\n'
+    assert source.read_text(encoding="utf-8") == "customer source\n"
+    assert output.read_text(encoding="utf-8") == "customer output\n"
+    assert (destination / "src/one_c_autoresearch/service.py").read_text(encoding="utf-8") == "VALUE = 2\n"
 
 
 def test_partial_replacement_fails_parity_and_rerun_converges(reference: Path, tmp_path: Path) -> None:

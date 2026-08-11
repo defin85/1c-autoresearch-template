@@ -46,7 +46,7 @@ PROBE_LIMITS: OperationLimits = {"requests": 1, "input_bytes": 65_536, "vectors"
 QUERY_LIMITS: OperationLimits = {"requests": 1, "input_bytes": 65_536, "vectors": 1, "elapsed_seconds": 30.0}
 BUILD_MAXIMA = {
     "requests": 10_000,
-    "input_bytes": 512 * 1024 * 1024,
+    "input_bytes": 2 * 1024 * 1024 * 1024,
     "vectors": 1_000_000,
     "concurrency": 4,
     "batch": 256,

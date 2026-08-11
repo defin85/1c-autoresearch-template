@@ -172,43 +172,6 @@ def test_search_service_api_keeps_endpoint_and_secret_out_of_reads(
         assert "127.0.0.1" not in json.dumps(projection)
 
 
-def test_stale_index_rollback_plan_does_not_stop_backends(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    plan = {
-        "schema_version": "indexing-schema3-rollback-plan/v1",
-        "plan_fingerprint": "sha256:current",
-    }
-    monkeypatch.setattr(
-        "one_c_autoresearch.indexes.preview_schema3_rollback",
-        lambda *_args, **_kwargs: plan,
-    )
-    stopped: list[str] = []
-    monkeypatch.setattr(
-        "one_c_autoresearch.search_runtime.shutdown_project_backends",
-        lambda project: stopped.append(project) or 0,
-    )
-    app = create_app(tmp_path / "state", [REPO], testing=True)
-    headers = {"Origin": "http://testserver", "Idempotency-Key": "bookmark"}
-    with TestClient(app) as client:
-        project = client.post(
-            "/api/v1/projects",
-            json={"name": "test", "root": str(REPO)},
-            headers=headers,
-        ).json()
-        response = client.post(
-            f"/api/v1/projects/{project['id']}/indexes/rollback",
-            headers=headers | {"Idempotency-Key": "rollback"},
-            json={
-                "expected_file_fingerprint": "sha256:file",
-                "plan_fingerprint": "sha256:stale",
-                "purge_v2_state": False,
-                "inflight_handling": "cancelled",
-                "confirmed": True,
-            },
-        )
-    assert response.status_code == 409
-    assert stopped == []
 
 
 def test_codex_capabilities_are_read_from_cli(monkeypatch) -> None:
@@ -299,7 +262,7 @@ def test_source_tool_and_routing_preview_api_matrix(tmp_path: Path, monkeypatch,
     connections = {role: {"platform_path": "/opt/1cv8/x86_64/8.3.27.1989"} for role in ("vendor_baseline", "target_cf", "next_vendor")}
     monkeypatch.setattr("one_c_autoresearch.user_state.load_connections", lambda *_args: connections)
     monkeypatch.setattr("one_c_autoresearch.source_tools.discover_tools", lambda _roots: {"schema_version": "1", "complete": tools_complete, "checked_at": "2026-01-01T00:00:00Z", "inventory_fingerprint": "sha256:" + "a" * 64, "tools": [], "diagnostics": []})
-    monkeypatch.setattr("one_c_autoresearch.indexes.backend_tool_inventory", lambda _repo: [{"tool_id": "rlm-tools-bsl", "status": "ready", "purpose": "source_indexer", "required": True, "route_capabilities": ["text-search"], "instances": []}])
+    monkeypatch.setattr("one_c_autoresearch.indexes.backend_tool_inventory", lambda _repo: [{"tool_id": "rlm-tools-bsl", "status": "ready", "purpose": "source_indexer", "required": True, "route_capabilities": ["code-search-lexical"], "instances": []}])
     preview_value = {
         "schema_version": "1",
         "routing_plan_fingerprint": "sha256:" + "b" * 64,

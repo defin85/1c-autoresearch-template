@@ -2174,7 +2174,6 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         from . import indexes, search_runtime
         project = repo(project_id)
         configuration = indexes.load_config(project)
-        _ = configuration.pop("source_schema_version", None)
         items = ApplicationService(project).index_statuses()
         backend_states = [backend_state(row) for row in indexes.backend_statuses(project)]
         bsl = next(
@@ -2234,70 +2233,6 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             project,
             agent_profiles=load_agent_profiles(project, operational),
         ).preview_index_configuration(json_object(body))
-
-    @app.post("/api/v1/projects/{project_id}/indexes/rollback-preview")
-    def preview_index_rollback(
-        project_id: str,
-        request: Request,
-        body: Annotated[dict[str, object], Body()],
-        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-    ):
-        mutation(request, idempotency_key)
-        if set(body) != {"expected_file_fingerprint", "purge_v2_state"}:
-            raise ValueError("invalid index rollback preview request")
-        from . import indexes
-        from .sqlite_state import DispatcherStore
-        project = repo(project_id)
-        with DispatcherStore(project, operational) as store:
-            inflight = store.active_source_search_invocations()
-        return indexes.preview_schema3_rollback(
-            project,
-            str(body["expected_file_fingerprint"]),
-            v2_inflight_ids=inflight,
-            purge_v2_state=body["purge_v2_state"] is True,
-        )
-
-    @app.post("/api/v1/projects/{project_id}/indexes/rollback")
-    def apply_index_rollback(
-        project_id: str,
-        request: Request,
-        body: Annotated[dict[str, object], Body()],
-        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-    ):
-        mutation(request, idempotency_key)
-        if set(body) != {
-            "expected_file_fingerprint", "plan_fingerprint",
-            "purge_v2_state", "inflight_handling", "confirmed",
-        } or body["confirmed"] is not True:
-            raise ValueError("invalid index rollback request")
-        from . import indexes, search_runtime
-        from .sqlite_state import DispatcherStore
-        project = repo(project_id)
-        with DispatcherStore(project, operational) as store:
-            inflight = store.active_source_search_invocations()
-        plan = indexes.preview_schema3_rollback(
-            project,
-            str(body["expected_file_fingerprint"]),
-            v2_inflight_ids=inflight,
-            purge_v2_state=body["purge_v2_state"] is True,
-        )
-        if plan["plan_fingerprint"] != str(body["plan_fingerprint"]):
-            raise RuntimeError("stale indexing schema 3 rollback plan")
-        with DispatcherStore(project, operational) as store:
-            for invocation_id in inflight:
-                _ = store.close_source_search(invocation_id, "cancelled")
-        target = indexes.repository_instance_fingerprint(project).split(":", 1)[1]
-        _ = search_runtime.shutdown_project_backends(target)
-        return indexes.apply_schema3_rollback(
-            project,
-            str(body["expected_file_fingerprint"]),
-            str(body["plan_fingerprint"]),
-            indexes.prior_runtime_schema2_ready,
-            v2_inflight_ids=inflight,
-            purge_v2_state=body["purge_v2_state"] is True,
-            admission_closed=True,
-            inflight_handling=str(body["inflight_handling"]),
-        )
 
     @app.get("/api/v1/projects/{project_id}/search-services")
     def search_service_profiles(project_id: str):
@@ -2482,8 +2417,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         if not path.is_file() or path.suffix.lower() not in {".json", ".csv", ".txt", ".log", ".md"}: raise HTTPException(404, "artifact not found")
         return FileResponse(path, media_type="text/plain", headers={"Content-Disposition": "attachment", "Content-Security-Policy": "sandbox"})
     _ = (
-        action, add_project, agent_capabilities, agent_profiles, apply_index_rollback,
-        apply_index_storage_cleanup, apply_search_service_profile, artifact,
+            action, add_project, agent_capabilities, agent_profiles,
+            apply_index_storage_cleanup, apply_search_service_profile, artifact,
         attempt_log, cancel_external_folder_preview, cancel_run,
         cancel_source_routing_preview, cancel_stage_recompute,
         confirm_external_folder_preview, conflict, create_external_folder_preview,
@@ -2491,8 +2426,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         event_stream, events, external_folder_diff, external_folder_entries,
         finalize_external_folder_preview, get_source_routing_preview, health,
         index_status, invalid, next_work, operational_artifact,
-        preview_external_folder_diff, preview_index_configuration,
-        preview_index_rollback, preview_index_storage_cleanup,
+            preview_external_folder_diff, preview_index_configuration,
+            preview_index_storage_cleanup,
         preview_search_service_profile, preview_stage_recompute, projects,
         put_agent_profile, put_connection, put_external_folder_entry,
         put_external_upload, registry, run_next_step, run_stage_recompute,

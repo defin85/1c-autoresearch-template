@@ -19,152 +19,20 @@ requires_source_generation = pytest.mark.skipif(
 )
 
 
-def _schema2_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "repo"
-    (repo / "research").mkdir(parents=True)
-    (repo / "project.toml").write_text('[project]\nid = "migration-test"\n')
-    (repo / "research/indexing.toml").write_text(
-        'schema_version = "2"\n\n'
-        '[[backends]]\nadapter_id = "bsl-analyzer"\nengine_version = "1.0"\n\n'
-        '[routes]\n"text-search" = ["bsl-analyzer"]\n',
-        encoding="utf-8",
-    )
-    return repo
-
-
 def _schema3_candidate() -> dict:
     return {
         "schema_version": "3",
         "machine_contract_version": "1.3",
         "backends": [{"adapter_id": "bsl-analyzer", "engine_version": "1.0"}],
         "routes": {
-            "code-search-lexical": ["bsl-analyzer"],
-            "code-search-hybrid": ["bsl-analyzer"],
+            capability: ["bsl-analyzer"]
+            for capability in indexes.COMPLETE_SEARCH_CAPABILITIES
         },
         "service_profiles": {
             "lexical": "source-search-lexical/v2",
             "hybrid": "source-search-hybrid/v2",
         },
     }
-
-
-def _complete_bsl_probe(_repo: Path, _backend: dict) -> dict:
-    return {
-        "available": True,
-        "contract_version": "1.3",
-        "surface_manifest": {
-            "state": "complete",
-            "machine_contract_version": "1.3",
-        },
-    }
-
-
-def test_schema3_migration_is_previewed_backed_up_and_does_not_build(
-    tmp_path: Path, monkeypatch
-) -> None:
-    repo = _schema2_repo(tmp_path)
-    state = tmp_path / "state"
-    original = (repo / "research/indexing.toml").read_bytes()
-    monkeypatch.setattr(indexes, "probe_backend", _complete_bsl_probe)
-    operations = {
-        "lexical": ["code.search_lexical"],
-        "hybrid": ["code.search_hybrid", "graph.callers"],
-    }
-    preview = indexes.preview_schema3_migration(
-        repo, _schema3_candidate(), indexes.config_fingerprint(repo), operations,
-        ("legacy-running",),
-    )
-    assert (repo / "research/indexing.toml").read_bytes() == original
-    assert preview["explicit_routes"] == {
-        "lexical": ["bsl-analyzer"],
-        "hybrid": ["bsl-analyzer"],
-    }
-    result = indexes.apply_schema3_migration(
-        repo, _schema3_candidate(), indexes.config_fingerprint(repo),
-        preview["plan_fingerprint"], operations, ("legacy-running",), state,
-    )
-    assert result["build_started"] is False
-    assert result["preserved_v1_inflight"] == ["legacy-running"]
-    assert indexes.load_config(repo)["source_schema_version"] == "3"
-    backup = Path(result["backup"]["path"])
-    assert backup.read_bytes() == original
-    assert backup.stat().st_mode & 0o777 == 0o600
-    marker = (
-        state / indexes.repository_instance_fingerprint(repo).split(":", 1)[1]
-        / "schema3/stale-semantic-targets.json"
-    )
-    assert json.loads(marker.read_text())["targets"] == ["code-search-hybrid"]
-
-
-def test_schema3_migration_requires_exact_contract_and_rejects_legacy_operation(
-    tmp_path: Path, monkeypatch
-) -> None:
-    repo = _schema2_repo(tmp_path)
-    fingerprint = indexes.config_fingerprint(repo)
-    operations = {
-        "lexical": ["code.search_lexical"],
-        "hybrid": ["code.search_hybrid"],
-    }
-    monkeypatch.setattr(
-        indexes, "probe_backend",
-        lambda *_args: {
-            "available": True,
-            "contract_version": "1.2",
-            "surface_manifest": {"state": "complete", "machine_contract_version": "1.2"},
-        },
-    )
-    with pytest.raises(RuntimeError, match="contract 1.3"):
-        indexes.preview_schema3_migration(
-            repo, _schema3_candidate(), fingerprint, operations,
-        )
-    monkeypatch.setattr(indexes, "probe_backend", _complete_bsl_probe)
-    operations["hybrid"].append("find_references")
-    with pytest.raises(ValueError, match="not admitted"):
-        indexes.preview_schema3_migration(
-            repo, _schema3_candidate(), fingerprint, operations,
-        )
-
-
-def test_schema3_rollback_checks_readiness_and_restores_schema2(
-    tmp_path: Path, monkeypatch
-) -> None:
-    repo = _schema2_repo(tmp_path)
-    state = tmp_path / "state"
-    original = (repo / "research/indexing.toml").read_bytes()
-    monkeypatch.setattr(indexes, "probe_backend", _complete_bsl_probe)
-    operations = {
-        "lexical": ["code.search_lexical"],
-        "hybrid": ["code.search_hybrid"],
-    }
-    migration = indexes.preview_schema3_migration(
-        repo, _schema3_candidate(), indexes.config_fingerprint(repo), operations,
-    )
-    indexes.apply_schema3_migration(
-        repo, _schema3_candidate(), indexes.config_fingerprint(repo),
-        migration["plan_fingerprint"], operations, state_root=state,
-    )
-    schema3 = (repo / "research/indexing.toml").read_bytes()
-    rollback = indexes.preview_schema3_rollback(
-        repo, indexes.config_fingerprint(repo), state,
-        v2_inflight_ids=("v2-running",), purge_v2_state=True,
-    )
-    with pytest.raises(RuntimeError, match="readiness"):
-        indexes.apply_schema3_rollback(
-            repo, indexes.config_fingerprint(repo), rollback["plan_fingerprint"],
-            lambda _backup: False, state, v2_inflight_ids=("v2-running",),
-            purge_v2_state=True, admission_closed=True,
-            inflight_handling="drained",
-        )
-    assert (repo / "research/indexing.toml").read_bytes() == schema3
-    result = indexes.apply_schema3_rollback(
-        repo, indexes.config_fingerprint(repo), rollback["plan_fingerprint"],
-        lambda backup: backup.read_bytes() == original, state,
-        v2_inflight_ids=("v2-running",), purge_v2_state=True,
-        admission_closed=True, inflight_handling="cancelled",
-    )
-    assert result["prior_runtime_ready"] is True
-    assert (repo / "research/indexing.toml").read_bytes() == original
-    assert indexes.load_config(repo)["source_schema_version"] == "2"
 
 
 def test_index_executable_is_found_above_nested_project(tmp_path: Path, monkeypatch) -> None:
@@ -197,7 +65,7 @@ def test_backend_tool_inventory_marks_only_routed_adapter_required(
         "load_config",
         lambda _repo: {
             "backends": [{"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"}],
-            "routes": {"text-search": ["rlm-tools-bsl"]},
+            "routes": {"code-search-lexical": ["rlm-tools-bsl"]},
         },
     )
     monkeypatch.setattr(
@@ -217,7 +85,7 @@ def test_backend_tool_inventory_marks_only_routed_adapter_required(
     )
     tools = {item["tool_id"]: item for item in indexes.backend_tool_inventory(tmp_path)}
     assert tools["rlm-tools-bsl"]["required"] is True
-    assert tools["rlm-tools-bsl"]["route_capabilities"] == ["text-search"]
+    assert tools["rlm-tools-bsl"]["route_capabilities"] == ["code-search-lexical"]
     assert tools["rlm-tools-bsl"]["status"] == "ready"
     assert tools["bsl-analyzer"]["required"] is False
     assert tools["bsl-analyzer"]["status"] == "unavailable"
@@ -257,7 +125,7 @@ def test_next_work_indexes_every_source_component_before_research(tmp_path: Path
         {"component_id": "a", "representation": "xml-hierarchical/v1", "bsl_file_count": 1},
     ])
     monkeypatch.setattr(indexes, "load_config", lambda _repo: {
-        "routes": {"text-search": ["rlm-tools-bsl"]},
+        "routes": {"code-search-lexical": ["rlm-tools-bsl"]},
     })
     monkeypatch.setattr(indexes, "backend_statuses", lambda *_args, **_kwargs: [
         {"component_id": "b", "adapter_id": "rlm-tools-bsl", "status": "stale", "capabilities": []},
@@ -277,7 +145,7 @@ def test_next_gate_checks_only_capabilities_used_by_assigned_profiles(tmp_path: 
     service = ApplicationService.__new__(ApplicationService)
     service.repo = tmp_path
     service.agent_profiles = {
-        "local": {"source_search": {"operations": ["search_text"]}},
+        "local": {"source_search": {"operations": ["code.search_lexical"]}},
     }
     service.snapshot = lambda: {}
     monkeypatch.setattr(
@@ -307,8 +175,8 @@ def test_next_gate_checks_only_capabilities_used_by_assigned_profiles(tmp_path: 
         "load_config",
         lambda _repo: {
             "routes": {
-                "text-search": ["rlm-tools-bsl"],
-                "callers": ["rlm-tools-bsl"],
+                "code-search-lexical": ["rlm-tools-bsl"],
+                "graph-callers": ["rlm-tools-bsl"],
             },
         },
     )
@@ -319,7 +187,7 @@ def test_next_gate_checks_only_capabilities_used_by_assigned_profiles(tmp_path: 
             **component,
             "adapter_id": "rlm-tools-bsl",
             "status": "ready",
-            "capabilities": ["text-search"],
+            "capabilities": ["code-search-lexical"],
         }],
     )
     assert service.next()["action"] == "mrq.discover-next"
@@ -331,17 +199,13 @@ def test_configuration_requires_routes_used_by_assigned_profiles():
     service = ApplicationService.__new__(ApplicationService)
     service.repo = REPO
     service.agent_profiles = {
-        "local": {"source_search": {"operations": ["search_text"]}},
+        "local": {"source_search": {"operations": ["code.search_lexical"]}},
     }
-    assert service._required_index_capabilities() == ("text-search",)
-    with pytest.raises(ValueError, match="missing required indexing routes"):
+    assert service._required_index_capabilities() == ("code-search-lexical",)
+    with pytest.raises(ValueError, match="indexing.schema3_required"):
         service.preview_index_configuration({
             "configuration": {
-                "schema_version": "2",
-                "backends": [{
-                    "adapter_id": "rlm-tools-bsl",
-                    "engine_version": "1.30.0",
-                }],
+                **_schema3_candidate(),
                 "routes": {},
             },
             "expected_file_fingerprint": indexes.config_fingerprint(REPO),
@@ -391,7 +255,12 @@ def test_index_ensure_reuses_ready_state_and_rebuild_is_confirmed(tmp_path: Path
 def test_unsupported_representation_is_not_indexed(tmp_path: Path):
     (tmp_path / "research").mkdir(); (tmp_path / "sources/generations/g").mkdir(parents=True)
     (tmp_path / "research/active-source-generation.json").write_text('{"generation_id":"g","representation_schema":"binary"}', encoding="utf-8")
-    (tmp_path / "research/indexing.toml").write_text('engine="rlm-tools-bsl"\nengine_version="1.0.0"\n', encoding="utf-8")
+    config = _schema3_candidate()
+    config["routes"] = {
+        capability: ["bsl-analyzer"]
+        for capability in indexes.COMPLETE_SEARCH_CAPABILITIES
+    }
+    (tmp_path / "research/indexing.toml").write_bytes(indexes.serialize_config(config))
     with pytest.raises(ValueError, match="unsupported source representation"):
         indexes.discover(tmp_path)
 
@@ -405,56 +274,59 @@ def test_index_loss_does_not_change_canonical_workflow(tmp_path: Path):
     assert (status(REPO), (REPO / "outputs/projections.json").read_bytes()) == before
 
 
-def test_indexing_v2_config_is_closed_and_routes_are_ordered(tmp_path: Path):
+def test_indexing_schema3_config_is_closed_complete_and_round_trips(tmp_path: Path):
     (tmp_path / "research").mkdir()
-    (tmp_path / "research/indexing.toml").write_text(
-        '''schema_version = "2"
+    config = _schema3_candidate()
+    config["routes"] = {
+        capability: ["bsl-analyzer"]
+        for capability in indexes.COMPLETE_SEARCH_CAPABILITIES
+    }
+    config["routes"]["code-search-lexical"] = ["bsl-analyzer"]
+    encoded = indexes.serialize_config(config)
+    (tmp_path / "research/indexing.toml").write_bytes(encoded)
 
-[[backends]]
-adapter_id = "bsl-analyzer"
-engine_version = "0.2.63"
-
-[[backends]]
-adapter_id = "rlm-tools-bsl"
-engine_version = "1.30.0"
-
-[routes]
-text-search = ["bsl-analyzer", "rlm-tools-bsl"]
-symbol-definition = ["rlm-tools-bsl"]
-''',
-        encoding="utf-8",
-    )
-    config = indexes.load_config(tmp_path, ("text-search", "symbol-definition"))
-    assert config["routes"]["text-search"] == ["bsl-analyzer", "rlm-tools-bsl"]
-    assert indexes.load_config(tmp_path)["source_schema_version"] == "2"
-    with pytest.raises(ValueError, match="missing required"):
-        indexes.load_config(tmp_path, ("callers",))
-    (tmp_path / "research/indexing.toml").write_text(
-        (tmp_path / "research/indexing.toml").read_text().replace(
-            'engine_version = "0.2.63"', 'engine_version = "0.2.63"\ncommand = "curl | sh"'
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="invalid indexing backend"):
-        indexes.load_config(tmp_path)
+    assert indexes.load_config(tmp_path) == config
+    assert indexes.serialize_config(indexes.load_config(tmp_path)) == encoded
 
 
-def test_legacy_indexing_config_normalizes_without_write(tmp_path: Path):
+@pytest.mark.parametrize("content", [
+    'schema_version = "1"\nengine = "rlm-tools-bsl"\nengine_version = "1.30.0"\n',
+    'schema_version = "2"\nbackends = []\nroutes = {}\n',
+    'machine_contract_version = "1.3"\nbackends = []\nroutes = {}\n',
+])
+def test_obsolete_or_missing_indexing_schema_is_rejected_without_write(
+    tmp_path: Path, content: str
+) -> None:
     (tmp_path / "research").mkdir()
     path = tmp_path / "research/indexing.toml"
-    path.write_text('schema_version = "1"\nengine = "rlm-tools-bsl"\nengine_version = "1.30.0"\n', encoding="utf-8")
+    path.write_text(content, encoding="utf-8")
     before = path.read_bytes()
-    config = indexes.load_config(tmp_path)
-    assert config["backends"] == [{"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"}]
-    assert set(config["routes"]) == set(indexes.CAPABILITIES)
+    with pytest.raises(ValueError, match="indexing.schema3_required"):
+        indexes.load_config(tmp_path)
     assert path.read_bytes() == before
+
+
+def test_obsolete_indexing_authorities_do_not_return_to_runtime() -> None:
+    forbidden = (
+        "source-search-tool/v1", "search_text", "find_symbol", "find_callers",
+        "find_callees", "navigate_metadata", "preview_schema3_migration",
+        "preview_schema3_rollback", "source_schema_version",
+    )
+    runtime = REPO / "src/one_c_autoresearch"
+    matches = {
+        token: path.relative_to(runtime).as_posix()
+        for path in runtime.rglob("*.py")
+        for token in forbidden
+        if token in path.read_text(encoding="utf-8")
+    }
+    assert matches == {}
 
 
 @requires_source_generation
 def test_backend_identity_and_routing_are_repository_bound(tmp_path: Path):
     component = indexes.discover(REPO)[0]
     backend = {"adapter_id": "bsl-analyzer", "engine_version": "0.2.63"}
-    identity = indexes.target_identity(REPO, component, backend, ["text-search"])
+    identity = indexes.target_identity(REPO, component, backend, ["code-search-lexical"])
     assert identity["repository_instance_fingerprint"].startswith("sha256:")
     assert "repository_root" not in identity
     promoted = indexes.promoted_identity(identity, [{"path": ".build/index", "sha256": "abc", "size_bytes": 3}])
@@ -463,13 +335,13 @@ def test_backend_identity_and_routing_are_repository_bound(tmp_path: Path):
         "component_id": component["component_id"],
         "adapter_id": "bsl-analyzer",
         "adapter_version": "bsl-analyzer-workspace/v1",
-        "capabilities": ["text-search"],
+        "capabilities": ["code-search-lexical"],
         "status": "ready",
     }
     config = {
-        "routes": {"text-search": ["rlm-tools-bsl", "bsl-analyzer"]},
+        "routes": {"code-search-lexical": ["rlm-tools-bsl", "bsl-analyzer"]},
     }
-    decision = indexes.select_backend(config, "text-search", component, [state])
+    decision = indexes.select_backend(config, "code-search-lexical", component, [state])
     assert decision["selected_backend_id"] == "bsl-analyzer"
     assert decision["fallback"] and decision["fallback_reason"] == "backend_unavailable"
     hit = indexes.normalize_hit(
@@ -491,7 +363,7 @@ def test_route_coverage_allows_ready_fallback_and_reports_degradation():
     }
     config = {
         "routes": {
-            "text-search": ["bsl-analyzer", "rlm-tools-bsl"],
+            "code-search-lexical": ["bsl-analyzer", "rlm-tools-bsl"],
         },
     }
     states = [
@@ -505,171 +377,30 @@ def test_route_coverage_allows_ready_fallback_and_reports_degradation():
             "component_id": component["component_id"],
             "adapter_id": "rlm-tools-bsl",
             "status": "ready",
-            "capabilities": ["text-search"],
+            "capabilities": ["code-search-lexical"],
         },
     ]
     coverage = indexes.route_coverage(config, [component], states)
     assert coverage["blockers"] == []
     assert coverage["degraded"] == [{
         "component_id": component["component_id"],
-        "capability": "text-search",
+        "capability": "code-search-lexical",
         "selected_backend_id": "rlm-tools-bsl",
         "fallback_reason": "index_not_ready",
         "skipped": [{"adapter_id": "bsl-analyzer", "reason": "index_not_ready"}],
     }]
 
 
-def test_index_configuration_preview_apply_is_stale_safe_and_starts_no_build(tmp_path: Path):
-    (tmp_path / "research").mkdir()
-    path = tmp_path / "research/indexing.toml"
-    path.write_text('schema_version = "1"\nengine = "rlm-tools-bsl"\nengine_version = "1.30.0"\n', encoding="utf-8")
-    expected = indexes.config_fingerprint(tmp_path)
-    candidate = {
-        "schema_version": "2",
-        "backends": [
-            {"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"},
-            {"adapter_id": "bsl-analyzer", "engine_version": "0.2.63"},
-        ],
-        "routes": {
-            capability: ["bsl-analyzer", "rlm-tools-bsl"]
-            for capability in indexes.CAPABILITIES
-        },
-    }
-    preview = indexes.preview_config(tmp_path, candidate, expected)
-    assert preview["rebuild_backends"] == ["bsl-analyzer"]
-    assert path.read_text().startswith('schema_version = "1"')
-    with pytest.raises(RuntimeError, match="stale.*plan"):
-        indexes.apply_config(tmp_path, candidate, expected, "sha256:stale")
-    result = indexes.apply_config(tmp_path, candidate, expected, preview["plan_fingerprint"])
-    assert result["build_started"] is False
-    assert indexes.load_config(tmp_path)["backends"] == candidate["backends"]
-    with pytest.raises(RuntimeError, match="stale.*configuration"):
-        indexes.preview_config(tmp_path, candidate, expected)
-
-
-def test_index_configuration_exact_v1_downgrade_and_blocked_downgrade(tmp_path: Path):
-    (tmp_path / "research").mkdir()
-    path = tmp_path / "research/indexing.toml"
-    representable = {
-        "schema_version": "2",
-        "backends": [{"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"}],
-        "routes": {
-            capability: ["rlm-tools-bsl"]
-            for capability in indexes.CAPABILITIES
-        },
-    }
-    path.write_bytes(indexes.serialize_config(representable))
-    expected = indexes.config_fingerprint(tmp_path)
-    preview = indexes.preview_config(tmp_path, {"schema_version": "1"}, expected)
-    assert preview["target_schema_version"] == "1"
-    assert preview["normalized_file"] == (
-        'schema_version = "1"\n'
-        'engine = "rlm-tools-bsl"\n'
-        'engine_version = "1.30.0"\n'
-    )
-    indexes.apply_config(
-        tmp_path,
-        {"schema_version": "1"},
-        expected,
-        preview["plan_fingerprint"],
-    )
-    assert indexes.load_config(tmp_path)["source_schema_version"] == "1"
-
-    blocked = {
-        "schema_version": "2",
-        "backends": [
-            {"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"},
-            {"adapter_id": "bsl-analyzer", "engine_version": "0.2.63"},
-        ],
-        "routes": {
-            capability: ["bsl-analyzer", "rlm-tools-bsl"]
-            for capability in indexes.CAPABILITIES
-        },
-    }
-    path.write_bytes(indexes.serialize_config(blocked))
-    with pytest.raises(ValueError, match="not exactly representable"):
-        indexes.preview_config(
-            tmp_path,
-            {"schema_version": "1"},
-            indexes.config_fingerprint(tmp_path),
-        )
-
-
-def test_schema2_backup_is_owner_only_and_prior_runtime_reports_ready(
-    tmp_path: Path, monkeypatch
-):
-    repo = tmp_path / "repo"
-    state = tmp_path / "state"
-    (repo / "research").mkdir(parents=True)
-    (repo / "project.toml").write_text('[project]\nid = "backup-test"\n', encoding="utf-8")
-    config = {
-        "schema_version": "2",
-        "backends": [{"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"}],
-        "routes": {
-            capability: ["rlm-tools-bsl"]
-            for capability in indexes.CAPABILITIES
-        },
-    }
-    original = indexes.serialize_config(config)
-    (repo / "research/indexing.toml").write_bytes(original)
-
-    captured = indexes.capture_schema2_backup(repo, state)
-    backup = Path(captured["path"])
-    assert backup.read_bytes() == original
-    assert backup.stat().st_mode & 0o777 == 0o600
-    assert captured["fingerprint"] == indexes.config_fingerprint(repo)
-
-    restored = tmp_path / "prior-runtime"
-    (restored / "research").mkdir(parents=True)
-    (restored / "research/indexing.toml").write_bytes(backup.read_bytes())
-    assert indexes.load_config(restored) == {
-        **config,
-        "source_schema_version": "2",
-    }
-    component = {
-        "component_id": "target_cf:configuration",
-        "path": "target_cf/configuration",
-        "fingerprint": "sha256:source",
-        "representation": "xml-hierarchical",
-        "source_generation_id": "source-1",
-        "engine": "rlm-tools-bsl",
-        "engine_version": "1.30.0",
-        "bsl_file_count": 1,
-    }
-    monkeypatch.setattr(indexes, "discover", lambda _repo: [component])
-    monkeypatch.setattr(indexes, "probe_backend", lambda *_args, **_kwargs: {
-        "available": True,
-        "capabilities": list(indexes.CAPABILITIES),
-        "contract_version": "provider-query/v1",
-        "capability_fingerprint": "sha256:capabilities",
-    })
-    monkeypatch.setattr(indexes, "ready_backend_state", lambda *_args, **_kwargs: {
-        "status": "ready",
-        "index_fingerprint": "sha256:index",
-        "target_fingerprint": "sha256:target",
-        "last_validation": "2026-07-30T00:00:00+00:00",
-    })
-    status = indexes.backend_statuses(restored)
-    assert len(status) == 1
-    assert status[0]["status"] == "ready"
-    assert status[0]["index_fingerprint"] == "sha256:index"
-
-    assert indexes.capture_schema2_backup(repo, state) == captured
-    (repo / "research/indexing.toml").write_text(
-        original.decode().replace("1.30.0", "1.31.0"),
-        encoding="utf-8",
-    )
-    with pytest.raises(RuntimeError, match="backup conflicts"):
-        indexes.capture_schema2_backup(repo, state)
-
-
 def _minimal_index_repo(root: Path, project_id: str = "index-test") -> tuple[Path, dict]:
     (root / "research").mkdir(parents=True)
     (root / "project.toml").write_text(f'[project]\nid = "{project_id}"\n', encoding="utf-8")
-    (root / "research/indexing.toml").write_text(
-        'schema_version = "1"\nengine = "rlm-tools-bsl"\nengine_version = "1.30.0"\n',
-        encoding="utf-8",
-    )
+    config = _schema3_candidate()
+    config["backends"] = [{"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"}]
+    config["routes"] = {
+        capability: ["rlm-tools-bsl"]
+        for capability in indexes.COMPLETE_SEARCH_CAPABILITIES
+    }
+    (root / "research/indexing.toml").write_bytes(indexes.serialize_config(config))
     source = root / "sources/generations/gen/target_cf/configuration"
     (source / "CommonModules/Test/Ext").mkdir(parents=True)
     (source / "CommonModules/Test/Ext/Module.bsl").write_text(
@@ -730,7 +461,7 @@ def test_ready_validation_does_not_create_operational_state(
             "available": True,
             "executable": "/fixed/rlm-bsl-index",
             "executable_fingerprint": "sha256:binary",
-            "capabilities": list(indexes.CAPABILITIES),
+            "capabilities": list(indexes.RLM_CAPABILITIES),
             "contract_version": "provider-query/v1",
         },
     )
@@ -785,7 +516,6 @@ def test_backend_probe_uses_bsl_machine_contract(monkeypatch, tmp_path: Path):
     assert probe["available"] is True
     assert probe["contract_version"] == "1.3"
     assert set(probe["capabilities"]) == {
-        *indexes.BSL_CAPABILITIES,
         *indexes.COMPLETE_SEARCH_CAPABILITIES,
     }
     assert probe["surface_manifest"]["state"] == "complete"
@@ -1212,6 +942,51 @@ def test_bsl_mcp_requires_structured_ready_state(monkeypatch, tmp_path: Path):
     assert result[0]["structuredContent"]["state"] == "ready"
 
 
+def test_bsl_mcp_waits_beyond_old_fixed_poll_limit(monkeypatch, tmp_path: Path):
+    @contextmanager
+    def proxy(*_args, **_kwargs):
+        yield {"command": ["bsl-analyzer"], "environment": {}}
+
+    monkeypatch.setattr(search_runtime, "supervised_workspace_proxy", proxy)
+
+    class Input:
+        def write(self, _value): return None
+        def flush(self): return None
+        def close(self): return None
+
+    loading = {
+        "structuredContent": {
+            "schema_version": "bsl-analyzer-status/v1",
+            "state": "loading",
+        }
+    }
+    replies = iter(
+        [{"jsonrpc": "2.0", "id": 1, "result": {}}]
+        + [{"jsonrpc": "2.0", "id": identifier, "result": loading} for identifier in range(3, 84)]
+        + [{"jsonrpc": "2.0", "id": 84, "result": {"structuredContent": {"schema_version": "bsl-analyzer-status/v1", "state": "ready", "stale": False}}}]
+    )
+
+    class Output:
+        def readline(self): return json.dumps(next(replies)) + "\n"
+
+    class Process:
+        pid = 1
+        stdin = Input()
+        stdout = Output()
+        def wait(self, timeout=None): return 0
+
+    class Selector:
+        def register(self, *_args): return None
+        def select(self, _timeout): return [object()]
+        def close(self): return None
+
+    monkeypatch.setattr(indexes.subprocess, "Popen", lambda _command, **_kwargs: Process())
+    monkeypatch.setattr(indexes.selectors, "DefaultSelector", Selector)
+    monkeypatch.setattr(indexes.time, "sleep", lambda _seconds: None)
+    result = indexes._bsl_mcp("bsl-analyzer", tmp_path, [("graph", {"action": "status"}, True)])
+    assert result[0]["structuredContent"]["state"] == "ready"
+
+
 def test_bsl_mcp_rejects_incompatible_structured_output(monkeypatch, tmp_path: Path):
     @contextmanager
     def proxy(*_args, **_kwargs):
@@ -1271,7 +1046,7 @@ def test_private_index_promotion_is_clone_isolated_and_keeps_source_clean(monkey
         lambda *_args, **_kwargs: {
             "available": True,
             "executable": "/fixed/rlm-bsl-index",
-            "capabilities": list(indexes.CAPABILITIES),
+            "capabilities": list(indexes.RLM_CAPABILITIES),
             "contract_version": "provider-query/v1",
         },
     )
@@ -1301,7 +1076,7 @@ def test_rebuild_promotes_a_new_instance_and_atomically_switches_pointer(monkeyp
     probe = {
         "available": True,
         "executable": "/fixed/rlm-bsl-index",
-        "capabilities": list(indexes.CAPABILITIES),
+        "capabilities": list(indexes.RLM_CAPABILITIES),
         "contract_version": "provider-query/v1",
     }
     monkeypatch.setattr(indexes, "probe_backend", lambda *_args, **_kwargs: probe)
@@ -1345,7 +1120,7 @@ def test_index_build_rejects_adapter_mutation_of_private_source(monkeypatch, tmp
         lambda *_args, **_kwargs: {
             "available": True,
             "executable": "/fixed/rlm-bsl-index",
-            "capabilities": list(indexes.CAPABILITIES),
+            "capabilities": list(indexes.RLM_CAPABILITIES),
             "contract_version": "provider-query/v1",
         },
     )
@@ -1379,7 +1154,7 @@ def test_cancelled_build_quarantines_output_without_promotion(
         lambda *_args, **_kwargs: {
             "available": True,
             "executable": "/fixed/rlm-bsl-index",
-            "capabilities": list(indexes.CAPABILITIES),
+            "capabilities": list(indexes.RLM_CAPABILITIES),
             "contract_version": "provider-query/v1",
         },
     )
@@ -1418,7 +1193,7 @@ def test_oversized_state_fails_before_instance_promotion(monkeypatch, tmp_path: 
         lambda *_args, **_kwargs: {
             "available": True,
             "executable": "/fixed/rlm-bsl-index",
-            "capabilities": list(indexes.CAPABILITIES),
+            "capabilities": list(indexes.RLM_CAPABILITIES),
             "contract_version": "provider-query/v1",
         },
     )
@@ -1457,7 +1232,7 @@ def test_oversized_index_payload_is_quarantined_before_promotion(
         lambda *_args, **_kwargs: {
             "available": True,
             "executable": "/fixed/rlm-bsl-index",
-            "capabilities": list(indexes.CAPABILITIES),
+            "capabilities": list(indexes.RLM_CAPABILITIES),
             "contract_version": "provider-query/v1",
         },
     )
@@ -1545,7 +1320,7 @@ def test_simultaneous_rebuild_is_fenced_and_validation_keeps_old_pointer(
     probe = {
         "available": True,
         "executable": "/fixed/rlm-bsl-index",
-        "capabilities": list(indexes.CAPABILITIES),
+        "capabilities": list(indexes.RLM_CAPABILITIES),
         "contract_version": "provider-query/v1",
     }
     monkeypatch.setattr(indexes, "probe_backend", lambda *_args, **_kwargs: probe)
@@ -1603,7 +1378,7 @@ def test_dead_index_lease_is_recovered_but_live_lease_is_fenced(monkeypatch, tmp
     probe = {
         "available": True,
         "executable": "/fixed/rlm-bsl-index",
-        "capabilities": list(indexes.CAPABILITIES),
+        "capabilities": list(indexes.RLM_CAPABILITIES),
         "contract_version": "provider-query/v1",
     }
     monkeypatch.setattr(indexes, "probe_backend", lambda *_args, **_kwargs: probe)
@@ -1668,36 +1443,3 @@ def test_explicit_validation_never_builds(monkeypatch, tmp_path: Path):
         backend_ids=["rlm-tools-bsl"],
         state_root=tmp_path / "state",
     )[0]["status"] == "ready"
-
-
-def test_legacy_rlm_state_is_adopted_by_the_real_query_path(monkeypatch, tmp_path: Path):
-    repo, component = _minimal_index_repo(tmp_path / "repo")
-    backend = {"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"}
-    state_root = tmp_path / "legacy-state"
-    legacy = state_root / indexes.index_key(repo, component) / "state.json"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text(
-        json.dumps({
-            "schema_version": "1",
-            "index_key": indexes.index_key(repo, component),
-            "status": "ready",
-            "last_validation": "2026-01-01T00:00:00+00:00",
-        }),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        indexes,
-        "probe_backend",
-        lambda *_args, **_kwargs: {
-            "available": True,
-            "executable": "/fixed/rlm-bsl-index",
-            "capabilities": list(indexes.CAPABILITIES),
-            "capability_fingerprint": "sha256:capabilities",
-            "contract_version": "provider-query/v1",
-        },
-    )
-    ready = indexes.ready_backend_state(
-        repo, component, backend, state_root=state_root,
-    )
-    assert ready and ready["legacy_adopted"]
-    assert ready["instance_path"].endswith("target_cf/configuration")

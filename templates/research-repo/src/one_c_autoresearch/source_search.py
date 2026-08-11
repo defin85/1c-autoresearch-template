@@ -31,26 +31,7 @@ V2_OPERATIONS = {
     "reference.syntax_help": "reference-syntax-help",
     "reference.its_help": "reference-its-help",
 }
-V1_ALIASES = {
-    "search_text": "code.search_lexical",
-    "find_symbol": "symbol.info",
-    "find_callers": "graph.callers",
-    "find_callees": "graph.callees",
-    "navigate_metadata": "metadata.tree",
-}
-V1_CAPABILITIES = {
-    "search_text": "text-search",
-    "find_symbol": "symbol-definition",
-    "find_callers": "callers",
-    "find_callees": "callees",
-    "navigate_metadata": "metadata-navigation",
-}
-# Includes compatibility names for persisted v1 policy readers; schemas expose V2_OPERATIONS only.
-OPERATIONS = {**V2_OPERATIONS, **V1_CAPABILITIES}
-V1_EXECUTION_OPERATIONS = {value: key for key, value in V1_ALIASES.items()}
-V1_EXECUTION_CAPABILITIES = {
-    current: V1_CAPABILITIES[legacy] for legacy, current in V1_ALIASES.items()
-}
+OPERATIONS = V2_OPERATIONS
 POLICY_LIMITS = {
     "max_calls": 64,
     "max_concurrent_calls": 4,
@@ -162,7 +143,6 @@ def normalize_operation(operation: object) -> str:
         raise ValueError(
             "source_search.find_references_unsupported: use symbol.info usage summary or graph.callers"
         )
-    value = V1_ALIASES.get(value, value)
     if value not in V2_OPERATIONS:
         raise ValueError("invalid source_search operations")
     return value
@@ -329,25 +309,6 @@ def query_hmac(key: bytes, key_version: str, query: dict[str, object]) -> str:
 
 
 def request_schema(tool_schema_version: str = TOOL_SCHEMA_VERSION) -> dict[str, JsonValue]:
-    if tool_schema_version == "source-search-tool/v1":
-        return {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["operation", "query", "component_id", "path_prefix", "max_results"],
-            "properties": {
-                "operation": {"type": "string", "enum": sorted(V1_ALIASES)},
-                "query": {
-                    "type": "string", "minLength": 1,
-                    "maxLength": POLICY_LIMITS["max_query_bytes"],
-                },
-                "component_id": {"type": ["string", "null"]},
-                "path_prefix": {"type": ["string", "null"]},
-                "max_results": {
-                    "type": "integer", "minimum": 1,
-                    "maximum": POLICY_LIMITS["max_results_per_call"],
-                },
-            },
-        }
     if tool_schema_version != TOOL_SCHEMA_VERSION:
         raise ValueError("unsupported source_search tool schema")
     text = {"type": "string", "minLength": 1, "maxLength": POLICY_LIMITS["max_query_bytes"]}
@@ -735,27 +696,6 @@ def _canonical_v2_item(
     }]
 
 
-def _raw_hit(value: object) -> indexes.RawHit:
-    raw = json_object(value)
-    hit = indexes.RawHit()
-    component_relative_path = raw.get("component_relative_path")
-    symbol = raw.get("symbol")
-    kind = raw.get("kind")
-    rank = raw.get("rank")
-    if isinstance(component_relative_path, str):
-        hit["component_relative_path"] = component_relative_path
-    if isinstance(symbol, str):
-        hit["symbol"] = symbol
-    if isinstance(kind, str):
-        hit["kind"] = kind
-    if isinstance(rank, str):
-        hit["rank"] = rank
-    line = raw.get("line")
-    if isinstance(line, int) and not isinstance(line, bool):
-        hit["line"] = line
-    return hit
-
-
 def _backend_state(value: object) -> indexes.BackendState:
     raw = json_object(value)
     state = indexes.BackendState()
@@ -797,294 +737,187 @@ def execute_query(
     operation = normalize_operation(requested_operation)
     if operation not in {normalize_operation(item) for item in policy["operations"]}:
         raise ValueError("source_search.operation_forbidden")
-    if requested_operation not in V1_ALIASES:
-        normalized = _v2_request(request, operation, policy)
-        if operation.startswith("reference."):
-            from . import reference_search
+    normalized = _v2_request(request, operation, policy)
+    if operation.startswith("reference."):
+        from . import reference_search
 
-            executable = indexes.backend_executable(repo, "bsl-analyzer")
-            backend = next(
-                (
-                    item for item in indexes.load_config(repo)["backends"]
-                    if item["adapter_id"] == "bsl-analyzer"
-                ),
-                None,
-            )
-            if not executable or not backend:
-                raise RuntimeError("source_search.reference_backend_unavailable")
-            probe = indexes.probe_backend(repo, backend)
-            surface = probe.get("surface_manifest", {})
-            surface_identity = str(surface.get("surface_fingerprint", ""))
-            executable_fingerprint = probe.get("executable_fingerprint")
-            capability_fingerprint = probe.get("capability_fingerprint")
-            if (
-                not probe.get("available")
-                or not surface_identity.startswith("sha256:")
-                or not isinstance(executable_fingerprint, str)
-                or not isinstance(capability_fingerprint, str)
-            ):
-                raise RuntimeError("source_search.reference_surface_incompatible")
-            _selected, reference_identity, _probe, reference_root = (
-                indexes.reference_index_target(repo, backend)
-            )
-            token = None
-            acknowledged = False
-            if operation == "reference.its_help":
-                from . import search_services
-                _profile_id, its_profile, token = search_services.selected_profile(
-                    repo, "its"
-                )
-                acknowledged = bool(
-                    its_profile.get("disclosure_acknowledged")
-                )
-                service_identity = its_profile.get("service_identity")
-                secret_version = its_profile.get("secret_version")
-                if not isinstance(service_identity, str) or not isinstance(secret_version, str):
-                    raise RuntimeError("source_search.reference_profile_incomplete")
-                reference_identity = "sha256:" + sha256(canonical_json({
-                    "schema_version": "its-reference-identity/v1",
-                    "executable_fingerprint": executable_fingerprint,
-                    "surface_identity": surface_identity,
-                    "service": service_identity,
-                    "secret_version": secret_version,
-                }))
-            if operation in {
-                "reference.find_docs", "reference.search_docs",
-            }:
-                try:
-                    reference_root = reference_search.current_reference_index(
-                        reference_root, executable_fingerprint
-                    )
-                except (OSError, KeyError, ValueError):
-                    raise RuntimeError(
-                        "source_search.reference_index_not_ready: run indexes.build"
-                    )
-            backend_result = reference_search.execute_reference(
-                Path(executable),
-                reference_root,
-                normalized,
-                token=token,
-                disclosure_acknowledged=acknowledged,
-                cancelled=cancelled,
-            )
-            raw_items = backend_result.get("items")
-            if not isinstance(raw_items, list):
-                raise ValueError("source_search.backend_result_invalid")
-            reference_items: list[dict[str, JsonValue]] = [
-                json_object(raw_items[index]) for index in range(len(raw_items))
-            ]
-            encoded = canonical_json(reference_items)
-            route = {
-                "route_fingerprint": "sha256:" + sha256(canonical_json({
-                    "operation": operation,
-                    "backend": "bsl-analyzer",
-                    "reference_identity": reference_identity,
-                })),
-                "preferred_backend_id": "bsl-analyzer",
-                "selected_backend_id": "bsl-analyzer",
-                "fallback_reason": None,
-                "adapter_version": indexes.BACKEND_CATALOG["bsl-analyzer"]["adapter_version"],
-                "capability_fingerprint": capability_fingerprint,
-                "index_fingerprint": reference_identity,
-                "surface_identity": surface_identity,
-                "reference_identity": reference_identity,
-            }
-            return {
-                "schema_version": "source-search-result/v2",
-                "operation": operation,
-                "capability": V2_OPERATIONS[operation],
-                "route": route,
-                "items": reference_items,
-                "truncated": bool(backend_result.get("truncated")),
-                "narrowing_hint": backend_result.get("narrowing_hint"),
-                "result_count": len(reference_items),
-                "returned_bytes": len(encoded),
-                "result_manifest_fingerprint": "sha256:" + sha256(encoded),
-            }
-        component_id = str(
-            normalized.get("component_id") or policy["component_ids"][0]
-        )
-        if component_id not in policy["component_ids"]:
-            raise ValueError("source_search.scope_forbidden")
-        component = next(
+        executable = indexes.backend_executable(repo, "bsl-analyzer")
+        backend = next(
             (
-                item for item in indexes.discover(repo)
-                if item["component_id"] == component_id
+                item for item in indexes.load_config(repo)["backends"]
+                if item["adapter_id"] == "bsl-analyzer"
             ),
             None,
         )
-        if component is None or component["source_generation_id"] != policy["source_generation_id"]:
-            raise RuntimeError("source_search.source_stale")
-        for field in ("path", "path_prefix"):
-            if normalized.get(field):
-                normalized[field] = _component_relative_request_path(
-                    str(normalized[field]), component_id, policy,
-                )
-        normalized["component_id"] = component_id
-        config = indexes.load_config(repo)
-        decision = indexes.select_backend(
-            config, V2_OPERATIONS[operation], component, states,
+        if not executable or not backend:
+            raise RuntimeError("source_search.reference_backend_unavailable")
+        probe = indexes.probe_backend(repo, backend)
+        surface = probe.get("surface_manifest", {})
+        surface_identity = str(surface.get("surface_fingerprint", ""))
+        executable_fingerprint = probe.get("executable_fingerprint")
+        capability_fingerprint = probe.get("capability_fingerprint")
+        if (
+            not probe.get("available")
+            or not surface_identity.startswith("sha256:")
+            or not isinstance(executable_fingerprint, str)
+            or not isinstance(capability_fingerprint, str)
+        ):
+            raise RuntimeError("source_search.reference_surface_incompatible")
+        _selected, reference_identity, _probe, reference_root = (
+            indexes.reference_index_target(repo, backend)
         )
-        backend_result = json_object(query_backend(decision, normalized))
-        raw_items = backend_result.get("items")
-        max_results = normalized["max_results"]
-        if not isinstance(raw_items, list) or not isinstance(max_results, int) or len(raw_items) > max_results:
-            raise ValueError("source_search.backend_result_invalid")
-        items: list[dict[str, object]] = []
-        for index in range(len(raw_items)):
-            v2_raw: object = raw_items[index]
-            items.extend(
-                _canonical_v2_item(
-                    repo, policy, component_id, operation, json_object(v2_raw),
-                )
+        token = None
+        acknowledged = False
+        if operation == "reference.its_help":
+            from . import search_services
+            _profile_id, its_profile, token = search_services.selected_profile(
+                repo, "its"
             )
-        encoded = canonical_json(items)
-        if len(encoded) > policy["max_returned_bytes_per_call"]:
-            raise ValueError("source_search.returned_bytes_exhausted")
-        state = decision["state"]
-        state_values: dict[str, object] = dict(state)
-        adapter_version = state.get("adapter_version")
-        index_fingerprint = state.get("index_fingerprint")
-        if not isinstance(adapter_version, str) or not isinstance(index_fingerprint, str):
-            raise ValueError("source_search.backend_state_invalid")
-        result: dict[str, object] = {
+            acknowledged = bool(
+                its_profile.get("disclosure_acknowledged")
+            )
+            service_identity = its_profile.get("service_identity")
+            secret_version = its_profile.get("secret_version")
+            if not isinstance(service_identity, str) or not isinstance(secret_version, str):
+                raise RuntimeError("source_search.reference_profile_incomplete")
+            reference_identity = "sha256:" + sha256(canonical_json({
+                "schema_version": "its-reference-identity/v1",
+                "executable_fingerprint": executable_fingerprint,
+                "surface_identity": surface_identity,
+                "service": service_identity,
+                "secret_version": secret_version,
+            }))
+        if operation in {
+            "reference.find_docs", "reference.search_docs",
+        }:
+            try:
+                reference_root = reference_search.current_reference_index(
+                    reference_root, executable_fingerprint
+                )
+            except (OSError, KeyError, ValueError):
+                raise RuntimeError(
+                    "source_search.reference_index_not_ready: run indexes.build"
+                )
+        backend_result = reference_search.execute_reference(
+            Path(executable),
+            reference_root,
+            normalized,
+            token=token,
+            disclosure_acknowledged=acknowledged,
+            cancelled=cancelled,
+        )
+        raw_items = backend_result.get("items")
+        if not isinstance(raw_items, list):
+            raise ValueError("source_search.backend_result_invalid")
+        reference_items: list[dict[str, JsonValue]] = [
+            json_object(raw_items[index]) for index in range(len(raw_items))
+        ]
+        encoded = canonical_json(reference_items)
+        route = {
+            "route_fingerprint": "sha256:" + sha256(canonical_json({
+                "operation": operation,
+                "backend": "bsl-analyzer",
+                "reference_identity": reference_identity,
+            })),
+            "preferred_backend_id": "bsl-analyzer",
+            "selected_backend_id": "bsl-analyzer",
+            "fallback_reason": None,
+            "adapter_version": indexes.BACKEND_CATALOG["bsl-analyzer"]["adapter_version"],
+            "capability_fingerprint": capability_fingerprint,
+            "index_fingerprint": reference_identity,
+            "surface_identity": surface_identity,
+            "reference_identity": reference_identity,
+        }
+        return {
             "schema_version": "source-search-result/v2",
             "operation": operation,
             "capability": V2_OPERATIONS[operation],
-            "route": {
-                "route_fingerprint": decision["route_fingerprint"],
-                "preferred_backend_id": decision["preferred_backend_id"],
-                "selected_backend_id": decision["selected_backend_id"],
-                "fallback_reason": decision["fallback_reason"],
-                "adapter_version": adapter_version,
-                "capability_fingerprint": state.get(
-                    "capability_fingerprint", ""
-                ),
-                "index_fingerprint": index_fingerprint,
-                **(
-                    {"surface_identity": state_values["surface_identity"]}
-                    if state_values.get("surface_identity") else {}
-                ),
-                **(
-                    {"embedding_identity": backend_result["embedding_identity"]}
-                    if operation == "code.search_hybrid"
-                    and backend_result.get("embedding_identity") else {}
-                ),
-            },
-            "items": items,
+            "route": route,
+            "items": reference_items,
             "truncated": bool(backend_result.get("truncated")),
             "narrowing_hint": backend_result.get("narrowing_hint"),
-            "result_count": len(items),
+            "result_count": len(reference_items),
             "returned_bytes": len(encoded),
             "result_manifest_fingerprint": "sha256:" + sha256(encoded),
         }
-        return result
-    if set(request) != {"operation", "query", "component_id", "path_prefix", "max_results"}:
-        raise ValueError("source_search.invalid_request")
-    query = str(request["query"])
-    if not query or len(query.encode()) > policy["max_query_bytes"]:
-        raise ValueError("source_search.query_bytes_exhausted")
-    requested = request["max_results"]
-    if not isinstance(requested, int) or isinstance(requested, bool) or not 1 <= requested <= policy["max_results_per_call"]:
-        raise ValueError("source_search.result_limit_invalid")
-    component_id = str(request.get("component_id") or policy["component_ids"][0])
+    component_id = str(
+        normalized.get("component_id") or policy["component_ids"][0]
+    )
     if component_id not in policy["component_ids"]:
         raise ValueError("source_search.scope_forbidden")
-    component = next((item for item in indexes.discover(repo) if item["component_id"] == component_id), None)
+    component = next(
+        (
+            item for item in indexes.discover(repo)
+            if item["component_id"] == component_id
+        ),
+        None,
+    )
     if component is None or component["source_generation_id"] != policy["source_generation_id"]:
         raise RuntimeError("source_search.source_stale")
-    path_prefix = request.get("path_prefix")
-    component_relative_prefix = None
-    if path_prefix:
-        normalized_prefix = normalize_relative(str(path_prefix))
-        logical_root = _logical_prefix(component_id)
-        if not (
-            normalized_prefix == logical_root.rstrip("/")
-            or normalized_prefix.startswith(logical_root)
-        ):
-            raise ValueError("source_search.path_scope_forbidden")
-        if not any(
-            normalized_prefix == allowed.rstrip("/")
-            or normalized_prefix.startswith(allowed.rstrip("/") + "/")
-            for allowed in policy["logical_path_prefixes"]
-        ):
-            raise ValueError("source_search.path_scope_forbidden")
-        component_relative_prefix = normalized_prefix[len(logical_root):] or None
+    for field in ("path", "path_prefix"):
+        if normalized.get(field):
+            normalized[field] = _component_relative_request_path(
+                str(normalized[field]), component_id, policy,
+            )
+    normalized["component_id"] = component_id
     config = indexes.load_config(repo)
     decision = indexes.select_backend(
-        config, V1_EXECUTION_CAPABILITIES[operation], component, states,
+        config, V2_OPERATIONS[operation], component, states,
     )
-    raw_hits = query_backend(decision, {
-        "operation": V1_EXECUTION_OPERATIONS[operation],
-        "query": query,
-        "component_id": component_id,
-        "component_relative_path_prefix": component_relative_prefix,
-        "max_results": requested,
-    })
-    if not isinstance(raw_hits, list):
+    backend_result = json_object(query_backend(decision, normalized))
+    raw_items = backend_result.get("items")
+    max_results = normalized["max_results"]
+    if not isinstance(raw_items, list) or not isinstance(max_results, int) or len(raw_items) > max_results:
         raise ValueError("source_search.backend_result_invalid")
-    validated_hits = _json_list(raw_hits)
-    if len(validated_hits) > requested:
-        raise ValueError("source_search.backend_result_invalid")
-    canonical: list[dict[str, object]] = []
-    identities: dict[tuple[str, int | None, str], bytes] = {}
-    for raw in validated_hits:
-        hit = indexes.normalize_hit(_raw_hit(raw), decision, component)
-        if component_relative_prefix and not (
-            hit["component_relative_path"] == component_relative_prefix.rstrip("/")
-            or hit["component_relative_path"].startswith(
-                component_relative_prefix.rstrip("/") + "/"
+    items: list[dict[str, object]] = []
+    for index in range(len(raw_items)):
+        v2_raw: object = raw_items[index]
+        items.extend(
+            _canonical_v2_item(
+                repo, policy, component_id, operation, json_object(v2_raw),
             )
-        ):
-            raise ValueError("source_search.backend_result_out_of_scope")
-        evidence = indexes.canonical_evidence(repo, component_id, hit["component_relative_path"])
-        if not any(
-            evidence["path"] == allowed.rstrip("/")
-            or evidence["path"].startswith(allowed.rstrip("/") + "/")
-            for allowed in policy["logical_path_prefixes"]
-        ):
-            raise ValueError("source_search.backend_result_out_of_scope")
-        item: dict[str, object] = dict(evidence)
-        if "line" in hit: item["line"] = hit["line"]
-        if "symbol" in hit: item["symbol"] = hit["symbol"]
-        item["kind"] = hit["kind"]
-        item_path = item.get("path")
-        item_line = item.get("line")
-        item_kind = item.get("kind")
-        if (
-            not isinstance(item_path, str)
-            or not (item_line is None or isinstance(item_line, int))
-            or not isinstance(item_kind, str)
-        ):
-            raise ValueError("source_search.backend_result_invalid")
-        identity = (item_path, item_line, item_kind)
-        encoded_item = canonical_json(item)
-        if identity in identities and identities[identity] != encoded_item:
-            raise ValueError("source_search.conflicting_hits")
-        if identity not in identities:
-            identities[identity] = encoded_item
-            canonical.append(item)
-    encoded = canonical_json(canonical)
+        )
+    encoded = canonical_json(items)
     if len(encoded) > policy["max_returned_bytes_per_call"]:
         raise ValueError("source_search.returned_bytes_exhausted")
-    return {
-        "schema_version": "source-search-result/v1",
+    state = decision["state"]
+    state_values: dict[str, object] = dict(state)
+    adapter_version = state.get("adapter_version")
+    index_fingerprint = state.get("index_fingerprint")
+    if not isinstance(adapter_version, str) or not isinstance(index_fingerprint, str):
+        raise ValueError("source_search.backend_state_invalid")
+    result: dict[str, object] = {
+        "schema_version": "source-search-result/v2",
         "operation": operation,
-        "capability": V1_EXECUTION_CAPABILITIES[operation],
+        "capability": V2_OPERATIONS[operation],
         "route": {
             "route_fingerprint": decision["route_fingerprint"],
             "preferred_backend_id": decision["preferred_backend_id"],
             "selected_backend_id": decision["selected_backend_id"],
             "fallback_reason": decision["fallback_reason"],
-            "adapter_version": decision["state"].get("adapter_version", ""),
-            "capability_fingerprint": decision["state"].get("capability_fingerprint", ""),
-            "index_fingerprint": decision["state"].get("index_fingerprint", ""),
+            "adapter_version": adapter_version,
+            "capability_fingerprint": state.get(
+                "capability_fingerprint", ""
+            ),
+            "index_fingerprint": index_fingerprint,
+            **(
+                {"surface_identity": state_values["surface_identity"]}
+                if state_values.get("surface_identity") else {}
+            ),
+            **(
+                {"embedding_identity": backend_result["embedding_identity"]}
+                if operation == "code.search_hybrid"
+                and backend_result.get("embedding_identity") else {}
+            ),
         },
-        "items": canonical,
-        "result_count": len(canonical),
+        "items": items,
+        "truncated": bool(backend_result.get("truncated")),
+        "narrowing_hint": backend_result.get("narrowing_hint"),
+        "result_count": len(items),
         "returned_bytes": len(encoded),
         "result_manifest_fingerprint": "sha256:" + sha256(encoded),
     }
+    return result
 
 
 def revalidate_proposal_evidence(

@@ -901,7 +901,7 @@ def test_source_search_diagnostics_are_content_free_and_cursor_bound(
                 "schema_version": source_search.POLICY_VERSION,
                 "policy_fingerprint": "sha256:policy",
                 "scope_fingerprint": "sha256:scope",
-                "operations": ["search_text"],
+                "operations": ["code.search_lexical"],
                 "component_ids": ["target_cf:configuration"],
                 "logical_path_prefixes": ["configuration/CommonModules/"],
                 "max_calls": 4,
@@ -922,7 +922,7 @@ def test_source_search_diagnostics_are_content_free_and_cursor_bound(
                 store.reserve_source_search_call(
                     invocation["invocation_id"], f"call-{number}",
                     "sha256:capability", query_hmac=f"v1:hmac-{number}",
-                    capability="text-search", query_bytes=1,
+                    capability="code-search-lexical", query_bytes=1,
                     requested_results=1, requested_returned_bytes=10,
                     requested_backend_seconds=1,
                 )
@@ -943,7 +943,7 @@ def test_source_search_diagnostics_are_content_free_and_cursor_bound(
         assert first.status_code == 200
         diagnostics = first.json()["source_search"]
         assert diagnostics["available"] is True
-        assert diagnostics["operations"] == ["search_text"]
+        assert diagnostics["operations"] == ["code.search_lexical"]
         assert diagnostics["scope"] == {
             "component_count": 1,
             "path_count": 1,
@@ -966,7 +966,7 @@ def test_source_search_diagnostics_are_content_free_and_cursor_bound(
         with DispatcherStore(REPO, state) as store:
             store.reserve_source_search_call(
                 invocation["invocation_id"], "call-3", "sha256:capability",
-                query_hmac="v1:hmac-3", capability="text-search", query_bytes=1,
+                query_hmac="v1:hmac-3", capability="code-search-lexical", query_bytes=1,
                 requested_results=1, requested_returned_bytes=10,
                 requested_backend_seconds=1,
             )

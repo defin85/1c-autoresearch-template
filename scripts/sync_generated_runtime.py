@@ -41,6 +41,7 @@ IGNORED_PARTS = {"__pycache__", ".pytest_cache", ".venv", "node_modules", "test-
 FORBIDDEN_SUFFIXES = {".cf", ".cfe", ".epf", ".erf", ".dt", ".pyc", ".pyo"}
 FORBIDDEN_TEXT = (re.compile(r"/run/" + r"media/"), re.compile(r"/home/[A-Za-z0-9._-]+/"), re.compile(r"sppr", re.I))
 CUSTOMER_PATHS = ("sources/generations", "analysis/indexes/generations", "analysis/migration-requirements/generations")
+PROJECT_CONFIG_PATHS = {"research/indexing.toml", "research/workflow.toml"}
 SECRET_NAMES = re.compile(r"(?i)(?:^\.env$|credential|secret|private[_-]?key)")
 
 
@@ -163,7 +164,8 @@ def sanitize(root: Path, reference: Path) -> None:
                 "  assertApprovedAsset(approvedName);\n  if (process.env.PORTABLE_TEMPLATE === '1') return;\n  const expected",
             )
         if path.relative_to(root).as_posix() == "web/workspace/playwright.config.ts":
-            text = "process.env.PORTABLE_TEMPLATE = '1';\n" + text
+            marker = "process.env.PORTABLE_TEMPLATE = '1';\n"
+            text = marker + text.replace(marker, "")
         if "tests" in path.parts and path.suffix == ".py":
             text = text.replace('"gpt-5.6-' + 'sol"', '"test-model"')
         if path.suffix == ".py":
@@ -202,6 +204,29 @@ def change_plan(staged: Path, destination: Path) -> list[dict[str, str]]:
     return plan
 
 
+def owned_hashes(root: Path) -> dict[str, str]:
+    paths = [root / relative for relative in FILES if relative not in PROJECT_CONFIG_PATHS]
+    paths.append(root / "research/runtime-sync-manifest.json")
+    for relative in TREES:
+        tree = root / relative
+        if tree.exists():
+            paths.extend(path for path in tree.rglob("*") if path.is_file() and allowed(path.relative_to(root)))
+    for _source, target in VISUAL_ASSETS:
+        tree = root / target
+        if tree.exists():
+            paths.extend(path for path in tree.rglob("*") if path.is_file() and allowed(path.relative_to(root)))
+    return {path.relative_to(root).as_posix(): file_hash(path) for path in paths if path.is_file()}
+
+
+def owned_change_plan(staged: Path, destination: Path) -> list[dict[str, str]]:
+    before, after = owned_hashes(destination), owned_hashes(staged)
+    return [
+        {"status": "A" if path not in before else "D" if path not in after else "C", "path": path, "hash": (after if path in after else before)[path]}
+        for path in sorted(before.keys() | after.keys())
+        if before.get(path) != after.get(path)
+    ]
+
+
 def plan_fingerprint(reference: Path, destination: Path, staged: Path, plan: list[dict[str, str]]) -> str:
     payload = {
         "reference": str(reference),
@@ -231,6 +256,16 @@ def replace_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination)
 
 
+def apply_owned_plan(staging: Path, destination: Path, plan: list[dict[str, str]]) -> None:
+    for item in plan:
+        target = destination / item["path"]
+        if item["status"] == "D":
+            target.unlink(missing_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(staging / item["path"], target)
+
+
 def sync(
     reference: Path,
     destination: Path,
@@ -243,12 +278,13 @@ def sync(
     package_root = (package_root or Path(__file__).resolve().parents[1]).resolve()
     approved = Path(__file__).resolve().parents[1] / "templates/research-repo"
     generated = (destination / "research/runtime-sync-manifest.json").is_file()
+    existing_project = destination != approved.resolve() and generated
     if destination != approved.resolve() and destination.exists() and any(destination.iterdir()) and not generated:
         raise RuntimeError("destination is non-empty and is not the approved canonical scaffold")
     with tempfile.TemporaryDirectory(prefix="one-c-generated-runtime-") as temporary:
         staging = Path(temporary) / "research-repo"
         build_staging(reference, staging)
-        plan = change_plan(staging, destination)
+        plan = owned_change_plan(staging, destination) if existing_project else change_plan(staging, destination)
         if promote:
             plan = [{**item, "path": f"templates/research-repo/{item['path']}"} for item in plan]
             promoted = (
@@ -280,8 +316,14 @@ def sync(
             return result
         if not expected_fingerprint or expected_fingerprint != fingerprint:
             raise RuntimeError("plan fingerprint mismatch; generate a new preview")
-        replace_tree(staging, destination)
-        require_parity(staging, destination)
+        if existing_project:
+            apply_owned_plan(staging, destination, plan)
+            remaining = owned_change_plan(staging, destination)
+            if remaining:
+                raise RuntimeError("derived runtime parity is incomplete:\n" + "\n".join(f"{item['status']} {item['path']}" for item in remaining))
+        else:
+            replace_tree(staging, destination)
+            require_parity(staging, destination)
         if promote:
             promote_package(destination, package_root)
         return result

@@ -175,7 +175,7 @@ def _policy(value: object) -> source_search.SourceSearchPolicy:
     })
     return source_search.SourceSearchPolicy(
         schema_version=_text(raw.get("schema_version"), "source_search.invalid_policy"),
-        tool_schema_version=str(raw.get("tool_schema_version", "source-search-tool/v1")),
+        tool_schema_version=str(raw.get("tool_schema_version", source_search.TOOL_SCHEMA_VERSION)),
         bridge_version=str(raw.get("bridge_version", source_search.BRIDGE_VERSION)),
         operations=[item for item in operations if isinstance(item, str)],
         source_generation_id=str(raw.get("source_generation_id", "")),
@@ -306,7 +306,7 @@ def serve(repo: Path, state_base: Path | None, invocation_id: str, capability: s
                         "name": "source_search",
                         "description": "Search active bounded 1C sources through coordinator-owned routing.",
                         "inputSchema": source_search.request_schema(
-                            str(policy.get("tool_schema_version", "source-search-tool/v1")),
+                            str(policy.get("tool_schema_version", source_search.TOOL_SCHEMA_VERSION)),
                         ),
                     }]})
                 elif method == "tools/call":
@@ -332,19 +332,9 @@ def serve(repo: Path, state_base: Path | None, invocation_id: str, capability: s
                         call_id,
                         verifier,
                         query_hmac=source_search.query_hmac(hmac_key_value, key_version, query),
-                        capability=source_search.V1_EXECUTION_CAPABILITIES.get(
-                            operation, source_search.OPERATIONS[operation],
-                        ),
-                        operation=(
-                            operation
-                            if requested_operation not in source_search.V1_ALIASES
-                            else ""
-                        ),
-                        modality=(
-                            _modality(operation)
-                            if requested_operation not in source_search.V1_ALIASES
-                            else ""
-                        ),
+                        capability=source_search.OPERATIONS[operation],
+                        operation=operation,
+                        modality=_modality(operation),
                         query_bytes=len(str(arguments.get("query", "")).encode()),
                         requested_results=_integer(
                             arguments.get("max_results", 0),

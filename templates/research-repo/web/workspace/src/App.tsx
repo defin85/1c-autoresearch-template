@@ -132,14 +132,12 @@ const INDEX_BACKENDS = {
 } as const;
 
 const INDEX_CAPABILITIES: Record<string, string> = {
-  "text-search": "Поиск по тексту",
-  "symbol-definition": "Определение символа",
-  "symbol-references": "Использования символа",
-  callers: "Вызывающие методы",
-  callees: "Вызываемые методы",
-  "metadata-navigation": "Навигация по метаданным",
   "code-search-lexical": "Лексический поиск по коду",
   "code-search-hybrid": "Векторный поиск по коду",
+  "symbol-info": "Сведения о символе",
+  "symbol-info-positional": "Символ в позиции",
+  "graph-callers": "Вызывающие методы",
+  "graph-callees": "Вызываемые методы",
 };
 
 function ConfigurationPlanSummary({ plan }: { plan: Record<string, unknown> }) {
@@ -2466,11 +2464,8 @@ export function Indexes({
   const [busy, setBusy] = useState(false);
   const [pendingMode, setPendingMode] = useState<"ensure" | "rebuild" | "validate">();
   const [configuration, setConfiguration] = useState<IndexConfiguration>();
-  const [configurationSchema, setConfigurationSchema] = useState("");
   const [configurationFingerprint, setConfigurationFingerprint] = useState("");
   const [configurationPreview, setConfigurationPreview] = useState<Record<string, unknown>>();
-  const [rollbackPreview, setRollbackPreview] = useState<Record<string, unknown>>();
-  const [purgeV2State, setPurgeV2State] = useState(false);
   const [storageRoot, setStorageRoot] = useState("");
   const [routeHealth, setRouteHealth] = useState<{ blockers: Record<string, unknown>[]; degraded: Record<string, unknown>[] }>({ blockers: [], degraded: [] });
   const [serviceProfiles, setServiceProfiles] = useState<Record<string, unknown>[]>([]);
@@ -2480,7 +2475,7 @@ export function Indexes({
     kind: "embedding", label: "Основной векторный поиск", enabled: true,
     endpoint: "http://127.0.0.1:8080/v1", provider: "openai-compatible",
     model: "embedding", dimension: 1536, ca_bundle_id: null,
-    build_limits: { requests: 10000, input_bytes: 536870912, vectors: 1000000, concurrency: 4, batch: 256, elapsed_seconds: 1800 },
+    build_limits: { requests: 10000, input_bytes: 2147483648, vectors: 1000000, concurrency: 4, batch: 256, elapsed_seconds: 1800 },
   });
   const [profileSecret, setProfileSecret] = useState("");
   const [profileAcknowledged, setProfileAcknowledged] = useState(false);
@@ -2502,11 +2497,9 @@ export function Indexes({
           setItems(value.items);
           setRouteHealth(value.route_health ?? { blockers: [], degraded: [] });
           setConfiguration(value.configuration as IndexConfiguration);
-          setConfigurationSchema(String(value.configuration.schema_version ?? ""));
           setConfigurationFingerprint(value.configuration_fingerprint);
           setStorageRoot(value.storage_root);
           setConfigurationPreview(undefined);
-          setRollbackPreview(undefined);
           setServiceProfiles(services.profiles ?? []);
           setServiceFingerprint(services.state_fingerprint ?? "");
           setProfilePreview(undefined);
@@ -2528,7 +2521,6 @@ export function Indexes({
   const editConfiguration = (next: IndexConfiguration) => {
     setConfiguration(next);
     setConfigurationPreview(undefined);
-    setRollbackPreview(undefined);
   };
   const editProfile = (patch: Partial<SearchServiceProfile>) => {
     setProfile((current) => ({ ...current, ...patch }));
@@ -2623,39 +2615,6 @@ export function Indexes({
       setBusy(false);
     }
   };
-  const previewRollback = async () => {
-    setBusy(true); setError("");
-    try {
-      setRollbackPreview(await api<Record<string, unknown>>(`/projects/${project.id}/indexes/rollback-preview`, {
-        method: "POST",
-        headers: mutationHeaders(),
-        body: JSON.stringify({
-          expected_file_fingerprint: configurationFingerprint,
-          purge_v2_state: purgeV2State,
-        }),
-      }));
-    } catch (error) { setError((error as Error).message); }
-    finally { setBusy(false); }
-  };
-  const applyRollback = async () => {
-    if (!rollbackPreview || !window.confirm("Остановить поиск версии 2 и восстановить схему индексов 2?")) return;
-    setBusy(true); setError("");
-    try {
-      await api(`/projects/${project.id}/indexes/rollback`, {
-        method: "POST",
-        headers: mutationHeaders(),
-        body: JSON.stringify({
-          expected_file_fingerprint: configurationFingerprint,
-          plan_fingerprint: rollbackPreview.plan_fingerprint,
-          purge_v2_state: purgeV2State,
-          inflight_handling: "cancelled",
-          confirmed: true,
-        }),
-      });
-      await refresh();
-    } catch (error) { setError((error as Error).message); }
-    finally { setBusy(false); }
-  };
   const previewProfile = async () => {
     setBusy(true); setError("");
     const key = crypto.randomUUID();
@@ -2721,6 +2680,8 @@ export function Indexes({
       </>}
     </Stack>;
   }
+  const lexicalMissing = items.filter((item) => item.modality === "lexical" && item.status !== "ready").length;
+  const hybridMissing = items.filter((item) => item.modality === "hybrid" && item.status !== "ready").length;
   return (
     <Stack spacing={2}>
       {error && <Alert severity="error">{error}</Alert>}
@@ -2738,17 +2699,21 @@ export function Indexes({
           Использовано {storage.used_bytes.toLocaleString("ru-RU")} из {storage.quota_bytes.toLocaleString("ru-RU")} байт.
         </Box>}
       </Alert>
-      {routeHealth.blockers.length > 0 && <Alert severity="error">
-        Недоступные маршруты: {JSON.stringify(routeHealth.blockers)}
+      {routeHealth.blockers.length > 0 && <Alert severity="warning">
+        Поиск ещё не готов. Не хватает лексических индексов: {lexicalMissing};
+        семантических: {hybridMissing}. Настройте семантический поиск и создайте
+        недостающие индексы.
       </Alert>}
       {routeHealth.degraded.length > 0 && <Alert severity="warning">
-        Деградированные маршруты: {JSON.stringify(routeHealth.degraded)}
+        Часть запросов использует резервный движок: {routeHealth.degraded.length}.
       </Alert>}
       {runtimeBackends.length > 0 && <Alert severity="info">
-        Активные обслуживающие процессы: {JSON.stringify(runtimeBackends)}
+        Активные обслуживающие процессы: {runtimeBackends.length}.
       </Alert>}
       {referenceReadiness && <Alert severity={referenceReadiness.status === "ready" ? "success" : "warning"}>
-        Справочный индекс: {JSON.stringify(referenceReadiness)}
+        {referenceReadiness.status === "ready"
+          ? "Справочный поиск готов."
+          : "Справочный поиск ещё не готов. Он будет подготовлен при создании недостающих индексов."}
       </Alert>}
       <Stack direction="row" spacing={1}>
         <Button disabled={busy} onClick={() => void previewCleanup()}>Найти неактивные индексы</Button>
@@ -2877,33 +2842,19 @@ export function Indexes({
               <Button variant="contained" disabled={busy || !configurationPreview} onClick={() => void applyConfiguration()}>Применить проверенный план</Button>
             </Stack>
             {configurationPreview && <ConfigurationPlanSummary plan={configurationPreview} />}
-            {configurationSchema === "3" && <>
-              <FormControlLabel
-                control={<Checkbox checked={purgeV2State} onChange={(event) => {
-                  setPurgeV2State(event.target.checked);
-                  setRollbackPreview(undefined);
-                }} />}
-                label="Удалить состояние поиска версии 2 после отката"
-              />
-              <Stack direction="row" spacing={1}>
-                <Button color="warning" disabled={busy} onClick={() => void previewRollback()}>Просмотреть откат к схеме 2</Button>
-                <Button color="error" disabled={busy || !rollbackPreview} onClick={() => void applyRollback()}>Применить проверенный откат</Button>
-              </Stack>
-              {rollbackPreview && <Alert severity="warning">
-                <Box component="pre" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
-                  {JSON.stringify(rollbackPreview, null, 2)}
-                </Box>
-              </Alert>}
-            </>}
           </Stack>
         </AccordionDetails>
       </Accordion>
       <Accordion>
         <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
-          <Typography fontWeight={700}>Профили векторного поиска и ИТС</Typography>
+          <Typography fontWeight={700}>Семантический поиск</Typography>
         </AccordionSummary>
         <AccordionDetails>
           <Stack spacing={1}>
+            <Alert severity="info">
+              Укажите сервис векторизации, проверьте план передачи данных и включите профиль.
+              После этого отдельно создайте недостающие индексы кнопкой ниже.
+            </Alert>
             <Typography variant="body2">
               Настроено: {serviceProfiles.length}. Адреса и секреты сервер не возвращает.
             </Typography>
@@ -2944,21 +2895,21 @@ export function Indexes({
             </>}
             <TextField label="Новый секрет (необязательно при сохранении)" type="password" autoComplete="new-password" value={profileSecret} onChange={(event) => { setProfileSecret(event.target.value); setProfilePreview(undefined); }} />
             <FormControlLabel control={<Checkbox checked={profileAcknowledged} onChange={(event) => { setProfileAcknowledged(event.target.checked); setProfilePreview(undefined); }} />} label="Подтверждаю указанную в плане передачу данных внешнему сервису" />
-            <Stack direction="row" spacing={1}>
+            <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
               <Button disabled={busy} onClick={() => void previewProfile()}>Просмотреть план</Button>
-              <Button variant="contained" disabled={busy || !profilePreview} onClick={() => void applyProfile()}>Применить проверенный план</Button>
+              <Button variant="contained" disabled={busy || !profilePreview} onClick={() => void applyProfile()}>Включить семантический поиск</Button>
             </Stack>
             {profilePreview && <Alert severity="warning"><Box component="pre" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{JSON.stringify(profilePreview, null, 2)}</Box></Alert>}
           </Stack>
         </AccordionDetails>
       </Accordion>
-      <Stack direction="row" spacing={1}>
+      <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
         <Button
           disabled={busy}
           variant="contained"
           onClick={() => void run("ensure")}
         >
-          Обеспечить индексы
+          Создать недостающие индексы
         </Button>
         <Button
           disabled={busy}
@@ -2986,7 +2937,11 @@ export function Indexes({
           </Typography>
         </Stack>
       )}
-      {items.map((item) => (
+      <Accordion>
+        <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
+          <Typography fontWeight={700}>Диагностика по объектам ({items.length})</Typography>
+        </AccordionSummary>
+        <AccordionDetails><Stack spacing={1}>{items.map((item) => (
         <Card key={`${item.adapter_id}:${item.component_id}`} variant="outlined">
           <CardContent>
             <FormControlLabel
@@ -3038,7 +2993,8 @@ export function Indexes({
             </Typography>}
           </CardContent>
         </Card>
-      ))}
+      ))}</Stack></AccordionDetails>
+      </Accordion>
     </Stack>
   );
 }
@@ -3506,8 +3462,8 @@ function Workspace({
   return (
     <>
       <AppBar position="static" color="inherit" elevation={1}>
-        <Toolbar variant="dense" sx={{ minHeight: 56 }}>
-          <Box sx={{ flexGrow: 1 }}>
+        <Toolbar variant="dense" sx={{ minHeight: 56, flexDirection: { xs: "column", md: "row" }, alignItems: { xs: "stretch", md: "center" }, py: { xs: 0.75, md: 0 } }}>
+          <Box sx={{ flexGrow: { md: 1 } }}>
             <Typography variant="h6" fontWeight={750}>
               Диспетчер исследования
             </Typography>
@@ -3515,25 +3471,27 @@ function Workspace({
               {project.name}
             </Typography>
           </Box>
-          <Button
-            variant={view === "dispatcher" ? "contained" : "text"}
-            onClick={() => void openWorking()}
-          >
-            Диспетчер
-          </Button>
-          <Button onClick={() => setView("sources")}>Источники</Button>
-          <Button variant={view === "indexes" ? "contained" : "text"} onClick={() => setView("indexes")}>Индексы</Button>
-          <Button onClick={() => setView("journal")}>Журнал</Button>
-          <Button onClick={() => setView("registries")}>Реестры</Button>
-          <Button onClick={() => { setSettingsStep(undefined); setSettingsTab("stages"); setView("settings"); }}>
-            Профили и параметры
-          </Button>
-          <Button color="inherit" onClick={close}>
-            Другой проект
-          </Button>
+          <Box sx={{ display: "flex", overflowX: "auto", "& > button": { flexShrink: 0 } }}>
+            <Button
+              variant={view === "dispatcher" ? "contained" : "text"}
+              onClick={() => void openWorking()}
+            >
+              Диспетчер
+            </Button>
+            <Button onClick={() => setView("sources")}>Источники</Button>
+            <Button variant={view === "indexes" ? "contained" : "text"} onClick={() => setView("indexes")}>Индексы</Button>
+            <Button onClick={() => setView("journal")}>Журнал</Button>
+            <Button onClick={() => setView("registries")}>Реестры</Button>
+            <Button onClick={() => { setSettingsStep(undefined); setSettingsTab("stages"); setView("settings"); }}>
+              Профили и параметры
+            </Button>
+            <Button color="inherit" onClick={close}>
+              Другой проект
+            </Button>
+          </Box>
         </Toolbar>
       </AppBar>
-      <Box sx={{ px: working ? 1.5 : 3, py: 1.5 }}>
+      <Box sx={{ px: working ? 1.5 : { xs: 1.5, sm: 3 }, py: 1.5 }}>
         {error && <Alert severity="error" action={retryWorkingView
           ? <Button color="inherit" onClick={() => void openWorking()}>Повторить снимок</Button>
           : undefined}>{error}</Alert>}

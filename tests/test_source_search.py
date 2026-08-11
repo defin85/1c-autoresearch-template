@@ -19,7 +19,7 @@ requires_source_generation = pytest.mark.skipif(
 
 def policy(**overrides):
     value = {
-        "operations": ["search_text", "find_symbol"],
+        "operations": ["code.search_lexical", "symbol.info"],
         "max_calls": 4,
         "max_concurrent_calls": 2,
         "per_call_deadline_seconds": 10,
@@ -83,9 +83,9 @@ def test_v2_response_surface_is_closed_bounded_and_has_no_cursor():
     assert all(item["additionalProperties"] is False for item in variants)
 
 
-def test_v1_aliases_migrate_exactly_and_false_references_fail_with_guidance():
+def test_schema3_operations_are_exact_and_false_references_fail_with_guidance():
     migrated = source_search.validate_profile_policy(policy(operations=[
-        "search_text", "find_symbol", "find_callers", "find_callees", "navigate_metadata",
+        "code.search_lexical", "symbol.info", "graph.callers", "graph.callees", "metadata.tree",
     ]))
     assert migrated["operations"] == [
         "code.search_lexical", "symbol.info", "graph.callers", "graph.callees",
@@ -93,9 +93,8 @@ def test_v1_aliases_migrate_exactly_and_false_references_fail_with_guidance():
     ]
     with pytest.raises(ValueError, match=r"find_references_unsupported.*symbol\.info.*graph\.callers"):
         source_search.validate_profile_policy(policy(operations=["find_references"]))
-    assert source_search.request_schema("source-search-tool/v1")["properties"]["operation"]["enum"] == [
-        "find_callees", "find_callers", "find_symbol", "navigate_metadata", "search_text",
-    ]
+    with pytest.raises(ValueError, match="unsupported"):
+        source_search.request_schema("source-search-tool/v1")
 
 
 @requires_source_generation
@@ -126,18 +125,18 @@ def test_policy_freezes_role_scope_and_routes():
 def test_source_search_returns_only_canonical_verified_navigation():
     component = next(item for item in indexes.discover(REPO) if item["component_id"] == "target_cf:configuration")
     backend = {"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"}
-    identity = indexes.target_identity(REPO, component, backend, ["text-search"])
+    identity = indexes.target_identity(REPO, component, backend, ["code-search-lexical"])
     state = {
         **indexes.promoted_identity(identity, [{"path": "index", "sha256": "x", "size_bytes": 1}]),
         "adapter_id": "rlm-tools-bsl",
         "adapter_version": "rlm-index/v1",
         "component_id": component["component_id"],
-        "capabilities": ["text-search"],
+        "capabilities": ["code-search-lexical"],
         "status": "ready",
     }
     resolved = source_search.resolve_policy(
         REPO,
-        {"source_search": policy(operations=["search_text"])},
+        {"source_search": policy(operations=["code.search_lexical"])},
         "analyzer",
         {
             "allowed_paths": [
@@ -149,7 +148,7 @@ def test_source_search_returns_only_canonical_verified_navigation():
         REPO,
         resolved,
         {
-            "operation": "search_text",
+            "operation": "code.search_lexical",
             "query": "Процедура",
             "component_id": component["component_id"],
             "path_prefix": None,
@@ -173,7 +172,7 @@ def test_source_search_returns_only_canonical_verified_navigation():
             REPO,
             resolved,
             {
-                "operation": "search_text",
+                "operation": "code.search_lexical",
                 "query": "Процедура",
                 "component_id": component["component_id"],
                 "path_prefix": None,
@@ -190,7 +189,7 @@ def test_source_search_returns_only_canonical_verified_navigation():
             REPO,
             {**resolved, "source_generation_id": "stale"},
             {
-                "operation": "search_text",
+                "operation": "code.search_lexical",
                 "query": "Процедура",
                 "component_id": component["component_id"],
                 "path_prefix": None,
@@ -204,7 +203,7 @@ def test_source_search_returns_only_canonical_verified_navigation():
             REPO,
             resolved,
             {
-                "operation": "search_text",
+                "operation": "code.search_lexical",
                 "query": "Процедура",
                 "component_id": component["component_id"],
                 "path_prefix": None,
@@ -447,7 +446,7 @@ def test_empty_success_never_falls_back_and_conflicting_hits_fail_closed(monkeyp
     )
     resolved = source_search.resolve_policy(
         REPO,
-        {"source_search": policy(operations=["search_text"])},
+        {"source_search": policy(operations=["code.search_lexical"])},
         "analyzer",
         {
             "allowed_paths": [
@@ -465,7 +464,7 @@ def test_empty_success_never_falls_back_and_conflicting_hits_fail_closed(monkeyp
                 {"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"},
             ],
             "routes": {
-                "text-search": ["bsl-analyzer", "rlm-tools-bsl"],
+                "code-search-lexical": ["bsl-analyzer", "rlm-tools-bsl"],
             },
         },
     )
@@ -478,7 +477,7 @@ def test_empty_success_never_falls_back_and_conflicting_hits_fail_closed(monkeyp
             "adapter_id": adapter_id,
             "engine_version": "0.2.63" if adapter_id == "bsl-analyzer" else "1.30.0",
         }
-        identity = indexes.target_identity(REPO, component, backend, ["text-search"])
+        identity = indexes.target_identity(REPO, component, backend, ["code-search-lexical"])
         states.append({
             **indexes.promoted_identity(
                 identity,
@@ -487,12 +486,12 @@ def test_empty_success_never_falls_back_and_conflicting_hits_fail_closed(monkeyp
             "adapter_id": adapter_id,
             "adapter_version": adapter_version,
             "component_id": component["component_id"],
-            "capabilities": ["text-search"],
+            "capabilities": ["code-search-lexical"],
             "status": "ready",
         })
     calls = []
     request = {
-        "operation": "search_text",
+        "operation": "code.search_lexical",
         "query": "ничего",
         "component_id": component["component_id"],
         "path_prefix": None,
@@ -551,11 +550,19 @@ def test_external_artifact_hit_becomes_an_ordinary_external_evidence_path(
     tmp_path: Path,
 ):
     (tmp_path / "research").mkdir()
-    (tmp_path / "research/indexing.toml").write_text(
-        'schema_version = "1"\nengine = "rlm-tools-bsl"\n'
-        'engine_version = "1.30.0"\n',
-        encoding="utf-8",
-    )
+    (tmp_path / "research/indexing.toml").write_bytes(indexes.serialize_config({
+        "schema_version": "3",
+        "machine_contract_version": "1.3",
+        "backends": [{"adapter_id": "rlm-tools-bsl", "engine_version": "1.30.0"}],
+        "routes": {
+            capability: ["rlm-tools-bsl"]
+            for capability in indexes.COMPLETE_SEARCH_CAPABILITIES
+        },
+        "service_profiles": {
+            "lexical": "lexical-default",
+            "hybrid": "embedding-default",
+        },
+    }))
     source = (
         tmp_path
         / "sources/generations/gen/target_cf/external/processor/source"
@@ -582,7 +589,7 @@ def test_external_artifact_hit_becomes_an_ordinary_external_evidence_path(
     )
     resolved = source_search.resolve_policy(
         tmp_path,
-        {"source_search": policy(operations=["search_text"])},
+        {"source_search": policy(operations=["code.search_lexical"])},
         "analyzer",
         {"allowed_paths": ["target_cf/external/processor/source/Module.bsl"]},
     )
@@ -596,7 +603,7 @@ def test_external_artifact_hit_becomes_an_ordinary_external_evidence_path(
 
 
 def test_query_hmac_is_project_keyed_and_content_free():
-    query = {"operation": "search_text", "query": "СекретныйТекст"}
+    query = {"operation": "code.search_lexical", "query": "СекретныйТекст"}
     first = source_search.query_hmac(b"a" * 32, "v1", query)
     second = source_search.query_hmac(b"b" * 32, "v1", query)
     assert first != second and "СекретныйТекст" not in first
@@ -612,7 +619,7 @@ def test_hmac_rotation_keeps_old_key_and_changes_query_identity(tmp_path: Path):
     assert second_version == "v2"
     assert first_key != second_key
     assert (tmp_path / "source-search-hmac-v1.key").read_bytes() == first_key
-    query = {"operation": "search_text", "query": "Закрытый запрос"}
+    query = {"operation": "code.search_lexical", "query": "Закрытый запрос"}
     assert source_search.query_hmac(first_key, first_version, query) != (
         source_search.query_hmac(second_key, second_version, query)
     )
@@ -624,7 +631,7 @@ def test_final_evidence_revalidation_and_reuse_ignore_volatile_ledger_fields(
 ):
     resolved = source_search.resolve_policy(
         REPO,
-        {"source_search": policy(operations=["search_text"])},
+        {"source_search": policy(operations=["code.search_lexical"])},
         "analyzer",
         {
             "allowed_paths": [
@@ -648,7 +655,7 @@ def test_final_evidence_revalidation_and_reuse_ignore_volatile_ledger_fields(
             {"evidence": [{**evidence, "fingerprint": "sha256:altered"}]},
         )
     stable = {
-        "capability": "text-search",
+        "capability": "code-search-lexical",
         "route_fingerprint": resolved["routing_fingerprint"],
         "adapter_id": "rlm-tools-bsl",
         "adapter_version": "rlm-index/v1",
@@ -694,7 +701,7 @@ def test_final_evidence_revalidation_and_reuse_ignore_volatile_ledger_fields(
     monkeypatch.setattr(
         indexes,
         "load_config",
-        lambda _repo: {"routes": {"text-search": ["bsl-analyzer"]}},
+        lambda _repo: {"routes": {"code-search-lexical": ["bsl-analyzer"]}},
     )
     with pytest.raises(RuntimeError, match="route_stale"):
         source_search.revalidate_reuse_environment(REPO, resolved, ledger)
@@ -770,14 +777,14 @@ def test_sqlite_reservation_is_atomic_replay_safe_and_exactly_once(tmp_path: Pat
         "schema_version": source_search.POLICY_VERSION,
         "policy_fingerprint": "sha256:policy",
         "scope_fingerprint": "sha256:scope",
-        "operations": ["search_text"],
+        "operations": ["code.search_lexical"],
     }
     with DispatcherStore(REPO, tmp_path) as store:
         store.configure_source_search("inv-1", resolved, "sha256:capability")
         reserved = store.reserve_source_search_call(
             "inv-1", "call-1", "sha256:capability",
             query_hmac="v1:query",
-            capability="text-search",
+            capability="code-search-lexical",
             query_bytes=10,
             requested_results=2,
             requested_returned_bytes=100,
@@ -787,7 +794,7 @@ def test_sqlite_reservation_is_atomic_replay_safe_and_exactly_once(tmp_path: Pat
         with pytest.raises(RuntimeError, match="replay"):
             store.reserve_source_search_call(
                 "inv-1", "call-1", "sha256:capability",
-                query_hmac="v1:query", capability="text-search", query_bytes=10,
+                query_hmac="v1:query", capability="code-search-lexical", query_bytes=10,
                 requested_results=2, requested_returned_bytes=100,
                 requested_backend_seconds=5,
             )
@@ -805,7 +812,7 @@ def test_sqlite_reservation_is_atomic_replay_safe_and_exactly_once(tmp_path: Pat
         assert "query" not in item
         assert ledger["status_counts"] == {"completed": 1}
         assert ledger["route_summaries"] == [{
-            "capability": "text-search",
+            "capability": "code-search-lexical",
             "selected_backend_id": "rlm-tools-bsl",
             "fallback_reason": "index_not_ready",
             "calls": 1,
@@ -821,13 +828,13 @@ def test_sqlite_close_fences_admission_and_terminalizes_inflight(tmp_path: Path)
         "schema_version": source_search.POLICY_VERSION,
         "policy_fingerprint": "sha256:policy",
         "scope_fingerprint": "sha256:scope",
-        "operations": ["search_text"],
+        "operations": ["code.search_lexical"],
     }
     with DispatcherStore(REPO, tmp_path) as store:
         store.configure_source_search("inv-2", resolved, "sha256:capability")
         store.reserve_source_search_call(
             "inv-2", "call-1", "sha256:capability",
-            query_hmac="v1:query", capability="text-search", query_bytes=10,
+            query_hmac="v1:query", capability="code-search-lexical", query_bytes=10,
             requested_results=2, requested_returned_bytes=100,
             requested_backend_seconds=5,
         )
@@ -839,7 +846,7 @@ def test_sqlite_close_fences_admission_and_terminalizes_inflight(tmp_path: Path)
         with pytest.raises(RuntimeError, match="terminal"):
             store.reserve_source_search_call(
                 "inv-2", "call-2", "sha256:capability",
-                query_hmac="v1:query2", capability="text-search", query_bytes=10,
+                query_hmac="v1:query2", capability="code-search-lexical", query_bytes=10,
                 requested_results=2, requested_returned_bytes=100,
                 requested_backend_seconds=5,
             )
@@ -854,7 +861,7 @@ def test_dispatcher_cancellation_atomically_closes_source_search(tmp_path: Path)
         "schema_version": source_search.POLICY_VERSION,
         "policy_fingerprint": "sha256:policy",
         "scope_fingerprint": "sha256:scope",
-        "operations": ["search_text"],
+        "operations": ["code.search_lexical"],
     }
     with DispatcherStore(REPO, tmp_path) as store:
         token = store.acquire_lease(
@@ -872,7 +879,7 @@ def test_dispatcher_cancellation_atomically_closes_source_search(tmp_path: Path)
         )
         store.reserve_source_search_call(
             invocation_id, "call-1", "sha256:capability",
-            query_hmac="v1:query", capability="text-search", query_bytes=10,
+            query_hmac="v1:query", capability="code-search-lexical", query_bytes=10,
             requested_results=1, requested_returned_bytes=10,
             requested_backend_seconds=1,
         )
@@ -895,7 +902,7 @@ def test_mcp_bridge_exposes_only_source_search(monkeypatch, tmp_path: Path):
         "schema_version": source_search.POLICY_VERSION,
         "policy_fingerprint": "sha256:policy",
         "scope_fingerprint": "sha256:scope",
-        "operations": ["search_text"],
+        "operations": ["code.search_lexical"],
     }
     capability = "private-capability"
     from one_c_autoresearch.contracts import sha256
@@ -956,7 +963,7 @@ def test_mcp_bridge_discards_result_closed_before_settlement(
         "schema_version": source_search.POLICY_VERSION,
         "policy_fingerprint": "sha256:policy",
         "scope_fingerprint": "sha256:scope",
-        "operations": ["search_text"],
+        "operations": ["code.search_lexical"],
     }
     capability = "private-capability"
     with DispatcherStore(REPO, tmp_path) as store:
@@ -991,7 +998,7 @@ def test_mcp_bridge_discards_result_closed_before_settlement(
             "params": {
                 "name": "source_search",
                 "arguments": {
-                    "operation": "search_text",
+                    "operation": "code.search_lexical",
                     "query": "test",
                     "component_id": None,
                     "path_prefix": None,
@@ -1017,13 +1024,13 @@ def test_reservation_releases_unused_result_and_byte_capacity(tmp_path: Path):
         "schema_version": source_search.POLICY_VERSION,
         "policy_fingerprint": "sha256:policy",
         "scope_fingerprint": "sha256:scope",
-        "operations": ["search_text"],
+        "operations": ["code.search_lexical"],
     }
     with DispatcherStore(REPO, tmp_path) as store:
         store.configure_source_search("inv-release", resolved, "sha256:capability")
         store.reserve_source_search_call(
             "inv-release", "call-1", "sha256:capability",
-            query_hmac="v1:first", capability="text-search", query_bytes=10,
+            query_hmac="v1:first", capability="code-search-lexical", query_bytes=10,
             requested_results=2, requested_returned_bytes=100,
             requested_backend_seconds=5,
         )
@@ -1033,7 +1040,7 @@ def test_reservation_releases_unused_result_and_byte_capacity(tmp_path: Path):
         )
         store.reserve_source_search_call(
             "inv-release", "call-2", "sha256:capability",
-            query_hmac="v1:second", capability="text-search", query_bytes=10,
+            query_hmac="v1:second", capability="code-search-lexical", query_bytes=10,
             requested_results=2, requested_returned_bytes=100,
             requested_backend_seconds=5,
         )
@@ -1047,13 +1054,13 @@ def test_reservation_shortens_deadline_and_reports_exact_exhausted_limit(tmp_pat
         "schema_version": source_search.POLICY_VERSION,
         "policy_fingerprint": "sha256:policy",
         "scope_fingerprint": "sha256:scope",
-        "operations": ["search_text"],
+        "operations": ["code.search_lexical"],
     }
     with DispatcherStore(REPO, tmp_path) as store:
         store.configure_source_search("inv-limit", resolved, "sha256:capability")
         first = store.reserve_source_search_call(
             "inv-limit", "call-1", "sha256:capability",
-            query_hmac="v1:first", capability="text-search", query_bytes=5,
+            query_hmac="v1:first", capability="code-search-lexical", query_bytes=5,
             requested_results=1, requested_returned_bytes=10,
             requested_backend_seconds=5,
         )
@@ -1063,7 +1070,7 @@ def test_reservation_shortens_deadline_and_reports_exact_exhausted_limit(tmp_pat
         )
         second = store.reserve_source_search_call(
             "inv-limit", "call-2", "sha256:capability",
-            query_hmac="v1:second", capability="text-search", query_bytes=5,
+            query_hmac="v1:second", capability="code-search-lexical", query_bytes=5,
             requested_results=1, requested_returned_bytes=10,
             requested_backend_seconds=5,
         )
@@ -1074,7 +1081,7 @@ def test_reservation_shortens_deadline_and_reports_exact_exhausted_limit(tmp_pat
         with pytest.raises(SourceSearchBudgetError) as failure:
             store.reserve_source_search_call(
                 "inv-limit", "call-3", "sha256:capability",
-                query_hmac="v1:third", capability="text-search", query_bytes=1,
+                query_hmac="v1:third", capability="code-search-lexical", query_bytes=1,
                 requested_results=1, requested_returned_bytes=10,
                 requested_backend_seconds=1,
             )
@@ -1100,7 +1107,7 @@ def test_concurrent_reservation_admits_only_capacity_that_fits(tmp_path: Path):
         "schema_version": source_search.POLICY_VERSION,
         "policy_fingerprint": "sha256:policy",
         "scope_fingerprint": "sha256:scope",
-        "operations": ["search_text"],
+        "operations": ["code.search_lexical"],
     }
     with DispatcherStore(REPO, tmp_path) as store:
         store.configure_source_search("inv-race", resolved, "sha256:capability")
@@ -1113,7 +1120,7 @@ def test_concurrent_reservation_admits_only_capacity_that_fits(tmp_path: Path):
             try:
                 store.reserve_source_search_call(
                     "inv-race", call_id, "sha256:capability",
-                    query_hmac=f"v1:{call_id}", capability="text-search",
+                    query_hmac=f"v1:{call_id}", capability="code-search-lexical",
                     query_bytes=1, requested_results=1,
                     requested_returned_bytes=1, requested_backend_seconds=1,
                 )
@@ -1140,14 +1147,14 @@ def test_capability_cannot_cross_invocations_or_projects(tmp_path: Path):
         "schema_version": source_search.POLICY_VERSION,
         "policy_fingerprint": "sha256:policy",
         "scope_fingerprint": "sha256:scope",
-        "operations": ["search_text"],
+        "operations": ["code.search_lexical"],
     }
     with DispatcherStore(REPO, tmp_path / "first") as store:
         store.configure_source_search("inv-first", resolved, "sha256:first")
         with pytest.raises(PermissionError, match="authentication"):
             store.reserve_source_search_call(
                 "inv-first", "call", "sha256:second",
-                query_hmac="v1:query", capability="text-search", query_bytes=1,
+                query_hmac="v1:query", capability="code-search-lexical", query_bytes=1,
                 requested_results=1, requested_returned_bytes=1,
                 requested_backend_seconds=1,
             )
@@ -1155,7 +1162,7 @@ def test_capability_cannot_cross_invocations_or_projects(tmp_path: Path):
         with pytest.raises(PermissionError, match="authentication"):
             store.reserve_source_search_call(
                 "inv-first", "call", "sha256:first",
-                query_hmac="v1:query", capability="text-search", query_bytes=1,
+                query_hmac="v1:query", capability="code-search-lexical", query_bytes=1,
                 requested_results=1, requested_returned_bytes=1,
                 requested_backend_seconds=1,
             )
@@ -1169,7 +1176,7 @@ def test_expired_capability_and_inflight_completion_fail_closed(tmp_path: Path):
         "schema_version": source_search.POLICY_VERSION,
         "policy_fingerprint": "sha256:policy",
         "scope_fingerprint": "sha256:scope",
-        "operations": ["search_text"],
+        "operations": ["code.search_lexical"],
     }
     with DispatcherStore(REPO, tmp_path) as store:
         store.configure_source_search(
@@ -1183,14 +1190,14 @@ def test_expired_capability_and_inflight_completion_fail_closed(tmp_path: Path):
         with pytest.raises(RuntimeError, match="expired"):
             store.reserve_source_search_call(
                 "inv-expired", "call-1", "sha256:capability",
-                query_hmac="v1:query", capability="text-search", query_bytes=10,
+                query_hmac="v1:query", capability="code-search-lexical", query_bytes=10,
                 requested_results=1, requested_returned_bytes=10,
                 requested_backend_seconds=1,
             )
         store.configure_source_search("inv-complete", resolved, "sha256:capability")
         store.reserve_source_search_call(
             "inv-complete", "call-1", "sha256:capability",
-            query_hmac="v1:query", capability="text-search", query_bytes=10,
+            query_hmac="v1:query", capability="code-search-lexical", query_bytes=10,
             requested_results=1, requested_returned_bytes=10,
             requested_backend_seconds=1,
         )

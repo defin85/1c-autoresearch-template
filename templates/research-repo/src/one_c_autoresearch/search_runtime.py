@@ -23,6 +23,7 @@ PROJECT_CALL_LIMIT = 4
 SERVICE_CALL_LIMIT = 8
 MAX_IDLE_TTL_SECONDS = 300
 ORPHAN_GRACE_SECONDS = 30
+BROKER_START_GRACE_SECONDS = 0.5
 ADDRESS_SPACE_BYTES = 16 * 1024**3
 TERM_GRACE_SECONDS = 2
 
@@ -334,6 +335,11 @@ def supervised_workspace_proxy(
                 )
                 try:
                     process, identity = launch_backend(provisional["daemon"])
+                    # The installed analyzer does not retry broker-required while
+                    # the freshly launched daemon is still creating its socket.
+                    time.sleep(BROKER_START_GRACE_SECONDS)
+                    if process.poll() is not None:
+                        raise RuntimeError("search_runtime.backend_start_failed")
                 except BaseException:
                     if owned_resource is not None:
                         _ = owned_resource.close()

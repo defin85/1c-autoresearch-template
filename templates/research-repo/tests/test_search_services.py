@@ -180,6 +180,23 @@ def test_remote_preview_requires_disclosure_acknowledgement(
     assert preview["external_disclosure_acknowledged"] is True
 
 
+def test_local_profile_accepts_large_repository_within_build_limit(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state = tmp_path / "state"
+    profile = embedding_profile("http://127.0.0.1:9999/v1")
+    profile["build_limits"]["input_bytes"] = 2 * 1024 * 1024 * 1024
+    large_disclosure = disclosure()
+    large_disclosure["source_bytes"] = 724_000_000
+    large_disclosure["estimated_input_bytes"] = 724_000_000
+    preview = preview_profile(
+        repo, "semantic", profile, actor="owner", idempotency_key="large-local",
+        expected_state_fingerprint=state_fingerprint(repo, state),
+        disclosure=large_disclosure, acknowledged=False, base=state,
+    )
+    assert preview["disclosure"]["estimated_input_bytes"] == 724_000_000
+
+
 def test_its_profile_is_reviewed_and_never_returns_token(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

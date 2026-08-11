@@ -24,18 +24,7 @@ from .contracts import (
 )
 from .search_runtime import Closable
 
-CAPABILITIES = (
-    "text-search",
-    "symbol-definition",
-    "symbol-references",
-    "callers",
-    "callees",
-    "metadata-navigation",
-)
-BSL_CAPABILITIES = tuple(
-    capability for capability in CAPABILITIES
-    if capability != "symbol-references"
-)
+RLM_CAPABILITIES = ("code-search-lexical",)
 BACKEND_CATALOG = {
     "rlm-tools-bsl": {
         "executable": "rlm-bsl-index",
@@ -123,11 +112,10 @@ class BackendRow(TypedDict):
 
 class IndexConfig(TypedDict):
     schema_version: str
-    source_schema_version: str
+    machine_contract_version: str
     backends: list[BackendRow]
     routes: dict[str, list[str]]
-    machine_contract_version: NotRequired[str]
-    service_profiles: NotRequired[dict[str, str]]
+    service_profiles: dict[str, str]
 
 
 class ConfigCandidate(TypedDict, total=False):
@@ -149,35 +137,6 @@ class ConfigPlan(TypedDict):
     rebuild_backends: list[str]
     degraded_routes: list[str]
     reuse_invalidated: bool
-    plan_fingerprint: str
-
-
-class MigrationPlan(TypedDict):
-    schema_version: str
-    current_file_fingerprint: str
-    normalized_file_fingerprint: str
-    normalized_file: str
-    machine_contract_version: str
-    profile_bindings: dict[str, str]
-    profile_operations: dict[str, list[str]]
-    explicit_routes: dict[str, list[str]]
-    stale_semantic_targets: list[str]
-    v2_reuse_invalidated: bool
-    preserved_v1_inflight: list[str]
-    backup_required: bool
-    build_started: bool
-    plan_fingerprint: str
-
-
-class RollbackPlan(TypedDict):
-    schema_version: str
-    current_file_fingerprint: str
-    restore_file_fingerprint: str
-    v2_inflight_ids: list[str]
-    admission_closure_required: bool
-    inflight_handling_required: bool
-    v2_state_action: str
-    readiness_check_required: bool
     plan_fingerprint: str
 
 
@@ -486,15 +445,12 @@ def _index_config(candidate: ConfigCandidate) -> IndexConfig:
     ]
     routes = {name: list(values) for name, values in candidate.get("routes", {}).items()}
     result: IndexConfig = {
-        "schema_version": str(candidate.get("schema_version", "")),
-        "source_schema_version": str(candidate.get("schema_version", "")),
+        "schema_version": "3",
+        "machine_contract_version": "1.3",
         "backends": backends,
         "routes": routes,
+        "service_profiles": dict(candidate.get("service_profiles", {})),
     }
-    if "machine_contract_version" in candidate:
-        result["machine_contract_version"] = candidate["machine_contract_version"]
-    if "service_profiles" in candidate:
-        result["service_profiles"] = dict(candidate["service_profiles"])
     return result
 
 
@@ -599,27 +555,14 @@ def repository_instance_fingerprint(repo: Path) -> str:
 
 def load_config(repo: Path, required_capabilities: tuple[str, ...] = ()) -> IndexConfig:
     raw = _toml_json(repo / "research/indexing.toml")
-    version = str(raw.get("schema_version", "1"))
-    if version == "1":
-        if set(raw) - {"schema_version", "engine", "engine_version"} or set(raw) < {"engine", "engine_version"}:
-            raise ValueError("invalid indexing schema version 1")
-        if raw["engine"] != "rlm-tools-bsl" or not str(raw["engine_version"]).strip():
-            raise ValueError("invalid legacy indexing backend")
-        legacy_backends: list[BackendRow] = [{"adapter_id": "rlm-tools-bsl", "engine_version": str(raw["engine_version"])}]
-        legacy_routes: dict[str, list[str]] = {capability: ["rlm-tools-bsl"] for capability in CAPABILITIES}
-        return {"schema_version": "2", "source_schema_version": "1", "backends": legacy_backends, "routes": legacy_routes}
-    expected = (
-        {"schema_version", "backends", "routes"}
-        if version == "2"
-        else {
-            "schema_version", "machine_contract_version", "backends", "routes",
-            "service_profiles",
-        }
-    )
-    if version not in {"2", "3"} or set(raw) != expected:
-        raise ValueError(f"invalid indexing schema version {version}")
-    if version == "3" and str(raw["machine_contract_version"]) != "1.3":
-        raise ValueError("indexing schema version 3 requires machine contract 1.3")
+    expected = {
+        "schema_version", "machine_contract_version", "backends", "routes",
+        "service_profiles",
+    }
+    if raw.get("schema_version") != "3" or set(raw) != expected:
+        raise ValueError("indexing.schema3_required")
+    if raw["machine_contract_version"] != "1.3":
+        raise ValueError("indexing.schema3_required")
     backend_rows = raw.get("backends")
     routes_raw = raw.get("routes")
     if not isinstance(backend_rows, list) or not backend_rows or not isinstance(routes_raw, dict):
@@ -640,10 +583,7 @@ def load_config(repo: Path, required_capabilities: tuple[str, ...] = ()) -> Inde
         raise ValueError("duplicate indexing backend")
     routes: dict[str, list[str]] = {}
     for capability, members in routes_raw.items():
-        allowed_capabilities = (
-            COMPLETE_SEARCH_CAPABILITIES if version == "3" else CAPABILITIES
-        )
-        if capability not in allowed_capabilities:
+        if capability not in COMPLETE_SEARCH_CAPABILITIES:
             raise ValueError("unknown indexing capability")
         if (
             not isinstance(members, list)
@@ -654,42 +594,40 @@ def load_config(repo: Path, required_capabilities: tuple[str, ...] = ()) -> Inde
         ):
             raise ValueError("invalid indexing capability route")
         routes[capability] = [item for item in members if isinstance(item, str)]
+    missing = set(COMPLETE_SEARCH_CAPABILITIES) - set(routes)
+    if missing:
+        raise ValueError("indexing.schema3_required")
     missing = set(required_capabilities) - set(routes)
     if missing:
         raise ValueError(f"missing required indexing routes: {sorted(missing)}")
-    result: IndexConfig = {
-        "schema_version": version,
-        "source_schema_version": version,
+    profiles_value = raw["service_profiles"]
+    if (
+        not isinstance(profiles_value, dict)
+        or set(profiles_value) != set(SCHEMA3_SERVICE_PROFILES)
+        or any(
+            not isinstance(profiles_value.get(name), str) or not str(profiles_value.get(name)).strip()
+            for name in SCHEMA3_SERVICE_PROFILES
+        )
+        or len(set(str(value) for value in profiles_value.values())) != len(profiles_value)
+    ):
+        raise ValueError("indexing.schema3_required")
+    return {
+        "schema_version": "3",
+        "machine_contract_version": "1.3",
         "backends": backends,
         "routes": routes,
+        "service_profiles": {
+            name: str(profiles_value[name]) for name in SCHEMA3_SERVICE_PROFILES
+        },
     }
-    if version == "3":
-        if not {"code-search-lexical", "code-search-hybrid"} <= set(routes):
-            raise ValueError("indexing schema version 3 requires explicit lexical and hybrid routes")
-        profiles_value = raw["service_profiles"]
-        if (
-            not isinstance(profiles_value, dict)
-            or set(profiles_value) != set(SCHEMA3_SERVICE_PROFILES)
-            or any(
-                not isinstance(profiles_value.get(name), str) or not str(profiles_value.get(name)).strip()
-                for name in SCHEMA3_SERVICE_PROFILES
-            )
-            or len(set(str(value) for value in profiles_value.values())) != len(profiles_value)
-        ):
-            raise ValueError("invalid indexing schema version 3 service profiles")
-        profiles = {name: str(profiles_value[name]) for name in SCHEMA3_SERVICE_PROFILES}
-        result["machine_contract_version"] = "1.3"
-        result["service_profiles"] = dict(profiles)
-    return result
 
 
 def serialize_config(config: IndexConfig) -> bytes:
-    version = str(config.get("schema_version"))
-    if version not in {"2", "3"}:
-        raise ValueError("only normalized indexing schema versions 2 and 3 can be written")
-    lines = [f'schema_version = "{version}"']
-    if version == "3":
-        lines.append('machine_contract_version = "1.3"')
+    if config.get("schema_version") != "3" or config.get("machine_contract_version") != "1.3":
+        raise ValueError("indexing.schema3_required")
+    if set(config["routes"]) != set(COMPLETE_SEARCH_CAPABILITIES):
+        raise ValueError("indexing.schema3_required")
+    lines = ['schema_version = "3"', 'machine_contract_version = "1.3"']
     lines.append("")
     for backend in config["backends"]:
         lines.extend((
@@ -699,54 +637,29 @@ def serialize_config(config: IndexConfig) -> bytes:
             "",
         ))
     lines.append("[routes]")
-    capabilities = CAPABILITIES if version == "2" else COMPLETE_SEARCH_CAPABILITIES
-    for capability in capabilities:
-        if capability in config["routes"]:
-            values = ", ".join(json.dumps(item) for item in config["routes"][capability])
-            lines.append(f'{json.dumps(capability)} = [{values}]')
-    if version == "3":
-        lines.extend(("", "[service_profiles]"))
-        profiles = config.get("service_profiles")
-        if profiles is None:
-            raise ValueError("indexing schema version 3 service profiles are missing")
-        for name in SCHEMA3_SERVICE_PROFILES:
-            lines.append(f"{name} = {json.dumps(profiles[name])}")
+    for capability in COMPLETE_SEARCH_CAPABILITIES:
+        values = ", ".join(json.dumps(item) for item in config["routes"][capability])
+        lines.append(f'{json.dumps(capability)} = [{values}]')
+    lines.extend(("", "[service_profiles]"))
+    for name in SCHEMA3_SERVICE_PROFILES:
+        lines.append(f"{name} = {json.dumps(config['service_profiles'][name])}")
     return ("\n".join(lines) + "\n").encode()
 
 
 def _preview_candidate(
-    repo: Path,
+    _repo: Path,
     candidate: ConfigCandidate,
     required_capabilities: tuple[str, ...],
 ) -> tuple[IndexConfig, bytes, str]:
-    if candidate == {"schema_version": "1"}:
-        current = load_config(repo)
-        if (
-            current["backends"] != [{
-                "adapter_id": "rlm-tools-bsl",
-                "engine_version": current["backends"][0]["engine_version"],
-            }]
-            or set(current["routes"]) != set(CAPABILITIES)
-            or any(route != ["rlm-tools-bsl"] for route in current["routes"].values())
-        ):
-            raise ValueError("indexing configuration is not exactly representable as schema version 1")
-        engine_version = current["backends"][0]["engine_version"]
-        normalized = current
-        encoded = (
-            'schema_version = "1"\n'
-            'engine = "rlm-tools-bsl"\n'
-            f"engine_version = {json.dumps(engine_version)}\n"
-        ).encode()
-        return normalized, encoded, "1"
-    if candidate.get("schema_version") != "2":
-        raise ValueError("indexing configuration preview requires schema version 2 or an exact version 1 downgrade")
+    if candidate.get("schema_version") != "3":
+        raise ValueError("indexing.schema3_required")
     with tempfile.TemporaryDirectory() as temporary:
         shadow = Path(temporary)
         (shadow / "research").mkdir()
         normalized_candidate = _index_config(candidate)
         _ = (shadow / "research/indexing.toml").write_bytes(serialize_config(normalized_candidate))
         normalized = load_config(shadow, required_capabilities)
-    return normalized, serialize_config(normalized), "2"
+    return normalized, serialize_config(normalized), "3"
 
 
 def config_fingerprint(repo: Path) -> str:
@@ -766,7 +679,6 @@ def preview_config(
         candidate,
         required_capabilities,
     )
-    _ = normalized.pop("source_schema_version", None)
     current = load_config(repo)
     current_backend_ids = {item["adapter_id"] for item in current["backends"]}
     candidate_backend_ids = {item["adapter_id"] for item in normalized["backends"]}
@@ -789,7 +701,7 @@ def preview_config(
             for capability in set(current["routes"]) | set(normalized["routes"])
             if current["routes"].get(capability) != normalized["routes"].get(capability)
         ),
-        "reuse_invalidated": current != {**normalized, "source_schema_version": current.get("source_schema_version", "2")},
+        "reuse_invalidated": current != normalized,
         "plan_fingerprint": "",
     }
     plan["plan_fingerprint"] = "sha256:" + sha256(canonical_json({key: value for key, value in plan.items() if key != "plan_fingerprint"}))
@@ -815,241 +727,6 @@ def apply_config(
         "rebuild_backends": plan["rebuild_backends"],
         "reuse_invalidated": plan["reuse_invalidated"],
         "build_started": False,
-    }
-
-
-def _schema3_candidate(candidate: ConfigCandidate) -> tuple[IndexConfig, bytes]:
-    if (
-        candidate.get("schema_version") != "3"
-        or set(candidate) != {
-            "schema_version", "machine_contract_version", "backends", "routes",
-            "service_profiles",
-        }
-    ):
-        raise ValueError("schema 3 migration requires an indexing schema 3 candidate")
-    with tempfile.TemporaryDirectory() as temporary:
-        shadow = Path(temporary)
-        (shadow / "research").mkdir()
-        encoded = serialize_config(_index_config(candidate))
-        _ = (shadow / "research/indexing.toml").write_bytes(encoded)
-        normalized = load_config(shadow)
-    _ = normalized.pop("source_schema_version", None)
-    return normalized, serialize_config(normalized)
-
-
-def _validate_schema3_profiles(
-    profile_operations: dict[str, list[str]],
-) -> dict[str, list[str]]:
-    if set(profile_operations) != set(
-        SCHEMA3_SERVICE_PROFILES
-    ):
-        raise ValueError("lexical and hybrid profile operations are required")
-    normalized: dict[str, list[str]] = {}
-    for profile, operations in profile_operations.items():
-        if (
-            not operations
-            or len(operations) != len(set(operations))
-        ):
-            raise ValueError("invalid schema 3 profile operations")
-        if "find_references" in operations:
-            raise ValueError(
-                "find_references is not admitted for new v2 profiles; use symbol or graph operations"
-            )
-        if set(operations) - COMPLETE_SEARCH_OPERATIONS:
-            raise ValueError("unknown schema 3 profile operation")
-        normalized[profile] = list(operations)
-    return normalized
-
-
-def preview_schema3_migration(
-    repo: Path,
-    candidate: ConfigCandidate,
-    expected_file_fingerprint: str,
-    profile_operations: dict[str, list[str]],
-    v1_inflight_ids: tuple[str, ...] = (),
-) -> MigrationPlan:
-    if config_fingerprint(repo) != expected_file_fingerprint:
-        raise RuntimeError("stale indexing configuration fingerprint")
-    current = load_config(repo)
-    if current["source_schema_version"] != "2":
-        raise ValueError("schema 3 migration requires indexing schema version 2")
-    normalized, encoded = _schema3_candidate(candidate)
-    operations = _validate_schema3_profiles(profile_operations)
-    if any(not item for item in v1_inflight_ids):
-        raise ValueError("invalid v1 in-flight invocation identifier")
-    if len(v1_inflight_ids) != len(set(v1_inflight_ids)):
-        raise ValueError("duplicate v1 in-flight invocation identifier")
-    bsl = next(
-        (row for row in normalized["backends"] if row["adapter_id"] == "bsl-analyzer"),
-        None,
-    )
-    if bsl is None:
-        raise ValueError("schema 3 requires a bsl-analyzer backend")
-    probe = probe_backend(repo, bsl)
-    manifest = probe.get("surface_manifest", {})
-    if (
-        not probe.get("available")
-        or probe.get("contract_version") != "1.3"
-        or manifest.get("state") != "complete"
-        or manifest.get("machine_contract_version") != "1.3"
-    ):
-        raise RuntimeError("schema 3 requires the complete bsl-analyzer contract 1.3")
-    service_profiles = normalized.get("service_profiles")
-    if service_profiles is None:
-        raise ValueError("schema 3 requires service profiles")
-    plan: MigrationPlan = {
-        "schema_version": "indexing-schema3-migration-plan/v1",
-        "current_file_fingerprint": expected_file_fingerprint,
-        "normalized_file_fingerprint": "sha256:" + sha256(encoded),
-        "normalized_file": encoded.decode(),
-        "machine_contract_version": "1.3",
-        "profile_bindings": service_profiles,
-        "profile_operations": operations,
-        "explicit_routes": {
-            name: normalized["routes"][f"code-search-{name}"]
-            for name in SCHEMA3_SERVICE_PROFILES
-        },
-        "stale_semantic_targets": ["code-search-hybrid"],
-        "v2_reuse_invalidated": True,
-        "preserved_v1_inflight": list(v1_inflight_ids),
-        "backup_required": True,
-        "build_started": False,
-        "plan_fingerprint": "",
-    }
-    plan["plan_fingerprint"] = "sha256:" + sha256(canonical_json({key: value for key, value in plan.items() if key != "plan_fingerprint"}))
-    return plan
-
-
-def apply_schema3_migration(
-    repo: Path,
-    candidate: ConfigCandidate,
-    expected_file_fingerprint: str,
-    expected_plan_fingerprint: str,
-    profile_operations: dict[str, list[str]],
-    v1_inflight_ids: tuple[str, ...] = (),
-    state_root: Path | None = None,
-) -> dict[str, JsonValue]:
-    with repository_lock(repo):
-        plan = preview_schema3_migration(
-            repo, candidate, expected_file_fingerprint, profile_operations,
-            v1_inflight_ids,
-        )
-        if plan["plan_fingerprint"] != expected_plan_fingerprint:
-            raise RuntimeError("stale indexing schema 3 migration plan")
-        backup = capture_schema2_backup(repo, state_root)
-        from .contracts import atomic_bytes
-        atomic_bytes(repo / "research/indexing.toml", plan["normalized_file"].encode())
-        marker = _operational_root(repo, state_root) / "schema3/stale-semantic-targets.json"
-        _bounded_atomic_json(marker, {
-            "schema_version": "indexing-stale-targets/v1",
-            "targets": plan["stale_semantic_targets"],
-        })
-        marker.chmod(0o600)
-    return {
-        "operation": "indexes.migrate_schema3",
-        "configuration_fingerprint": config_fingerprint(repo),
-        "plan_fingerprint": expected_plan_fingerprint,
-        "backup": backup,
-        "stale_semantic_targets": plan["stale_semantic_targets"],
-        "preserved_v1_inflight": plan["preserved_v1_inflight"],
-        "build_started": False,
-    }
-
-
-def preview_schema3_rollback(
-    repo: Path,
-    expected_file_fingerprint: str,
-    state_root: Path | None = None,
-    *,
-    v2_inflight_ids: tuple[str, ...] = (),
-    purge_v2_state: bool = False,
-) -> RollbackPlan:
-    if config_fingerprint(repo) != expected_file_fingerprint:
-        raise RuntimeError("stale indexing configuration fingerprint")
-    if load_config(repo)["source_schema_version"] != "3":
-        raise ValueError("schema 3 rollback requires indexing schema version 3")
-    backup = _operational_path(
-        repo, state_root
-    ) / "migrations/pre-schema3-indexing.toml"
-    if not backup.is_file() or backup.is_symlink():
-        raise RuntimeError("schema 2 rollback backup is unavailable")
-    payload = backup.read_bytes()
-    if not prior_runtime_schema2_ready(backup):
-        raise RuntimeError("schema 2 rollback backup is invalid")
-    if any(not item for item in v2_inflight_ids):
-        raise ValueError("invalid v2 in-flight invocation identifier")
-    plan: RollbackPlan = {
-        "schema_version": "indexing-schema3-rollback-plan/v1",
-        "current_file_fingerprint": expected_file_fingerprint,
-        "restore_file_fingerprint": "sha256:" + sha256(payload),
-        "v2_inflight_ids": list(v2_inflight_ids),
-        "admission_closure_required": True,
-        "inflight_handling_required": bool(v2_inflight_ids),
-        "v2_state_action": "purge" if purge_v2_state else "retain",
-        "readiness_check_required": True,
-        "plan_fingerprint": "",
-    }
-    plan["plan_fingerprint"] = "sha256:" + sha256(canonical_json({key: value for key, value in plan.items() if key != "plan_fingerprint"}))
-    return plan
-
-
-def prior_runtime_schema2_ready(backup: Path) -> bool:
-    try:
-        with tempfile.TemporaryDirectory() as temporary:
-            shadow = Path(temporary)
-            (shadow / "research").mkdir()
-            _ = (shadow / "research/indexing.toml").write_bytes(backup.read_bytes())
-            return load_config(shadow)["source_schema_version"] == "2"
-    except (OSError, ValueError, KeyError):
-        return False
-
-
-def apply_schema3_rollback(
-    repo: Path,
-    expected_file_fingerprint: str,
-    expected_plan_fingerprint: str,
-    readiness_check: Callable[[Path], bool],
-    state_root: Path | None = None,
-    *,
-    v2_inflight_ids: tuple[str, ...] = (),
-    purge_v2_state: bool = False,
-    admission_closed: bool = False,
-    inflight_handling: str | None = None,
-) -> dict[str, JsonValue]:
-    with repository_lock(repo):
-        plan = preview_schema3_rollback(
-            repo, expected_file_fingerprint, state_root,
-            v2_inflight_ids=v2_inflight_ids, purge_v2_state=purge_v2_state,
-        )
-        if plan["plan_fingerprint"] != expected_plan_fingerprint:
-            raise RuntimeError("stale indexing schema 3 rollback plan")
-        if not admission_closed:
-            raise RuntimeError("v2 admission must be closed before rollback")
-        if v2_inflight_ids and inflight_handling not in {"drained", "cancelled"}:
-            raise RuntimeError("v2 invocations must be drained or cancelled before rollback")
-        backup = _operational_path(
-            repo, state_root
-        ) / "migrations/pre-schema3-indexing.toml"
-        if not readiness_check(backup):
-            raise RuntimeError("schema 2 readiness check failed")
-        from .contracts import atomic_bytes
-        atomic_bytes(repo / "research/indexing.toml", backup.read_bytes())
-        marker = _operational_path(
-            repo, state_root
-        ) / "schema3/stale-semantic-targets.json"
-        if purge_v2_state:
-            marker.unlink(missing_ok=True)
-            try:
-                marker.parent.rmdir()
-            except OSError:
-                pass
-    return {
-        "operation": "indexes.rollback_schema3",
-        "configuration_fingerprint": config_fingerprint(repo),
-        "plan_fingerprint": expected_plan_fingerprint,
-        "restored_schema_version": "2",
-        "prior_runtime_ready": True,
-        "v2_state_action": plan["v2_state_action"],
     }
 
 
@@ -1107,19 +784,14 @@ def _index_profile_identity(
     repo: Path, backend: BackendRow, modality: str
 ) -> str:
     config = load_config(repo)
-    if (
-        backend["adapter_id"] != "bsl-analyzer"
-        or config["source_schema_version"] != "3"
-    ):
+    if backend["adapter_id"] != "bsl-analyzer":
         return ""
     if modality == "lexical":
         return ""
     if modality != "hybrid":
         raise ValueError("invalid BSL Analyzer index modality")
     from . import search_services
-    profiles = config.get("service_profiles")
-    if profiles is None:
-        raise RuntimeError("search_services.hybrid_unavailable")
+    profiles = config["service_profiles"]
     profile_id = str(profiles["hybrid"])
     profile, _secret = search_services.private_profile(repo, profile_id, None)
     if profile.get("kind") != "embedding" or not profile.get("enabled"):
@@ -1153,7 +825,7 @@ def select_backend(
     component: Component,
     states: list[BackendState],
 ) -> BackendDecision:
-    if capability not in {*CAPABILITIES, *COMPLETE_SEARCH_CAPABILITIES}:
+    if capability not in COMPLETE_SEARCH_CAPABILITIES:
         raise ValueError("unknown indexing capability")
     route = config["routes"].get(capability)
     if not route:
@@ -1576,11 +1248,11 @@ def probe_backend(repo: Path, backend: BackendRow) -> BackendProbe:
             actual = cli_version(executable)
             if actual != backend["engine_version"]:
                 raise RuntimeError("rlm-tools-bsl build version mismatch")
-            capabilities = list(CAPABILITIES)
+            capabilities = list(RLM_CAPABILITIES)
             contract_version = "provider-query/v1"
         else:
             contract = _bsl_contract(executable, backend["engine_version"])
-            capabilities = list((*BSL_CAPABILITIES, *COMPLETE_SEARCH_CAPABILITIES))
+            capabilities = list(COMPLETE_SEARCH_CAPABILITIES)
             contract_version = str(contract["contract_version"])
             surface_manifest = _bsl_surface_manifest(
                 contract, executable_fingerprint
@@ -1883,10 +1555,11 @@ def _bsl_mcp(
     _ = selector.register(selector_target, selectors.EVENT_READ)
     deadline = time.monotonic() + timeout_seconds
     output_bytes = 0
+    last_diagnostic = ""
     next_id = 1
 
     def send(method: str, params: dict[str, JsonValue] | None = None, *, notify: bool = False) -> dict[str, JsonValue]:
-        nonlocal next_id, output_bytes
+        nonlocal next_id, output_bytes, last_diagnostic
         identifier = next_id
         next_id += 1
         payload: dict[str, JsonValue] = {"jsonrpc": "2.0", "method": method}
@@ -1907,13 +1580,15 @@ def _bsl_mcp(
                 raise TimeoutError("bsl-analyzer MCP request timed out")
             line = stdout_stream.readline()
             if not line:
-                raise RuntimeError("bsl-analyzer MCP exited before replying")
+                detail = f": {last_diagnostic}" if last_diagnostic else ""
+                raise RuntimeError(f"bsl-analyzer MCP exited before replying{detail}")
             output_bytes += len(line.encode())
             if output_bytes > ADAPTER_OUTPUT_LIMIT:
                 raise RuntimeError("bsl-analyzer MCP output limit exceeded")
             try:
                 response = parse_json_object(line)
             except ValueError:
+                last_diagnostic = line.strip()[-500:]
                 continue
             if response.get("id") != identifier:
                 continue
@@ -1934,9 +1609,8 @@ def _bsl_mcp(
         )
         _ = send("notifications/initialized", notify=True)
         for tool, arguments, wait_ready in calls:
-            attempts = 80 if wait_ready else 1
             result: dict[str, JsonValue] = {}
-            for attempt in range(attempts):
+            while True:
                 result = send("tools/call", {"name": tool, "arguments": arguments})
                 if wait_ready:
                     structured = _versioned_structured_content(result)
@@ -1954,9 +1628,10 @@ def _bsl_mcp(
                     and structured.get("superseded") is not True
                 ):
                     break
-                if attempt + 1 == attempts:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise TimeoutError("bsl-analyzer index did not become ready")
-                time.sleep(0.1)
+                time.sleep(min(0.25, remaining))
             results.append(result)
         return results
     finally:
@@ -1988,29 +1663,6 @@ def _operational_root(repo: Path, state_root: Path | None = None) -> Path:
     root = _operational_path(repo, state_root)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     return root
-
-
-def capture_schema2_backup(
-    repo: Path, state_root: Path | None = None
-) -> dict[str, str]:
-    path = repo / "research/indexing.toml"
-    payload = path.read_bytes()
-    if str(tomllib.loads(payload.decode()).get("schema_version")) != "2":
-        raise ValueError("pre-migration backup requires indexing schema version 2")
-    _ = load_config(repo)
-    backup = _operational_root(repo, state_root) / "migrations/pre-schema3-indexing.toml"
-    if backup.exists():
-        if backup.is_symlink() or backup.read_bytes() != payload:
-            raise RuntimeError("pre-migration indexing backup conflicts with current schema 2")
-    else:
-        from .contracts import atomic_bytes
-        atomic_bytes(backup, payload)
-        backup.chmod(0o600)
-    return {
-        "path": str(backup),
-        "fingerprint": "sha256:" + sha256(payload),
-        "schema_version": "2",
-    }
 
 
 def storage_diagnostics(
@@ -2190,9 +1842,7 @@ def build_backend_index(
             )
             broker = None
             if modality == "hybrid":
-                profiles = load_config(repo).get("service_profiles")
-                if profiles is None:
-                    raise RuntimeError("search_services.hybrid_unavailable")
+                profiles = load_config(repo)["service_profiles"]
                 profile_id = str(profiles["hybrid"])
                 profile, _secret = search_services.private_profile(
                     repo, profile_id, None
@@ -2468,115 +2118,6 @@ def _request_limit(request: dict[str, JsonValue]) -> int:
     return int(value)
 
 
-def _bsl_hits(
-    executable: str,
-    mirror: Path,
-    operation: str,
-    query: str,
-    limit: int,
-    timeout_seconds: int | float,
-    cancelled: Callable[[], bool] | None = None,
-) -> list[RawHit]:
-    budget = max(128, min(8192, limit * 256))
-    if operation == "search_text":
-        results = _bsl_mcp(
-            executable,
-            mirror,
-            [("search", {"action": "search_code", "query": query, "limit": min(limit, 50), "max_output_tokens": budget}, False)],
-            timeout_seconds,
-            cancelled,
-        )
-        kind = "text"
-    elif operation in {"find_symbol", "find_references"}:
-        results = _bsl_mcp(
-            executable,
-            mirror,
-            [("symbol_info", {"symbol": query, "max_output_tokens": budget}, False)],
-            timeout_seconds,
-            cancelled,
-        )
-        kind = "symbol" if operation == "find_symbol" else "reference"
-    elif operation in {"find_callers", "find_callees"}:
-        resolved = _bsl_mcp(
-            executable,
-            mirror,
-            [("graph", {"action": "resolve", "query": query, "top": min(limit, 50)}, False)],
-            timeout_seconds,
-            cancelled,
-        )[0]
-        node_id = next(
-            (
-                str(row["id"])
-                for row in _nested_dicts(
-                    _versioned_structured_content(resolved)
-                )
-                if row.get("id")
-            ),
-            "",
-        )
-        if not node_id:
-            return []
-        action = "callers" if operation == "find_callers" else "callees"
-        results = _bsl_mcp(
-            executable,
-            mirror,
-            [(
-                "graph",
-                {
-                    "action": action,
-                    "id": node_id,
-                    "max_nodes": min(limit, 50),
-                    "max_output_tokens": budget,
-                },
-                False,
-            )],
-            timeout_seconds,
-            cancelled,
-        )
-        kind = "caller" if operation == "find_callers" else "callee"
-    elif operation == "navigate_metadata":
-        results = _bsl_mcp(
-            executable,
-            mirror,
-            [(
-                "metadata",
-                {
-                    "action": "tree",
-                    "filter": query,
-                    "max_items": min(limit, 1000),
-                    "max_output_tokens": budget,
-                    "mode": "source",
-                },
-                False,
-            )],
-            timeout_seconds,
-            cancelled,
-        )
-        kind = "metadata"
-    else:
-        raise ValueError("source_search.operation_forbidden")
-    hits: list[RawHit] = []
-    structured_results: list[JsonValue] = [
-        _versioned_structured_content(result) for result in results
-    ]
-    for row in _nested_dicts(structured_results):
-        path = row.get("path") or row.get("relativePath") or row.get("file")
-        if not isinstance(path, str) or not path:
-            continue
-        hit: RawHit = {
-            "component_relative_path": path.replace("\\", "/"),
-            "kind": kind,
-        }
-        line = row.get("line_start", row.get("startLine", row.get("line")))
-        if isinstance(line, int) and line >= 0:
-            hit["line"] = line + 1
-        symbol = row.get("symbol") or row.get("symbolName") or row.get("name")
-        if isinstance(symbol, str) and symbol:
-            hit["symbol"] = symbol
-        hits.append(hit)
-        if len(hits) >= limit:
-            break
-    return hits
 
 
 def _bsl_workspace_request(request: dict[str, JsonValue]) -> tuple[str, dict[str, JsonValue]]:
@@ -2859,15 +2400,7 @@ def query_backend(
             )
             result["embedding_identity"] = semantic_identity
             return result
-        return _bsl_hits(
-            executable,
-            mirror,
-            operation_value,
-            query,
-            limit,
-            timeout_seconds,
-            cancelled,
-        )
+        raise ValueError("source_search.operation_forbidden")
     index_dir_value = ready.get("index_dir")
     result = _bounded_run(
         [
@@ -2892,14 +2425,8 @@ def query_backend(
         raise RuntimeError("rlm-tools-bsl returned invalid JSON") from exc
     if result.returncode or payload.get("status") != "available":
         raise RuntimeError("source_search.backend_query_failed")
-    kind_by_operation = {
-        "search_text": "text",
-        "find_symbol": "symbol",
-        "find_references": "reference",
-        "find_callers": "caller",
-        "find_callees": "callee",
-        "navigate_metadata": "metadata",
-    }
+    if operation_value != "code.search_lexical":
+        raise ValueError("source_search.operation_forbidden")
     hits: list[RawHit] = []
     candidates_value = payload.get("candidates", [])
     if not isinstance(candidates_value, list):
@@ -2911,7 +2438,7 @@ def query_backend(
         assert isinstance(relative_path, str)
         hit: RawHit = {
             "component_relative_path": relative_path,
-            "kind": kind_by_operation[operation_value],
+            "kind": "text",
         }
         start_line = row.get("startLine")
         if isinstance(start_line, int) and not isinstance(start_line, bool) and start_line >= 0:
@@ -2958,7 +2485,6 @@ def ensure_configured(
             modalities = (
                 ("lexical", "hybrid")
                 if backend["adapter_id"] == "bsl-analyzer"
-                and load_config(repo)["source_schema_version"] == "3"
                 else ("lexical",)
             )
             for modality in modalities:
@@ -2984,10 +2510,7 @@ def ensure_configured(
                         modality=modality,
                     )
                 )
-    if (
-        load_config(repo)["source_schema_version"] == "3"
-        and "bsl-analyzer" in selected_backends
-    ):
+    if "bsl-analyzer" in selected_backends:
         results.append(
             ensure_reference_index(
                 repo,
@@ -3030,7 +2553,6 @@ def validate_configured(
             modalities = (
                 ("lexical", "hybrid")
                 if backend["adapter_id"] == "bsl-analyzer"
-                and load_config(repo)["source_schema_version"] == "3"
                 else ("lexical",)
             )
             for modality in modalities:
@@ -3049,10 +2571,7 @@ def validate_configured(
                 if len(modalities) > 1:
                     result["modality"] = modality
                 results.append(result)
-    if (
-        load_config(repo)["source_schema_version"] == "3"
-        and "bsl-analyzer" in selected_backends
-    ):
+    if "bsl-analyzer" in selected_backends:
         results.append(reference_index_status(
             repo, backends["bsl-analyzer"], state_root=state_root
         ))
@@ -3254,7 +2773,6 @@ def backend_statuses(repo: Path, state_root: Path | None = None) -> list[dict[st
             modalities = (
                 ("lexical", "hybrid")
                 if adapter_id == "bsl-analyzer"
-                and config["source_schema_version"] == "3"
                 else ("lexical",)
             )
             for modality in modalities:
@@ -3319,6 +2837,7 @@ def backend_statuses(repo: Path, state_root: Path | None = None) -> list[dict[st
                 rows.append(_json_object({
                     **component,
                     "adapter_id": adapter_id,
+                    "engine": adapter_id,
                     **({"modality": modality} if len(modalities) > 1 else {}),
                     "adapter_version": str(BACKEND_CATALOG[adapter_id]["adapter_version"]),
                     "engine_version": backend["engine_version"],
