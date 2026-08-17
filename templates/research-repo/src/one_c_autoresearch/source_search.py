@@ -3,7 +3,7 @@ from __future__ import annotations
 from hashlib import sha256 as hashlib_sha256
 from pathlib import Path
 from collections.abc import Callable, Iterator, Mapping
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from . import indexes
 from .contracts import (
@@ -864,19 +864,63 @@ def execute_query(
     decision = indexes.select_backend(
         config, V2_OPERATIONS[operation], component, states,
     )
-    backend_result = json_object(query_backend(decision, normalized))
-    raw_items = backend_result.get("items")
+    raw_backend_result = query_backend(decision, normalized)
     max_results = normalized["max_results"]
-    if not isinstance(raw_items, list) or not isinstance(max_results, int) or len(raw_items) > max_results:
+    if not isinstance(max_results, int):
         raise ValueError("source_search.backend_result_invalid")
     items: list[dict[str, object]] = []
-    for index in range(len(raw_items)):
-        v2_raw: object = raw_items[index]
-        items.extend(
-            _canonical_v2_item(
-                repo, policy, component_id, operation, json_object(v2_raw),
+    if isinstance(raw_backend_result, list):
+        if len(raw_backend_result) > max_results:
+            raise ValueError("source_search.backend_result_invalid")
+        identities: dict[tuple[str, int | None, str], bytes] = {}
+        component_relative_prefix = str(normalized.get("path_prefix") or "")
+        for raw in raw_backend_result:
+            hit = indexes.normalize_hit(
+                cast(indexes.RawHit, cast(object, json_object(raw))),
+                decision,
+                component,
             )
-        )
+            if component_relative_prefix and not (
+                hit["component_relative_path"] == component_relative_prefix.rstrip("/")
+                or hit["component_relative_path"].startswith(
+                    component_relative_prefix.rstrip("/") + "/"
+                )
+            ):
+                raise ValueError("source_search.backend_result_out_of_scope")
+            evidence = indexes.canonical_evidence(
+                repo, component_id, hit["component_relative_path"],
+            )
+            if not any(
+                evidence["path"] == allowed.rstrip("/")
+                or evidence["path"].startswith(allowed.rstrip("/") + "/")
+                for allowed in policy["logical_path_prefixes"]
+            ):
+                raise ValueError("source_search.backend_result_out_of_scope")
+            item: dict[str, object] = dict(evidence)
+            item["kind"] = hit["kind"]
+            if "line" in hit:
+                item["line"] = hit["line"]
+            if "symbol" in hit:
+                item["symbol"] = hit["symbol"]
+            identity = (evidence["path"], hit.get("line"), hit["kind"])
+            encoded_item = canonical_json(item)
+            if identity in identities and identities[identity] != encoded_item:
+                raise ValueError("source_search.conflicting_hits")
+            if identity not in identities:
+                identities[identity] = encoded_item
+                items.append(item)
+        backend_result: dict[str, JsonValue] = {}
+    else:
+        backend_result = json_object(raw_backend_result)
+        raw_items = backend_result.get("items")
+        if not isinstance(raw_items, list) or len(raw_items) > max_results:
+            raise ValueError("source_search.backend_result_invalid")
+        for raw in raw_items:
+            items.extend(
+                _canonical_v2_item(
+                    repo, policy, component_id, operation, json_object(raw),
+                )
+            )
     encoded = canonical_json(items)
     if len(encoded) > policy["max_returned_bytes_per_call"]:
         raise ValueError("source_search.returned_bytes_exhausted")
