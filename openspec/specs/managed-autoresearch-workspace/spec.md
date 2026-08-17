@@ -11,22 +11,50 @@ The system SHALL let an authorized user configure, execute, monitor, review, and
 - **THEN** the system reaches a verified terminal result and exposes its outputs without asking the user to invoke the CLI
 
 ### Requirement: Guide initial project setup
-The system SHALL provide a resumable setup wizard that creates or opens a research project, collects product and version metadata, selects source roles and infobases, configures access policy, validates prerequisites, and selects enabled workflow stages.
+The system SHALL provide a resumable setup wizard that creates or opens a research project, collects product and version metadata, selects source roles and infobases, configures access policy, validates prerequisites, discovers configuration extensions, requires an explicit tracked include or exclude decision for every discovered extension UUID, and selects enabled workflow stages. The workspace SHALL present configuration extensions separately from uploaded external files.
 
 #### Scenario: Required input is unavailable
-- **WHEN** a wizard step cannot validate a required path, infobase connection, credential reference, or source role
+- **WHEN** a wizard step cannot validate a required path, infobase connection, credential reference, source role, or extension-scope decision
 - **THEN** the wizard preserves entered data, reports the exact failed check, and prevents completion of dependent setup steps
 
 #### Scenario: Resume unfinished setup
 - **WHEN** a user returns to a partially configured project
 - **THEN** the wizard restores saved non-secret values and resumes at the first incomplete required step
 
+#### Scenario: Extensions are discovered
+- **WHEN** tested infobase profiles report one or more extension UUIDs across the three source roles
+- **THEN** the workspace shows one UUID-sorted extension row per UUID with per-role presence, activation, observed name, observed version, and the tracked include or exclude decision, while identifying activation as informational
+
+#### Scenario: Extension has no decision
+- **WHEN** a discovered extension UUID has no tracked include or exclude decision
+- **THEN** source routing remains blocked with an `extension_scope_required` action directed to that exact extension row
+
+#### Scenario: User reviews extension-decision impact
+- **WHEN** the user selects `include` or `exclude`
+- **THEN** the workspace explains the resulting acquisition, DIF, and deterministic-classification behavior, requires rationale for exclusion, and previews the exact tracked contract and comparison-epoch change before confirmation
+
+#### Scenario: Extension decision is dormant
+- **WHEN** a tracked extension UUID is not discovered in any current role
+- **THEN** the workspace lists the decision separately as dormant, creates no routing member, and explains that the same decision applies if the exact UUID reappears
+
+#### Scenario: Extension observations reconcile while the user edits
+- **WHEN** unrelated progress or status reconciliation occurs while extension decisions are unsaved
+- **THEN** the workspace preserves the exact selections and rationales and updates no UUID row from stale server data
+
+#### Scenario: Extension review uses assistive input
+- **WHEN** a user navigates the extension section by keyboard or assistive technology
+- **THEN** every role observation, decision control, rationale, impact message, and validation error has an accessible name and is programmatically associated with its UUID row
+
+#### Scenario: No uploaded external files are declared
+- **WHEN** the external-artifact contract contains no EPF, ERF, source-tree, or other uploaded-file declaration
+- **THEN** the workspace states that no uploaded external files are declared without implying that no extensions were discovered
+
 ### Requirement: Manage infobase connections safely
-The system SHALL let users register, select, test, and update customer or vendor infobase profiles for the supported 1C MCP, web-publication, and optional direct-PostgreSQL-read channels while storing secrets in owner-only user-scope credential files, returning no stored secret values, redacting diagnostics, and defaulting to read-only access.
+The system SHALL let users register, select, test, and update customer or vendor infobase profiles for the supported 1C MCP, web-publication, and optional direct-PostgreSQL-read channels while storing secrets in owner-only user-scope credential files, returning no stored secret values, redacting diagnostics, and defaulting to read-only access. A successful fixed connection preflight SHALL enumerate extension UUID, name, version, and activation facts but SHALL NOT include an extension in research without a separate tracked scope decision.
 
 #### Scenario: Test a read-only connection
 - **WHEN** a user saves and tests an infobase profile with valid secret references
-- **THEN** the system reports verified capabilities and targets without exposing credentials or performing a write
+- **THEN** the system reports verified capabilities, targets, and bounded extension observations without exposing credentials, performing a write, or deciding extension scope
 
 #### Scenario: Request a write-capable probe
 - **WHEN** an enabled stage requires a write-capable infobase operation
@@ -35,6 +63,18 @@ The system SHALL let users register, select, test, and update customer or vendor
 #### Scenario: Select an unsupported connection channel
 - **WHEN** a user attempts to configure a channel not published by the server as supported
 - **THEN** the system marks it unavailable and persists no runnable connection profile
+
+#### Scenario: Extension observations change after preview
+- **WHEN** bounded read-only discovery immediately before export finds extension presence, UUID, activation, name, or version different from the reviewed route preview
+- **THEN** the system rejects acquisition as `extension_inventory_stale`, publishes no source generation, changes no tracked decision, and requires refreshed connection tests and extension review without forwarding credentials
+
+#### Scenario: Live extension discovery exceeds a bound
+- **WHEN** pre-export enumeration or UUID verification exceeds its extension-count, response-size, command-time, or overall operation bound
+- **THEN** acquisition fails before export or repository publication and reports the exact exhausted bound without treating the saved observations as current
+
+#### Scenario: Excluded extension identity is verified
+- **WHEN** live UUID verification requires a temporary export of an extension whose tracked decision is `exclude`
+- **THEN** the system confines the payload to private staging, publishes none of it, indexes none of it, exposes none of it to an agent, and deletes it after verification or on failure or cancellation
 
 ### Requirement: Present a dependency-aware project workspace
 The system SHALL present the supported autoresearch process as stable stage components showing dependencies, readiness, state, progress, blockers, approvals, actions, and outputs derived from server and repository evidence. DIF analysis and MRQ formation and consolidation SHALL be separate components whose readiness and actions are derived from separate canonical jobs.
@@ -233,23 +273,31 @@ The system SHALL maintain a browser queue of approvals and manual decisions with
 - **THEN** the approval remains unapplied, the stage stays blocked, and the UI reports the failure without presenting the SQLite audit record as canonical truth
 
 ### Requirement: Preserve CLI and repository compatibility
-The managed workspace SHALL use the canonical generated-repository artifact formats and supported runtime operations, and its absence or disablement SHALL not prevent canonical CLI operation or invalidate a canonical generated repository. Compatibility SHALL NOT include removed queue, `CUS`, subject-card, reverse-map, functional-gap, manual-cleanup, old dashboard, or compatibility-reader surfaces.
+The managed workspace SHALL use the canonical generated-repository artifact formats and supported runtime operations, and its absence or disablement SHALL not prevent canonical CLI operation or invalidate a canonical generated repository. Browser and CLI source setup SHALL enforce the same tracked extension decisions. Compatibility SHALL NOT include removed queue, `CUS`, subject-card, reverse-map, functional-gap, manual-cleanup, old dashboard, or compatibility-reader surfaces.
 
 #### Scenario: Open an existing research repository
 - **WHEN** a repository using the supported canonical workflow is registered
-- **THEN** the UI derives its stages from canonical artifacts and requests only missing UI-specific configuration.
+- **THEN** the UI derives its stages from canonical artifacts and requests only missing UI-specific configuration
+
+#### Scenario: Open a legacy repository with discovered extensions
+- **WHEN** existing immutable generations are present but a currently discovered extension UUID has no tracked decision
+- **THEN** the workspace keeps those generations readable, marks new acquisition blocked, and requires an explicit extension decision without rewriting prior evidence
 
 #### Scenario: Open a repository that depends on removed authorities
 - **WHEN** a repository requires a removed legacy path, command, route, module, or state authority
-- **THEN** the workspace MUST reject it as unsupported without importing, converting, deleting, or mutating its evidence.
+- **THEN** the workspace MUST reject it as unsupported without importing, converting, deleting, or mutating its evidence
 
 #### Scenario: Remove the optional UI runtime
 - **WHEN** the optional web dependencies and user-scope UI state are removed
-- **THEN** canonical research files and canonical CLI workflows remain usable.
+- **THEN** canonical research files, extension decisions, and canonical CLI workflows remain usable
+
+#### Scenario: Roll back only the frontend
+- **WHEN** the workspace frontend is rolled back while the enforcing backend remains active
+- **THEN** CLI enforcement and canonical extension decisions remain effective and source mutation cannot bypass them
 
 #### Scenario: Concurrent external edit precedes configuration save
-- **WHEN** `project.toml` no longer matches the fingerprint shown in the browser preview
-- **THEN** the service rejects the save, preserves the external edit, and requires a refreshed preview.
+- **WHEN** the tracked source contract no longer matches the fingerprint shown in the browser preview
+- **THEN** the service rejects the save, preserves the external edit, and requires a refreshed preview
 
 ### Requirement: Verify security, recovery, and responsiveness
 The implementation SHALL include automated API, frontend, and browser checks for operation allowlisting, path confinement, secret redaction, event order and replay, cancellation, restart reconciliation, polling fallback, stable component state, and a complete fixture workflow.
@@ -622,3 +670,87 @@ The managed workspace SHALL preview and apply the schema-version-3 complete-sear
 #### Scenario: An operator previews rollback
 - **WHEN** prior-runtime-readable schema 2 can be restored
 - **THEN** preview MUST show admission closure, in-flight handling, retained or purged v2 state and the mandatory prior-runtime readiness test before rollback can complete.
+
+### Requirement: Diagnose agent context safely
+The managed workspace SHALL expose bounded project-scoped context diagnostics through the existing dispatcher inspection, including context-envelope, estimator, and selection-policy versions, prepared-input estimate and headroom, origin groups, policy-exclusion groups, binding fingerprints, and reuse compatibility without exposing prompts, private reasoning, credentials, unrestricted provider output, or arbitrary file content or representing estimates as provider telemetry.
+
+#### Scenario: Inspect a current agent invocation
+- **WHEN** a user opens dispatcher details for an invocation with `context-envelope/v1`
+- **THEN** the inspector MUST show the context-window limit, prepared-input estimate, structured-response reserve, headroom, measurement units, versions, prepared-input and envelope fingerprints, counts by context and origin kind, and bounded included and policy-excluded summaries.
+
+#### Scenario: Inspect a capacity failure
+- **WHEN** an invocation is not started because its complete selected context does not fit
+- **THEN** the related stage and dispatcher diagnostics MUST show the typed blocker, required class, estimated deficit, limit, estimator version, and recovery guidance without exposing source content.
+
+#### Scenario: Inspect a reuse rejection
+- **WHEN** a prior result cannot be reused because a context binding changed
+- **THEN** the inspector MUST show the first incompatible field and old and current safe fingerprints or versions without returning the prior result payload.
+
+#### Scenario: Inspect a legacy invocation
+- **WHEN** an invocation predates the context-envelope contract
+- **THEN** the inspector MUST preserve its known operational data and show context budget, provenance, and selection diagnostics as unavailable rather than inventing values.
+
+#### Scenario: Context diagnostics exceed response bounds
+- **WHEN** included descriptors, policy-exclusion groups, or origin groups exceed their server-owned response bounds
+- **THEN** the existing dispatcher detail resource MUST return deterministic bounded lists, complete aggregate counts, truncation markers, and opaque project-scoped cursors without introducing a second diagnostic API.
+
+#### Scenario: Diagnostic text contains markup or secrets
+- **WHEN** repository-derived labels or provider errors contain markup or match secret-bearing fields
+- **THEN** the service MUST redact secret-bearing values and the browser MUST render remaining text literally without execution.
+
+### Requirement: Diagnose deterministic context decisions without fake invocations
+The managed workspace SHALL expose bounded provenance for deterministic workflow decisions and compatible result reuse that replace an agent call while keeping them distinct from dispatcher invocations and agent-budget accounting.
+
+#### Scenario: Inspect deterministic whole-component classification
+- **WHEN** stage 2 classifies a wholly added or deleted component without an agent
+- **THEN** the workspace MUST show `execution_kind=deterministic`, algorithm version, decision fingerprint, input bindings, affected DIF count, and bounded origin summary, and MUST show no provider invocation, slot, model, or consumed agent budget.
+
+#### Scenario: Inspect reused phase work
+- **WHEN** compatible prior agent output satisfies current work without a provider call
+- **THEN** the workspace MUST show `execution_kind=reused`, source result reference, compatibility fingerprint, and safe reuse summary, and MUST show no new invocation, slot allocation, or consumed provider budget.
+
+#### Scenario: Inspect phase context accounting
+- **WHEN** a user inspects an agent phase with planned, started, reused, deterministic, failed-preflight, and completed work
+- **THEN** the workspace MUST show exact counts by execution kind and aggregate prepared-input estimates for started provider calls without presenting monetary cost or provider-managed transcript usage.
+
+### Requirement: Operate one canonical indexing schema
+The managed workspace SHALL accept, emit, edit, diagnose, and execute only the closed schema-3 indexing configuration and SHALL NOT expose schema selection, schema-1/2 compatibility execution, downgrade, or configuration rollback.
+
+#### Scenario: A supported project opens
+- **WHEN** its exact schema-3 configuration passes closed validation
+- **THEN** the workspace MUST show task-oriented backend, profile, lexical, hybrid, operation, build, and readiness states without exposing a schema selector.
+
+#### Scenario: An obsolete indexing configuration is supplied
+- **WHEN** a tracked configuration declares schema 1, schema 2, no schema, a legacy alias, or an incomplete schema-3 route set
+- **THEN** the workspace MUST fail closed with `indexing.schema3_required`, MUST NOT execute or normalize the obsolete configuration, and MUST direct the operator to the reviewed release cutover procedure.
+
+#### Scenario: An operator enables semantic search
+- **WHEN** the exact BSL Analyzer contract and complete surface are ready and an enabled probed embedding profile satisfies disclosure policy
+- **THEN** the workspace MUST preview explicit lexical and hybrid routes, identities, affected components, retained inactive indexes, required explicit builds, and protected-data non-impact before applying an unchanged fingerprinted plan.
+
+#### Scenario: The reviewed configuration is applied
+- **WHEN** file and plan fingerprints remain current and no conflicting invocation is admitted
+- **THEN** apply MUST atomically write schema 3, start no build, delete no index, and mutate no source, generation, DIF/MRQ, decision, credential, or output state.
+
+#### Scenario: Schema-3 indexes are missing after cutover
+- **WHEN** lexical or hybrid readiness is evaluated
+- **THEN** each modality MUST report its exact missing state independently and MUST require an explicit create action without reusing an obsolete-schema identity.
+
+#### Scenario: An operator inspects obsolete operational indexes
+- **WHEN** current schema-3 identities make prior instances inactive
+- **THEN** the workspace MUST expose them only through fingerprinted garbage-collection preview and MUST require separate confirmation before confined deletion.
+
+### Requirement: Complete semantic-search setup through the user interface
+The managed workspace SHALL provide one end-to-end semantic-search setup flow that can reach a verified ready state without manual file editing or schema knowledge.
+
+#### Scenario: BSL Analyzer is incompatible
+- **WHEN** its exact build does not expose the approved machine contract 1.3 surface
+- **THEN** the flow MUST stop at the backend step, show the detected safe version and required recovery, and MUST NOT allow semantic enablement.
+
+#### Scenario: The embedding profile is incomplete
+- **WHEN** endpoint, model, dimension, secret, probe, or remote disclosure acknowledgement is missing or stale
+- **THEN** the flow MUST identify the exact missing requirement and preserve lexical readiness without claiming hybrid readiness.
+
+#### Scenario: Semantic setup completes
+- **WHEN** configuration apply and explicit hybrid index builds finish successfully
+- **THEN** the workspace MUST show semantic search ready for every covered component, the selected backend and embedding identity class, and the independently ready lexical route.

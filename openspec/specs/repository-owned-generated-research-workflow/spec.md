@@ -15,31 +15,43 @@ The template SHALL generate a repository with workflow schema version `4`, exact
 - **THEN** DIF analysis and MRQ consolidation have different job identifiers, operation identifiers, dependencies, profiles, leases, runs, and recovery actions.
 
 ### Requirement: Generated state follows immutable generation boundaries
-Generated repositories SHALL keep source payloads, physical differences, complete DIF classifications, MRQ graphs, and target-decision payloads in immutable generation directories and SHALL update only their canonical active pointers through typed operations.
+The system SHALL publish source, DIF classification, MRQ consolidation, and target-decision state through separate immutable generations with explicit active pointers, source bindings, deterministic manifests, and stale-result rejection. A source generation SHALL include only configuration extensions whose discovered UUID has an explicit tracked `include` decision; excluded or unreviewed extensions SHALL NOT enter its components.
 
 #### Scenario: Source acquisition publishes
-- **WHEN** all three roles and declared external artifacts validate
-- **THEN** one immutable source generation MUST be published atomically and the prior generation MUST remain addressable.
+- **WHEN** source acquisition completes with all discovered extension UUIDs explicitly reviewed
+- **THEN** it publishes immutable source artifacts, included-extension component bindings, source fingerprints, and an active source pointer atomically before downstream work can begin
+
+#### Scenario: Source acquisition encounters an unreviewed extension
+- **WHEN** the current tested profiles contain a discovered extension UUID without a tracked decision
+- **THEN** acquisition publishes no generation and reports `extension_scope_required` with bounded role observations
+
+#### Scenario: Live extension inventory changed
+- **WHEN** fixed bounded discovery immediately before export does not match the reviewed role observations
+- **THEN** acquisition publishes no generation, reports `extension_inventory_stale`, and requires refreshed connection tests and route review
+
+#### Scenario: Excluded extension is present
+- **WHEN** a discovered extension UUID has a tracked `exclude` decision with rationale
+- **THEN** route preview records the exclusion and observations while acquisition exports no payload and publishes no component for that UUID
 
 #### Scenario: DIF analysis publishes a window
-- **WHEN** one bounded DIF window completes validation
-- **THEN** one accumulated immutable classification generation MUST be published atomically with exact source and physical-diff bindings while prior classification generations remain addressable.
+- **WHEN** the DIF analyzer completes one deterministic bounded window
+- **THEN** it appends immutable, per-item, schema-valid classification results bound to the active source and DIF generation without publishing MRQ state
 
 #### Scenario: One DIF in a window fails
-- **WHEN** any selected DIF lacks a valid result
-- **THEN** the complete window MUST publish no classification pointer update, compatible successful envelopes MAY be reused only by explicit same-job recovery, and no MRQ work MUST start.
+- **WHEN** one item in the active DIF window fails validation or provider execution
+- **THEN** no partial classification generation becomes active, successful sibling results remain retry evidence only, and the failed item remains pending
 
 #### Scenario: MRQ consolidation publishes
-- **WHEN** a complete consolidation plan passes approval and validation
-- **THEN** one immutable MRQ generation MUST be activated through one atomically replaced consolidation pointer and no partial generation MUST be visible to a supported reader.
+- **WHEN** the grouping agent completes an accepted consolidation plan after all active DIF are classified
+- **THEN** the coordinator validates full primary-DIF closure, approved noise, retained MRQ decisions, evidence, and source bindings before atomically publishing a new MRQ batch generation
 
 #### Scenario: Target decisions publish
-- **WHEN** stage 5 decisions pass their typed approval against the current consolidation fingerprint
-- **THEN** one immutable decision generation MUST be written and an aggregate compare-and-swap MUST update only its decision binding while preserving the active MRQ generation, consolidation receipt, and compatible batch binding.
+- **WHEN** a target decision is accepted
+- **THEN** the coordinator publishes a separate immutable decision generation bound to the current MRQ batch generation
 
 #### Scenario: Operation is unsupported
-- **WHEN** a caller submits an arbitrary command or removed legacy operation
-- **THEN** the typed application boundary MUST reject it before repository mutation.
+- **WHEN** any CLI, service, or UI entrypoint requests an operation outside the canonical stage model
+- **THEN** the runtime rejects it without invoking a compatibility reader or mutating canonical state
 
 ### Requirement: Operational state remains outside generated repositories
 Generated repositories SHALL keep connection profiles, upload drafts, source indexes, events, bookmarks, previews, preferences, and credentials in mode-confined user scope and SHALL keep only portable declarations and evidence in tracked files.
@@ -49,39 +61,39 @@ Generated repositories SHALL keep connection profiles, upload drafts, source ind
 - **THEN** no secret, absolute host path, temporary byte stream, or raw preview identifier MUST be written to tracked repository state.
 
 ### Requirement: Synchronization is deterministic and customer-independent
-The template SHALL maintain explicit scoped reusable and forbidden inventories and a safe synchronization command that accepts a reference repository, rejects customer payloads and host-specific values, stages and validates the complete derived output set before mutation, defaults to a sorted content-free add/change/delete plan with a content-derived fingerprint, requires that expected fingerprint for explicit apply, replaces each reviewed owned tree from the unchanged staged set, rejects unexpected stale files, blocks packaging while parity is incomplete, and refuses to overwrite a non-empty unapproved destination.
+The template SHALL synchronize the canonical generated runtime, extension-scope contract schema, source workspace, tests, and documentation from a verified reference without copying customer sources, discovered extension observations, extension decisions, evidence, runtime state, credentials, or generated indexes.
 
 #### Scenario: Reference contains customer evidence
-- **WHEN** synchronization encounters source generations, analysis generations, binaries, credentials, absolute workstation paths, or customer-specific outputs
-- **THEN** those paths MUST be excluded or the synchronization MUST fail before updating the scaffold.
+- **WHEN** synchronization input contains source generations, extension observations or decisions, DIF, MRQ, approvals, outputs, indexes, runtime state, secrets, or customer-specific files
+- **THEN** synchronization rejects the input and changes no template output
 
 #### Scenario: Same reference is synchronized twice
-- **WHEN** identical reusable inputs are synchronized repeatedly
-- **THEN** the generated scaffold and its manifest fingerprints MUST be identical.
+- **WHEN** synchronization is run repeatedly from the same verified reusable reference
+- **THEN** generated runtime files, scaffold files, workspace assets, schemas, and packaged template remain byte-identical
 
 #### Scenario: Release version differs from reference
-- **WHEN** normalized target parity is checked for release `0.3.0` against the verified canonical reference
-- **THEN** only declared package and runtime version fields MAY differ, and every code, schema, command, route, asset, and behavior inventory MUST otherwise match.
+- **WHEN** the template release version is intentionally different from the verified reference
+- **THEN** synchronization normalizes only the declared release-version fields and rejects every other unexplained runtime or contract difference
 
 #### Scenario: Removed upstream file remains locally
-- **WHEN** a file absent from the staged canonical runtime remains in an owned package tree
-- **THEN** synchronization MUST remove it through full-tree replacement or fail before publication, and MUST NOT silently preserve it.
+- **WHEN** an owned runtime, test, schema, workspace, or documentation file is absent from the reviewed reference but present in a derived template tree
+- **THEN** synchronization plans its deletion and verification fails until the stale file is removed
 
 #### Scenario: Replacement is previewed
-- **WHEN** synchronization is invoked without explicit apply mode
-- **THEN** it MUST mutate nothing and report only sorted relative paths, add/change/delete status, non-secret hashes, and one fingerprint binding the reference, staged manifest, destination, and complete change set.
+- **WHEN** a maintainer requests synchronization without explicit apply mode
+- **THEN** the tool emits a sorted content-free add, change, and delete plan plus a fingerprint and changes no file
 
 #### Scenario: Planned inputs change before apply
-- **WHEN** explicit apply receives a missing or mismatched expected plan fingerprint or any bound input changed after preview
-- **THEN** synchronization MUST fail before mutation and require a new preview.
+- **WHEN** the reference, owned-tree inventory, normalization inputs, or expected plan fingerprint changes after preview
+- **THEN** apply fails before replacing any owned tree
 
 #### Scenario: Replacement stops after one owned tree
-- **WHEN** synchronization stops after replacing only part of the validated owned-tree set
-- **THEN** parity and packaging MUST fail, and a new preview plus explicit apply with the reference MUST replace every derived tree before packaging can continue.
+- **WHEN** synchronization stops after replacing only part of the derived outputs
+- **THEN** parity and package checks fail closed and an idempotent rerun from the same reference converges all owned trees
 
 #### Scenario: Historical OpenSpec evidence is scanned
-- **WHEN** forbidden-authority verification scans the repository root
-- **THEN** it MUST exclude historical OpenSpec archives and the active removal record while still rejecting the same markers in executable code, active docs, skills, tests, generated repositories, and distributions.
+- **WHEN** forbidden-authority checks inspect active runtime, contract, documentation, test, and distribution scopes
+- **THEN** archived OpenSpec history remains excluded as non-executable evidence while active change artifacts do not authorize a runtime interface
 
 ### Requirement: Generated runtime includes source folder import
 The generated repository SHALL expose the same versioned external-artifact folder preview, exact declaration-diff review, typed `sources.configure` confirmation, resumable draft staging, CLI, HTTP, and native web selector contract as the verified reusable implementation.
@@ -212,19 +224,27 @@ Active root documentation SHALL be limited to `README.md`, `AGENTS.md`, `docs/ag
 - **THEN** `build_workspace_template.py` MUST write a deterministic separate release artifact containing only the validated canonical portable repository payload and MUST NOT install it as `one_c_autoresearch` package data.
 
 ### Requirement: Canonical diff workflow owns normalization and stable identities
-The canonical source-routing and diff-generation workflow SHALL deterministically select supported semantic representations, publish immutable physical and semantic difference closure, assign content-derived stable `DIF-*` identities with lineage, and expose explicit diagnostics or physical-only evidence for unsupported or opaque payloads without restoring a standalone normalization CLI or cleanup queue.
+The canonical generated runtime SHALL own source comparison, semantic normalization, physical-to-semantic path closure, stable DIF identity and lineage, target coverage, DIF classification, and MRQ inputs for the supported configuration, included extension, and external-artifact representations. Automatic extension discovery SHALL NOT create a DIF authority until the UUID is explicitly included by the tracked source contract.
 
 #### Scenario: Supported sources are rebuilt unchanged
-- **WHEN** equal routed XML/BSL, `v8unpack`, extension, and declared external-artifact inputs are rebuilt with the same contract and tool versions
-- **THEN** routing fingerprints, comparison identities, sorted semantic and physical rows, stable `DIF-*` identities, and lineage MUST be identical.
+- **WHEN** the same tracked source contract, included extension decisions, source generation, comparison epoch, adapter versions, and normalized content are rebuilt
+- **THEN** comparison IDs, stable DIF IDs, lineage, semantic extension identities, path closure, and coverage remain deterministic
+
+#### Scenario: Excluded extension differs from the baseline
+- **WHEN** an extension exists in a role but its UUID has a tracked `exclude` decision
+- **THEN** its files and semantic interventions produce no physical extension row, DIF inventory row, classification unit, target-coverage row, or MRQ input
+
+#### Scenario: Included extension differs from the baseline
+- **WHEN** an extension UUID has a tracked `include` decision and its normalized component differs between roles
+- **THEN** the runtime preserves the existing UUID-based physical comparison, semantic intervention analysis, path closure, stable identity, and target-coverage behavior
 
 #### Scenario: Semantic representation covers a physical payload
-- **WHEN** an opaque or binary physical difference has an authoritative supported semantic representation
-- **THEN** the physical path MUST remain accounted for in closed path coverage but MUST NOT independently create or preserve a semantic customization DIF.
+- **WHEN** one physical source path maps to one or more semantic intervention rows
+- **THEN** the canonical path-coverage artifact records every semantic owner and the physical row does not also appear as an independent customer requirement
 
 #### Scenario: Representation is unsupported or inconclusive
-- **WHEN** source routing cannot prove a supported semantic representation
-- **THEN** the workflow MUST retain explicit bounded physical evidence and diagnostics and MUST NOT silently classify the payload as semantic customization or technical noise.
+- **WHEN** the selected adapter cannot prove a supported normalized representation or account for every physical path
+- **THEN** comparison fails closed without publishing partial DIF, classification, or MRQ authority
 
 ### Requirement: Canonical CSV readers accept large evidence fields
 The canonical runtime SHALL configure the largest CSV field limit supported by the active Python platform, with bounded `OverflowError` backoff, and SHALL NOT restore the retired standalone paged CSV reader.
@@ -543,3 +563,301 @@ The generated workflow SHALL require `add-pluggable-source-search-backends` to b
 #### Scenario: The owner rolls back
 - **WHEN** a reviewed downgrade is representable
 - **THEN** the runtime MUST close v2 admission, drain or cancel its process groups, restore the backed-up prior-runtime-readable schema 2 state, leave v2 namespaces unread by the prior runtime, offer confined retain or purge, and prove prior-runtime readiness before declaring rollback safe.
+
+### Requirement: Derive component-grouped consolidation context without a new authority
+The canonical workflow SHALL derive bounded component-grouped stage-3 context from existing source, DIF, classification, evidence, and target-coverage facts for included extensions and all declared external artifacts. A component group SHALL NOT have a canonical registry, stable package identifier, active pointer, approval, disposition, generation, or independent lifecycle.
+
+#### Scenario: Component contains many DIF
+- **WHEN** an included extension or declared external artifact owns more than one stable DIF
+- **THEN** grouping preserves every member DIF identity, evidence, classification, and ownership and does not publish a synthetic component-level DIF
+
+#### Scenario: Included component is wholly added
+- **WHEN** an included extension UUID or declared external-artifact ID exists only in `target_cf` for the customer comparison
+- **THEN** an explicitly started stage-2 job classifies every owned DIF as existing-schema deterministic `meaning` through its bounded windows without an agent call for those rows and stage 3 later receives their exact IDs through one derived component group
+
+#### Scenario: Included component is wholly deleted
+- **WHEN** an included extension UUID or declared external-artifact ID exists only in `vendor_baseline` for the customer comparison
+- **THEN** an explicitly started stage-2 job classifies every owned DIF as existing-schema deterministic `meaning` through its bounded windows without an agent call for those rows and stage 3 later receives their exact IDs through one derived component group
+
+#### Scenario: Included component exists on both sides
+- **WHEN** the same extension UUID or external-artifact ID exists in both customer-comparison roles and has internal differences
+- **THEN** every member DIF remains subject to ordinary stage-2 meaning-or-noise classification before stage 3 can run
+
+#### Scenario: Component group contains several functions
+- **WHEN** stage 3 finds multiple independently testable business meanings inside one derived component group
+- **THEN** it may propose multiple ordinary MRQs whose primary DIF sets are disjoint and whose union covers every meaningful member DIF
+
+#### Scenario: Compatible prior MRQs exist
+- **WHEN** current member DIF and evidence still satisfy retained MRQ identity and closure rules
+- **THEN** derived component grouping does not force replacement or merging and normal retention remains available
+
+#### Scenario: Component behavior depends on another component
+- **WHEN** a proposed MRQ relates primary or supporting DIF across a component boundary
+- **THEN** the proposal identifies every component key and includes explicit source-backed evidence and rationale for the relationship
+
+#### Scenario: Complete classification gate is evaluated
+- **WHEN** deterministic whole-component rows and agent-produced rows together contain exactly one valid classification for every active customer DIF
+- **THEN** the existing `all-dif-classified` gate becomes complete without treating the derived grouping as classification or canonical state
+
+#### Scenario: Deterministic classification validation fails
+- **WHEN** any deterministic or agent-produced row in the current bounded window fails source binding, evidence, schema, or fingerprint validation
+- **THEN** the stage-2 attempt publishes none of that window, preserves earlier published windows, and leaves the exact current-window DIF pending
+
+#### Scenario: Whole component was deleted
+- **WHEN** deterministic classification or consolidation reads evidence for a wholly deleted component
+- **THEN** it resolves the exact owned evidence under `vendor_baseline` in the active source generation rather than requiring an absent `target_cf` path
+
+#### Scenario: Whole component was added
+- **WHEN** deterministic classification or consolidation reads evidence for a wholly added component
+- **THEN** it resolves the exact owned evidence under `target_cf` in the active source generation
+
+#### Scenario: Deterministic rows complete stage 2
+- **WHEN** deterministic rows complete the active customer DIF inventory
+- **THEN** stage 2 becomes complete without an agent call and stage 3 remains stopped until its existing explicit start action
+
+#### Scenario: Derived context is rebuilt
+- **WHEN** stage 3 reconstructs component grouping from unchanged canonical inputs
+- **THEN** it produces the same ordered component keys and member DIF IDs without reading or writing a package registry
+
+#### Scenario: Component membership exceeds one context partition
+- **WHEN** one derived component group cannot fit in the validated stage-3 input capacity
+- **THEN** the coordinator supplies a deterministic summary and bounded ordered member pages through existing consolidation partitioning while retaining coordinator-owned proof of complete member closure and without merging the member DIF
+
+#### Scenario: Downstream publication completes
+- **WHEN** consolidation publishes accepted MRQ state
+- **THEN** canonical ownership and approvals refer only to existing DIF and MRQ identities and no component-package artifact is published
+
+### Requirement: Use a versioned context envelope for every agent invocation
+The generated workflow SHALL validate every provider-bound agent input against one versioned context envelope containing invocation bindings, subject, facts, evidence, related subjects, selection metadata, budget accounting, selected source paths, provenance, and a canonical envelope fingerprint while preserving stage-specific deterministic selection policies.
+
+#### Scenario: A stage prepares an agent call
+- **WHEN** DIF analysis, MRQ consolidation, MRQ classification, or target research prepares a provider-bound invocation
+- **THEN** the runtime MUST validate and fingerprint a complete `context-envelope/v1` before starting the invocation.
+
+#### Scenario: Envelope size is calculated
+- **WHEN** the adapter builds a context envelope
+- **THEN** it MUST freeze the selected payload and provenance, render the initial provider input without budget or fingerprint fields, calculate its budget and prepared-input fingerprint once, and calculate the completed envelope fingerprint excluding only itself.
+
+#### Scenario: Stage strategies differ
+- **WHEN** two stages require different subjects, evidence, partitioning, ordering, or coverage rules
+- **THEN** each stage MUST retain its versioned deterministic selection policy while producing the same envelope shape.
+
+#### Scenario: An included context item has no provenance
+- **WHEN** a subject, fact, evidence reference, or related subject lacks a stable item key, applicable file or registry origin, source or registry binding, or selection reason
+- **THEN** the runtime MUST fail before provider invocation and publish no partial stage result.
+
+#### Scenario: A selected file origin is invalid or stale
+- **WHEN** an envelope file origin is absolute, escapes the repository, is absent from the context manifest, or no longer matches its recorded fingerprint
+- **THEN** the runtime MUST reject the envelope without returning the referenced content; this selection check MUST NOT be represented as narrowing the repository-level read-only sandbox.
+
+### Requirement: Budget every agent context before invocation
+The generated workflow SHALL prove the complete initial rendered input and bounded response schema of every provider-bound invocation against that invocation role's effective profile context-window limit using a versioned estimator, a fixed 4096-token structured-response reserve, and non-negative estimated byte headroom, and SHALL identify these values as prepared-context estimates rather than provider telemetry.
+
+#### Scenario: Context fits
+- **WHEN** the base instruction, operation framing, instruction-version framing, supplement, canonical selected payload, fixed adapter framing, and canonical response schema fit within `2 × (context_window_tokens - 4096)` UTF-8 bytes under `utf8-v1`
+- **THEN** the envelope MUST record context-window tokens, reserved-output tokens, estimated-input bytes, byte headroom, estimator identifier, and estimator version.
+
+#### Scenario: Response schema is unbounded
+- **WHEN** any structured-response string, array, or nested collection lacks a finite maximum or its maximum canonical JSON exceeds the 8192-byte `utf8-v1` response reserve
+- **THEN** the runtime MUST fail preflight before slot allocation or provider invocation.
+
+#### Scenario: Stage policy excludes candidates
+- **WHEN** a versioned stage policy excludes candidates before rendering the complete selected input
+- **THEN** diagnostics MUST record bounded excluded counts and reasons and MUST distinguish policy exclusion from budget truncation.
+
+#### Scenario: Complete selected context does not fit
+- **WHEN** the complete stage-selected input exceeds its invocation role's estimated byte allowance
+- **THEN** the stage MUST perform no budget-driven truncation, fail closed with a typed context-capacity blocker before slot or provider invocation, and publish no partial result.
+
+#### Scenario: Capacity cannot be validated
+- **WHEN** the effective role profile lacks either a validated context-window limit or capability fingerprint, its limit is not greater than 4096 tokens, or the configured estimator identifier or version is unsupported
+- **THEN** the stage MUST fail preflight and identify the missing capability.
+
+#### Scenario: Consolidation roles have different capacities
+- **WHEN** grouper and coordinator profiles expose different context-window limits
+- **THEN** every partition and pair call MUST be budgeted with the grouper profile and final reduction MUST be budgeted with the coordinator profile.
+
+#### Scenario: Complete consolidation output exceeds one response reserve
+- **WHEN** candidate proposals or final MRQ membership cannot be represented within one bounded coordinator response
+- **THEN** stage 3 MUST use deterministic bounded candidate-page comparisons, server-owned membership union, binary descriptive reductions, and paged noise review rather than increasing the 4096-token reserve, truncating output, or returning the complete graph in one call.
+
+#### Scenario: Provider tools add transcript context
+- **WHEN** a provider-managed tool read or transcript compaction occurs after the initial request
+- **THEN** the workflow MUST NOT report that provider-managed context as measured preflight usage or monetary cost and MUST retain the prepared-input estimate as such.
+
+### Requirement: Bind result reuse to context construction
+The generated workflow SHALL reuse an agent result only when its execution bindings, context-envelope version and fingerprint, estimator version, selection-policy version, selected-path-manifest fingerprint, provider capability fingerprint, profile, instruction, and result schema match the active work.
+
+#### Scenario: All reuse bindings match
+- **WHEN** a prior validated result has exactly equal active reuse bindings
+- **THEN** the workflow MAY reuse it and MUST record `execution_kind=reused`, its source result reference, compatibility fingerprint, and bounded diagnostics in existing phase-work state without creating an invocation.
+
+#### Scenario: A reuse binding differs
+- **WHEN** any required reuse binding differs or is unavailable
+- **THEN** the workflow MUST reject reuse, report the first incompatible field, and schedule ordinary recomputation without rebinding the prior result.
+
+#### Scenario: A legacy invocation lacks envelope metadata
+- **WHEN** an immutable prior invocation predates `context-envelope/v1`
+- **THEN** the workflow MUST keep it readable as legacy evidence and MUST NOT fabricate, rewrite, or infer missing envelope metadata.
+
+#### Scenario: An adapted stage encounters a legacy cached result
+- **WHEN** a stage using `context-envelope/v1` encounters a cached result without the complete new fingerprint set
+- **THEN** it MUST reject reuse and recompute rather than applying the prior compatibility rules.
+
+#### Scenario: Upgrade finds active snapshot-version-1 agent work
+- **WHEN** the new runtime finds a running or resumable agent job bound to execution-snapshot schema version 1
+- **THEN** one existing fenced recovery transaction MUST terminalize its invocation and phase work as interrupted, preserve completed evidence, and require an explicit new run using execution-snapshot schema version 2 without reusing legacy node results.
+
+### Requirement: Preserve non-agent and stage boundaries
+The generated workflow SHALL emit comparable provenance diagnostics for deterministic context-consuming decisions without fabricating agent invocations and SHALL NOT use the common envelope contract to merge workflow stages or create a new canonical context entity.
+
+#### Scenario: Whole-component classification is deterministic
+- **WHEN** an included wholly added or deleted component receives deterministic meaningful classifications
+- **THEN** the workflow MUST record the algorithm version, input bindings, item origins, and decision fingerprint with `execution_kind=deterministic` and MUST NOT create an agent invocation or consume an agent budget.
+
+#### Scenario: Budget preflight fails before invocation
+- **WHEN** the complete selected input fails context-budget validation
+- **THEN** the workflow MUST store the typed blocker and safe budget diagnostic in existing phase-work or checkpoint state and MUST NOT create an invocation.
+
+#### Scenario: Context compilation is unified
+- **WHEN** all active stage compilers use the shared envelope builder
+- **THEN** the runtime MUST remove the unused combined discovery compiler while preserving historical readers and immutable evidence.
+
+#### Scenario: Envelope validation succeeds
+- **WHEN** a valid envelope is built for an existing stage
+- **THEN** the workflow MUST preserve that stage's explicit start, readiness gate, stable DIF and MRQ identities, publication boundary, and approval behavior.
+
+### Requirement: Consolidate MRQ hierarchically within bounded responses
+The generated workflow SHALL replace the monolithic coordinator response with a deterministic hierarchy that preserves complete global candidate, conflict, noise, and DIF-ownership coverage while every agent response remains within the fixed structured-response reserve.
+
+#### Scenario: Candidate leaves are ready
+- **WHEN** all partition and pair grouper calls return validated proposals
+- **THEN** the runtime MUST assign content-derived candidate IDs, retain complete membership server-side, create deterministic bounded descriptor pages, and schedule every unordered page pair exactly once.
+
+#### Scenario: Coordinator compares candidate pages
+- **WHEN** a page-pair comparison runs
+- **THEN** its bounded response MUST reference only candidate IDs from those pages, classify every eligible cross-page relationship as merge or keep separate, and contain no repeated full DIF membership.
+
+#### Scenario: Page comparisons complete
+- **WHEN** every planned page-pair result validates
+- **THEN** the runtime MUST reject merge/keep contradictions, apply merge links through deterministic union-find, and prove exact page-pair coverage before descriptive reduction.
+
+#### Scenario: One linked component needs final description
+- **WHEN** a union component contains more than one candidate proposal
+- **THEN** the coordinator MUST reduce its ordered child aggregates through a deterministic binary tree whose calls name exactly two child IDs and whose server-owned aggregate carries the union of their DIF membership.
+
+#### Scenario: Noise candidates require approval
+- **WHEN** active classifications contain noise candidates
+- **THEN** the coordinator MUST review them in deterministic bounded pages and the runtime MUST prove each noise candidate has exactly one approved or rejected result before plan construction.
+
+#### Scenario: Hierarchy is incomplete or stale
+- **WHEN** a page, pair, child aggregate, noise decision, binding, or DIF owner is missing, duplicated, unknown, contradictory, oversized, or stale
+- **THEN** stage 3 MUST fail before approval or canonical publication and MUST expose the exact incomplete hierarchy count and typed blocker.
+
+#### Scenario: Hierarchy completes
+- **WHEN** link, reduction, noise, and ownership closure all validate
+- **THEN** the runtime MUST assemble the existing ordinary consolidation plan from server-owned memberships and reduced descriptions without creating a canonical page, candidate, or aggregate entity.
+
+### Requirement: Retain agent context provenance operationally
+The generated workflow SHALL store a content-free provenance descriptor for every included context item, the envelope fingerprint, and a bounded diagnostic summary in owner-only operational state, SHALL atomically bind them to invocation start, and SHALL keep canonical source and evidence content in their existing stores.
+
+#### Scenario: Invocation starts
+- **WHEN** budget and context validation succeed and the dispatcher allocates an invocation
+- **THEN** one SQLite transaction MUST store the invocation row, envelope and prepared-input fingerprints, complete content-free provenance ledger, bounded diagnostic summary, phase-work assignment, and `invocation.started` outbox transition.
+
+#### Scenario: Provenance is recorded
+- **WHEN** a subject, fact, evidence reference, or related subject is included according to the item granularity declared by its versioned stage policy
+- **THEN** its descriptor MUST contain stable item key, closed kind and selection-reason codes, applicable generation or registry fingerprint, and either a repository-relative fingerprinted file origin or a stable registry identifier without storing the item's value, free-form rationale, label, or source content.
+
+#### Scenario: Process stops after invocation start
+- **WHEN** the service stops after the invocation transaction commits but before provider completion
+- **THEN** restart reconciliation MUST retain the exact context identity and provenance while terminalizing or recovering the invocation through existing lifecycle rules.
+
+#### Scenario: Operational schema is upgraded
+- **WHEN** the service opens a database without context-envelope diagnostic columns
+- **THEN** it MUST create the owner-only online backup `.pre-context-envelope.sqlite` without reusing `.pre-inspector.sqlite`, add nullable columns with explicit insert target lists, preserve legacy rows, and make repeated migration idempotent.
+
+#### Scenario: Backend rollback is required
+- **WHEN** an operator restores a backend that predates the additive context columns
+- **THEN** mutations MUST stop and the documented recovery MUST restore `.pre-context-envelope.sqlite` while preserving repository generations and warning that post-upgrade operational history is lost.
+
+### Requirement: Verify the owned Python runtime without type-checking suppressions
+
+The canonical generated workflow SHALL run one pinned BasedPyright check over every production module under `src/one_c_autoresearch` and SHALL complete only when the unsuppressed result contains zero errors, zero warnings and zero notes.
+
+#### Scenario: Production source is verified
+
+- **WHEN** local, scaffold, release or CI verification runs
+- **THEN** it MUST execute the pinned BasedPyright version against every owned production module with no baseline, ignored diagnostic, disabled rule, per-file override or production-source exclusion
+
+#### Scenario: Dynamic external data enters the runtime
+
+- **WHEN** JSON, TOML, SQLite, subprocess, HTTP, filesystem or third-party data crosses into owned domain logic
+- **THEN** the owning boundary MUST validate and narrow it to a concrete typed shape before downstream use and MUST NOT propagate an unknown or broad `Any` value through the workflow
+
+#### Scenario: A diagnostic identifies a possible runtime defect
+
+- **WHEN** BasedPyright reports optional access, an unbound value, invalid argument or return, missing initialization or an ignored fallible result
+- **THEN** implementation MUST establish the invariant through runtime validation or correct the behavior with focused regression coverage and MUST NOT silence the diagnostic with an unconditional cast or ignore
+
+#### Scenario: A third-party interface lacks complete typing
+
+- **WHEN** an approved dependency returns a value whose precise type is unavailable
+- **THEN** the runtime MUST confine the escape hatch to the smallest adapter boundary, validate or narrow the value before returning it, and MUST NOT introduce a general shadow-stub package or spread `Any` into owned modules
+
+#### Scenario: The runtime is synchronized
+
+- **WHEN** verified target changes are promoted into the canonical scaffold and installable runtime
+- **THEN** normalized two-way parity MUST include production source, BasedPyright configuration, pinned dependency metadata and verification commands while excluding the temporary migration baseline from the completed artifact
+
+#### Scenario: Type-checking policy is weakened
+
+- **WHEN** a change adds a baseline, ignored diagnostic, rule downgrade, per-file override, broad production exclusion or unreviewed `Any` escape hatch
+- **THEN** canonical verification MUST fail before packaging or scaffold publication
+
+#### Scenario: Supported platforms verify the release
+
+- **WHEN** the Python release matrix runs on Ubuntu, Windows and macOS
+- **THEN** the same pinned unsuppressed check MUST pass without platform-specific rule changes or excluded branches
+
+### Requirement: Generate and distribute schema-3-only source search
+The canonical generator and installable runtime SHALL emit and execute only schema-3 indexing configuration and SHALL remove schema-1/2 and source-search-tool-v1 authorities from every distributed and generated surface.
+
+#### Scenario: A new research repository is generated
+- **WHEN** bootstrap creates an empty destination
+- **THEN** the repository MUST contain the exact schema-3 configuration structure, complete explicit routes and stable service-profile identifiers, and MUST contain no credential, endpoint, operational index, compatibility reader, migration queue, downgrade, or rollback authority.
+
+#### Scenario: Runtime and template are synchronized
+- **WHEN** an unchanged fingerprinted synchronization plan is applied
+- **THEN** canonical and generated runtime trees MUST converge on schema-3-only code and tests while project configuration, evidence, sources, generations, decisions, outputs, credentials, and operational indexes remain outside the replacement set.
+
+#### Scenario: A generated project from an obsolete release is discovered
+- **WHEN** its indexing configuration is not schema 3
+- **THEN** the new runtime MUST reject it without mutation and release tooling MUST require the explicit reviewed cutover before installing the incompatible runtime.
+
+#### Scenario: Existing operational indexes are present during cutover
+- **WHEN** a project adopts schema 3
+- **THEN** no index payload MUST be converted, copied, promoted, overwritten, or deleted; only explicitly built schema-3 instances MAY become current.
+
+#### Scenario: Obsolete schema authority is checked
+- **WHEN** release verification scans executable source, generated source, API, CLI, UI, tests and active documentation
+- **THEN** it MUST fail if schema-1/2 indexing parsers, serializers, aliases, migration/downgrade/rollback paths, or source-search-tool-v1 execution return, while ignoring unrelated domain schema versions.
+
+### Requirement: Cut over generated projects without customer-data mutation
+The release workflow SHALL cut over every operator-approved generated project through an exact reviewed schema-3 configuration operation before removing obsolete readers and SHALL prove protected project state unchanged. Discovered projects explicitly excluded by the operator SHALL remain untouched.
+
+#### Scenario: The current generated project is previewed
+- **WHEN** `sppr-research-ver2` is selected for cutover
+- **THEN** preview MUST bind its exact tracked indexing-file fingerprint, compatible BSL Analyzer surface, service profiles, route changes and affected components and MUST state that indexes will be rebuilt rather than migrated.
+
+#### Scenario: The current generated project is cut over
+- **WHEN** the reviewed plan is applied
+- **THEN** only its tracked indexing configuration MAY change, no build may start implicitly, and before/after manifests for protected sources, generations, DIF/MRQ state, decisions and outputs MUST match.
+
+#### Scenario: A discovered project is excluded from the change
+- **WHEN** the operator excludes `/Projects/OneC/sppr-research` from the cutover set
+- **THEN** synchronization, cutover, verification and cleanup MUST NOT modify its tracked configuration, runtime, evidence or operational indexes.
+
+#### Scenario: Obsolete runtime code is contracted
+- **WHEN** every inventoried project is verified on schema 3
+- **THEN** the temporary cutover helper and every schema-1/2 runtime branch MUST be deleted before the incompatible release artifact is built.
