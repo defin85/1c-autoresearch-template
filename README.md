@@ -69,7 +69,7 @@ distribution. It is not package data inside `one_c_autoresearch`.
 python scripts/checks/test_template.py
 python scripts/checks/test_doctor.py
 python scripts/checks/test_research_repo.py --repo-path <target-repo>
-pytest -q
+uv run --extra workspace --with pytest --with httpx python -m pytest -q tests
 ```
 
 The release gate also verifies canonical two-way parity, forbidden-authority

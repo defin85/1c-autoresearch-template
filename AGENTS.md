@@ -49,7 +49,7 @@ python scripts/checks/test_template.py
 python scripts/checks/test_doctor.py
 python scripts/checks/test_research_repo.py --repo-path <target-repo>
 uv run --extra workspace basedpyright
-pytest -q
+uv run --extra workspace --with pytest --with httpx python -m pytest -q tests
 ```
 
 `dist/research-template.zip` is a separate release artifact, never runtime

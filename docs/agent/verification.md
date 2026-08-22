@@ -10,7 +10,7 @@ python scripts/checks/test_template.py
 python scripts/checks/test_doctor.py
 python scripts/checks/test_research_repo.py --repo-path <target-repo>
 uv run --extra workspace basedpyright
-pytest -q
+uv run --extra workspace --with pytest --with httpx python -m pytest -q tests
 ```
 
 For workspace changes:

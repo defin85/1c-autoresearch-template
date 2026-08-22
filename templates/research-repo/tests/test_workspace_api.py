@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from one_c_autoresearch.workspace_api import create_app
+from one_c_autoresearch.workspace_api import create_app, main
 from one_c_autoresearch.contracts import external_id
 from one_c_autoresearch.events import EventStore
 from one_c_autoresearch.sources import draft_fingerprint, extension_scope_status
@@ -14,6 +14,47 @@ from one_c_autoresearch.user_state import load_connections
 
 
 REPO = Path(__file__).parents[1]
+
+
+@pytest.mark.parametrize("help_flag", ["-help", "--help"])
+def test_workspace_help_does_not_start_server(help_flag: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr("sys.argv", ["one-c-autoresearch-workspace", help_flag])
+    monkeypatch.setattr("one_c_autoresearch.workspace_api.create_app", lambda: pytest.fail("server started"))
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+    assert exit_info.value.code == 0
+    assert "usage: one-c-autoresearch-workspace" in capsys.readouterr().out
+
+
+def test_workspace_health_uses_versioned_api_path(tmp_path: Path) -> None:
+    app = create_app(tmp_path / "state", [REPO], testing=True)
+    with TestClient(app) as client:
+        assert client.get("/api/v1/health").status_code == 200
+        assert client.get("/api/projects").status_code == 404
+
+
+def test_indexes_snapshot_skips_repeated_deep_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from one_c_autoresearch import indexes
+    calls: list[object] = []
+    row = {"adapter_id": "bsl-analyzer", "component_id": "target_cf:configuration", "status": "ready", "capabilities": ["code-search-lexical"]}
+    monkeypatch.setattr(indexes, "backend_statuses", lambda _repo, *, verify_manifests=True: calls.append(verify_manifests) or [row])
+    monkeypatch.setattr(indexes, "storage_diagnostics", lambda _repo, *, calculate_usage=True: calls.append(("storage", calculate_usage)) or {"root": "/indexes"})
+    monkeypatch.setattr(indexes, "load_config", lambda _repo: {"schema_version": "3", "backends": [], "routes": {}})
+    monkeypatch.setattr(indexes, "config_fingerprint", lambda _repo: "sha256:config")
+    monkeypatch.setattr(indexes, "discover", lambda _repo: [])
+    monkeypatch.setattr(indexes, "route_coverage", lambda *_args: {"blockers": [], "degraded": []})
+    monkeypatch.setattr(indexes, "backend_tool_inventory", lambda _repo: [])
+    monkeypatch.setattr("one_c_autoresearch.search_runtime.runtime_diagnostics", lambda: [])
+    monkeypatch.setattr("one_c_autoresearch.workspace_api.ApplicationService.index_statuses", lambda _self: calls.append("service") or [])
+    app = create_app(tmp_path / "state", [REPO], testing=True)
+    headers = {"Origin": "http://testserver", "Idempotency-Key": "bookmark"}
+    with TestClient(app) as client:
+        project = client.post("/api/v1/projects", json={"name": "test", "root": str(REPO)}, headers=headers).json()
+        response = client.get(f"/api/v1/projects/{project['id']}/indexes")
+    assert response.status_code == 200
+    assert response.json()["items"] == [row]
+    assert "storage" not in response.json()
+    assert calls == [False, ("storage", False)]
 
 def test_event_replay_can_open_at_the_current_tail(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events", "project")

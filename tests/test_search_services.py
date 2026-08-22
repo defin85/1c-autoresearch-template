@@ -159,6 +159,40 @@ def test_profile_preview_apply_is_reviewed_idempotent_and_secret_safe(tmp_path: 
     assert state_fingerprint(repo, state) == applied["state_fingerprint"]
 
 
+def test_existing_embedding_profile_keeps_hidden_endpoint_when_editing(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state = tmp_path / "state"
+    installed = install_profile(
+        repo, "semantic", embedding_profile("http://127.0.0.1:9999/v1"), base=state,
+    )
+    edited = embedding_profile("")
+    edited["label"] = "renamed"
+    preview = preview_profile(
+        repo, "semantic", edited, actor="owner", idempotency_key="keep-endpoint",
+        expected_state_fingerprint=state_fingerprint(repo, state), disclosure=disclosure(),
+        acknowledged=False, base=state,
+    )
+
+    assert preview["profile"]["label"] == "renamed"
+    assert preview["impact"]["semantic_rebuild_required"] is False
+    assert preview["profile"]["semantic_identity"] == installed["semantic_identity"]
+
+
+def test_new_embedding_profile_still_requires_endpoint(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state = tmp_path / "state"
+
+    with pytest.raises(ValueError, match="endpoint_forbidden"):
+        preview_profile(
+            repo, "semantic", embedding_profile(""), actor="owner",
+            idempotency_key="missing-endpoint",
+            expected_state_fingerprint=state_fingerprint(repo, state), disclosure=disclosure(),
+            acknowledged=False, base=state,
+        )
+
+
 def test_remote_preview_requires_disclosure_acknowledgement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

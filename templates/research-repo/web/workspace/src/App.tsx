@@ -126,19 +126,86 @@ type SearchServiceProfile = {
   };
 };
 
+const DEFAULT_BUILD_LIMITS = {
+  requests: 10000,
+  input_bytes: 2147483648,
+  vectors: 1000000,
+  concurrency: 4,
+  batch: 256,
+  elapsed_seconds: 1800,
+};
+
+function editableSearchProfile(value?: Record<string, unknown>): SearchServiceProfile {
+  const limits = value?.build_limits as Partial<SearchServiceProfile["build_limits"]> | undefined;
+  return {
+    kind: value?.kind === "its" ? "its" : "embedding",
+    label: String(value?.label ?? "Основной векторный поиск"),
+    enabled: value?.enabled !== false,
+    endpoint: "",
+    provider: "openai-compatible",
+    model: String(value?.model ?? ""),
+    dimension: typeof value?.dimension === "number" ? value.dimension : 1536,
+    ca_bundle_id: typeof value?.ca_bundle_id === "string" ? value.ca_bundle_id : null,
+    build_limits: { ...DEFAULT_BUILD_LIMITS, ...limits },
+  };
+}
+
 const INDEX_BACKENDS = {
   "rlm-tools-bsl": "RLM Tools BSL",
   "bsl-analyzer": "BSL Analyzer",
 } as const;
+
+function indexComponentLabel(componentId: string) {
+  if (componentId === "next_vendor:configuration") return "Новая типовая конфигурация";
+  if (componentId === "target_cf:configuration") return "Рабочая конфигурация";
+  if (componentId.startsWith("target_cf:extension:")) return "Расширение рабочей конфигурации";
+  if (componentId === "vendor_baseline:configuration") return "Исходная типовая конфигурация";
+  return componentId;
+}
+
+const INDEX_STATUS: Record<string, string> = {
+  ready: "готов",
+  unavailable: "недоступен",
+  missing: "отсутствует",
+  stale: "устарел",
+  not_indexable: "не требуется",
+};
 
 const INDEX_CAPABILITIES: Record<string, string> = {
   "code-search-lexical": "Лексический поиск по коду",
   "code-search-hybrid": "Векторный поиск по коду",
   "symbol-info": "Сведения о символе",
   "symbol-info-positional": "Символ в позиции",
+  "graph-overview": "Обзор графа",
+  "graph-schema": "Схема графа",
+  "graph-resolve": "Поиск узла графа",
+  "graph-node": "Узел графа",
+  "graph-source": "Исходный код узла",
+  "graph-neighbors": "Связанные узлы",
   "graph-callers": "Вызывающие методы",
   "graph-callees": "Вызываемые методы",
+  "metadata-info": "Сведения о метаданных",
+  "metadata-tree": "Дерево метаданных",
+  "metadata-object": "Объект метаданных",
+  "metadata-form": "Форма метаданных",
+  "diagnostics-catalog": "Каталог диагностик",
+  "diagnostics-schema": "Схема диагностики",
+  "diagnostics-file": "Диагностика файла",
+  "diagnostics-workspace": "Диагностика рабочей области",
+  "reference-docs-find": "Поиск документации",
+  "reference-docs-search": "Поиск по документации",
+  "reference-syntax-help": "Справка по синтаксису",
+  "reference-its-help": "Справка ИТС",
 };
+
+const INDEX_CAPABILITY_GROUPS: [string, string[]][] = [
+  ["Код", ["code-search-lexical", "code-search-hybrid"]],
+  ["Символы", ["symbol-info", "symbol-info-positional"]],
+  ["Граф вызовов", ["graph-overview", "graph-schema", "graph-resolve", "graph-node", "graph-source", "graph-neighbors", "graph-callers", "graph-callees"]],
+  ["Метаданные", ["metadata-info", "metadata-tree", "metadata-object", "metadata-form"]],
+  ["Диагностика", ["diagnostics-catalog", "diagnostics-schema", "diagnostics-file", "diagnostics-workspace"]],
+  ["Справка", ["reference-docs-find", "reference-docs-search", "reference-syntax-help", "reference-its-help"]],
+];
 
 function ConfigurationPlanSummary({ plan }: { plan: Record<string, unknown> }) {
   const rebuild = Array.isArray(plan.rebuild_backends) ? plan.rebuild_backends.map(String) : [];
@@ -2471,12 +2538,7 @@ export function Indexes({
   const [serviceProfiles, setServiceProfiles] = useState<Record<string, unknown>[]>([]);
   const [serviceFingerprint, setServiceFingerprint] = useState("");
   const [profileId, setProfileId] = useState("embedding-default");
-  const [profile, setProfile] = useState<SearchServiceProfile>({
-    kind: "embedding", label: "Основной векторный поиск", enabled: true,
-    endpoint: "http://127.0.0.1:8080/v1", provider: "openai-compatible",
-    model: "embedding", dimension: 1536, ca_bundle_id: null,
-    build_limits: { requests: 10000, input_bytes: 2147483648, vectors: 1000000, concurrency: 4, batch: 256, elapsed_seconds: 1800 },
-  });
+  const [profile, setProfile] = useState<SearchServiceProfile>(() => editableSearchProfile());
   const [profileSecret, setProfileSecret] = useState("");
   const [profileAcknowledged, setProfileAcknowledged] = useState(false);
   const [profilePreview, setProfilePreview] = useState<Record<string, unknown>>();
@@ -2500,7 +2562,12 @@ export function Indexes({
           setConfigurationFingerprint(value.configuration_fingerprint);
           setStorageRoot(value.storage_root);
           setConfigurationPreview(undefined);
-          setServiceProfiles(services.profiles ?? []);
+          const profiles = services.profiles ?? [];
+          setServiceProfiles(profiles);
+          if (profiles[0]) {
+            setProfileId(String(profiles[0].profile_id));
+            setProfile(editableSearchProfile(profiles[0]));
+          }
           setServiceFingerprint(services.state_fingerprint ?? "");
           setProfilePreview(undefined);
           setProfileSecret("");
@@ -2542,7 +2609,7 @@ export function Indexes({
     if (
       mode === "rebuild" &&
       !window.confirm(
-        `Перестроить ${selected.length || items.length} одноразовых индексов?`,
+        `Перестроить индексы выбранных объектов (${selected.length})?`,
       )
     )
       return;
@@ -2682,6 +2749,20 @@ export function Indexes({
   }
   const lexicalMissing = items.filter((item) => item.modality === "lexical" && item.status !== "ready").length;
   const hybridMissing = items.filter((item) => item.modality === "hybrid" && item.status !== "ready").length;
+  const missingComponents = [...new Set(items.filter((item) => item.status !== "ready").map((item) => item.component_id))];
+  const components = [...new Set(items.map((item) => item.component_id))].map((componentId) => ({
+    componentId,
+    indexes: items.filter((item) => item.component_id === componentId),
+  }));
+  const incompatibleTool = backendTools.find((item) => item.required === true && item.status === "incompatible");
+  const incompatibleInstance = Array.isArray(incompatibleTool?.instances)
+    ? incompatibleTool.instances[0] as Record<string, unknown> | undefined
+    : undefined;
+  const incompatibleToolId = String(incompatibleTool?.tool_id ?? "");
+  const incompatibleToolLabel = INDEX_BACKENDS[incompatibleToolId as keyof typeof INDEX_BACKENDS] ?? incompatibleToolId;
+  const configuredContractVersion = String(incompatibleInstance?.configured_contract_version ?? "");
+  const contractVersion = String(incompatibleInstance?.contract_version ?? "");
+  const contractMismatch = Boolean(configuredContractVersion && contractVersion && configuredContractVersion !== contractVersion);
   return (
     <Stack spacing={2}>
       {error && <Alert severity="error">{error}</Alert>}
@@ -2699,23 +2780,32 @@ export function Indexes({
           Использовано {storage.used_bytes.toLocaleString("ru-RU")} из {storage.quota_bytes.toLocaleString("ru-RU")} байт.
         </Box>}
       </Alert>
-      {routeHealth.blockers.length > 0 && <Alert severity="warning">
+      {incompatibleTool && <Alert severity="error">
+        <Typography fontWeight={700}>{incompatibleToolLabel} несовместим с настройками проекта.</Typography>
+        <Typography variant="body2">
+          {contractMismatch
+            ? `Версия ${incompatibleToolLabel} ${String(incompatibleInstance?.version ?? "не определена")}. Проект поддерживает машинный контракт ${configuredContractVersion}, установленный движок предоставляет ${contractVersion}.`
+            : `Настроена версия ${String(incompatibleInstance?.configured_version ?? "не указана")}, установлена ${String(incompatibleInstance?.version ?? "не определена")}.`}
+          {incompatibleToolId === "bsl-analyzer" && " Лексический поиск временно работает через RLM Tools BSL; векторный и справочный поиск, граф, метаданные и диагностика недоступны. Согласуйте версию движка, затем создайте индексы."}
+        </Typography>
+      </Alert>}
+      {routeHealth.blockers.length > 0 && !incompatibleTool && <Alert severity="warning">
         Поиск ещё не готов. Не хватает лексических индексов: {lexicalMissing};
         семантических: {hybridMissing}. Настройте семантический поиск и создайте
         недостающие индексы.
       </Alert>}
-      {routeHealth.degraded.length > 0 && <Alert severity="warning">
+      {routeHealth.degraded.length > 0 && !incompatibleTool && <Alert severity="warning">
         Часть запросов использует резервный движок: {routeHealth.degraded.length}.
       </Alert>}
       {runtimeBackends.length > 0 && <Alert severity="info">
         Активные обслуживающие процессы: {runtimeBackends.length}.
       </Alert>}
-      {referenceReadiness && <Alert severity={referenceReadiness.status === "ready" ? "success" : "warning"}>
+      {referenceReadiness && !incompatibleTool && <Alert severity={referenceReadiness.status === "ready" ? "success" : "warning"}>
         {referenceReadiness.status === "ready"
           ? "Справочный поиск готов."
           : "Справочный поиск ещё не готов. Он будет подготовлен при создании недостающих индексов."}
       </Alert>}
-      <Stack direction="row" spacing={1}>
+      <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
         <Button disabled={busy} onClick={() => void previewCleanup()}>Найти неактивные индексы</Button>
         <Button color="warning" disabled={busy || !cleanupPreview?.candidates.length} onClick={() => void applyCleanup()}>
           Удалить неактивные индексы
@@ -2756,13 +2846,14 @@ export function Indexes({
                         : item),
                     })}
                   />
-                  {configuration.backends.length > 1 && <Button
+                  <Button
                     color="error"
                     sx={{ alignSelf: "flex-start" }}
+                    disabled={configuration.backends.length < 2}
                     onClick={() => removeBackend(backend.adapter_id)}
                   >
-                    Отключить движок
-                  </Button>}
+                    Убрать из плана
+                  </Button>
                 </Stack>
               </CardContent>
             </Card>)}
@@ -2797,29 +2888,62 @@ export function Indexes({
                   <Alert severity="info">
                     Первый движок — основной, следующие используются только при его недоступности.
                   </Alert>
-                  {configuration && Object.entries(configuration.routes).map(([capability, adapters]) => <FormControl key={capability} fullWidth>
-                    <InputLabel>{INDEX_CAPABILITIES[capability] ?? capability}</InputLabel>
-                    <Select
-                      multiple
-                      label={INDEX_CAPABILITIES[capability] ?? capability}
-                      value={adapters}
-                      renderValue={(value) => value.join(" → ")}
-                      onChange={(event) => editConfiguration({
-                        ...configuration,
-                        routes: {
-                          ...configuration.routes,
-                          [capability]: typeof event.target.value === "string"
-                            ? event.target.value.split(",")
-                            : event.target.value,
-                        },
-                      })}
-                    >
-                      {configuration.backends.map((backend) => <MenuItem key={backend.adapter_id} value={backend.adapter_id}>
-                        <Checkbox checked={adapters.includes(backend.adapter_id)} />
-                        {INDEX_BACKENDS[backend.adapter_id as keyof typeof INDEX_BACKENDS] ?? backend.adapter_id}
-                      </MenuItem>)}
-                    </Select>
-                  </FormControl>)}
+                  {configuration && [...INDEX_CAPABILITY_GROUPS, [
+                    "Прочие",
+                    Object.keys(configuration.routes).filter((capability) => !INDEX_CAPABILITY_GROUPS.some(([, members]) => members.includes(capability))),
+                  ] as [string, string[]]].map(([group, capabilities]) => {
+                    const routes = capabilities.filter((capability) => capability in configuration.routes);
+                    return routes.length > 0 && <Accordion key={group} variant="outlined">
+                      <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
+                        <Typography variant="subtitle2">{group} · {routes.length}</Typography>
+                      </AccordionSummary>
+                      <AccordionDetails>
+                      <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1 }}>
+                        {routes.map((capability) => {
+                          const adapters = configuration.routes[capability];
+                          const label = INDEX_CAPABILITIES[capability] ?? capability;
+                          return <Box
+                            key={capability}
+                            sx={{
+                              display: "grid",
+                              gridTemplateColumns: { xs: "1fr", sm: "minmax(220px, 1fr) minmax(260px, 1.4fr)" },
+                              gap: 1,
+                              alignItems: "center",
+                              p: 1,
+                              borderBottom: 1,
+                              borderColor: "divider",
+                              "&:last-child": { borderBottom: 0 },
+                            }}
+                          >
+                            <Typography variant="body2">{label}</Typography>
+                            <FormControl fullWidth size="small">
+                              <Select
+                                multiple
+                                inputProps={{ "aria-label": `Цепочка движков: ${label}` }}
+                                value={adapters}
+                                renderValue={(value) => value.map((adapterId) => INDEX_BACKENDS[adapterId as keyof typeof INDEX_BACKENDS] ?? adapterId).join(" → ")}
+                                onChange={(event) => editConfiguration({
+                                  ...configuration,
+                                  routes: {
+                                    ...configuration.routes,
+                                    [capability]: typeof event.target.value === "string"
+                                      ? event.target.value.split(",")
+                                      : event.target.value,
+                                  },
+                                })}
+                              >
+                                {configuration.backends.map((backend) => <MenuItem key={backend.adapter_id} value={backend.adapter_id}>
+                                  <Checkbox checked={adapters.includes(backend.adapter_id)} />
+                                  {INDEX_BACKENDS[backend.adapter_id as keyof typeof INDEX_BACKENDS] ?? backend.adapter_id}
+                                </MenuItem>)}
+                              </Select>
+                            </FormControl>
+                          </Box>;
+                        })}
+                      </Box>
+                      </AccordionDetails>
+                    </Accordion>;
+                  })}
                   {configuration?.service_profiles && <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
                     <TextField
                       fullWidth
@@ -2871,7 +2995,14 @@ export function Indexes({
             </Stack>
             <FormControlLabel control={<Checkbox checked={profile.enabled} onChange={(event) => editProfile({ enabled: event.target.checked })} />} label="Профиль включён" />
             {profile.kind === "embedding" && <>
-              <TextField label="Адрес сервиса" helperText="OpenAI-совместимый адрес, например http://127.0.0.1:8080/v1" value={profile.endpoint ?? ""} onChange={(event) => editProfile({ endpoint: event.target.value })} />
+              <TextField
+                label="Новый адрес сервиса"
+                helperText={serviceProfiles.some((item) => item.profile_id === profileId)
+                  ? "Оставьте пустым, чтобы сохранить текущий адрес."
+                  : "Для нового профиля укажите OpenAI-совместимый адрес."}
+                value={profile.endpoint ?? ""}
+                onChange={(event) => editProfile({ endpoint: event.target.value })}
+              />
               <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
                 <TextField fullWidth label="Модель" value={profile.model ?? ""} onChange={(event) => editProfile({ model: event.target.value })} />
                 <TextField fullWidth label="Размерность вектора" type="number" value={profile.dimension ?? ""} onChange={(event) => editProfile({ dimension: Number(event.target.value) })} />
@@ -2905,7 +3036,7 @@ export function Indexes({
       </Accordion>
       <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
         <Button
-          disabled={busy}
+          disabled={busy || missingComponents.length === 0 || Boolean(incompatibleTool)}
           variant="contained"
           onClick={() => void run("ensure")}
         >
@@ -2918,13 +3049,14 @@ export function Indexes({
           Проверить готовность
         </Button>
         <Button
-          disabled={busy}
+          disabled={busy || selected.length === 0}
           color="warning"
           onClick={() => void run("rebuild")}
         >
-          Перестроить с подтверждением
+          Перестроить выбранные
         </Button>
       </Stack>
+      {items.length > 0 && missingComponents.length === 0 && <Alert severity="success">Все индексы готовы.</Alert>}
       {pendingMode && (
         <Stack direction="row" spacing={1} alignItems="center" role="status" aria-live="polite">
           <CircularProgress size={18} />
@@ -2939,58 +3071,57 @@ export function Indexes({
       )}
       <Accordion>
         <AccordionSummary expandIcon={<Typography aria-hidden="true">⌄</Typography>}>
-          <Typography fontWeight={700}>Диагностика по объектам ({items.length})</Typography>
+          <Typography fontWeight={700}>Диагностика по объектам ({components.length})</Typography>
         </AccordionSummary>
-        <AccordionDetails><Stack spacing={1}>{items.map((item) => (
-        <Card key={`${item.adapter_id}:${item.component_id}`} variant="outlined">
+        <AccordionDetails><Stack spacing={1}>{components.map(({ componentId, indexes }) => (
+        <Card key={componentId} variant="outlined">
           <CardContent>
             <FormControlLabel
               control={
                 <Checkbox
-                  checked={selected.includes(item.component_id)}
+                  checked={selected.includes(componentId)}
                   onChange={(event) =>
                     setSelected(
                       event.target.checked
-                        ? [...selected, item.component_id]
-                        : selected.filter((id) => id !== item.component_id),
+                        ? [...selected, componentId]
+                        : selected.filter((id) => id !== componentId),
                     )
                   }
                 />
               }
-              label={item.component_id}
+              label={indexComponentLabel(componentId)}
             />
-            <Stack direction="row" spacing={1}>
-              <Chip
+            <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+              {indexes.map((item) => <Chip
+                key={`${item.adapter_id}:${item.modality ?? "default"}`}
                 size="small"
-                label={item.status}
+                label={`${INDEX_BACKENDS[item.adapter_id as keyof typeof INDEX_BACKENDS] ?? item.adapter_id}${item.modality ? ` · ${item.modality === "lexical" ? "лексический" : "векторный"}` : ""}: ${INDEX_STATUS[item.status] ?? item.status}`}
                 color={item.status === "ready" ? "success" : "default"}
-              />
-              <Chip size="small" label={`${item.bsl_file_count} BSL`} />
+              />)}
+              <Chip size="small" label={`${Math.max(...indexes.map((item) => item.bsl_file_count))} BSL`} />
             </Stack>
-            <Typography display="block" variant="caption">
-              {item.adapter_id} {item.engine_version} · адаптер {item.adapter_version}
-              {item.contract_version ? ` · контракт ${item.contract_version}` : ""} · поколение{" "}
-              {item.source_generation_id}
-              {item.modality ? ` · режим ${item.modality}` : ""}
-            </Typography>
-            <Typography display="block" variant="caption">
-              Возможности: {item.capabilities.join(", ") || "не объявлены"} · приоритеты:{" "}
-              {JSON.stringify(item.route_priorities)}
-            </Typography>
-            <Typography display="block" variant="caption">
-              Индекс {item.index_fingerprint || "не создан"} · проверка{" "}
-              {item.last_validation || "ещё не выполнялась"} · исходник {item.fingerprint}
-            </Typography>
-            {(item.surface_identity || item.embedding_identity) && <Typography display="block" variant="caption">
-              Поверхность {item.surface_identity || "не подтверждена"}
-              {item.embedding_identity ? ` · векторная модель ${item.embedding_identity}` : ""}
-            </Typography>}
-            {item.failure_code && <Alert severity="error" sx={{ mt: 1 }}>
-              {item.failure_code}{item.failure_summary ? `: ${item.failure_summary}` : ""}
-            </Alert>}
-            {item.readiness_reason && <Typography display="block" variant="caption">
-              Причина: {item.readiness_reason} · восстановление: {item.recovery_action}
-            </Typography>}
+            <Box component="details" sx={{ mt: 1 }}>
+              <Typography component="summary" variant="caption" sx={{ cursor: "pointer" }}>Технические сведения</Typography>
+              {indexes.map((item) => <Box key={`${item.adapter_id}:${item.modality ?? "default"}`} sx={{ mt: 1 }}>
+                <Typography display="block" variant="caption">
+                  {componentId} · {item.adapter_id} {item.engine_version} · адаптер {item.adapter_version}
+                  {item.contract_version ? ` · контракт ${item.contract_version}` : ""} · поколение {item.source_generation_id}
+                  {item.modality ? ` · режим ${item.modality}` : ""}
+                </Typography>
+                <Typography display="block" variant="caption">
+                  Возможности: {item.capabilities.join(", ") || "не объявлены"} · приоритеты: {JSON.stringify(item.route_priorities)}
+                </Typography>
+                <Typography display="block" variant="caption">
+                  Индекс {item.index_fingerprint || "не создан"} · проверка {item.last_validation || "ещё не выполнялась"} · исходник {item.fingerprint}
+                </Typography>
+                {item.failure_code && <Alert severity="error" sx={{ mt: 1 }}>
+                  {item.failure_code}{item.failure_summary ? `: ${item.failure_summary}` : ""}
+                </Alert>}
+                {item.readiness_reason && <Typography display="block" variant="caption">
+                  Причина: {item.readiness_reason} · восстановление: {item.recovery_action}
+                </Typography>}
+              </Box>)}
+            </Box>
           </CardContent>
         </Card>
       ))}</Stack></AccordionDetails>
@@ -3471,7 +3602,12 @@ function Workspace({
               {project.name}
             </Typography>
           </Box>
-          <Box sx={{ display: "flex", overflowX: "auto", "& > button": { flexShrink: 0 } }}>
+          <Box sx={{
+            display: "flex",
+            flexWrap: { xs: "wrap", md: "nowrap" },
+            overflowX: { md: "auto" },
+            "& > button": { flexShrink: 0, px: { xs: 1, sm: 1.5 }, minWidth: 0 },
+          }}>
             <Button
               variant={view === "dispatcher" ? "contained" : "text"}
               onClick={() => void openWorking()}

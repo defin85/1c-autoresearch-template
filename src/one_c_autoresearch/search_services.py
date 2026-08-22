@@ -626,12 +626,20 @@ def preview_profile(
         or not 1 <= ttl_seconds <= 900
     ):
         raise ValueError("search_services.invalid_preview")
-    normalized = _validate_profile(profile)
     current_state = _state(repo, base)
     current_fingerprint = _state_fingerprint(current_state)
     if expected_state_fingerprint != current_fingerprint:
         raise RuntimeError("search_services.state_changed")
     current = current_state["profiles"].get(profile_id)
+    profile_to_validate = dict(profile)
+    if (
+        profile_to_validate.get("kind") == "embedding"
+        and not profile_to_validate.get("endpoint")
+        and current is not None
+        and current["kind"] == "embedding"
+    ):
+        profile_to_validate["endpoint"] = current["endpoint"]
+    normalized = _validate_profile(profile_to_validate)
     credential = current.get("credential") if current is not None else None
     secret_version = current.get("secret_version") if current is not None else None
     if secret is not None:

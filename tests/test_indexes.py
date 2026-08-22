@@ -111,6 +111,41 @@ def test_backend_tool_inventory_reads_unconfigured_adapter_version(
     assert tools["bsl-analyzer"]["instances"][0]["version"] == "0.2.65"
 
 
+def test_backend_tool_inventory_reports_actual_incompatible_version(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        indexes,
+        "load_config",
+        lambda _repo: {
+            "backends": [{"adapter_id": "bsl-analyzer", "engine_version": "0.2.65"}],
+            "routes": {"code-search-hybrid": ["bsl-analyzer"]},
+        },
+    )
+    monkeypatch.setattr(
+        indexes,
+        "backend_executable",
+        lambda _repo, adapter_id: "/tools/bsl-analyzer" if adapter_id == "bsl-analyzer" else None,
+    )
+    monkeypatch.setattr(
+        indexes,
+        "probe_backend",
+        lambda *_args: {
+            "available": False,
+            "engine_version": "0.2.67",
+            "contract_version": "1.6",
+            "configured_contract_version": "1.3",
+            "failure_code": "backend.contract_incompatible",
+        },
+    )
+
+    tool = {item["tool_id"]: item for item in indexes.backend_tool_inventory(tmp_path)}["bsl-analyzer"]
+    assert tool["instances"][0]["version"] == "0.2.67"
+    assert tool["instances"][0]["configured_version"] == "0.2.65"
+    assert tool["instances"][0]["contract_version"] == "1.6"
+    assert tool["instances"][0]["configured_contract_version"] == "1.3"
+
+
 def test_next_work_indexes_every_source_component_before_research(tmp_path: Path, monkeypatch) -> None:
     from one_c_autoresearch.service import ApplicationService
     from one_c_autoresearch import workflow
@@ -531,6 +566,15 @@ def test_backend_probe_uses_bsl_machine_contract(monkeypatch, tmp_path: Path):
     )
     assert before != after["capability_fingerprint"]
     assert probe["executable_fingerprint"] != after["executable_fingerprint"]
+
+    contract["contract_version"] = "1.6"
+    incompatible = indexes.probe_backend(
+        repo,
+        {"adapter_id": "bsl-analyzer", "engine_version": "0.2.63"},
+    )
+    assert incompatible["available"] is False
+    assert incompatible["contract_version"] == "1.6"
+    assert incompatible["configured_contract_version"] == "1.3"
 
 
 def test_bsl_lexical_and_hybrid_targets_have_distinct_identities(tmp_path: Path):
@@ -1069,6 +1113,10 @@ def test_private_index_promotion_is_clone_isolated_and_keeps_source_clean(monkey
     ready = indexes.ready_backend_state(repo, component, backend, state_root=state)
     assert ready
     assert Path(ready["index_dir"], "bsl_index.db").read_bytes() == b"index"
+    monkeypatch.setattr(indexes, "file_manifest", lambda _root: pytest.fail("shallow status must not hash manifests"))
+    assert indexes.ready_backend_state(
+        repo, component, backend, state_root=state, verify_manifests=False,
+    )
 
 
 def test_rebuild_promotes_a_new_instance_and_atomically_switches_pointer(monkeypatch, tmp_path: Path):

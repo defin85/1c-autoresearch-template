@@ -2174,8 +2174,8 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         from . import indexes, search_runtime
         project = repo(project_id)
         configuration = indexes.load_config(project)
-        items = ApplicationService(project).index_statuses()
-        backend_states = [backend_state(row) for row in indexes.backend_statuses(project)]
+        items = indexes.backend_statuses(project, verify_manifests=False)
+        backend_states = [backend_state(row) for row in items]
         bsl = next(
             (
                 backend for backend in configuration["backends"]
@@ -2183,7 +2183,7 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
             ),
             None,
         )
-        storage = indexes.storage_diagnostics(project)
+        storage = indexes.storage_diagnostics(project, calculate_usage=False)
         return {
             "items": items,
             "configuration": configuration,
@@ -2192,7 +2192,6 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 configuration, indexes.discover(project), backend_states,
             )),
             "storage_root": _string(storage["root"]),
-            "storage": storage,
             "backend_tools": indexes.backend_tool_inventory(project),
             "disposable": True,
             "runtime_backends": search_runtime.runtime_diagnostics(),
@@ -2441,6 +2440,11 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
 
 
 def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Serve the 1C autoresearch workspace.")
+    _ = parser.add_argument("-help", action="help", help=argparse.SUPPRESS)
+    _ = parser.parse_args()
     import uvicorn
     uvicorn.run(create_app(), host="127.0.0.1", port=8765)
     return 0

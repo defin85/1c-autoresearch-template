@@ -184,6 +184,7 @@ class BackendProbe(TypedDict):
     executable: NotRequired[str]
     engine_version: NotRequired[str]
     contract_version: NotRequired[str]
+    configured_contract_version: NotRequired[str]
     executable_fingerprint: NotRequired[str]
     capability_fingerprint: NotRequired[str]
     surface_manifest: NotRequired[dict[str, JsonValue]]
@@ -335,6 +336,9 @@ class LegacyStatus(Component):
 
 class ToolInstance(TypedDict):
     version: str
+    configured_version: NotRequired[str]
+    contract_version: NotRequired[str]
+    configured_contract_version: NotRequired[str]
     status: str
     path: str
     reason_code: str
@@ -455,9 +459,14 @@ def _index_config(candidate: ConfigCandidate) -> IndexConfig:
 
 
 class BslSurfaceContractError(RuntimeError):
-    def __init__(self, state: str, summary: str):
+    def __init__(
+        self, state: str, summary: str, *,
+        expected_contract_version: str = "", actual_contract_version: str = "",
+    ):
         super().__init__(summary)
         self.state: str = state
+        self.expected_contract_version: str = expected_contract_version
+        self.actual_contract_version: str = actual_contract_version
 
 
 def native_text_envelope(
@@ -1121,7 +1130,11 @@ def _bsl_contract(executable: str, configured_version: str) -> BslContract:
         or str(contract["contract_version"]) != "1.3"
         or str(contract.get("build_version")) != configured_version
     ):
-        raise RuntimeError("bsl-analyzer contract or build version mismatch")
+        raise BslSurfaceContractError(
+            "incompatible", "bsl-analyzer contract or build version mismatch",
+            expected_contract_version="1.3",
+            actual_contract_version=str(contract["contract_version"]),
+        )
     actual = {
         str(profile): {
             str(tool["name"]): {
@@ -1285,6 +1298,13 @@ def probe_backend(repo: Path, backend: BackendRow) -> BackendProbe:
             "failure_summary": str(exc)[:500],
             "capabilities": [],
         }
+        try:
+            failure_result["engine_version"] = cli_version(executable)
+        except RuntimeError:
+            pass
+        if isinstance(exc, BslSurfaceContractError):
+            failure_result["contract_version"] = exc.actual_contract_version
+            failure_result["configured_contract_version"] = exc.expected_contract_version
         if adapter_id == "bsl-analyzer":
             failure_result["surface_manifest"] = {
                 "schema_version": "bsl-search-surface/v1",
@@ -1313,12 +1333,18 @@ def backend_tool_inventory(repo: Path) -> list[ToolInventory]:
         if executable and backend:
             probe = probe_backend(repo, backend)
             status = "ready" if probe["available"] else "incompatible"
-            instances.append({
+            instance: ToolInstance = {
                 "version": str(probe.get("engine_version", backend["engine_version"])),
+                "configured_version": backend["engine_version"],
                 "status": status,
                 "path": executable,
                 "reason_code": str(probe.get("failure_code", "")),
-            })
+            }
+            for key in ("contract_version", "configured_contract_version"):
+                value = probe.get(key)
+                if isinstance(value, str) and value:
+                    instance[key] = value
+            instances.append(instance)
         elif executable:
             try:
                 version = cli_version(executable)
@@ -1666,9 +1692,11 @@ def _operational_root(repo: Path, state_root: Path | None = None) -> Path:
 
 
 def storage_diagnostics(
-    repo: Path, state_root: Path | None = None
+    repo: Path, state_root: Path | None = None, *, calculate_usage: bool = True,
 ) -> dict[str, JsonValue]:
     root = _operational_root(repo, state_root)
+    if not calculate_usage:
+        return {"root": str(root)}
     used = _tree_size(root)
     return {
         "root": str(root),
@@ -1982,6 +2010,7 @@ def ready_backend_state(
     *,
     state_root: Path | None = None,
     modality: str = "lexical",
+    verify_manifests: bool = True,
 ) -> BackendState | None:
     probe = probe_backend(repo, backend)
     if not probe["available"]:
@@ -2062,10 +2091,12 @@ def ready_backend_state(
             repo / "sources/generations" / component["source_generation_id"],
             component["path"],
         )
-        if file_manifest(source_root) != source_manifest_value:
+        if not source_root.is_dir():
             return None
         index_dir = instance / "index"
-        if backend["adapter_id"] == "rlm-tools-bsl":
+        if verify_manifests and file_manifest(source_root) != source_manifest_value:
+            return None
+        if verify_manifests and backend["adapter_id"] == "rlm-tools-bsl":
             expected_index: list[dict[str, str | int]] = []
             for item_value in index_manifest_value:
                 if not isinstance(item_value, dict) or not isinstance(item_value.get("path"), str):
@@ -2763,7 +2794,9 @@ def statuses(repo: Path, state_root: Path | None = None, probe: Callable[[Path],
     return rows
 
 
-def backend_statuses(repo: Path, state_root: Path | None = None) -> list[dict[str, JsonValue]]:
+def backend_statuses(
+    repo: Path, state_root: Path | None = None, *, verify_manifests: bool = True,
+) -> list[dict[str, JsonValue]]:
     config = load_config(repo)
     rows: list[dict[str, JsonValue]] = []
     for backend in config["backends"]:
@@ -2794,6 +2827,7 @@ def backend_statuses(repo: Path, state_root: Path | None = None) -> list[dict[st
                 promoted = ready_backend_state(
                     repo, component, backend, state_root=state_root,
                     modality=modality,
+                    verify_manifests=verify_manifests,
                 )
                 status = (
                     "ready" if promoted else

@@ -496,6 +496,62 @@ test("index workspace shows loading instead of a false empty configuration", asy
   expect(screen.getAllByLabelText("Версия движка", { selector: "input" })[1]).toHaveValue("0.2.65");
 });
 
+test("index workspace explains an incompatible required backend instead of calling it missing", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string) => Promise.resolve({
+    ok: true,
+    json: async () => url.endsWith("/indexes")
+      ? {
+          items: [{
+            component_id: "target_cf:configuration",
+            source_generation_id: "gen",
+            fingerprint: "sha256:source",
+            adapter_id: "bsl-analyzer",
+            adapter_version: "bsl-analyzer-workspace/v1",
+            engine_version: "0.2.65",
+            bsl_file_count: 5,
+            status: "unavailable",
+            modality: "hybrid",
+            capabilities: [],
+            route_priorities: {},
+            failure_code: "backend.contract_incompatible",
+          }],
+          configuration: {
+            schema_version: "3",
+            backends: [{ adapter_id: "bsl-analyzer", engine_version: "0.2.65" }],
+            routes: { "code-search-hybrid": ["bsl-analyzer"] },
+          },
+          configuration_fingerprint: "sha256:config",
+          route_health: { blockers: [{}], degraded: [{}] },
+          backend_tools: [{
+            tool_id: "bsl-analyzer",
+            status: "incompatible",
+            required: true,
+            instances: [{
+              version: "0.2.67",
+              configured_version: "0.2.67",
+              contract_version: "1.6",
+              configured_contract_version: "1.3",
+              status: "incompatible",
+            }],
+          }],
+          reference_readiness: { status: "not_ready" },
+        }
+      : { profiles: [], state_fingerprint: "sha256:services" },
+  })));
+
+  render(<Indexes
+    project={{ id: "p", name: "p", root: "/repo" }}
+    snapshot={{ workflow_fingerprint: "sha256:workflow" } as never}
+  />);
+
+  expect(await screen.findByText("BSL Analyzer несовместим с настройками проекта.")).toBeInTheDocument();
+  expect(screen.getByText(/Версия BSL Analyzer 0.2.67. Проект поддерживает машинный контракт 1.3, установленный движок предоставляет 1.6/)).toBeInTheDocument();
+  expect(screen.getByText(/Лексический поиск временно работает через RLM Tools BSL/)).toBeInTheDocument();
+  expect(screen.queryByText(/Не хватает лексических индексов/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/Часть запросов использует резервный движок/)).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Создать недостающие индексы" })).toBeDisabled();
+});
+
 test("index cleanup preview explains removable copies without raw JSON", async () => {
   vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string) => Promise.resolve({
     ok: true,
@@ -571,6 +627,7 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
                 ],
                 routes: {
                   "code-search-lexical": ["rlm-tools-bsl", "bsl-analyzer"],
+                  "diagnostics-catalog": ["bsl-analyzer"],
                 },
               },
               configuration_fingerprint: "sha256:config",
@@ -585,7 +642,29 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
                 }],
               },
             }
-          : {},
+          : url.endsWith("/search-services")
+            ? {
+                profiles: [{
+                  profile_id: "embedding-default",
+                  kind: "embedding",
+                  label: "Сохранённый профиль",
+                  enabled: true,
+                  provider: "openai-compatible",
+                  model: "nomic-embed-text:latest",
+                  dimension: 768,
+                  endpoint_class: "loopback_http",
+                  build_limits: {
+                    requests: 10000,
+                    input_bytes: 2147483648,
+                    vectors: 1000000,
+                    concurrency: 4,
+                    batch: 256,
+                    elapsed_seconds: 1800,
+                  },
+                }],
+                state_fingerprint: "sha256:services",
+              }
+            : {},
     }),
   );
   vi.stubGlobal("fetch", fetchMock);
@@ -599,10 +678,22 @@ test("index workspace shows mixed backend readiness and reviewed route impact", 
   expect(screen.getByText(/fix_backend_installation/)).toBeInTheDocument();
   expect(screen.getByText(/Часть запросов использует резервный движок/)).toBeInTheDocument();
   expect(screen.getByText(/\/state\/one-c-autoresearch\/indexes-v2\/repository/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Семантический поиск" }));
+  expect(screen.getByRole("textbox", { name: "Модель" })).toHaveValue("nomic-embed-text:latest");
+  expect(screen.getByRole("spinbutton", { name: "Размерность вектора" })).toHaveValue(768);
+  expect(screen.getByRole("textbox", { name: "Новый адрес сервиса" })).toHaveValue("");
+  fireEvent.click(screen.getByRole("button", { name: "Диагностика по объектам (1)" }));
+  expect(screen.getAllByRole("checkbox", { name: "Рабочая конфигурация" })).toHaveLength(1);
   fireEvent.click(screen.getByText("Настройка адаптеров и маршрутов"));
   expect(screen.getAllByLabelText("Версия движка", { selector: "input" })[0]).toHaveValue("0.2.63");
-  expect(screen.getAllByRole("button", { name: "Отключить движок" })).toHaveLength(2);
+  expect(screen.getAllByRole("button", { name: "Убрать из плана" })).toHaveLength(2);
   expect(screen.getByText("Расширенные настройки маршрутов")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Расширенные настройки маршрутов" }));
+  expect(screen.getByRole("button", { name: "Диагностика · 1" })).toBeInTheDocument();
+  expect(screen.getByText("Каталог диагностик")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Код · 1" }));
+  expect(screen.getByRole("combobox", { name: "Цепочка движков: Лексический поиск по коду" }))
+    .toHaveTextContent("RLM Tools BSL → BSL Analyzer");
   expect(screen.queryByLabelText("Типизированная конфигурация")).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Проверить изменения" }));
   expect(await screen.findByText("Настройки корректны и готовы к применению")).toBeInTheDocument();
