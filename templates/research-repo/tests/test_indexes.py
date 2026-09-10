@@ -46,6 +46,17 @@ def test_index_executable_is_found_above_nested_project(tmp_path: Path, monkeypa
     assert indexes.discover_executable(repo) == str(executable)
 
 
+def test_bsl_backend_prefers_direct_app_over_auto_update_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = {
+        "bsl-analyzer-app": "/tools/bsl-analyzer-app",
+        "bsl-analyzer": "/tools/bsl-analyzer",
+    }
+    monkeypatch.setattr(shutil, "which", paths.get)
+    assert indexes.backend_executable(tmp_path, "bsl-analyzer") == paths["bsl-analyzer-app"]
+
+
 def test_cli_version_accepts_semver_build_metadata(monkeypatch) -> None:
     monkeypatch.setattr(
         indexes,
@@ -482,6 +493,27 @@ def test_backend_status_has_safe_recovery_without_mutating_state(
     assert row["readiness_reason"] == "backend.executable_unavailable"
     assert row["recovery_action"] == "fix_backend_installation"
     assert not state.exists()
+
+
+def test_backend_statuses_reuses_one_probe_per_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo, _component = _minimal_index_repo(tmp_path / "repo")
+    calls: list[str] = []
+    probe = {
+        "available": True,
+        "executable": "/fixed/rlm-bsl-index",
+        "executable_fingerprint": "sha256:binary",
+        "capabilities": list(indexes.RLM_CAPABILITIES),
+        "contract_version": "provider-query/v1",
+    }
+    monkeypatch.setattr(
+        indexes,
+        "probe_backend",
+        lambda _repo, backend: calls.append(backend["adapter_id"]) or probe,
+    )
+    _ = indexes.backend_statuses(repo, tmp_path / "state", verify_manifests=False)
+    assert calls == ["rlm-tools-bsl"]
 
 
 def test_ready_validation_does_not_create_operational_state(

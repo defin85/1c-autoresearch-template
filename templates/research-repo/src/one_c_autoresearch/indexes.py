@@ -986,6 +986,8 @@ def discover_executable(repo: Path) -> str | None:
 def backend_executable(repo: Path, adapter_id: str) -> str | None:
     if adapter_id == "rlm-tools-bsl":
         return discover_executable(repo)
+    if adapter_id == "bsl-analyzer":
+        return shutil.which("bsl-analyzer-app") or shutil.which("bsl-analyzer")
     return shutil.which(str(BACKEND_CATALOG[adapter_id]["executable"]))
 
 
@@ -1313,7 +1315,9 @@ def probe_backend(repo: Path, backend: BackendRow) -> BackendProbe:
         return failure_result
 
 
-def backend_tool_inventory(repo: Path) -> list[ToolInventory]:
+def backend_tool_inventory(
+    repo: Path, *, probes: dict[str, BackendProbe] | None = None,
+) -> list[ToolInventory]:
     config = load_config(repo)
     configured = {item["adapter_id"]: item for item in config["backends"]}
     required = {
@@ -1331,7 +1335,9 @@ def backend_tool_inventory(repo: Path) -> list[ToolInventory]:
         instances: list[ToolInstance] = []
         status = "unavailable"
         if executable and backend:
-            probe = probe_backend(repo, backend)
+            probe = probes.get(adapter_id) if probes else None
+            if probe is None:
+                probe = probe_backend(repo, backend)
             status = "ready" if probe["available"] else "incompatible"
             instance: ToolInstance = {
                 "version": str(probe.get("engine_version", backend["engine_version"])),
@@ -2011,8 +2017,10 @@ def ready_backend_state(
     state_root: Path | None = None,
     modality: str = "lexical",
     verify_manifests: bool = True,
+    probe: BackendProbe | None = None,
 ) -> BackendState | None:
-    probe = probe_backend(repo, backend)
+    if probe is None:
+        probe = probe_backend(repo, backend)
     if not probe["available"]:
         return None
     contract_value = probe.get("contract_version")
@@ -2613,9 +2621,11 @@ def _reference_index_target_impl(
     repo: Path,
     backend: BackendRow,
     state_root: Path | None = None,
+    probe: BackendProbe | None = None,
 ) -> tuple[Path, str, BackendProbe, Path]:
     executable = backend_executable(repo, "bsl-analyzer")
-    probe = probe_backend(repo, backend)
+    if probe is None:
+        probe = probe_backend(repo, backend)
     surface_identity = str(
         probe.get("surface_manifest", {}).get("surface_fingerprint", "")
     )
@@ -2647,8 +2657,12 @@ def reference_index_target(
     repo: Path,
     backend: BackendRow,
     state_root: Path | None = None,
+    *,
+    probe: BackendProbe | None = None,
 ) -> tuple[Path, str, BackendProbe, Path]:
-    return _reference_index_target(repo, backend, state_root)
+    if probe is None:
+        return _reference_index_target(repo, backend, state_root)
+    return _reference_index_target_impl(repo, backend, state_root, probe)
 
 
 def reference_index_status(
@@ -2656,11 +2670,12 @@ def reference_index_status(
     backend: BackendRow,
     *,
     state_root: Path | None = None,
+    probe: BackendProbe | None = None,
 ) -> BackendState:
     from . import reference_search
     try:
         _executable, identity, probe, root = reference_index_target(
-            repo, backend, state_root
+            repo, backend, state_root, probe=probe
         )
         executable_fingerprint = probe.get("executable_fingerprint")
         if not isinstance(executable_fingerprint, str):
@@ -2796,12 +2811,15 @@ def statuses(repo: Path, state_root: Path | None = None, probe: Callable[[Path],
 
 def backend_statuses(
     repo: Path, state_root: Path | None = None, *, verify_manifests: bool = True,
+    probes: dict[str, BackendProbe] | None = None,
 ) -> list[dict[str, JsonValue]]:
     config = load_config(repo)
     rows: list[dict[str, JsonValue]] = []
     for backend in config["backends"]:
         adapter_id = backend["adapter_id"]
-        backend_probe = probe_backend(repo, backend)
+        backend_probe = probes.get(adapter_id) if probes else None
+        if backend_probe is None:
+            backend_probe = probe_backend(repo, backend)
         for component in discover(repo):
             modalities = (
                 ("lexical", "hybrid")
@@ -2828,6 +2846,7 @@ def backend_statuses(
                     repo, component, backend, state_root=state_root,
                     modality=modality,
                     verify_manifests=verify_manifests,
+                    probe=backend_probe,
                 )
                 status = (
                     "ready" if promoted else

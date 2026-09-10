@@ -37,13 +37,16 @@ def test_indexes_snapshot_skips_repeated_deep_validation(tmp_path: Path, monkeyp
     from one_c_autoresearch import indexes
     calls: list[object] = []
     row = {"adapter_id": "bsl-analyzer", "component_id": "target_cf:configuration", "status": "ready", "capabilities": ["code-search-lexical"]}
-    monkeypatch.setattr(indexes, "backend_statuses", lambda _repo, *, verify_manifests=True: calls.append(verify_manifests) or [row])
+    probe = {"available": False, "failure_code": "test"}
+    monkeypatch.setattr(indexes, "probe_backend", lambda *_args: calls.append("probe") or probe)
+    monkeypatch.setattr(indexes, "backend_statuses", lambda _repo, *, verify_manifests=True, probes=None: calls.append(("statuses", verify_manifests, probes == {"bsl-analyzer": probe})) or [row])
     monkeypatch.setattr(indexes, "storage_diagnostics", lambda _repo, *, calculate_usage=True: calls.append(("storage", calculate_usage)) or {"root": "/indexes"})
-    monkeypatch.setattr(indexes, "load_config", lambda _repo: {"schema_version": "3", "backends": [], "routes": {}})
+    monkeypatch.setattr(indexes, "load_config", lambda _repo: {"schema_version": "3", "backends": [{"adapter_id": "bsl-analyzer"}], "routes": {}})
     monkeypatch.setattr(indexes, "config_fingerprint", lambda _repo: "sha256:config")
     monkeypatch.setattr(indexes, "discover", lambda _repo: [])
     monkeypatch.setattr(indexes, "route_coverage", lambda *_args: {"blockers": [], "degraded": []})
-    monkeypatch.setattr(indexes, "backend_tool_inventory", lambda _repo: [])
+    monkeypatch.setattr(indexes, "backend_tool_inventory", lambda _repo, *, probes=None: calls.append(("inventory", probes == {"bsl-analyzer": probe})) or [])
+    monkeypatch.setattr(indexes, "reference_index_status", lambda _repo, _backend, *, probe=None: calls.append(("reference", probe is not None)) or {})
     monkeypatch.setattr("one_c_autoresearch.search_runtime.runtime_diagnostics", lambda: [])
     monkeypatch.setattr("one_c_autoresearch.workspace_api.ApplicationService.index_statuses", lambda _self: calls.append("service") or [])
     app = create_app(tmp_path / "state", [REPO], testing=True)
@@ -54,7 +57,14 @@ def test_indexes_snapshot_skips_repeated_deep_validation(tmp_path: Path, monkeyp
     assert response.status_code == 200
     assert response.json()["items"] == [row]
     assert "storage" not in response.json()
-    assert calls == [False, ("storage", False)]
+    assert calls == [
+        "probe",
+        ("statuses", False, True),
+        ("storage", False),
+        ("inventory", True),
+        ("reference", True),
+    ]
+
 
 def test_event_replay_can_open_at_the_current_tail(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events", "project")

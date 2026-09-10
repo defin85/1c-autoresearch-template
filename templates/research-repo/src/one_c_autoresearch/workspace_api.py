@@ -2174,7 +2174,13 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
         from . import indexes, search_runtime
         project = repo(project_id)
         configuration = indexes.load_config(project)
-        items = indexes.backend_statuses(project, verify_manifests=False)
+        probes = {
+            backend["adapter_id"]: indexes.probe_backend(project, backend)
+            for backend in configuration["backends"]
+        }
+        items = indexes.backend_statuses(
+            project, verify_manifests=False, probes=probes,
+        )
         backend_states = [backend_state(row) for row in items]
         bsl = next(
             (
@@ -2192,11 +2198,13 @@ def create_app(state_root: Path | None = None, approved_roots: list[Path] | None
                 configuration, indexes.discover(project), backend_states,
             )),
             "storage_root": _string(storage["root"]),
-            "backend_tools": indexes.backend_tool_inventory(project),
+            "backend_tools": indexes.backend_tool_inventory(project, probes=probes),
             "disposable": True,
             "runtime_backends": search_runtime.runtime_diagnostics(),
             "reference_readiness": (
-                indexes.reference_index_status(project, bsl)
+                indexes.reference_index_status(
+                    project, bsl, probe=probes.get("bsl-analyzer"),
+                )
                 if bsl and configuration.get("schema_version") == "3"
                 else None
             ),
